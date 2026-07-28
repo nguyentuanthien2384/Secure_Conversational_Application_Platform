@@ -29,7 +29,7 @@ jobs:
       - run: uv run bandit -r src/app -ll -ii -f json -o reports-bandit.json
       - run: uv export --frozen --no-dev --no-emit-project --output-file requirements-audit.txt
       - run: uv run pip-audit -r requirements-audit.txt -f json -o reports-pip-audit.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: security-test-reports
@@ -79,7 +79,7 @@ jobs:
           scan-ref: .
           format: cyclonedx
           output: sbom-source.cdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sbom-source
@@ -110,7 +110,7 @@ jobs:
           image-ref: secure-chat:ci
           format: cyclonedx
           output: sbom-image.cdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sbom-image
