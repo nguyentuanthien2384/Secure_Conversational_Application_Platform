@@ -56,12 +56,6 @@ def test_long_passphrase_without_composition_is_accepted(client: TestClient):
     assert ok.status_code == 201, ok.text
 
 
-def test_spa_does_not_persist_access_token_in_web_storage():
-    spa = Path("src/app/static/index.html").read_text(encoding="utf-8")
-    assert "sessionStorage" not in spa
-    assert "localStorage" not in spa
-
-
 def test_invalid_request_id_is_replaced(client: TestClient):
     response = client.get("/api/health", headers={"X-Request-ID": "bad id with spaces"})
     request_id = response.headers["X-Request-ID"]

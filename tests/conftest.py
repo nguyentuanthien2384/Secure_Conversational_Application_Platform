@@ -39,6 +39,24 @@ def client(app):
         yield test_client
 
 
+@pytest.fixture()
+def db_session(app):
+    """Session SQLAlchemy trỏ vào cùng database mà ứng dụng đang dùng.
+
+    Dùng cho các test cần kiểm tra hoặc thao tác trực tiếp ở tầng DB — ví dụ mô
+    phỏng kẻ tấn công có quyền SQL sửa nhật ký kiểm toán.
+    """
+    with app.state.database.session_factory() as session:
+        yield session
+
+
+@pytest.fixture()
+def auth_headers(client: TestClient) -> dict[str, str]:
+    """Header Authorization của một tài khoản user thường đã đăng nhập."""
+    token = register_and_login(client, "nguoi.dung.test")
+    return {"Authorization": f"Bearer {token}"}
+
+
 def register_and_login(
     client: TestClient, username: str, password: str = "Correct Horse Battery1"
 ) -> str:

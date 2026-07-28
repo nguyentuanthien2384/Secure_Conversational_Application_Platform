@@ -54,10 +54,10 @@ def test_stage_lists_and_reset_tuple_have_matching_arity():
     stage1 = len(_find_list_assign(body, "STAGE1").elts)
     stage2 = len(_find_list_assign(body, "STAGE2").elts)
     reset_len = _final_return_len(_find_func(body, "_reset_tuple"))
-    # RESET_OUTS = STAGE1 + STAGE2 + [md_countdown]
-    assert reset_len == stage1 + stage2 + 1, (
+    # RESET_OUTS = STAGE1 + STAGE2 + [md_countdown, st_warned]
+    assert reset_len == stage1 + stage2 + 2, (
         f"_reset_tuple trả {reset_len} giá trị nhưng RESET_OUTS cần "
-        f"{stage1 + stage2 + 1} (STAGE1={stage1}, STAGE2={stage2}, +md_countdown)"
+        f"{stage1 + stage2 + 2} (STAGE1={stage1}, STAGE2={stage2}, +countdown/warned)"
     )
 
 

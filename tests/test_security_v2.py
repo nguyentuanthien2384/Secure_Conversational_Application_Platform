@@ -11,7 +11,7 @@ import base64
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from src.app.audit_chain import GENESIS_HASH, derive_audit_key, verify_chain
 from src.app.ids import Detection, IntrusionState, detect_anomalies, scan_text
@@ -246,6 +246,15 @@ def test_admin_can_verify_chain_and_read_ids_state(client: TestClient, app):
     verify = client.get("/api/admin/audit/verify", headers=headers)
     assert verify.status_code == 200
     assert verify.json()["chain_intact"] is True
+    assert verify.json()["checked_by"] == "ids-admin"
+    assert verify.json()["checked_at"]
+    assert verify.json()["total_events"] == verify.json()["verified_events"]
+    assert (
+        db.execute(
+            select(func.count()).select_from(AuditEvent).where(AuditEvent.event_type == "audit.chain.verify")
+        ).scalar_one()
+        == 1
+    )
 
     assert client.get("/api/admin/ids/detections", headers=headers).status_code == 200
     assert client.get("/api/admin/ids/anomalies", headers=headers).status_code == 200
