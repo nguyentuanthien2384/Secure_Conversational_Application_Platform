@@ -184,9 +184,9 @@ footer { display: none !important; }
   margin: 0; font-size: 12px; font-family: var(--font-mono);
   color: var(--body-text-color-subdued);
 }
-#dlp-banner, #sec-verdict-ok, #sec-verdict-bad {
+#dlp-banner, #sec-verdict {
   border-radius: 8px; padding: 10px 13px; margin-top: 6px;
-  border-left-width: 3px; border-left-style: solid;
+  border-left: 3px solid var(--scap-warn-bd);
 }
 #dlp-banner {
   border: 1px solid var(--scap-warn-bd);
@@ -194,19 +194,12 @@ footer { display: none !important; }
   background: var(--scap-warn-bg);
 }
 #dlp-banner p { margin: 0; font-size: 13px; color: var(--scap-warn-fg); }
-#sec-verdict-ok {
-  border: 1px solid var(--scap-ok-bd);
-  border-left-color: var(--scap-ok-bd);
-  background: var(--scap-ok-bg);
-  color: var(--scap-ok-fg);
+#sec-verdict {
+  border: 1px solid var(--scap-warn-bd);
+  background: var(--scap-warn-bg);
+  color: var(--scap-warn-fg);
 }
-#sec-verdict-bad {
-  border: 1px solid var(--scap-bad-bd);
-  border-left-color: var(--scap-bad-bd);
-  background: var(--scap-bad-bg);
-  color: var(--scap-bad-fg);
-}
-#sec-verdict-ok p, #sec-verdict-bad p { margin: 0; font-size: 13px; }
+#sec-verdict p { margin: 0; font-size: 13px; }
 
 /* ── Bố cục ngang ──────────────────────────────────────────────────────── */
 @media (min-width: 1000px) {
@@ -234,6 +227,46 @@ footer { display: none !important; }
 
 
 # ────────────────────────── API helper ──────────────────────────
+# Cạnh ô hiển thị mã QR. Ảnh được dựng đúng bằng số pixel này rồi mới đưa vào
+# gr.Image, để trình duyệt không phải co giãn — co giãn không nguyên lần làm nhoè
+# biên các module và là lý do chính khiến camera điện thoại không đọc được mã.
+QR_DISPLAY_PX = 352
+
+
+def _totp_qr_image(uri: str, target_px: int = QR_DISPLAY_PX):
+    """Dựng ảnh QR sắc nét, đúng ``target_px`` pixel mỗi cạnh.
+
+    Ba điểm quyết định việc quét được hay không:
+
+    1. ``border=4`` — vùng yên tĩnh (quiet zone) tối thiểu theo ISO/IEC 18004.
+       Bản cũ dùng ``border=2``, thiếu viền nên bộ dò khó khoá được ba ô định vị.
+    2. ``box_size`` là số nguyên chia hết, và phần thiếu được **đệm thêm viền
+       trắng** thay vì phóng to ảnh. Nhờ vậy mỗi module luôn là một khối pixel
+       vuông sắc nét, không có pixel xám ở biên do nội suy.
+    3. Mức sửa lỗi M (mặc định) là cân bằng đúng: L quá mỏng khi màn hình loá,
+       Q/H làm mã dày thêm mà không cần thiết cho khoảng cách quét gần.
+    """
+    import qrcode
+    from PIL import Image
+
+    qr = qrcode.QRCode(border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(uri)
+    qr.make(fit=True)
+    total_modules = qr.modules_count + 2 * qr.border
+    box_size = max(1, target_px // total_modules)
+    qr.box_size = box_size
+    image = qr.make_image(fill_color="black", back_color="white").get_image().convert("RGB")
+
+    # Đệm cho đủ kích thước đích. Đệm bằng nền trắng nên chỉ làm quiet zone rộng
+    # thêm — luôn có lợi cho việc quét, khác hẳn với phóng to ảnh.
+    if image.width < target_px:
+        canvas = Image.new("RGB", (target_px, target_px), "white")
+        offset = (target_px - image.width) // 2
+        canvas.paste(image, (offset, offset))
+        image = canvas
+    return image
+
+
 def _api(token, method, path, body=None, *, params=None):
     import httpx
 
@@ -334,6 +367,9 @@ def build_ui() -> gr.Blocks:
         st_token = gr.State("")
         st_exp = gr.State(0.0)
         st_mfa = gr.State("")
+        # Đã hiện cảnh báo "sắp hết phiên" chưa — để chỉ nhắc một lần cho mỗi
+        # phiên thay vì mỗi giây một lần trong suốt hai phút cuối.
+        st_warned = gr.State(False)
 
         # ============ XÁC THỰC ============
         with gr.Column(visible=True, elem_id="auth-wrap") as auth_sec:
@@ -373,6 +409,7 @@ def build_ui() -> gr.Blocks:
             with gr.Row(elem_id="topbar"):
                 md_banner = gr.Markdown("", elem_classes="md")
                 md_countdown = gr.Markdown("", elem_classes="md")
+                btn_extend = gr.Button("Gia hạn phiên", scale=0, size="sm")
                 btn_logout = gr.Button("Đăng xuất", scale=0, size="sm")
             timer = gr.Timer(1, active=False)
 
@@ -506,8 +543,14 @@ def build_ui() -> gr.Blocks:
                             btn_enroll = gr.Button("Bắt đầu thiết lập 2FA", size="sm")
                             with gr.Group(visible=False) as grp_mfa_setup:
                                 with gr.Row():
+                                    # height/width khớp đúng ảnh sinh ra (xem
+                                    # _totp_qr_image) nên tỉ lệ hiển thị là 1:1.
                                     img_qr = gr.Image(
-                                        label="Quét bằng ứng dụng xác thực", height=220, scale=1
+                                        label="Quét bằng ứng dụng xác thực",
+                                        height=QR_DISPLAY_PX,
+                                        width=QR_DISPLAY_PX,
+                                        scale=1,
+                                        interactive=False,
                                     )
                                     with gr.Column(scale=2):
                                         tb_secret = gr.Textbox(
@@ -616,8 +659,11 @@ def build_ui() -> gr.Blocks:
                             "`HMAC-SHA256(khóa, prev_hash ‖ bản_ghi)`. Sửa hoặc xoá một dòng "
                             "sẽ làm gãy chuỗi và bị phát hiện tại đây. *Chức năng này cần vai trò admin.*"
                         )
-                        btn_sec_verify = gr.Button("Xác minh chuỗi", size="sm")
-                        md_sec_verdict = gr.Markdown("")
+                        btn_sec_verify = gr.Button("Xác minh chuỗi", variant="primary", size="sm")
+                        md_sec_verdict = gr.Markdown(
+                            "*Chưa xác minh trong phiên làm việc này.*",
+                            elem_id="sec-verdict",
+                        )
 
                     with gr.Accordion("2 · IDS — mẫu tấn công đã phát hiện", open=True):
                         df_sec_det = gr.Dataframe(
@@ -673,7 +719,9 @@ def build_ui() -> gr.Blocks:
             dd_revoke,
             timer,
         ]
-        RESET_OUTS = STAGE1 + STAGE2 + [md_countdown]
+        # st_warned nằm ở CUỐI danh sách một cách có chủ đích: các handler chỉ
+        # trả về STAGE1 (đăng nhập, xác minh MFA) không phải sửa gì thêm.
+        RESET_OUTS = STAGE1 + STAGE2 + [md_countdown, st_warned]
 
         def _reset_tuple():
             return (
@@ -701,6 +749,7 @@ def build_ui() -> gr.Blocks:
                 gr.update(choices=[], value=None),
                 gr.Timer(active=False),
                 "",
+                False,
             )
 
         # ---- đăng ký ----
@@ -842,18 +891,63 @@ def build_ui() -> gr.Blocks:
 
         btn_logout.click(_guard(do_logout, len(RESET_OUTS)), [st_token], RESET_OUTS)
 
-        def tick(exp):
+        # Ngưỡng nhắc trước khi phiên hết hạn (giây).
+        WARN_BEFORE_EXPIRY = 120
+
+        def _alive(countdown_markdown, warned):
+            """Giữ nguyên mọi output trừ đồng hồ và cờ cảnh báo.
+
+            gr.skip() để đồng hồ chạy mỗi giây không ghi đè state của người dùng
+            (ô đang gõ, hội thoại đang chọn…).
+            """
+            return tuple(gr.skip() for _ in range(len(RESET_OUTS) - 2)) + (
+                countdown_markdown,
+                warned,
+            )
+
+        def tick(exp, warned):
+            """Chạy mỗi giây: đếm ngược, nhắc trước, và tự đăng xuất khi hết hạn.
+
+            Trước đây hàm này chỉ đổi dòng chữ thành "token đã hết hạn" rồi thôi:
+            giao diện vẫn hiện đầy đủ, mọi nút vẫn bấm được, và người dùng chỉ
+            biết mình đã mất phiên khi một thao tác trả về 401. Tệ hơn, dữ liệu
+            hội thoại đã giải mã vẫn nằm trong state của trình duyệt sau khi
+            phiên đã chết. Bây giờ hết hạn là dọn sạch state và quay về màn đăng
+            nhập, đúng như khi bấm Đăng xuất.
+            """
             if not exp:
-                return ""
+                return _alive("", False)
             left = int(exp - time.time())
             if left <= 0:
-                return "⛔ **Token đã hết hạn** — hãy đăng nhập lại."
+                gr.Warning("Phiên đã hết hạn — vui lòng đăng nhập lại.")
+                return _reset_tuple()
+            if left <= WARN_BEFORE_EXPIRY and not warned:
+                gr.Warning(
+                    f"Phiên sẽ hết hạn sau {left} giây. "
+                    "Bấm “Gia hạn phiên” để tiếp tục làm việc."
+                )
+                warned = True
             hours, rem = divmod(left, 3600)
             minutes, seconds = divmod(rem, 60)
             shown = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
-            return f"⏳ **{shown}**"
+            icon = "⚠️" if left <= WARN_BEFORE_EXPIRY else "⏳"
+            return _alive(f"{icon} **{shown}**", warned)
 
-        timer.tick(tick, [st_exp], [md_countdown])
+        timer.tick(tick, [st_exp, st_warned], RESET_OUTS)
+
+        def extend_session(token):
+            """Xin token mới trước khi token hiện tại hết hạn (sliding session).
+
+            Máy chủ xoay jti và thu hồi cái cũ, đồng thời áp trần tuyệt đối tính
+            từ lần đăng nhập gốc — nên phiên không thể được gia hạn vô hạn.
+            """
+            data = _api(token, "POST", "/api/auth/refresh")
+            gr.Info("Đã gia hạn phiên.")
+            return data["access_token"], time.time() + data["expires_in"], False
+
+        btn_extend.click(
+            _guard(extend_session, 3), [st_token], [st_token, st_exp, st_warned]
+        )
 
         # ---- trò chuyện ----
         def refresh_sessions(token, selected=None):
@@ -1077,14 +1171,11 @@ def build_ui() -> gr.Blocks:
             data = _api(token, "POST", "/api/auth/mfa/enroll")
             image = None
             try:
-                import qrcode
-
-                qr = qrcode.QRCode(box_size=6, border=2)
-                qr.add_data(data["provisioning_uri"])
-                qr.make(fit=True)
-                image = qr.make_image(fill_color="black", back_color="white").get_image()
-            except Exception:
+                image = _totp_qr_image(data["provisioning_uri"], QR_DISPLAY_PX)
+            except ImportError:
                 gr.Warning("Thiếu thư viện qrcode (chạy `uv sync`) — dùng khóa thủ công bên dưới.")
+            except Exception:
+                gr.Warning("Không dựng được mã QR — hãy dùng khóa thủ công bên dưới.")
             if image is not None:
                 gr.Info("Quét mã QR rồi nhập mã 6 số để kích hoạt.")
             else:
@@ -1291,28 +1382,53 @@ def build_ui() -> gr.Blocks:
         _SEV_ICON = {"high": "🔴 cao", "medium": "🟠 vừa", "low": "🟡 thấp"}
 
         def verify_chain_ui(token):
-            """Xác minh chuỗi băm audit và diễn giải kết quả cho người đọc."""
-            data = _api(token, "GET", "/api/admin/audit/verify")
+            """Return a persistent, readable audit-chain verification result.
+
+            This handler handles API failures itself. The generic Gradio guard
+            returns gr.skip() on errors, which previously left this panel blank
+            and hid the only useful diagnostic in a transient toast.
+            """
+            if not token:
+                return "**Không thể xác minh:** phiên đăng nhập đã hết hạn. Hãy đăng nhập lại."
+            try:
+                data = _api(token, "GET", "/api/admin/audit/verify")
+            except gr.Error as err:
+                return f"**Không thể xác minh chuỗi:** {err}"
             total = data.get("total_events", 0)
             verified = data.get("verified_events", 0)
+            unsealed = data.get("unsealed_events", 0)
+            checked_at = _fmt(data.get("checked_at"))
+            checked_by = data.get("checked_by") or "admin"
+            if total == 0:
+                return (
+                    "**Chưa có nhật ký để xác minh.** Hệ thống sẽ tạo nhật ký khi có đăng ký, "
+                    "đăng nhập, tạo hội thoại hoặc gửi tin nhắn."
+                )
             if data.get("chain_intact"):
                 return (
-                    '<div id="sec-verdict-ok">'
-                    f"<b>✅ Chuỗi nguyên vẹn.</b> Đã xác minh {verified}/{total} bản ghi. "
-                    "Không có dấu hiệu bản ghi bị sửa, xoá hay đảo thứ tự."
-                    "</div>"
+                    f"**Chuỗi nguyên vẹn.** Đã xác minh **{verified}/{total}** bản ghi; "
+                    "toàn bộ nhật ký đều được chuỗi băm bảo vệ. Không có dấu hiệu bản ghi bị "
+                    f"sửa, xóa hoặc đảo thứ tự.\n\nKiểm tra lúc {checked_at} bởi {checked_by}."
+                )
+            # Trường hợp riêng: không có mắt xích nào sai, nhưng một số bản ghi
+            # nằm ngoài chuỗi. Đó là lỗ hổng phạm vi bảo vệ, không phải bằng
+            # chứng bị tấn công — và phải nói đúng như vậy.
+            if data.get("reason") == "unsealed_events":
+                return (
+                    f"**Chuỗi chưa phủ hết nhật ký.** {verified}/{total} bản ghi được bảo vệ; "
+                    f"**{unsealed} bản ghi chưa được niêm phong** (bản ghi đầu tiên: "
+                    f"#{data.get('first_unsealed_id')}). Các bản ghi này có thể bị sửa mà "
+                    "không bị phát hiện. Chạy python scripts/repair_audit_chain.py để vá."
                 )
             reason = {
                 "entry_hash_mismatch": "nội dung bản ghi đã bị sửa",
                 "prev_hash_mismatch": "có bản ghi bị xoá hoặc bị đảo thứ tự",
             }.get(data.get("reason"), data.get("reason") or "không xác định")
             return (
-                '<div id="sec-verdict-bad">'
-                f"<b>🚨 Chuỗi đã bị phá vỡ.</b> Bản ghi đầu tiên có vấn đề: "
-                f"<code>#{data.get('first_broken_id')}</code> — {reason}. "
-                f"Đã xác minh được {verified}/{total} bản ghi trước điểm gãy. "
-                "Sự kiện phát hiện này cũng đã được ghi vào nhật ký."
-                "</div>"
+                "**Chuỗi đã bị phá vỡ.** Bản ghi đầu tiên có vấn đề: "
+                f"#{data.get('first_broken_id')} - {reason}. Đã xác minh được "
+                f"{verified}/{total} bản ghi trước điểm gãy. Sự kiện phát hiện này cũng đã "
+                "được ghi vào nhật ký."
             )
 
         def load_detections(token):
@@ -1372,7 +1488,7 @@ def build_ui() -> gr.Blocks:
                     return fallback
 
             verdict = safe(
-                lambda: verify_chain_ui(token), "*Cần vai trò admin để xác minh chuỗi băm.*"
+                lambda: verify_chain_ui(token), "**Không thể xác minh chuỗi.**"
             )
             det = safe(lambda: load_detections(token), [])
             anom = safe(lambda: load_anomalies(token, window), [])
@@ -1382,7 +1498,7 @@ def build_ui() -> gr.Blocks:
         SEC_OUTS = [md_sec_verdict, df_sec_det, df_sec_anom, df_sec_block]
         btn_sec_all.click(_guard(refresh_security, 4), [st_token, sl_sec_win], SEC_OUTS)
         sec_tab.select(_guard(refresh_security, 4), [st_token, sl_sec_win], SEC_OUTS)
-        btn_sec_verify.click(_guard(verify_chain_ui, 1), [st_token], [md_sec_verdict])
+        btn_sec_verify.click(verify_chain_ui, [st_token], [md_sec_verdict])
         btn_sec_anom.click(_guard(load_anomalies, 1), [st_token, sl_sec_win], [df_sec_anom])
         btn_sec_unblock.click(
             _guard(unblock_ip, 2), [st_token, tb_sec_ip], [df_sec_block, tb_sec_ip]

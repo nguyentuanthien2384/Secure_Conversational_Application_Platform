@@ -64,6 +64,13 @@ class AuthSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Thời điểm đăng nhập *gốc* của chuỗi phiên này. Mỗi lần /api/auth/refresh
+    # xoay token, giá trị này được mang sang phiên mới, nên nó là mốc để áp trần
+    # tuyệt đối. Không có nó, sliding session sẽ cho phép gia hạn vĩnh viễn và
+    # một token bị đánh cắp có thể được giữ sống mãi.
+    root_issued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     user: Mapped[User] = relationship(back_populates="auth_sessions")
 

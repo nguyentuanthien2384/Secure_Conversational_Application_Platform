@@ -1,10 +1,8 @@
 import logging
-import os
 import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Annotated
 
 import gradio as gr
@@ -12,9 +10,8 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -118,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     message_limiter = limiter_type(*limiter_args)
     mfa_limiter = limiter_type(*limiter_args)
     password_change_limiter = limiter_type(*limiter_args)
+    refresh_limiter = limiter_type(*limiter_args)
     totp_service = TotpService()
     chat_service = ChatService(crypto_service, AIService(settings))
     # Structured JSON security log on stdout for SIEM ingestion (Bài 7 §SIEM).
@@ -153,7 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     db.commit()
         # Dữ liệu mẫu phục vụ demo/chấm bài: bật bằng SEED_DEMO_DATA=true trong .env.
         # Idempotent — không tạo trùng khi khởi động lại; tắt mặc định ở production.
-        if os.getenv("SEED_DEMO_DATA", "").strip().lower() in {"1", "true", "yes", "on"}:
+        if settings.seed_demo_data:
             from src.app.demo_seed import seed_demo_data
 
             seed_demo_data(database, password_service, crypto_service, log=logger.info)
@@ -457,22 +455,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             auth_session.revoked_at = now
         user.token_version += 1
 
-    def issue_access_session(db: Session, request: Request, user: User, ip: str) -> str:
+    def issue_access_session(
+        db: Session,
+        request: Request,
+        user: User,
+        ip: str,
+        *,
+        root_issued_at: datetime | None = None,
+    ) -> str:
         """Mint an access token and persist its server-side AuthSession record.
 
         Shared by password-only login and the MFA second step so both paths create
-        an identical, revocable device session.
+        an identical, revocable device session. ``root_issued_at`` is carried over
+        by ``/api/auth/refresh`` so a renewed session keeps the timestamp of the
+        original password (+ MFA) authentication, which is what the absolute
+        session cap is measured against.
         """
         token = token_service.issue(user.id, user.username, user.role, user.token_version)
         token_payload = token_service.decode(token)
+        issued_at = datetime.fromtimestamp(int(token_payload["iat"]), tz=timezone.utc)
         db.add(
             AuthSession(
                 jti=str(token_payload["jti"]),
                 user_id=user.id,
-                issued_at=datetime.fromtimestamp(int(token_payload["iat"]), tz=timezone.utc),
+                issued_at=issued_at,
                 expires_at=datetime.fromtimestamp(int(token_payload["exp"]), tz=timezone.utc),
                 ip_address=ip,
                 user_agent=request.headers.get("user-agent", "")[:256] or None,
+                root_issued_at=root_issued_at or issued_at,
             )
         )
         return token
@@ -949,6 +959,98 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db, request, "auth.logout", actor_id=user.id, target_type="user", target_id=user.id
         )
         return Response(status_code=204)
+
+    @app.post("/api/auth/refresh", response_model=TokenResponse)
+    def refresh_session(
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        """Xoay access token còn hiệu lực thành token mới (sliding session).
+
+        Ba tính chất bảo mật cần nêu rõ trong báo cáo:
+
+        1. **Xoay, không nhân bản.** jti cũ bị đưa vào denylist và AuthSession
+           của nó bị thu hồi ngay, nên tại mỗi thời điểm một thiết bị chỉ có
+           đúng một token sống. Nếu token cũ bị đánh cắp, nó chết ngay khi
+           người dùng thật gia hạn.
+        2. **Trần tuyệt đối.** Mốc ``root_issued_at`` được mang sang token mới,
+           nên chuỗi gia hạn không thể vượt quá ``SESSION_ABSOLUTE_HOURS`` tính
+           từ lần đăng nhập gốc. Không có ràng buộc này, sliding session biến
+           một lần xác thực thành quyền truy cập vĩnh viễn.
+        3. **Không hạ cấp yêu cầu xác thực.** Endpoint đòi một access token còn
+           hiệu lực; token hết hạn không gia hạn được, và MFA challenge (audience
+           khác) không bao giờ dùng được ở đây.
+        """
+        ip = client_ip(request)
+        allowed, retry_after = refresh_limiter.allow(
+            f"refresh:{user.id}", settings.refresh_max_attempts, settings.refresh_window_seconds
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Gia hạn phiên quá nhiều lần. Thử lại sau.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        payload = token_service.decode(credentials.credentials)
+        old_jti = str(payload["jti"])
+        old_session = db.get(AuthSession, old_jti)
+
+        root_issued_at = None
+        if old_session is not None:
+            root_issued_at = old_session.root_issued_at or old_session.issued_at
+        if root_issued_at is not None and root_issued_at.tzinfo is None:
+            root_issued_at = root_issued_at.replace(tzinfo=timezone.utc)
+
+        now = utcnow()
+        if root_issued_at is not None:
+            age = now - root_issued_at
+            if age > timedelta(hours=settings.session_absolute_hours):
+                record_audit(
+                    db,
+                    request,
+                    "auth.session.refresh",
+                    actor_id=user.id,
+                    outcome="denied",
+                    target_type="user",
+                    target_id=user.id,
+                    details={"reason": "absolute_lifetime_exceeded"},
+                )
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        f"Phiên đã vượt quá thời hạn tối đa "
+                        f"{settings.session_absolute_hours} giờ. Vui lòng đăng nhập lại."
+                    ),
+                )
+
+        token = issue_access_session(db, request, user, ip, root_issued_at=root_issued_at)
+        # Thu hồi token cũ SAU khi đã cấp token mới, trong cùng transaction.
+        db.add(
+            RevokedToken(
+                jti=old_jti,
+                user_id=user.id,
+                expires_at=datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc),
+                reason="refresh",
+            )
+        )
+        if old_session is not None:
+            old_session.revoked_at = now
+        db.commit()
+        record_audit(
+            db,
+            request,
+            "auth.session.refresh",
+            actor_id=user.id,
+            target_type="user",
+            target_id=user.id,
+        )
+        return TokenResponse(
+            access_token=token,
+            expires_in=settings.access_token_minutes * 60,
+        )
 
     @app.patch("/api/auth/password", status_code=204)
     def change_password(
@@ -1656,6 +1758,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=409, detail="Audit chain đang tắt (AUDIT_CHAIN_ENABLED=false)."
             )
+        # The verification itself must be auditable. Record it before walking
+        # the chain so the returned result covers this action as well.
+        record_audit(
+            db,
+            request,
+            "audit.chain.verify",
+            actor_id=admin.id,
+            target_type="audit_event",
+            outcome="success",
+        )
         result = verify_chain(db, audit_key)
         if not result.intact:
             record_audit(
@@ -1668,7 +1780,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 target_id=str(result.first_broken_id),
                 details={"reason": result.reason},
             )
-        return result.as_dict()
+        payload = result.as_dict()
+        payload["checked_at"] = utcnow().isoformat()
+        payload["checked_by"] = admin.username
+        return payload
 
     @app.get("/api/admin/ids/detections")
     def ids_detections(
@@ -1716,17 +1831,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return Response(status_code=204)
 
-    # Giao diện chính là Gradio (thuần Python, đồng bộ với toàn bộ dự án),
-    # mount tại "/" sau khi mọi API route đã đăng ký. Bản SPA tĩnh (HTML/JS)
-    # vẫn được phục vụ tại /spa để tham khảo, so sánh hai cách tiếp cận.
-    static_dir = Path(__file__).resolve().parent / "static"
-    if static_dir.is_dir():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-
-        @app.get("/spa", include_in_schema=False)
-        def spa_index() -> FileResponse:
-            return FileResponse(static_dir / "index.html")
-
+    # The Gradio interface is the only supported web client. Keeping the former
+    # static SPA alongside it duplicated authentication and security-sensitive
+    # client code without serving the production workflow.
     gradio_demo = build_ui()
     app = gr.mount_gradio_app(app, gradio_demo, path="/")
 

@@ -15,9 +15,24 @@ from datetime import timedelta
 
 from sqlalchemy import select
 
+from src.app.audit_chain import derive_audit_key, seal_event
 from src.app.db import Database, utcnow
 from src.app.models import AuditEvent, ChatSession, SecureMessage, User
 from src.app.security import CryptoService, PasswordService
+
+
+def _seed_audit_key() -> bytes | None:
+    """Khóa HMAC của hash chain, dẫn xuất từ cùng APP_SECRET_KEY mà server dùng.
+
+    Trả về ``None`` khi chuỗi audit bị tắt, để seed vẫn chạy được trong lab.
+    Phải là *cùng* khóa, nếu không mọi bản ghi mẫu sẽ báo entry_hash_mismatch.
+    """
+    from src.app.config import Settings
+
+    settings = Settings.from_env()
+    if not settings.audit_chain_enabled:
+        return None
+    return derive_audit_key(settings.secret_key)
 
 # Mật khẩu chung cho các tài khoản demo — thỏa chính sách mật khẩu của dự án:
 # >= 15 ký tự, không chứa chuỗi phổ biến, >= 5 ký tự khác nhau.
@@ -275,8 +290,23 @@ def seed_demo_data(
                             {"content_length": random.randint(20, 300)},
                         )
                     )
-            db.add_all(events)
-            db.commit()
-            log(f"[audit] Đã ghi {len(events)} sự kiện kiểm toán mô phỏng.")
+            # Trước đây các bản ghi này được INSERT trực tiếp, không đi qua
+            # seal_event, nên entry_hash = NULL và GET /api/admin/audit/verify
+            # báo "đã xác minh 97/120". Bây giờ mỗi bản ghi được niêm phong đúng
+            # thứ tự id, nên chuỗi phủ 100% và trang Bảo mật hiển thị 120/120.
+            audit_key = _seed_audit_key()
+            if audit_key is None:
+                log("[audit] AUDIT_CHAIN_ENABLED=false — bỏ qua niêm phong hash chain.")
+                db.add_all(events)
+                db.commit()
+            else:
+                for event in events:
+                    seal_event(db, event, audit_key)
+                    db.add(event)
+                    # seal_event đọc hash của bản ghi cuối cùng trong DB, nên phải
+                    # flush từng bản ghi để bản kế tiếp nối vào đúng mắt xích.
+                    db.flush()
+                db.commit()
+            log(f"[audit] Đã ghi {len(events)} sự kiện kiểm toán mô phỏng (đã niêm phong).")
 
     log("[seed] Dữ liệu mẫu sẵn sàng — mật khẩu chung: " + DEMO_PASSWORD)

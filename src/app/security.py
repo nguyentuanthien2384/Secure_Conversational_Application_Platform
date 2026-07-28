@@ -323,17 +323,28 @@ class TotpService:
                 return counter
         return None
 
-    def provisioning_uri(self, secret_b32: str, account_name: str, issuer: str) -> str:
-        """Build the otpauth:// URI that seeds authenticator apps (also as a QR)."""
+    def provisioning_uri(
+        self, secret_b32: str, account_name: str, issuer: str, *, compact: bool = True
+    ) -> str:
+        """Build the otpauth:// URI that seeds authenticator apps (also as a QR).
+
+        ``compact`` omits ``algorithm``/``digits``/``period`` whenever they equal
+        the Key Uri Format defaults (SHA1 / 6 / 30), which every authenticator
+        assumes anyway. This is not cosmetic: those three parameters add ~40
+        characters, which pushed the QR from version 5 (37x37 modules) to version
+        9 (53x53). At the size the QR is displayed that is under 4 pixels per
+        module — below what a phone camera reliably resolves off a screen, which
+        is why the code could not be scanned. Non-default settings are always
+        emitted, because omitting them would produce wrong codes.
+        """
         label = quote(f"{issuer}:{account_name}")
-        params = (
-            f"secret={secret_b32}"
-            f"&issuer={quote(issuer)}"
-            f"&algorithm={self.algorithm.upper()}"
-            f"&digits={self.digits}"
-            f"&period={self.period}"
-        )
-        return f"otpauth://totp/{label}?{params}"
+        params = [f"secret={secret_b32}", f"issuer={quote(issuer)}"]
+        defaults = compact and self.algorithm.lower() == "sha1"
+        if not (defaults and self.digits == 6 and self.period == 30):
+            params.append(f"algorithm={self.algorithm.upper()}")
+            params.append(f"digits={self.digits}")
+            params.append(f"period={self.period}")
+        return f"otpauth://totp/{label}?{'&'.join(params)}"
 
 
 def generate_recovery_code() -> str:

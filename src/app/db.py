@@ -38,6 +38,9 @@ class Database:
         inspector = inspect(self.engine)
         columns = {column["name"] for column in inspector.get_columns("users")}
         audit_columns = {column["name"] for column in inspector.get_columns("audit_events")}
+        auth_session_columns = {
+            column["name"] for column in inspector.get_columns("auth_sessions")
+        }
         with self.engine.begin() as connection:
             # Hash-chain columns for the tamper-evident audit trail.
             if "prev_hash" not in audit_columns:
@@ -77,6 +80,19 @@ class Database:
             if "mfa_last_counter" not in columns:
                 connection.execute(
                     text("ALTER TABLE users ADD COLUMN mfa_last_counter INTEGER NOT NULL DEFAULT 0")
+                )
+            # Mốc đăng nhập gốc cho trần tuyệt đối của sliding session.
+            if "root_issued_at" not in auth_session_columns:
+                connection.execute(
+                    text("ALTER TABLE auth_sessions ADD COLUMN root_issued_at TIMESTAMP")
+                )
+                # Phiên đã tồn tại chưa có mốc gốc: lấy chính thời điểm cấp phát,
+                # nếu không chúng sẽ được coi là "vô hạn tuổi" và bị từ chối gia hạn.
+                connection.execute(
+                    text(
+                        "UPDATE auth_sessions SET root_issued_at = issued_at "
+                        "WHERE root_issued_at IS NULL"
+                    )
                 )
 
     def assert_schema_ready(self) -> None:

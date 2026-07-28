@@ -72,7 +72,10 @@ class Settings:
     registration_max_attempts: int = 5
     message_window_seconds: int = 60
     message_max_attempts: int = 20
-    mfa_issuer: str = "Secure Chat Course"
+    # Issuer xuất hiện HAI lần trong otpauth URI (trong label và trong query),
+    # nên tên dài đẩy mật độ QR lên đáng kể. Giữ ngắn; đây chỉ là nhãn hiển thị
+    # trong ứng dụng xác thực và có thể đổi bất cứ lúc nào qua MFA_ISSUER.
+    mfa_issuer: str = "SCAP"
     mfa_challenge_minutes: int = 5
     mfa_recovery_codes: int = 10
     mfa_window_seconds: int = 300
@@ -84,17 +87,23 @@ class Settings:
     csp_allow_unsafe_eval: bool = False
     password_min_length: int = 15
     password_breach_check: bool = False
-    legacy_lab_enabled: bool = False
     allow_demo_ai: bool = True
     google_genai_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash-lite"
     bootstrap_admin_username: str = ""
     bootstrap_admin_password: str = ""
     docs_enabled: bool = True
+    seed_demo_data: bool = False
     ids_enabled: bool = True
     ids_block_threshold: int = 5
     ids_block_seconds: int = 900
     audit_chain_enabled: bool = True
+    # Trần tuyệt đối cho một chuỗi phiên: dù gia hạn bao nhiêu lần, sau ngần
+    # này giờ kể từ lần đăng nhập gốc vẫn phải xác thực lại từ đầu.
+    session_absolute_hours: int = 8
+    # Số lần được gọi /api/auth/refresh trong một cửa sổ, chống lạm dụng.
+    refresh_window_seconds: int = 60
+    refresh_max_attempts: int = 10
     siem_json_logs: bool = True
     password_change_max_attempts: int = 5
     password_change_window_seconds: int = 900
@@ -139,10 +148,6 @@ class Settings:
                 raise RuntimeError(
                     "Không đặt BOOTSTRAP_ADMIN_PASSWORD ở production; tạo admin qua quy trình one-off."
                 )
-            if _bool_env("LEGACY_LAB_ENABLED", False):
-                raise RuntimeError(
-                    "LEGACY_LAB_ENABLED phải tắt ở production; app Streamlit/Vigenère chỉ dùng trong lab cô lập."
-                )
             if _bool_env("SEED_DEMO_DATA", False):
                 raise RuntimeError(
                     "SEED_DEMO_DATA phải tắt ở production vì tài khoản mẫu có thông tin đăng nhập công khai."
@@ -170,8 +175,7 @@ class Settings:
             registration_max_attempts=int(os.getenv("REGISTRATION_MAX_ATTEMPTS", "5")),
             message_window_seconds=int(os.getenv("MESSAGE_WINDOW_SECONDS", "60")),
             message_max_attempts=int(os.getenv("MESSAGE_MAX_ATTEMPTS", "20")),
-            mfa_issuer=os.getenv("MFA_ISSUER", "Secure Chat Course").strip()
-            or "Secure Chat Course",
+            mfa_issuer=os.getenv("MFA_ISSUER", "SCAP").strip() or "SCAP",
             mfa_challenge_minutes=int(os.getenv("MFA_CHALLENGE_MINUTES", "5")),
             mfa_recovery_codes=int(os.getenv("MFA_RECOVERY_CODES", "10")),
             mfa_window_seconds=int(os.getenv("MFA_WINDOW_SECONDS", "300")),
@@ -183,17 +187,20 @@ class Settings:
             csp_allow_unsafe_eval=_bool_env("CSP_ALLOW_UNSAFE_EVAL", False),
             password_min_length=int(os.getenv("PASSWORD_MIN_LENGTH", "15")),
             password_breach_check=_bool_env("PASSWORD_BREACH_CHECK", False),
-            legacy_lab_enabled=_bool_env("LEGACY_LAB_ENABLED", False),
             allow_demo_ai=_bool_env("ALLOW_DEMO_AI", True),
             google_genai_api_key=os.getenv("GOOGLE_GENAI_API_KEY", ""),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
             bootstrap_admin_username=os.getenv("BOOTSTRAP_ADMIN_USERNAME", ""),
             bootstrap_admin_password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD", ""),
             docs_enabled=_bool_env("DOCS_ENABLED", environment != "production"),
+            seed_demo_data=_bool_env("SEED_DEMO_DATA", False),
             ids_enabled=_bool_env("IDS_ENABLED", True),
             ids_block_threshold=int(os.getenv("IDS_BLOCK_THRESHOLD", "5")),
             ids_block_seconds=int(os.getenv("IDS_BLOCK_SECONDS", "900")),
             audit_chain_enabled=_bool_env("AUDIT_CHAIN_ENABLED", True),
+            session_absolute_hours=int(os.getenv("SESSION_ABSOLUTE_HOURS", "8")),
+            refresh_window_seconds=int(os.getenv("REFRESH_WINDOW_SECONDS", "60")),
+            refresh_max_attempts=int(os.getenv("REFRESH_MAX_ATTEMPTS", "10")),
             siem_json_logs=_bool_env("SIEM_JSON_LOGS", True),
             password_change_max_attempts=int(os.getenv("PASSWORD_CHANGE_MAX_ATTEMPTS", "5")),
             password_change_window_seconds=int(os.getenv("PASSWORD_CHANGE_WINDOW_SECONDS", "900")),
