@@ -85,7 +85,6 @@ Write-Host " CAI DAT XONG" -ForegroundColor Green
 Write-Host "========================================================" -ForegroundColor Green
 Write-Host "  Giao dien web : http://127.0.0.1:8000"
 Write-Host "  Swagger API   : http://127.0.0.1:8000/docs"
-Write-Host "  SPA tinh      : http://127.0.0.1:8000/spa"
 Write-Host ""
 Write-Host "  Tai khoan demo (mat khau chung: Phenikaa-Vault#2026-Lab)"
 Write-Host "    demo.user  - user"

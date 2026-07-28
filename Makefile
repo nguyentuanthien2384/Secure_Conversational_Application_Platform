@@ -1,4 +1,4 @@
-.PHONY: install run test security legacy docker
+.PHONY: install run test security docker
 
 install:
 	uv sync --group dev
@@ -12,9 +12,6 @@ test:
 security:
 	uv run bandit -r src/app
 	uv run pip-audit
-
-legacy:
-	uv run python run_legacy_app.py
 
 docker:
 	docker compose up --build

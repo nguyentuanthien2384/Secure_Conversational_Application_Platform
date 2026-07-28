@@ -95,7 +95,6 @@ echo -e "${GREEN} CÀI ĐẶT XONG${NC}"
 echo -e "${GREEN}========================================================${NC}"
 echo "  Giao diện web  : http://127.0.0.1:8000"
 echo "  Swagger API    : http://127.0.0.1:8000/docs"
-echo "  SPA tĩnh       : http://127.0.0.1:8000/spa"
 echo
 echo "  Tài khoản demo (mật khẩu chung: Phenikaa-Vault#2026-Lab)"
 echo "    demo.user  — vai trò user"

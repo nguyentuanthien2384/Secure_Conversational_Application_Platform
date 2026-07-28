@@ -1,0 +1,58 @@
+# Tác vụ bảo trì một lần: vá các bản ghi audit chưa được niêm phong.
+#
+# TẠI SAO CẦN FILE RIÊNG THAY VÌ `docker compose exec app ...`?
+#
+# Vì nó sẽ KHÔNG chạy được — và đó là thiết kế đúng. Trong scripts/db_least_privilege.sql:
+#
+#     REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_events FROM scap_app;
+#     GRANT  SELECT, INSERT            ON TABLE audit_events TO   scap_app;
+#
+# Tài khoản runtime `scap_app` chỉ được THÊM vào nhật ký, không được SỬA. Việc vá
+# cần quyền UPDATE, nên phải dùng credential owner `secure_chat` — đúng như cách
+# service `migrate` làm. Nếu lệnh vá chạy được bằng tài khoản app thì mới là dấu
+# hiệu phân quyền đã hỏng.
+#
+# CÁCH DÙNG (chạy từ thư mục gốc dự án, cùng chỗ với docker-compose.yml):
+#
+#     # Xem trước, không sửa gì:
+#     docker compose -f docker-compose.yml -f docker-compose.repair.yml \
+#       run --rm repair /app/.venv/bin/python scripts/repair_audit_chain.py --check
+#
+#     # Vá thật:
+#     docker compose -f docker-compose.yml -f docker-compose.repair.yml \
+#       run --rm repair
+#
+# Sau khi chạy xong, container tự bị xóa (--rm). Không cần dừng service app.
+
+services:
+  repair:
+    build: .
+    # Nạp .env để lấy APP_SECRET_KEY. Đây là điểm SỐNG CÒN: khóa HMAC của chuỗi
+    # băm được dẫn xuất từ APP_SECRET_KEY. Nếu container này dùng khóa khác với
+    # server, các bản ghi vừa vá sẽ được niêm phong bằng khóa sai và trang Bảo mật
+    # sẽ báo entry_hash_mismatch — trông y hệt như dữ liệu bị tấn công.
+    env_file: .env
+    environment:
+      # Credential owner, giống service migrate: cần quyền UPDATE audit_events.
+      DATABASE_URL: postgresql+psycopg://secure_chat:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/secure_chat
+      # Ghi đè APP_ENV của .env một cách có chủ đích. Cấu hình production từ chối
+      # DATABASE_URL dùng tài khoản chủ (xem src/app/config.py) — ràng buộc đó
+      # nhắm vào tiến trình phục vụ web, không nhắm vào tác vụ bảo trì one-shot
+      # vốn buộc phải dùng quyền cao hơn. Container này không mở cổng nào.
+      APP_ENV: development
+    command: ["/app/.venv/bin/python", "scripts/repair_audit_chain.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Chỉ ở mạng nội bộ, không ra Internet.
+    networks: [backend]
+    # Không chạy cùng `docker compose up`; chỉ chạy khi được gọi tên qua
+    # `docker compose run`. Nếu không có dòng này, mỗi lần up lại vá một lần.
+    profiles: ["maintenance"]
