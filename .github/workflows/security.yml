@@ -19,7 +19,7 @@ jobs:
         with:
           version: "0.10.0"
           enable-cache: true
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: uv lock --check
