@@ -140,7 +140,7 @@ Kiểm tra sống:
 curl http://localhost:8000/api/health
 ```
 
-Truy cập: <http://localhost:8000> (Gradio UI) và <http://localhost:8000/spa>.
+Truy cập: <http://localhost:8000> (Gradio UI).
 Lưu ý `/docs` **404** vì Compose đặt `DOCS_ENABLED=false` — đúng theo yêu cầu
 production (không lộ schema API). Muốn có Swagger để demo, thêm
 `DOCS_ENABLED: "true"` vào `docker-compose.local.yml`, nhưng nên nói rõ với giảng

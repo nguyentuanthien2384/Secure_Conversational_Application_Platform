@@ -6,7 +6,7 @@
 - Failed sign-ins now lock an existing account temporarily after the configured threshold. Configure `LOGIN_LOCKOUT_SECONDS`; public registration is also rate-limited with `REGISTRATION_WINDOW_SECONDS` and `REGISTRATION_MAX_ATTEMPTS`.
 - Password changes, account locking, and role changes revoke all existing sessions. The database startup upgrade adds the required fields and table without discarding existing users.
 
-Đồ án môn **Bảo mật ứng dụng và hệ thống** phát triển từ dự án chatbot mã hóa Vigenère/Streamlit ban đầu. Phiên bản mới giữ ứng dụng cũ như một **legacy insecure lab** để so sánh, đồng thời bổ sung một luồng chính an toàn hơn bằng FastAPI.
+Đồ án môn **Bảo mật ứng dụng và hệ thống** là nền tảng trò chuyện AI đa người dùng, xây dựng bằng FastAPI và Gradio.
 
 ## 1. Những gì đã được phát triển
 
@@ -92,45 +92,16 @@ DAST khi app đang chạy:
 bash scripts/run_zap_baseline.sh http://host.docker.internal:8000
 ```
 
-## 6. Legacy insecure lab
-
-Ứng dụng Streamlit/Vigenère ban đầu được giữ để trình diễn điểm yếu của thuật toán tự chế và mô hình đơn người dùng. Nó bị **tắt mặc định** và sẽ từ chối chạy ở môi trường `production`/`staging`; chỉ bật trong lab cô lập:
-
-```bash
-LEGACY_LAB_ENABLED=true uv run python run_legacy_app.py
-```
-
-Không dùng luồng legacy cho dữ liệu thật hoặc triển khai Internet, và không đóng gói chung image với luồng an toàn.
-
-## 7. Cấu trúc chính
+## 6. Cấu trúc chính
 
 ```text
 src/app/                 FastAPI secure application
-src/app/templates/       Giao diện web demo
-src/core, src/database/  Mã nguồn chatbot cũ
-src/ui/                  Streamlit legacy UI
 tests/                   Security regression tests
-docs/                    Kiến trúc, threat model, pentest, demo, IR
 scripts/                 Tạo secret và chạy ZAP
 .github/workflows/       CI và security scanning
 ```
 
-## 8. Tài liệu nộp/bảo vệ
-
-- [Kiến trúc](docs/ARCHITECTURE.md)
-- [Xác thực hai lớp (MFA/TOTP)](docs/MFA.md)
-- [Threat model STRIDE](docs/THREAT_MODEL.md)
-- [Kế hoạch pentest](docs/PENTEST_PLAN.md)
-- [Kịch bản demo](docs/DEMO_SCRIPT.md)
-- [Ứng cứu sự cố](docs/INCIDENT_RESPONSE.md)
-- [Backup và khôi phục](docs/BACKUP_AND_RECOVERY.md)
-- [Logging tập trung và SIEM](docs/LOGGING_AND_SIEM.md)
-- [Ma trận yêu cầu bảo mật](docs/SECURITY_REQUIREMENTS.md)
-- [Đối chiếu dự án với 9 slide môn học](docs/GAP_ANALYSIS.md)
-- [Bản nâng cấp bảo mật v2 — tích hợp & demo](docs/HARDENING_V2.md)
-- [Báo cáo rà soát độc lập 26/07/2026](BAO_CAO_RA_SOAT_BAO_MAT.md)
-
-## 8b. Bản nâng cấp bảo mật v2
+## 7. Bản nâng cấp bảo mật v2
 
 - **Sửa lỗi nghiêm trọng:** lớp DLP che dữ liệu nhạy cảm trước khi gửi tới nhà
   cung cấp AI bên ngoài trước đây **không hoạt động** (regex bị escape hai lần
@@ -148,14 +119,12 @@ scripts/                 Tạo secret và chạy ZAP
   migration tách khỏi tài khoản runtime; production từ chối demo seed và tài
   khoản owner; `uv.lock` cùng SCA là cổng bắt buộc trong CI.
 
-Chi tiết: [Đối chiếu với 9 slide môn học](docs/GAP_ANALYSIS.md) ·
-[Hướng dẫn tích hợp và demo](docs/HARDENING_V2.md)
-
-## 9. Giới hạn có chủ đích
+## 8. Giới hạn có chủ đích
 
 - Development một instance dùng rate limiter in-memory; cấu hình production bắt
   buộc Redis để giới hạn dùng chung giữa nhiều worker/instance.
-- JWT access token đã có thu hồi phía máy chủ (AuthSession + RevokedToken + token_version, logout-all, per-device revoke); chưa có refresh-token rotation, thời hạn mặc định 30 phút.
+- JWT access token có gia hạn trượt qua `POST /api/auth/refresh` (xoay jti, thu
+  hồi token cũ, trần tuyệt đối `SESSION_ABSOLUTE_HOURS`) và thu hồi phía máy chủ (AuthSession + RevokedToken + token_version, logout-all, per-device revoke). Thời hạn access token mặc định 30 phút; gia hạn bị chặn cứng sau 8 giờ kể từ lần đăng nhập gốc.
 - Ứng dụng hỗ trợ keyring và xoay khóa AES-GCM; production thật vẫn nên chuyển
   vật liệu khóa khỏi biến môi trường sang KMS/Vault và envelope encryption.
 - SQLite là mặc định để chạy nhanh; Docker Compose cung cấp PostgreSQL cho bản trình diễn gần production hơn.
@@ -168,7 +137,6 @@ Chi tiết: [Đối chiếu với 9 slide môn học](docs/GAP_ANALYSIS.md) ·
 - Giao diện chính tại `/` được viết lại **hoàn toàn bằng Gradio** (`src/app/gradio_ui.py`) — thuần Python, đồng bộ với toàn bộ dự án. Mọi thao tác trên UI gọi chính REST API của hệ thống qua httpx, nên đều đi qua đầy đủ JWT, RBAC, rate limiting và audit trail.
 - Tính năng bao phủ 100% API: đăng ký / đăng nhập kèm bước 2FA, trò chuyện (tạo / đổi tên / xóa / xuất JSON / tìm trong hội thoại / tự tạo hội thoại khi gửi tin đầu tiên), xem bản mã trong DB, tìm kiếm toàn cục, tài khoản (đổi mật khẩu, đồng ý AI, thiết lập 2FA với mã QR + mã khôi phục, quản lý thiết bị đăng nhập, đăng xuất tất cả), quản trị (thống kê, cảnh báo an ninh, quản lý người dùng, nhật ký kiểm toán — moderator chỉ thấy nhật ký).
 - Đồng hồ đếm ngược vòng đời token cập nhật mỗi 10 giây trên banner.
-- Bản SPA tĩnh (HTML/JS) vẫn được giữ tại `/spa` để tham khảo và so sánh hai cách tiếp cận.
 - Endpoint mới: `GET /api/search/messages?q=` — tìm kiếm toàn cục trên mọi hội thoại thuộc sở hữu của người gọi (giải mã phía máy chủ, ghi audit `chat.message.search`).
 
 ## Dữ liệu mẫu (demo data)

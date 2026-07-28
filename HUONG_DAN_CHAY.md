@@ -11,7 +11,7 @@ Tài liệu này bổ sung cho `README.md`, viết theo hướng "làm theo từ
 |---|---|
 | Internet | Bắt buộc cho lần cài dependency đầu tiên |
 | Python 3.10+ | Không có cũng được — `uv` sẽ tự tải Python 3.12 |
-| ~1.5 GB đĩa trống | Gradio + Streamlit + Pillow khá nặng |
+| ~1 GB đĩa trống | Gradio và các thư viện AI/QR |
 | Docker | **Chỉ khi** muốn chạy bản PostgreSQL (mục 4) |
 
 ---
@@ -46,7 +46,6 @@ Khi thấy dòng `Uvicorn running on http://127.0.0.1:8000`, mở trình duyệt
 |---|---|
 | <http://127.0.0.1:8000> | Giao diện chính (Gradio, thuần Python) |
 | <http://127.0.0.1:8000/docs> | Swagger / OpenAPI |
-| <http://127.0.0.1:8000/spa> | Bản SPA tĩnh HTML/JS để so sánh |
 
 ---
 
@@ -167,6 +166,5 @@ Hoặc dùng `make`: `make install`, `make run`, `make test`, `make security`.
 5. **Brute-force**: nhập sai mật khẩu 6 lần → tài khoản bị lock, IDS ghi cảnh báo.
 6. **Đăng nhập `demo.boss`** → trang quản trị: thống kê, cảnh báo an ninh, nhật ký kiểm toán.
 7. **Xác minh audit chain**: gọi `GET /api/admin/audit/verify` → chuỗi HMAC-SHA256 nguyên vẹn.
-8. **So sánh legacy**: `LEGACY_LAB_ENABLED=true uv run python run_legacy_app.py` → Vigenère tự chế, đơn người dùng, dễ phá.
 
 Chi tiết hơn: `docs/DEMO_SCRIPT.md`, `docs/HARDENING_V2.md`, `BAO_CAO_RA_SOAT_BAO_MAT.md`.
