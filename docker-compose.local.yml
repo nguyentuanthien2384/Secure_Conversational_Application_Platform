@@ -1,0 +1,64 @@
+# =====================================================================
+# docker-compose.local.yml — LỚP PHỦ ĐỂ CHẠY DOCKER TRÊN MÁY CÁ NHÂN
+#
+# docker-compose.yml gốc là cấu hình production: Caddy đi xin chứng chỉ
+# Let's Encrypt nên cần tên miền thật trỏ về máy. File này tắt Caddy và
+# publish thẳng cổng app ra localhost để demo trên laptop.
+#
+# CÁCH DÙNG:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+# CẢNH BÁO BẢO MẬT (nên nói rõ khi bảo vệ đồ án):
+#   Ở đây app bị publish trực tiếp trong khi CMD vẫn bật
+#   --proxy-headers --forwarded-allow-ips=* . Ngoài môi trường có Caddy làm
+#   peer duy nhất, client có thể tự chèn X-Forwarded-For để làm sai lệch
+#   nguồn IP trong rate limit / IDS / audit log. Chỉ dùng file này để demo
+#   cục bộ, KHÔNG dùng khi phơi ra Internet.
+# =====================================================================
+services:
+  app:
+    environment:
+      # Cho phép truy cập qua localhost (TrustedHostMiddleware bỏ qua port).
+      ALLOWED_HOSTS: localhost,127.0.0.1
+      ALLOWED_ORIGINS: http://localhost:8000,http://127.0.0.1:8000
+      # HIBP cần gọi ra Internet; tắt để demo offline chạy nhanh, ổn định.
+      PASSWORD_BREACH_CHECK: "false"
+      # Script vận hành nằm ngoài /app nên cần PYTHONPATH để `import src` chạy.
+      PYTHONPATH: /app
+    # Chỉ bind vào loopback, không phơi ra LAN.
+    ports:
+      - "127.0.0.1:8000:8000"
+    # Dockerfile chỉ COPY scripts/migrate_database.py vào image, nên các script
+    # vận hành khác (seed dữ liệu mẫu, xoay khóa) không có sẵn trong container.
+    # Mount read-only để chạy được mà không phải build lại image.
+    # CHỈ DÙNG KHI HỌC/DEMO: bản production cố ý giữ image bất biến.
+    volumes:
+      - ./scripts:/opt/scap-scripts:ro
+
+  # ── SỬA LỖI: migrate crash "ModuleNotFoundError: No module named 'src'" ──
+  # Dockerfile đặt WORKDIR /app và chạy `python scripts/migrate_database.py`.
+  # Python đưa THƯ MỤC CHỨA SCRIPT (/app/scripts) vào sys.path, không phải
+  # thư mục làm việc (/app), nên `import src` thất bại.
+  # scripts/seed_demo_data.py đã xử lý đúng bằng sys.path.insert(...), còn
+  # scripts/migrate_database.py thì thiếu. Service app không bị vì uvicorn
+  # tự thêm thư mục hiện tại vào sys.path.
+  # PYTHONPATH ở đây vá được ngay mà không cần build lại image.
+  migrate:
+    environment:
+      PYTHONPATH: /app
+
+  # ── SỬA LỖI: redis không khởi động được với cap_drop: ALL ──────────────
+  # Entrypoint của image redis, khi chạy bằng root, sẽ chown /data rồi dùng
+  # su-exec hạ quyền xuống user "redis". Hai việc đó cần CHOWN + SETUID +
+  # SETGID, mà docker-compose.yml đã cap_drop: ALL và không cap_add lại
+  # (service db có cap_add đúng vì lý do này, redis thì bị thiếu).
+  #
+  # Cách sửa ở đây TỐT HƠN việc cap_add: chỉ định luôn user không phải root,
+  # entrypoint sẽ bỏ qua nhánh hạ quyền, nhờ vậy vẫn giữ nguyên cap_drop: ALL.
+  # Redis chạy với --appendonly no --save "" nên không ghi gì xuống /data.
+  redis:
+    user: "redis"
+
+  caddy:
+    # Gán profile không được bật -> `docker compose up` sẽ bỏ qua service này.
+    profiles: ["with-caddy"]

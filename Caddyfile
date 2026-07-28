@@ -1,0 +1,79 @@
+{
+	email {$CADDY_EMAIL}
+	# Không quảng bá phiên bản Caddy (giảm thông tin trinh sát cho attacker).
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+{$PUBLIC_DOMAIN} {
+	encode zstd gzip
+
+	# ── RFC 9116: kênh báo cáo lỗ hổng có trách nhiệm (Bài 8 §vận hành) ──
+	handle /.well-known/security.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `Contact: mailto:{$CADDY_EMAIL}
+Preferred-Languages: vi, en
+Canonical: https://{$PUBLIC_DOMAIN}/.well-known/security.txt
+Policy: https://{$PUBLIC_DOMAIN}/security-policy
+Expires: {$SECURITY_TXT_EXPIRES}
+` 200
+	}
+
+	handle /security-policy {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `Vulnerability Disclosure Policy
+
+Only test systems you own or are explicitly authorized to assess.
+Do not access, alter, retain, or disclose other users' data.
+Avoid denial-of-service, social engineering, and destructive testing.
+Report findings to {$CADDY_EMAIL} with reproducible steps and impact.
+We will acknowledge a valid report and coordinate remediation in good faith.
+` 200
+	}
+
+	# ── Chặn sớm các đường dẫn trinh sát của stack khác (WordPress/PHP/git) ──
+	# Lọc ở biên rẻ hơn nhiều so với để request đi tới tầng ứng dụng.
+	@recon path_regexp recon ^/(wp-admin|wp-login\.php|phpmyadmin|xmlrpc\.php|\.env|\.git/|\.aws/|\.ssh/|config\.php|cgi-bin/)
+	handle @recon {
+		respond 404
+	}
+
+	# ── Chỉ cho phép các HTTP method mà API thực sự dùng ──
+	@bad_method not method GET POST PATCH DELETE HEAD OPTIONS
+	handle @bad_method {
+		respond 405
+	}
+
+	reverse_proxy app:8000 {
+		# Giới hạn thời gian để một backend chậm không giữ kết nối vô hạn.
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+		}
+		# Truyền IP thật để tầng ứng dụng ghi log/rate-limit đúng nguồn.
+		header_up X-Real-IP {remote_host}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		-Server
+		-X-Powered-By
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+# HTTP chỉ để chuyển hướng sang HTTPS; không phục vụ nội dung.
+http://{$PUBLIC_DOMAIN} {
+	redir https://{host}{uri} permanent
+}

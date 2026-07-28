@@ -1,0 +1,117 @@
+name: test-and-security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.0"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv lock --check
+      - run: uv sync --frozen --group dev
+      - run: uv run python -m pytest --cov=src.app --cov-report=xml
+      - run: uv run ruff check src/app tests scripts/migrate_database.py
+      - run: uv run bandit -r src/app -ll -ii -f json -o reports-bandit.json
+      - run: uv export --frozen --no-dev --no-emit-project --output-file requirements-audit.txt
+      - run: uv run pip-audit -r requirements-audit.txt -f json -o reports-pip-audit.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-test-reports
+          path: |
+            coverage.xml
+            reports-bandit.json
+            reports-pip-audit.json
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: returntocorp/semgrep-action@v1
+        with:
+          config: auto
+
+  filesystem-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Generate CycloneDX SBOM from source tree
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: sbom-source.cdx.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-source
+          path: sbom-source.cdx.json
+
+  image-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build container image
+        run: docker build -t secure-chat:ci .
+      - name: Scan built image (not just the source tree)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: secure-chat:ci
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Generate CycloneDX SBOM from built image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: secure-chat:ci
+          format: cyclonedx
+          output: sbom-image.cdx.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-image
+          path: sbom-image.cdx.json

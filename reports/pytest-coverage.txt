@@ -1,0 +1,14 @@
+Security verification run: 2026-07-26
+Python: 3.12.13
+Command: uv run --frozen python -m pytest --cov=src.app --cov-report=term-missing
+
+Result: 86 passed, 0 failed
+Statement coverage: 74% (2327 statements, 613 missed)
+
+Additional gates:
+- Ruff (secure application, tests, migration scripts): passed
+- Bandit medium/high confidence and severity: 0 findings
+- pip-audit against frozen production dependency export: no known vulnerabilities
+- uv lock --check: passed
+
+See ../BAO_CAO_RA_SOAT_BAO_MAT.md for scope, limitations, and residual risks.
