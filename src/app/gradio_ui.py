@@ -602,7 +602,9 @@ def _pw_meter_html(password: str) -> str:
 
 # ────────────────────────── giao diện ──────────────────────────
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="SCAP", theme=THEME, css=CUSTOM_CSS) as demo:
+    # Gradio 6 applies theme and CSS when the UI is mounted/launched.  Supplying
+    # them to Blocks itself is deprecated and emits a warning on every startup.
+    with gr.Blocks(title="SCAP") as demo:
         st_token = gr.State("")
         st_exp = gr.State(0.0)
         st_mfa = gr.State("")
