@@ -20,7 +20,7 @@ from src.app.audit import client_ip, record_audit
 from src.app.audit_chain import derive_audit_key, verify_chain
 from src.app.config import Settings
 from src.app.db import Database, utcnow
-from src.app.gradio_ui import build_ui
+from src.app.gradio_ui import CUSTOM_CSS, THEME, build_ui
 from src.app.ids import (
     DECOY_PATHS,
     SCANNER_AGENTS,
@@ -343,7 +343,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             # Gradio demo UI. 'unsafe-eval' is dropped by default (CSP hardening phase 1) and
             # only re-enabled through CSP_ALLOW_UNSAFE_EVAL if a specific Gradio build needs it,
-            # so the main origin no longer ships eval unconditionally. 'unsafe-inline' remains
+            # so the main origin no longer ships eval unconditionally. The UI deliberately avoids
+            # gr.HTML for this reason: Gradio 6 compiles that component's markup with
+            # new Function(), which this policy blocks — see _static_html in gradio_ui.py.
+            # 'unsafe-inline' remains
             # pending a nonce/hash refactor (phase 2). object-src is locked to 'none'.
             script_eval = " 'unsafe-eval'" if settings.csp_allow_unsafe_eval else ""
             csp = (
@@ -1854,7 +1857,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # static SPA alongside it duplicated authentication and security-sensitive
     # client code without serving the production workflow.
     gradio_demo = build_ui()
-    app = gr.mount_gradio_app(app, gradio_demo, path="/")
+    # Từ Gradio 6, theme/css thuộc về ứng dụng chứ không thuộc về Blocks. Khi
+    # nhúng vào FastAPI thì mount_gradio_app mới là chỗ nhận chúng — truyền lại
+    # ở đây để giao diện không bị rơi về theme mặc định. try/except giữ tương
+    # thích ngược với các bản Gradio chưa có tham số này.
+    try:
+        app = gr.mount_gradio_app(app, gradio_demo, path="/", theme=THEME, css=CUSTOM_CSS)
+    except TypeError:
+        app = gr.mount_gradio_app(app, gradio_demo, path="/")
 
     return app
 

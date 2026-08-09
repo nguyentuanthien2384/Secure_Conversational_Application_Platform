@@ -19,6 +19,7 @@ import gradio as gr
 
 BASE_URL = os.getenv("SELF_BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
 PASSWORD_MIN = 15
+
 # Ảnh tĩnh của giao diện (avatar trợ lý). Đặt cạnh module để không phụ thuộc
 # thư mục làm việc khi chạy bằng uvicorn hay Docker.
 ASSET_DIR = Path(__file__).resolve().parent / "ui_assets"
@@ -33,10 +34,12 @@ THEME = gr.themes.Soft(
     neutral_hue=gr.themes.colors.slate,
     # radius_lg (22px) trông như app tiêu dùng; md gọn và "công cụ" hơn.
     radius_size=gr.themes.sizes.radius_md,
-    # Thang chữ và khoảng cách nhỏ hơn -> mật độ thông tin cao hơn, giống
-    # bảng điều khiển vận hành thật thay vì một trang demo.
-    text_size=gr.themes.sizes.text_sm,
-    spacing_size=gr.themes.sizes.spacing_sm,
+    # text_sm (chữ nền 13px) từng được chọn để tăng mật độ thông tin, nhưng ở
+    # zoom 100% trên màn hình thường thì phải nheo mắt hoặc phóng to mới đọc
+    # được. text_lg đưa chữ nền lên 16px — đúng cỡ mà giao diện vẫn dễ đọc
+    # ngay khi mở, không cần zoom. Mật độ giảm một chút là cái giá xứng đáng.
+    text_size=gr.themes.sizes.text_lg,
+    spacing_size=gr.themes.sizes.spacing_md,
     font=[gr.themes.GoogleFont("Be Vietnam Pro"), "system-ui", "sans-serif"],
     font_mono=[gr.themes.GoogleFont("IBM Plex Mono"), "ui-monospace", "monospace"],
 )
@@ -49,8 +52,10 @@ CUSTOM_CSS = """
    ========================================================================== */
 
 :root {
-  --scap-shell: 1200px;      /* cột nội dung — thay cho max-width: 100% */
-  --scap-rail-h: 44px;
+  /* Cột nội dung: 1400px lấp vừa một cửa sổ trình duyệt cỡ thường mà vẫn không
+     trải dài vô tận trên màn hình rộng — dòng chữ quá dài thì mắt khó bắt dòng. */
+  --scap-shell: 1400px;
+  --scap-rail-h: 52px;
   --scap-ok-bg: #ecfdf5;   --scap-ok-bd: #6ee7b7;   --scap-ok-fg: #065f46;
   --scap-warn-bg: #fffbeb; --scap-warn-bd: #fcd34d; --scap-warn-fg: #78350f;
   --scap-bad-bg: #fef2f2;  --scap-bad-bd: #fca5a5;  --scap-bad-fg: #7f1d1d;
@@ -71,31 +76,180 @@ footer { display: none !important; }
 .gradio-container {
   max-width: var(--scap-shell) !important;
   margin: 0 auto !important;
-  padding: 18px 24px 48px !important;
+  padding: 22px 28px 56px !important;
 }
 
-/* ── Trang đăng nhập ───────────────────────────────────────────────────── */
-/* 580px quá rộng cho một form 2 ô; 420px là chuẩn thực tế. */
-#auth-wrap { max-width: 420px; margin: 8vh auto 0; }
+/* ── Trang đăng nhập ─────────────────────────────────────────────────────
+   Một thẻ duy nhất, canh giữa, chỉ làm đúng hai việc: đăng nhập và tạo tài
+   khoản. Trang xác thực không phải chỗ giới thiệu sản phẩm, nên không có cột
+   quảng bá, không gợi ý tài khoản mẫu, không chú thích dài dòng.
+   ───────────────────────────────────────────────────────────────────────── */
+#auth-wrap {
+  max-width: 440px;
+  /* 34px trong số này là chỗ cho nửa huy hiệu nhô lên khỏi mép thẻ. */
+  margin: calc(6vh + 34px) auto 0;
+  display: block !important;
+  animation: auth-rise .35s cubic-bezier(.2,.7,.3,1) both;
+}
+@keyframes auth-rise { from { opacity: 0; transform: translateY(8px); } }
+/* BẮT BUỘC: display:block ở trên dùng !important nên nó sẽ thắng cả cơ chế ẩn
+   của Gradio (class .hide, thuộc tính hidden, hoặc style inline) và màn đăng
+   nhập sẽ không biến mất sau khi đăng nhập. Bốn quy tắc dưới có specificity
+   1-1-0 nên luôn thắng lại 1-0-0 ở trên. Đừng xoá. */
+#auth-wrap.hide,
+#auth-wrap[hidden],
+#auth-wrap[style*="display: none"],
+#auth-wrap[style*="display:none"] { display: none !important; }
+#auth-wrap > * { min-width: 0; }
+
+/* Gỡ padding/viền mặc định của các khối Gradio nằm trong khung xác thực. */
+#auth-wrap .html-container,
+#auth-wrap .html-container > div { padding: 0 !important; border: 0 !important; background: none !important; }
+#auth-wrap > .html-container { min-width: 0 !important; }
+
+/* Khối markup tĩnh (xem _static_html): dựng bằng gr.Markdown để không cần
+   'unsafe-eval', nên phải trung hoà khung và kiểu chữ mặc định của Markdown thì
+   mới giống hệt gr.HTML trước đây. */
+.static-md,
+.static-md > div,
+.static-md .md,
+.static-md .prose {
+  padding: 0 !important; border: 0 !important; background: none !important;
+  max-width: none !important; min-width: 0 !important;
+  overflow: visible !important; max-height: none !important;
+}
+.static-md ul, .static-md ol { list-style: none; margin: 0; padding: 0; }
+
+/* ── Thẻ xác thực ─────────────────────────────────────────────────────── */
 #auth-card {
-  border: 1px solid var(--border-color-primary);
-  border-radius: 14px;
-  padding: 8px 24px 26px;
+  padding: 30px 28px 26px !important;
+  gap: 0 !important;
+  border: 1px solid var(--border-color-primary) !important;
+  border-radius: 16px;
   background: var(--background-fill-primary);
-  box-shadow: 0 1px 2px rgba(15,23,42,.04), 0 12px 32px rgba(15,23,42,.06);
+  box-shadow: 0 1px 2px rgba(2,6,23,.05), 0 18px 44px -30px rgba(2,6,23,.3);
+  /* overflow phải là visible thì huy hiệu tròn mới nhô được ra ngoài mép trên. */
+  overflow: visible !important;
 }
-/* Giữ 16px để iOS không tự zoom khi focus vào input. */
+/* Giữ >=16px để iOS không tự phóng to khi focus vào input. */
 #auth-card input, #auth-card textarea { font-size: 16px !important; }
-#auth-card button.primary, #auth-card .primary { padding: 10px 16px; font-weight: 600; }
-#brand-auth { text-align: center; margin-bottom: 14px; }
-#brand-auth h1 {
-  font-size: 22px; font-weight: 650; letter-spacing: .18em;
-  text-transform: uppercase; margin: 0;
+
+/* Huy hiệu tròn nhô lên nửa trên mép thẻ. Vòng nền cùng màu thẻ tạo cảm giác
+   viền thẻ bị khoét một khoảng cho huy hiệu lọt vào, đúng như mẫu tham chiếu. */
+.auth-brand {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 12px; margin: 0 0 24px;
 }
-#brand-auth p {
-  color: var(--body-text-color-subdued); margin-top: 6px;
-  font-size: 12px; letter-spacing: .04em;
+.auth-medallion {
+  width: 68px; height: 68px; flex: none;
+  margin-top: -64px;
+  border-radius: 50%;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/%3E%3Crect x='9' y='11' width='6' height='5' rx='1'/%3E%3Cpath d='M10.5 11V9.6a1.5 1.5 0 0 1 3 0V11'/%3E%3C/svg%3E")
+      center / 31px no-repeat,
+    linear-gradient(150deg, #34d399, #059669 72%);
+  box-shadow:
+    0 0 0 9px var(--background-fill-primary),
+    0 10px 22px -10px rgba(5,150,105,.75);
 }
+.mark-word {
+  font-family: var(--font-mono); font-size: 15px; font-weight: 600;
+  letter-spacing: .34em; color: var(--body-text-color);
+}
+
+/* Thanh tab bị ẩn: hai nút xếp dọc (đặc / viền) mới là thứ chuyển giữa đăng
+   nhập và tạo tài khoản — giống mẫu, và bớt một tầng điều hướng. */
+#auth-card .tab-nav, #auth-card [role="tablist"] { display: none !important; }
+#auth-card .tabitem, #auth-card [role="tabpanel"] {
+  padding: 0 !important; border: 0 !important; background: none !important;
+}
+
+/* Ô nhập bo tròn hoàn toàn, icon nằm sẵn bên trong lề trái. */
+#auth-card label > span { font-size: 14px !important; font-weight: 600 !important; }
+#auth-card input[type="text"], #auth-card input[type="password"] {
+  padding: 14px 18px 14px 48px !important;
+  border-radius: 999px !important;
+  background-repeat: no-repeat;
+  background-position: 19px center;
+  background-size: 19px 19px;
+}
+#li-user input, #re-user input {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2'/%3E%3Ccircle cx='12' cy='7' r='4'/%3E%3C/svg%3E");
+}
+#li-pass input, #re-pass input {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='11' width='18' height='11' rx='2'/%3E%3Cpath d='M7 11V7a5 5 0 0 1 10 0v4'/%3E%3C/svg%3E");
+}
+
+/* Nút chính (đặc) và nút phụ (viền) — cùng dáng viên thuốc, xếp dọc. */
+#auth-card button.primary {
+  width: 100%; margin-top: 6px;
+  padding: 15px 18px !important;
+  font-size: 16px !important; font-weight: 650 !important;
+  letter-spacing: .01em;
+  border-radius: 999px !important;
+}
+#auth-card button.auth-alt {
+  width: 100%; margin-top: 10px;
+  padding: 14px 18px !important;
+  font-size: 15px !important; font-weight: 600 !important;
+  border-radius: 999px !important;
+  border: 1px solid var(--border-color-primary) !important;
+  background: transparent !important;
+  color: var(--body-text-color-subdued) !important;
+  box-shadow: none !important;
+  transition: border-color .15s ease, color .15s ease, background .15s ease;
+}
+#auth-card button.auth-alt:hover {
+  border-color: var(--scap-ok-bd) !important;
+  color: var(--body-text-color) !important;
+  background: var(--scap-ok-bg) !important;
+}
+
+/* Hàng tiện ích dưới ô mật khẩu (hiện mật khẩu…). */
+#auth-util { margin: -6px 0 12px !important; gap: 8px !important; }
+#auth-util .block, #auth-util .form {
+  padding: 0 !important; border: 0 !important; background: none !important;
+  min-width: 0 !important; box-shadow: none !important;
+}
+#chk-showpw label { font-size: 14px !important; color: var(--body-text-color-subdued); }
+
+/* Thang đo độ mạnh mật khẩu — 4 vạch, đọc được không cần màu. */
+#pw-meter { margin: -4px 0 12px; }
+.pw-bars { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+.pw-bars i {
+  height: 4px; border-radius: 99px;
+  background: var(--border-color-primary);
+  transition: background .2s ease;
+}
+.pw-bars i.lv1 { background: #f87171; }
+.pw-bars i.lv2 { background: #fbbf24; }
+.pw-bars i.lv3 { background: #34d399; }
+.pw-bars i.lv4 { background: #10b981; }
+.pw-text {
+  margin: 8px 0 0; font-size: 13px; line-height: 1.55;
+  color: var(--body-text-color-subdued);
+}
+.pw-text b { color: var(--body-text-color); font-weight: 600; }
+
+/* Bước 2 — xác thực hai lớp. */
+#mfa-panel { border: 0 !important; background: none !important; padding: 0 !important; gap: 0 !important; }
+.mfa-badge {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-family: var(--font-mono); font-size: 11.5px;
+  letter-spacing: .16em; text-transform: uppercase;
+  color: var(--scap-ok-fg); background: var(--scap-ok-bg);
+  border: 1px solid var(--scap-ok-bd);
+  padding: 6px 12px; border-radius: 99px;
+}
+.mfa-head { margin-bottom: 16px; text-align: center; }
+.mfa-head h3 { margin: 12px 0 0; font-size: 19px; font-weight: 620; color: var(--body-text-color); }
+#tb-mfa input {
+  font-family: var(--font-mono) !important;
+  font-size: 23px !important; letter-spacing: .34em !important;
+  text-align: center; padding: 15px !important;
+}
+#mfa-row { gap: 8px !important; }
+#mfa-row button.primary { margin-top: 0; }
 
 /* ── Thanh trạng thái: chi tiết đặc trưng của giao diện này ─────────────
    Đọc như màn hình chỉ báo của thiết bị: phiên khóa, thời hạn token, trạng
@@ -104,16 +258,16 @@ footer { display: none !important; }
   min-height: var(--scap-rail-h);
   border: 1px solid var(--border-color-primary);
   border-radius: 10px;
-  padding: 0 14px;
+  padding: 0 18px;
   background: var(--scap-rail-bg);
   align-items: center;
-  gap: 14px;
+  gap: 16px;
   overflow: hidden;
 }
 #topbar .md p {
   margin: 0;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 14px;
   font-variant-numeric: tabular-nums;
   letter-spacing: .01em;
   color: var(--body-text-color-subdued);
@@ -122,50 +276,50 @@ footer { display: none !important; }
 #topbar .md strong, #topbar .md code {
   color: var(--body-text-color); font-weight: 600; background: none; padding: 0;
 }
-#topbar button { font-size: 12px !important; }
+#topbar button { font-size: 14px !important; }
 
 /* ── Thẻ nội dung ──────────────────────────────────────────────────────── */
 .section-card {
   border: 1px solid var(--border-color-primary);
   border-radius: 10px;
-  padding: 14px;
+  padding: 16px;
   background: var(--background-fill-primary);
 }
 
-/* ── Tab: gọn, chữ nhỏ ─────────────────────────────────────────────────── */
+/* ── Tab ───────────────────────────────────────────────────────────────── */
 .tab-nav { gap: 2px; }
 .tab-nav button {
-  font-size: 13px !important;
-  padding: 8px 12px !important;
+  font-size: 15px !important;
+  padding: 10px 16px !important;
   letter-spacing: .01em;
 }
 
 /* ── Bảng dữ liệu: mọi thứ liên quan mật mã đều monospace ──────────────── */
 .mono-df table {
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 13.5px;
   font-variant-numeric: tabular-nums;
 }
-.mono-df th { font-size: 11px !important; text-transform: uppercase; letter-spacing: .05em; }
+.mono-df th { font-size: 12.5px !important; text-transform: uppercase; letter-spacing: .05em; }
 .mono-df td { white-space: nowrap; }
 
 /* ── Danh sách hội thoại ───────────────────────────────────────────────── */
 #side-title h4 {
-  margin: 0 0 10px; font-size: 11px; font-weight: 650;
+  margin: 0 0 10px; font-size: 12.5px; font-weight: 650;
   text-transform: uppercase; letter-spacing: .07em;
   color: var(--body-text-color-subdued);
 }
-#session-list { max-height: 400px; overflow-y: auto; margin-bottom: 10px; }
+#session-list { max-height: 460px; overflow-y: auto; margin-bottom: 10px; }
 #session-list .wrap { flex-direction: column !important; gap: 3px !important; }
 #session-list label {
   display: flex !important;
   align-items: center;
   width: 100%;
-  padding: 8px 10px !important;
+  padding: 10px 12px !important;
   border: 1px solid transparent !important;
   border-radius: 7px !important;
   background: transparent !important;
-  font-size: 13px !important;
+  font-size: 15px !important;
   cursor: pointer;
   transition: background .12s ease, border-color .12s ease;
 }
@@ -181,11 +335,11 @@ footer { display: none !important; }
 /* ── Khối trạng thái ───────────────────────────────────────────────────── */
 #enc-note { margin-bottom: 8px; }
 #enc-note p {
-  margin: 0; font-size: 12px; font-family: var(--font-mono);
+  margin: 0; font-size: 14px; font-family: var(--font-mono);
   color: var(--body-text-color-subdued);
 }
 #dlp-banner, #sec-verdict {
-  border-radius: 8px; padding: 10px 13px; margin-top: 6px;
+  border-radius: 8px; padding: 12px 15px; margin-top: 6px;
   border-left: 3px solid var(--scap-warn-bd);
 }
 #dlp-banner {
@@ -193,13 +347,13 @@ footer { display: none !important; }
   border-left-color: var(--scap-warn-bd);
   background: var(--scap-warn-bg);
 }
-#dlp-banner p { margin: 0; font-size: 13px; color: var(--scap-warn-fg); }
+#dlp-banner p { margin: 0; font-size: 15px; color: var(--scap-warn-fg); }
 #sec-verdict {
   border: 1px solid var(--scap-warn-bd);
   background: var(--scap-warn-bg);
   color: var(--scap-warn-fg);
 }
-#sec-verdict p { margin: 0; font-size: 13px; }
+#sec-verdict p { margin: 0; font-size: 15px; }
 
 /* ── Bố cục ngang ──────────────────────────────────────────────────────── */
 @media (min-width: 1000px) {
@@ -207,9 +361,14 @@ footer { display: none !important; }
   #topbar { flex-wrap: nowrap !important; }
 }
 @media (max-width: 999px) {
-  .gradio-container { padding: 12px 14px 32px !important; }
-  #topbar { padding: 10px 12px; }
-  #auth-wrap { margin-top: 4vh; }
+  .gradio-container { padding: 14px 16px 36px !important; }
+  #topbar { padding: 12px 14px; }
+}
+/* Dưới 900px: thẻ bám sát mép trên để ô nhập đầu tiên luôn nằm trên nếp gấp
+   màn hình điện thoại. */
+@media (max-width: 900px) {
+  #auth-wrap { margin-top: 3vh; }
+  #auth-card { padding: 24px 20px 20px !important; }
 }
 
 /* Sàn chất lượng: focus thấy được bằng bàn phím, tôn trọng reduced-motion. */
@@ -296,7 +455,7 @@ def _api(token, method, path, body=None, *, params=None):
         if isinstance(detail, list):
             detail = " · ".join(item.get("msg", str(item)) for item in detail)
         message = detail or f"HTTP {resp.status_code}"
-        if resp.status_code == 429:
+        if resp.status_code in (429, 503):
             retry = resp.headers.get("Retry-After")
             if retry:
                 message += f" Thử lại sau {retry} giây."
@@ -361,6 +520,86 @@ def _devices_snapshot(token):
     return table, revoke
 
 
+# ─────────────────── mảnh HTML tĩnh của trang đăng nhập ───────────────────
+# Trang đăng nhập chỉ giữ đúng hai việc: đăng nhập và tạo tài khoản. Dấu nhận
+# diện dưới đây là thứ duy nhất còn lại — đủ để người dùng biết mình đang gõ
+# mật khẩu vào đâu, không kèm bất kỳ nội dung giới thiệu nào.
+AUTH_BRAND_HTML = (
+    '<div class="auth-brand">'
+    '<span class="auth-medallion" role="img" aria-label="Khiên bảo mật SCAP"></span>'
+    '<span class="mark-word">SCAP</span>'
+    "</div>"
+)
+
+MFA_HEAD_HTML = (
+    '<div class="mfa-head">'
+    '<span class="mfa-badge">Bước 2 · Xác thực hai lớp</span>'
+    "<h3>Nhập mã xác thực</h3>"
+    "</div>"
+)
+
+
+def _static_html(markup: str, **kwargs) -> gr.Markdown:
+    """Đổ một khối markup tĩnh mà không cần 'unsafe-eval'.
+
+    Từ Gradio 6, gr.HTML luôn biên dịch giá trị qua ``new Function(...)`` (nội
+    suy ``html_template`` và chạy ``js_on_load``). CSP của ứng dụng không cấp
+    ``'unsafe-eval'`` cho script-src nên component đó chỉ hiện dòng "Error
+    rendering HTML". gr.Markdown dựng DOM trực tiếp, không eval, nên hiển thị
+    đúng markup mà chính sách vẫn giữ nguyên.
+
+    ``sanitize_html=False`` là an toàn ở đây vì mọi chuỗi truyền vào đều là hằng
+    số trong mã nguồn; không có đường nào cho dữ liệu người dùng lọt vào (kể cả
+    thang đo mật khẩu bên dưới cũng chỉ dùng độ dài, không in lại mật khẩu).
+    """
+    classes = kwargs.pop("elem_classes", [])
+    if isinstance(classes, str):
+        classes = [classes]
+    return gr.Markdown(
+        markup,
+        sanitize_html=False,
+        container=False,
+        padding=False,
+        elem_classes=["static-md", *classes],
+        **kwargs,
+    )
+
+
+def _pw_meter_html(password: str) -> str:
+    """Thang đo độ mạnh mật khẩu cho ô đăng ký.
+
+    Chấm điểm theo đúng chính sách của hệ thống (độ dài tối thiểu là điều kiện
+    cần) chứ không theo một công thức chung chung: dưới ngưỡng thì luôn là mức
+    1, kèm số ký tự còn thiếu — người dùng biết chính xác phải gõ thêm bao nhiêu
+    thay vì đoán. Bốn vạch cũng đọc được khi không phân biệt được màu.
+    """
+    pw = password or ""
+    if not pw:
+        return (
+            '<div class="pw-bars"><i></i><i></i><i></i><i></i></div>'
+            f'<p class="pw-text">Tối thiểu {PASSWORD_MIN} ký tự.</p>'
+        )
+    variety = sum(
+        (
+            any(c.islower() for c in pw),
+            any(c.isupper() for c in pw),
+            any(c.isdigit() for c in pw),
+            any(not c.isalnum() for c in pw),
+        )
+    )
+    if len(pw) < PASSWORD_MIN:
+        level, note = 1, f"Còn thiếu {PASSWORD_MIN - len(pw)} ký tự."
+    elif len(pw) >= 20 and variety >= 3:
+        level, note = 4, "Đủ dài và đa dạng ký tự."
+    elif variety >= 3:
+        level, note = 3, "Đã đạt yêu cầu của hệ thống."
+    else:
+        level, note = 2, "Đạt độ dài — thêm chữ hoa, chữ số hoặc ký tự đặc biệt."
+    labels = {1: "Chưa dùng được", 2: "Trung bình", 3: "Mạnh", 4: "Rất mạnh"}
+    bars = "".join(f'<i class="lv{level}"></i>' if i < level else "<i></i>" for i in range(4))
+    return f'<div class="pw-bars">{bars}</div><p class="pw-text"><b>{labels[level]}</b> · {note}</p>'
+
+
 # ────────────────────────── giao diện ──────────────────────────
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="SCAP", theme=THEME, css=CUSTOM_CSS) as demo:
@@ -372,36 +611,95 @@ def build_ui() -> gr.Blocks:
         st_warned = gr.State(False)
 
         # ============ XÁC THỰC ============
+        # Một thẻ duy nhất: dấu nhận diện, hai tab (đăng nhập / tạo tài khoản),
+        # và bước xác thực hai lớp khi tài khoản có bật 2FA. Không có gì khác.
         with gr.Column(visible=True, elem_id="auth-wrap") as auth_sec:
-            gr.Markdown(
-                "# 🔐 SCAP\nSecure Conversational Application Platform",
-                elem_id="brand-auth",
-            )
             with gr.Column(elem_id="auth-card"):
-                with gr.Tabs() as auth_tabs:
-                    with gr.Tab("Đăng nhập", id="tab_login"):
-                        li_user = gr.Textbox(label="Tên đăng nhập", max_length=64)
-                        li_pass = gr.Textbox(label="Mật khẩu", type="password", max_length=128)
-                        btn_login = gr.Button("Đăng nhập", variant="primary")
-                    with gr.Tab("Tạo tài khoản", id="tab_register"):
-                        re_user = gr.Textbox(
-                            label="Tên đăng nhập", max_length=32, info="3–32 ký tự: chữ, số, . _ -"
-                        )
-                        re_pass = gr.Textbox(
-                            label="Mật khẩu",
-                            type="password",
-                            max_length=128,
-                            info=f"Tối thiểu {PASSWORD_MIN} ký tự",
-                        )
-                        btn_register = gr.Button("Tạo tài khoản", variant="primary")
-                with gr.Group(visible=False) as grp_mfa_login:
-                    tb_mfa_code = gr.Textbox(
-                        label="Mã xác thực hai lớp",
-                        info="Mã 6 số từ ứng dụng, hoặc mã khôi phục",
-                        max_length=32,
+                _static_html(AUTH_BRAND_HTML)
+
+                # Cả cụm form được ẩn khi chuyển sang bước xác thực hai lớp, để
+                # màn hình chỉ còn đúng một việc phải làm.
+                with gr.Column(elem_id="auth-forms") as grp_auth_forms:
+                    with gr.Tabs() as auth_tabs:
+                        with gr.Tab("Đăng nhập", id="tab_login"):
+                            li_user = gr.Textbox(
+                                label="Tên đăng nhập",
+                                placeholder="Nhập tên đăng nhập",
+                                max_length=64,
+                                autofocus=True,
+                                elem_id="li-user",
+                            )
+                            li_pass = gr.Textbox(
+                                label="Mật khẩu",
+                                type="password",
+                                max_length=128,
+                                placeholder="Nhập mật khẩu",
+                                elem_id="li-pass",
+                            )
+                            with gr.Row(elem_id="auth-util"):
+                                chk_showpw = gr.Checkbox(
+                                    label="Hiện mật khẩu",
+                                    value=False,
+                                    container=False,
+                                    elem_id="chk-showpw",
+                                )
+                            btn_login = gr.Button("Đăng nhập", variant="primary")
+                            # Nút viền: vừa là lối sang tab tạo tài khoản, vừa là
+                            # thứ thay cho thanh tab đã ẩn.
+                            btn_goto_register = gr.Button(
+                                "Tạo tài khoản", elem_classes="auth-alt"
+                            )
+
+                            # Ô mật khẩu che ký tự là nguyên nhân gõ sai phổ biến
+                            # nhất trên điện thoại; cho phép nhìn là cách sửa rẻ
+                            # nhất, và người dùng tự quyết định khi nào an toàn.
+                            chk_showpw.change(
+                                lambda show: gr.update(type="text" if show else "password"),
+                                chk_showpw,
+                                li_pass,
+                            )
+
+                        with gr.Tab("Tạo tài khoản", id="tab_register"):
+                            re_user = gr.Textbox(
+                                label="Tên đăng nhập",
+                                placeholder="3–32 ký tự",
+                                max_length=32,
+                                info="Cho phép chữ, số và các ký tự . _ -",
+                                elem_id="re-user",
+                            )
+                            re_pass = gr.Textbox(
+                                label="Mật khẩu",
+                                type="password",
+                                max_length=128,
+                                placeholder=f"Tối thiểu {PASSWORD_MIN} ký tự",
+                                elem_id="re-pass",
+                            )
+                            html_pw_meter = _static_html(_pw_meter_html(""), elem_id="pw-meter")
+                            btn_register = gr.Button("Tạo tài khoản", variant="primary")
+                            btn_goto_login = gr.Button(
+                                "Quay lại đăng nhập", elem_classes="auth-alt"
+                            )
+
+                            re_pass.change(_pw_meter_html, re_pass, html_pw_meter)
+
+                    # Thanh tab đã ẩn bằng CSS nên hai nút này là đường duy nhất
+                    # đi lại giữa hai biểu mẫu.
+                    btn_goto_register.click(
+                        lambda: gr.Tabs(selected="tab_register"), None, auth_tabs
                     )
-                    with gr.Row():
-                        btn_mfa_verify = gr.Button("Xác nhận", variant="primary")
+                    btn_goto_login.click(lambda: gr.Tabs(selected="tab_login"), None, auth_tabs)
+
+                # ---- bước 2: xác thực hai lớp ----
+                with gr.Column(visible=False, elem_id="mfa-panel") as grp_mfa_login:
+                    _static_html(MFA_HEAD_HTML)
+                    tb_mfa_code = gr.Textbox(
+                        label="Mã xác thực",
+                        placeholder="000000",
+                        max_length=32,
+                        elem_id="tb-mfa",
+                    )
+                    with gr.Row(elem_id="mfa-row"):
+                        btn_mfa_verify = gr.Button("Xác minh", variant="primary")
                         btn_mfa_cancel = gr.Button("Quay lại")
 
         # ============ ỨNG DỤNG ============
@@ -417,7 +715,7 @@ def build_ui() -> gr.Blocks:
                 # ---------- TRÒ CHUYỆN ----------
                 with gr.Tab("Trò chuyện"):
                     with gr.Row(elem_id="chat-row"):
-                        with gr.Column(scale=1, min_width=290, elem_classes="section-card"):
+                        with gr.Column(scale=1, min_width=330, elem_classes="section-card"):
                             gr.Markdown("#### Phiên hội thoại", elem_id="side-title")
                             # Danh sách chọn được bằng một cú bấm (thay cho Dropdown).
                             # gr.Radio giữ nguyên API choices/value nên mọi handler cũ
@@ -448,7 +746,7 @@ def build_ui() -> gr.Blocks:
                                     btn_export = gr.Button("Xuất JSON", size="sm")
                                     btn_delete = gr.Button("Xóa", variant="stop", size="sm")
                             file_export = gr.File(label="Tệp đã xuất", visible=False)
-                        with gr.Column(scale=3, min_width=520):
+                        with gr.Column(scale=3, min_width=600):
                             # Nhắc trạng thái mã hoá ngay trên khung chat.
                             gr.Markdown(
                                 "🔒 **Đã mã hoá** — nội dung lưu dưới dạng AES-256-GCM, "
@@ -457,7 +755,7 @@ def build_ui() -> gr.Blocks:
                             )
                             chatbot = gr.Chatbot(
                                 label="Nội dung",
-                                height=540,
+                                height=600,
                                 avatar_images=AVATARS,
                                 buttons=["copy", "copy_all"],
                                 allow_file_downloads=False,
@@ -700,7 +998,17 @@ def build_ui() -> gr.Blocks:
 
         # ══════════════════════ HANDLERS ══════════════════════
         # Giai đoạn 1 (nhẹ, ít output): xác thực + chuyển màn hình.
-        STAGE1 = [st_token, st_exp, st_mfa, auth_sec, app_sec, grp_mfa_login, li_pass, tb_mfa_code]
+        STAGE1 = [
+            st_token,
+            st_exp,
+            st_mfa,
+            auth_sec,
+            app_sec,
+            grp_mfa_login,
+            li_pass,
+            tb_mfa_code,
+            grp_auth_forms,
+        ]
         # Giai đoạn 2 (chạy nối bằng .then): nạp dữ liệu không gian làm việc.
         STAGE2 = [
             adm_tab,
@@ -733,6 +1041,7 @@ def build_ui() -> gr.Blocks:
                 gr.update(visible=False),
                 "",
                 "",
+                gr.update(visible=True),  # grp_auth_forms
                 gr.update(visible=False),
                 gr.update(visible=False),
                 gr.update(visible=False),
@@ -791,6 +1100,7 @@ def build_ui() -> gr.Blocks:
                     gr.update(visible=True),
                     gr.skip(),
                     "",
+                    gr.update(visible=False),  # ẩn form đăng nhập ở bước 2
                 )
             gr.Info("Đăng nhập thành công.")
             return (
@@ -802,6 +1112,7 @@ def build_ui() -> gr.Blocks:
                 gr.update(visible=False),
                 "",
                 "",
+                gr.update(visible=True),
             )
 
         def load_workspace(token):
@@ -867,6 +1178,7 @@ def build_ui() -> gr.Blocks:
                 gr.update(visible=False),
                 "",
                 "",
+                gr.update(visible=True),
             )
 
         btn_mfa_verify.click(
@@ -876,7 +1188,9 @@ def build_ui() -> gr.Blocks:
             _guard(load_workspace, len(STAGE2)), [st_token], STAGE2
         )
         btn_mfa_cancel.click(
-            lambda: ("", gr.update(visible=False), ""), None, [st_mfa, grp_mfa_login, tb_mfa_code]
+            lambda: ("", gr.update(visible=False), "", gr.update(visible=True)),
+            None,
+            [st_mfa, grp_mfa_login, tb_mfa_code, grp_auth_forms],
         )
 
         # ---- đăng xuất + đồng hồ token ----
