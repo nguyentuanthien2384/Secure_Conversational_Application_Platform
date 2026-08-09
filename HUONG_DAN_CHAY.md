@@ -221,7 +221,7 @@ Chi tiết Docker đầy đủ: `HUONG_DAN_DOCKER.md`.
 
 ```bash
 uv run pytest --cov=src.app --cov-report=term-missing      # unit + security regression
-uv run ruff check src/app tests scripts/migrate_database.py # lint
+uv run ruff check src tests scripts                      # lint
 uv run bandit -q -r src/app -ll -ii                        # SAST
 uv export --frozen --no-dev --no-emit-project --output-file /tmp/req.txt
 uv run pip-audit -r /tmp/req.txt                           # SCA (CVE dependency)

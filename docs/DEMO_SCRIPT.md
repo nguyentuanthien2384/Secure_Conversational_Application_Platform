@@ -352,7 +352,7 @@ Chạy trước buổi demo, chụp màn hình đưa vào báo cáo; trên lớp
 
 ```bash
 uv run pytest --cov=src.app --cov-report=term-missing   # kiểm thử + độ phủ
-uv run ruff check src/app tests                          # lint
+uv run ruff check src tests scripts                      # lint
 uv run bandit -q -r src/app -ll -ii                      # SAST
 uv export --frozen --no-dev --no-emit-project --output-file /tmp/req.txt
 uv run pip-audit -r /tmp/req.txt                         # SCA — CVE của dependency

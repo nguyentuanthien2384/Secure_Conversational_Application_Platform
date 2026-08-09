@@ -73,7 +73,7 @@ Ok "Moi truong ao .venv da san sang"
 if ($Test) {
     Step "5/5 Kiem thu va quet bao mat"
     uv run pytest --cov=src.app --cov-report=term-missing
-    uv run ruff check src/app tests scripts/migrate_database.py
+    uv run ruff check src tests scripts
     uv run bandit -q -r src/app -ll -ii
 } else {
     Step "5/5 Bo qua test (them -Test neu muon chay)"

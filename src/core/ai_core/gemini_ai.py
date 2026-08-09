@@ -1,9 +1,9 @@
 import os
 from collections.abc import Sequence
-from google import genai
-from google.genai import types
 
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 _ = load_dotenv()
 

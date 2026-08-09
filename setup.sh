@@ -83,7 +83,7 @@ ok "Môi trường ảo .venv đã sẵn sàng"
 if [ "$RUN_TESTS" -eq 1 ]; then
   step "5/5 Kiểm thử và quét bảo mật"
   uv run pytest --cov=src.app --cov-report=term-missing || warn "Có test thất bại — xem log ở trên"
-  uv run ruff check src/app tests scripts/migrate_database.py || warn "Ruff báo lỗi lint"
+  uv run ruff check src tests scripts || warn "Ruff báo lỗi lint"
   uv run bandit -q -r src/app -ll -ii || warn "Bandit báo cảnh báo"
 else
   step "5/5 Bỏ qua test (thêm --test nếu muốn chạy)"

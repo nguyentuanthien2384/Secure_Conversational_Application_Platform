@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "argon2-cffi>=25.1.0",
-    "cryptography>=46.0.0",
+    # 50.0.0 là bản vá PYSEC-2026-3552; giữ sàn ở đây để pip-audit trong CI không đỏ lại.
+    "cryptography>=50.0.0",
     "fastapi>=0.140.0",
     "google-genai==1.32.0",
     "gradio>=6.20.0,<7.0.0",
