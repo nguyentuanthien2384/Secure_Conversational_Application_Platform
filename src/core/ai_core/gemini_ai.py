@@ -22,13 +22,13 @@ class GeminiClient:
     Args:
         api_key: Khóa truy cập Google GenAI. Nếu None, sẽ đọc từ
             biến môi trường `GOOGLE_GENAI_API_KEY`.
-        model: Tên model mặc định. Ví dụ: "gemini-2.5-flash-lite".
+        model: Tên model mặc định. Ví dụ: "gemini-flash-lite-latest".
 
     Raises:
         ValueError: Nếu không tìm thấy `api_key`.
     """
 
-    def __init__(self, api_key: str | None = None, model: str = "gemini-2.5-flash-lite"):
+    def __init__(self, api_key: str | None = None, model: str = "gemini-flash-lite-latest"):
         if api_key is None:
             api_key = os.getenv("GOOGLE_GENAI_API_KEY", "")
         self.api_key: str = api_key
@@ -76,7 +76,7 @@ class GeminiClient:
         user_content: str | Sequence[str] | Sequence[types.Part],
         *,
         system_instruction: str | None = None,
-        thinking_budget: int | None = 0,
+        thinking_budget: int | None = None,
         temperature: float | None = None,
         extra_config: dict | None = None,
         model: str | None = None,
@@ -86,7 +86,10 @@ class GeminiClient:
         Args:
             user_content: Nội dung người dùng. Hỗ trợ `str`, list[str] hoặc list[types.Part].
             system_instruction: Chuỗi hướng dẫn hệ thống (tùy chọn).
-            thinking_budget: Ngân sách “thinking” (nếu model hỗ trợ). Mặc định 0.
+            thinking_budget: Ngân sách “thinking” (nếu model hỗ trợ). Mặc định
+                `None` = không gửi `ThinkingConfig`, để model dùng mặc định.
+                LƯU Ý: giá trị `0` (tắt hẳn thinking) bị các model thế hệ mới
+                từ chối bằng 400 INVALID_ARGUMENT — chỉ dùng với model cũ.
             temperature: Nhiệt độ sampling (nếu model hỗ trợ).
             extra_config: Dict bổ sung vào `GenerateContentConfig` (advanced).
             model: Ghi đè model mặc định cho lần gọi này (tùy chọn).
@@ -142,6 +145,6 @@ class GeminiClient:
 if __name__ == "__main__":
     # Cách dùng:
     #   export GOOGLE_GENAI_API_KEY="..."  # hoặc đặt trong .env rồi load trước đó
-    client = GeminiClient(model="gemini-2.5-flash-lite")
-    print(client.generate("hello", thinking_budget=0))
+    client = GeminiClient(model="gemini-flash-lite-latest")
+    print(client.generate("hello"))
     

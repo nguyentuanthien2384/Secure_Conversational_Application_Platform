@@ -18,11 +18,26 @@
 services:
   app:
     environment:
+      # ── APP_ENV: production -> development ────────────────────────────────
+      # BẮT BUỘC phải hạ xuống development, không phải để cho tiện. Guard trong
+      # src/app/config.py từ chối khởi động ở production nếu DOCS_ENABLED=true
+      # HOẶC SEED_DEMO_DATA=true. Mà kịch bản demo cần CẢ HAI:
+      #   - Swagger /docs  -> bước 5, tấn công IDOR qua API trực tiếp
+      #   - Tài khoản demo -> toàn bộ 8 bước
+      # Nói cách khác: giữ production thì không demo được, nên overlay "local"
+      # phải là development. Bản production thật vẫn nguyên ở docker-compose.yml.
+      APP_ENV: development
       # Cho phép truy cập qua localhost (TrustedHostMiddleware bỏ qua port).
       ALLOWED_HOSTS: localhost,127.0.0.1
       ALLOWED_ORIGINS: http://localhost:8000,http://127.0.0.1:8000
       # HIBP cần gọi ra Internet; tắt để demo offline chạy nhanh, ổn định.
       PASSWORD_BREACH_CHECK: "false"
+      # Swagger cho bước demo IDOR. Production tắt (không lộ schema API) — nhớ
+      # nói rõ điểm khác biệt này với giảng viên.
+      DOCS_ENABLED: "true"
+      # Tự nạp 3 tài khoản + 4 hội thoại đã mã hoá + chuỗi audit mô phỏng ngay
+      # lúc khởi động. Idempotent nên `up` lại nhiều lần không tạo trùng.
+      SEED_DEMO_DATA: "true"
       # Script vận hành nằm ngoài /app nên cần PYTHONPATH để `import src` chạy.
       PYTHONPATH: /app
     # Chỉ bind vào loopback, không phơi ra LAN.
@@ -62,3 +77,56 @@ services:
   caddy:
     # Gán profile không được bật -> `docker compose up` sẽ bỏ qua service này.
     profiles: ["with-caddy"]
+
+  # ── Bổ sung dữ liệu mẫu còn thiếu (tùy chọn) ───────────────────────────
+  # Service `app` đã tự seed lúc khởi động (SEED_DEMO_DATA=true) và thao tác này
+  # idempotent, nên bình thường KHÔNG cần gọi tới service này. Nó chỉ hữu ích khi
+  # bạn lỡ xoá một tài khoản demo và muốn tạo lại phần còn thiếu.
+  #
+  # ⚠️  KHÔNG thêm cờ `--reset` vào đây. ĐÃ KIỂM CHỨNG: `--reset` xoá các bản ghi
+  # audit `seed-%` nằm GIỮA chuỗi băm, làm `GET /api/admin/audit/verify` trả
+  # `chain_intact: false` với lý do `prev_hash_mismatch`. Đó không phải lỗi —
+  # chuỗi băm sinh ra chính là để phát hiện việc xoá bản ghi. Nhưng khi demo thì
+  # nó trông y hệt như hệ thống vừa bị tấn công, và `scripts/repair_audit_chain.py`
+  # CỐ Ý từ chối vá chuỗi đã gãy nên không có đường quay lại.
+  #
+  # MUỐN RESET SẠCH THẬT SỰ thì xoá luôn volume, chuỗi sẽ bắt đầu lại từ đầu:
+  #   docker compose -f docker-compose.yml -f docker-compose.local.yml down -v
+  #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+  # (đã kiểm chứng: sau lệnh này verify trả chain_intact=true, coverage 100%)
+  #
+  # TẠI SAO DÙNG CREDENTIAL OWNER? Để service này còn dùng được cho các tác vụ
+  # bảo trì cần quyền cao hơn scap_app, giống hệt service `migrate`.
+  #
+  # CÁCH DÙNG (từ thư mục gốc dự án):
+  #   docker compose -f docker-compose.yml -f docker-compose.local.yml \
+  #     run --rm seed
+  seed:
+    build: .
+    env_file: .env
+    environment:
+      # Tài khoản chủ schema, giống service `migrate`.
+      DATABASE_URL: postgresql+psycopg://secure_chat:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/secure_chat
+      # Guard production từ chối DATABASE_URL dùng tài khoản chủ; ràng buộc đó
+      # nhắm vào tiến trình phục vụ web, không nhắm vào tác vụ bảo trì one-shot.
+      APP_ENV: development
+      # Script được mount ở /opt/scap-scripts, ngoài /app, nên cần PYTHONPATH.
+      PYTHONPATH: /app
+    volumes:
+      - ./scripts:/opt/scap-scripts:ro
+    command:
+      - /app/.venv/bin/python
+      - /opt/scap-scripts/seed_demo_data.py
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks: [backend]
+    # Không chạy cùng `docker compose up`; chỉ chạy khi được gọi tên.
+    profiles: ["maintenance"]

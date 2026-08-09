@@ -34,7 +34,7 @@ Thứ tự khởi động do Compose đảm bảo: `db` healthy → `migrate` ch
 ### 1.1. `BOOTSTRAP_ADMIN_PASSWORD` phải để trống
 
 Service `app` dùng `env_file: .env`, và nó chạy với `APP_ENV=production`.
-`config.py` có guard:
+`src/app/config.py` có guard:
 
 ```
 RuntimeError: Không đặt BOOTSTRAP_ADMIN_PASSWORD ở production;
@@ -140,11 +140,63 @@ Kiểm tra sống:
 curl http://localhost:8000/api/health
 ```
 
-Truy cập: <http://localhost:8000> (Gradio UI).
-Lưu ý `/docs` **404** vì Compose đặt `DOCS_ENABLED=false` — đúng theo yêu cầu
-production (không lộ schema API). Muốn có Swagger để demo, thêm
-`DOCS_ENABLED: "true"` vào `docker-compose.local.yml`, nhưng nên nói rõ với giảng
-viên rằng bản production tắt nó.
+Truy cập: <http://localhost:8000> (Gradio UI), Swagger ở <http://localhost:8000/docs>.
+
+**Sau bước này bạn đã có đủ mọi thứ để demo** — không cần tạo tài khoản thủ công.
+`docker-compose.local.yml` đặt `SEED_DEMO_DATA=true`, nên lúc khởi động app tự nạp
+3 tài khoản demo, 4 hội thoại đã mã hoá và chuỗi audit mô phỏng. Kiểm tra:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml logs app | grep -i seed
+```
+
+| Tài khoản | Vai trò | Mật khẩu chung |
+|---|---|---|
+| `demo.user` | user | `Phenikaa-Vault#2026-Lab` |
+| `demo.mod` | moderator | `Phenikaa-Vault#2026-Lab` |
+| `demo.boss` | admin | `Phenikaa-Vault#2026-Lab` |
+
+> **Khác biệt so với production — cần nói rõ khi bảo vệ.** Overlay local hạ
+> `APP_ENV` xuống `development` để bật được `/docs` và dữ liệu mẫu. Đó **không phải
+> tuỳ tiện**: guard trong `src/app/config.py` từ chối khởi động ở production nếu
+> `DOCS_ENABLED=true` hoặc `SEED_DEMO_DATA=true` — vì Swagger làm lộ schema API, còn
+> tài khoản mẫu có mật khẩu công khai. Bản `docker-compose.yml` gốc vẫn giữ nguyên
+> cấu hình production; chính sự khác biệt này là thứ đáng trình bày.
+
+### Reset về trạng thái sạch
+
+Muốn quay lại trạng thái sạch (ví dụ sau khi demo brute-force làm khoá tài khoản),
+**xoá luôn volume** rồi dựng lại — app sẽ tự seed lại từ đầu:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml down -v
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+```
+
+> ⚠️ **Đừng dùng `seed_demo_data.py --reset` trên database đang chạy.** Đã kiểm
+> chứng: cờ `--reset` xoá các bản ghi audit `seed-%` nằm **giữa** chuỗi băm, khiến
+> `GET /api/admin/audit/verify` trả `chain_intact: false` /
+> `reason: prev_hash_mismatch`. Đó **không phải lỗi của hệ thống** — chuỗi băm sinh
+> ra chính là để phát hiện việc xoá bản ghi, nên nó đang làm đúng việc. Nhưng giữa
+> buổi demo thì kết quả đó trông y hệt như vừa bị tấn công, và
+> `scripts/repair_audit_chain.py` **cố ý từ chối** vá chuỗi đã gãy (vá được nghĩa là
+> bằng chứng vô giá trị). Không có đường quay lại ngoài `down -v`.
+>
+> Sau `down -v` + `up`, verify trả `chain_intact: true`, coverage 100%.
+
+Nếu chỉ lỡ xoá một tài khoản demo và muốn tạo lại phần thiếu (không đụng audit):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml run --rm seed
+```
+
+Chỉ cần mở khoá tài khoản bị lockout thì không phải reset gì cả:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml exec -T db \
+  sh -c 'PGPASSWORD=$POSTGRES_PASSWORD psql -U secure_chat -d secure_chat -c \
+  "UPDATE users SET failed_login_attempts=0, locked_until=NULL WHERE username='"'"'demo.user'"'"';"'
+```
 
 ---
 
@@ -204,8 +256,11 @@ sự có hiệu lực (HSTS bị bỏ qua trên kết nối có lỗi certificat
 
 ## Phần 5. Tạo tài khoản đăng nhập
 
-Vì production chặn `BOOTSTRAP_ADMIN_*` và `SEED_DEMO_DATA`, phải tạo admin bằng
-quy trình one-off. Chọn 1 trong 2 cách.
+> **Đi cách A (mục 3) thì BỎ QUA cả phần này** — overlay local đã tự nạp 3 tài
+> khoản demo lúc khởi động. Phần 5 chỉ cần khi bạn chạy **cấu hình production
+> thật** (cách B hoặc C), nơi `SEED_DEMO_DATA` và `BOOTSTRAP_ADMIN_*` đều bị chặn.
+
+Ở production phải tạo admin bằng quy trình one-off. Chọn 1 trong 2 cách.
 
 ### Cách 1 — Nạp dữ liệu mẫu (nhanh, có sẵn 3 vai trò + dữ liệu cho trang quản trị)
 
@@ -227,19 +282,9 @@ Kết quả — mật khẩu chung `Phenikaa-Vault#2026-Lab`:
 | `demo.mod` | moderator | như user + nhật ký kiểm toán |
 | `demo.boss` | admin | toàn bộ trang quản trị |
 
-Muốn xóa sạch rồi nạp lại (`--reset` xóa cả audit `seed-%`, mà `scap_app` bị
-REVOKE DELETE trên `audit_events` → phải dùng tài khoản chủ):
-
-```bash
-docker compose run --rm --no-deps \
-  -e APP_ENV=development \
-  -e DATABASE_URL="postgresql+psycopg://secure_chat:$POSTGRES_PASSWORD@db:5432/secure_chat" \
-  app /app/.venv/bin/python -c "from src.app.config import Settings; from src.app.db import Database; from src.app.demo_seed import seed_demo_data; from src.app.security import CryptoService, PasswordService; s=Settings.from_env(); seed_demo_data(Database(s.database_url), PasswordService(), CryptoService(s.master_encryption_key), reset=True)"
-```
-
-(Cần `export POSTGRES_PASSWORD=...` trước, hoặc thay trực tiếp mật khẩu vào chuỗi.
-`APP_ENV=development` là bắt buộc: guard production từ chối `DATABASE_URL` dùng
-tài khoản chủ.)
+Muốn xóa sạch rồi nạp lại: **dùng `docker compose down -v` rồi `up` lại**, đừng
+gọi `seed_demo_data(..., reset=True)` trên database đang chạy — xem cảnh báo về
+chuỗi băm audit ở cuối Phần 3.
 
 ### Cách 2 — Tự đăng ký rồi nâng quyền bằng SQL (giống quy trình thật hơn)
 
@@ -288,7 +333,8 @@ docker compose exec db sh -c 'PGPASSWORD=$APP_DB_PASSWORD psql -U scap_app -d se
 ```sql
 DROP TABLE users;                     -- ERROR: must be owner of table users
 DELETE FROM audit_events;             -- ERROR: permission denied for table audit_events
-INSERT INTO audit_events (event, outcome) VALUES ('test','success');  -- OK: chỉ được ghi thêm
+UPDATE audit_events SET outcome='hacked';  -- ERROR: permission denied for table audit_events
+SELECT count(*) FROM audit_events;         -- OK: đọc và ghi thêm thì được
 \q
 ```
 
@@ -298,7 +344,7 @@ INSERT INTO audit_events (event, outcome) VALUES ('test','success');  -- OK: ch�
 Vai trò auditor cho giảng viên:
 
 ```bash
-docker compose exec db sh -c 'PGPASSWORD=$AUDITOR_DB_PASSWORD psql -U scap_auditor -d secure_chat -c "SELECT event, outcome, created_at FROM audit_events ORDER BY id DESC LIMIT 10;"'
+docker compose exec db sh -c 'PGPASSWORD=$AUDITOR_DB_PASSWORD psql -U scap_auditor -d secure_chat -c "SELECT event_type, outcome, created_at FROM audit_events ORDER BY id DESC LIMIT 10;"'
 docker compose exec db sh -c 'PGPASSWORD=$AUDITOR_DB_PASSWORD psql -U scap_auditor -d secure_chat -c "SELECT * FROM users LIMIT 1;"'
 # -> permission denied for table users
 ```
@@ -384,7 +430,9 @@ docker compose exec db sh -c 'PGPASSWORD=$POSTGRES_PASSWORD pg_dump -U secure_ch
 cat backup.sql | docker compose exec -T db sh -c 'PGPASSWORD=$POSTGRES_PASSWORD psql -U secure_chat -d secure_chat'
 ```
 
-Xem thêm `docs/BACKUP_AND_RECOVERY.md`.
+Volume `postgres_data` giữ dữ liệu qua `down`; chỉ `down -v` mới xoá. Nhớ sao lưu
+cả `MASTER_ENCRYPTION_KEY` cùng với file dump — thiếu khóa thì bản dump chỉ là
+bản mã không giải được.
 
 ---
 
@@ -396,7 +444,7 @@ Xem thêm `docs/BACKUP_AND_RECOVERY.md`.
 | `app` khởi động rồi tắt ngay, log có `Không đặt BOOTSTRAP_ADMIN_PASSWORD ở production` | Xóa giá trị 2 dòng `BOOTSTRAP_ADMIN_*` trong `.env`, rồi `docker compose up -d app` |
 | Log app: `REDIS_URL bắt buộc ở production` | Đang chạy service `app` lẻ mà không qua Compose. Luôn dùng `docker compose up`, đừng `docker run` tay |
 | Log app: `Database schema chưa được migrate; thiếu bảng: ...` | `migrate` chưa chạy xong hoặc lỗi. `docker compose logs migrate`, sửa rồi `docker compose up migrate` |
-| `migrate` báo `role "scap_app" does not exist` | Volume `postgres_data` được tạo từ lần trước khi chưa có `init_db_roles.sh`. Init script chỉ chạy trên volume rỗng → `docker compose down -v` rồi `up` lại |
+| `migrate` báo `role "scap_app" does not exist` | Volume `postgres_data` được tạo từ lần trước khi chưa có `scripts/init_db_roles.sh`. Init script chỉ chạy trên volume rỗng → `docker compose down -v` rồi `up` lại |
 | `password authentication failed for user "scap_app"` | Đã đổi `APP_DB_PASSWORD` sau khi volume được khởi tạo. Đổi lại mật khẩu cũ, hoặc `ALTER ROLE scap_app WITH PASSWORD '...'` bằng tài khoản chủ, hoặc `down -v` |
 | Truy cập trả về `400 Invalid host header` | `ALLOWED_HOSTS` không khớp Host bạn dùng. Cách A phải vào bằng `localhost`; cách B bằng đúng `PUBLIC_DOMAIN` |
 | `/docs` trả 404 | Đúng thiết kế: `DOCS_ENABLED=false` ở production |
@@ -406,7 +454,10 @@ Xem thêm `docs/BACKUP_AND_RECOVERY.md`.
 | Đăng nhập báo sai dù mật khẩu đúng | Đã bị lockout sau 5 lần sai. Chờ `LOGIN_LOCKOUT_SECONDS=900`, hoặc `UPDATE users SET failed_login_attempts=0, locked_until=NULL WHERE username='...';` |
 | Hội thoại cũ lỗi giải mã | `MASTER_ENCRYPTION_KEY` đã bị đổi. Khôi phục khóa cũ hoặc dùng keyring rotation |
 | Bot trả lời chung chung | Chưa có `GOOGLE_GENAI_API_KEY` → chế độ DEMO AI, vẫn đủ để demo bảo mật |
-| Muốn reset sạch từ đầu | `docker compose down -v` → `docker compose up -d --build` → nạp lại dữ liệu mẫu (Phần 5) |
+| Muốn reset sạch từ đầu | `docker compose down -v` → `docker compose up -d` (cách A tự seed lại, chuỗi audit về lại nguyên vẹn) |
+| **Windows + Git Bash:** `exec: "D:/Download/Git/app/.venv/bin/python": no such file or directory` | Git Bash tự đổi đường dẫn `/app/...` thành đường dẫn Windows. Thêm `MSYS_NO_PATHCONV=1` trước lệnh, hoặc chạy bằng PowerShell |
+| `audit/verify` báo `chain_intact: false`, `prev_hash_mismatch` mà không ai tấn công | Đã chạy `seed_demo_data.py --reset` trên DB đang dùng → xoá bản ghi audit giữa chuỗi. Không vá được; `down -v` rồi `up` lại |
+| Log app: `permission denied for table audit_events` khi seed | Đang seed bằng `scap_app`. Dùng service `seed` (credential owner) hoặc để app tự seed lúc khởi động |
 
 ---
 
@@ -424,6 +475,6 @@ Xem thêm `docs/BACKUP_AND_RECOVERY.md`.
    docker compose build --build-arg BASE_IMAGE=python:3.12-slim@sha256:<digest>
    ```
 
-6. Sau khi có admin, cân nhắc `IDS_ENABLED=true` + gom log JSON về SIEM
-   (`docs/LOGGING_AND_SIEM.md`), và chuyển khóa AES sang KMS/Vault thay vì biến
-   môi trường — đây là giới hạn đã ghi nhận trong `README.md` mục 9.
+6. Sau khi có admin, cân nhắc `IDS_ENABLED=true` + gom log JSON (`SIEM_JSON_LOGS=true`,
+   xem `src/app/siem.py`) về Loki/ELK/Wazuh, và chuyển khóa AES sang KMS/Vault thay
+   vì biến môi trường — đây là giới hạn đã ghi nhận trong `README.md`.

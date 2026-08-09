@@ -89,7 +89,7 @@ class Settings:
     password_breach_check: bool = False
     allow_demo_ai: bool = True
     google_genai_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash-lite"
+    gemini_model: str = "gemini-flash-lite-latest"
     bootstrap_admin_username: str = ""
     bootstrap_admin_password: str = ""
     docs_enabled: bool = True
@@ -189,7 +189,7 @@ class Settings:
             password_breach_check=_bool_env("PASSWORD_BREACH_CHECK", False),
             allow_demo_ai=_bool_env("ALLOW_DEMO_AI", True),
             google_genai_api_key=os.getenv("GOOGLE_GENAI_API_KEY", ""),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest"),
             bootstrap_admin_username=os.getenv("BOOTSTRAP_ADMIN_USERNAME", ""),
             bootstrap_admin_password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD", ""),
             docs_enabled=_bool_env("DOCS_ENABLED", environment != "production"),
