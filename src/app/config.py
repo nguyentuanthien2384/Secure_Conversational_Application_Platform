@@ -107,6 +107,16 @@ class Settings:
     siem_json_logs: bool = True
     password_change_max_attempts: int = 5
     password_change_window_seconds: int = 900
+    # Secure AI Agent Platform: every tool receives a distinct, short-lived
+    # capability grant and can only see a per-user workspace below this root.
+    # The root should be a dedicated mounted volume in production, never the
+    # application checkout or a host home directory.
+    agent_workspace_root: str = "./agent_workspaces"
+    agent_capability_seconds: int = 300
+    agent_max_tool_calls: int = 8
+    # Empty is deliberately deny-all.  The built-in egress tool only validates
+    # destinations; a production proxy must enforce this same allowlist again.
+    agent_egress_allowed_hosts: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -117,6 +127,7 @@ class Settings:
         secret_key = os.getenv("APP_SECRET_KEY", "").strip() or "development-only-change-me"  # nosec B105
         master_key = os.getenv("MASTER_ENCRYPTION_KEY", "").strip()
         keyring = _keyring_env()
+        agent_workspace_root = os.getenv("AGENT_WORKSPACE_ROOT", "").strip()
         if not master_key and not keyring and environment != "production":
             master_key = derive_demo_key(secret_key)
         active_version_raw = os.getenv("ACTIVE_KEY_VERSION", "").strip()
@@ -151,6 +162,10 @@ class Settings:
             if _bool_env("SEED_DEMO_DATA", False):
                 raise RuntimeError(
                     "SEED_DEMO_DATA phải tắt ở production vì tài khoản mẫu có thông tin đăng nhập công khai."
+                )
+            if not agent_workspace_root:
+                raise RuntimeError(
+                    "AGENT_WORKSPACE_ROOT bắt buộc ở production; dùng một mount tách biệt, không phải mã nguồn."
                 )
             if database_url.startswith(("postgresql://", "postgresql+")):
                 runtime_user = urlparse(database_url).username
@@ -204,4 +219,8 @@ class Settings:
             siem_json_logs=_bool_env("SIEM_JSON_LOGS", True),
             password_change_max_attempts=int(os.getenv("PASSWORD_CHANGE_MAX_ATTEMPTS", "5")),
             password_change_window_seconds=int(os.getenv("PASSWORD_CHANGE_WINDOW_SECONDS", "900")),
+            agent_workspace_root=agent_workspace_root or "./agent_workspaces",
+            agent_capability_seconds=int(os.getenv("AGENT_CAPABILITY_SECONDS", "300")),
+            agent_max_tool_calls=int(os.getenv("AGENT_MAX_TOOL_CALLS", "8")),
+            agent_egress_allowed_hosts=_csv_env("AGENT_EGRESS_ALLOWED_HOSTS"),
         )

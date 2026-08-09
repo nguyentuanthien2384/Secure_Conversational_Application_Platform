@@ -115,6 +115,25 @@ class SecureMessage(Base):
     session: Mapped[ChatSession] = relationship(back_populates="messages")
 
 
+class AgentDocument(Base):
+    """Tenant-owned retrieval document; content is encrypted at rest."""
+
+    __tablename__ = "agent_documents"
+    __table_args__ = (Index("ix_agent_documents_owner_created", "owner_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    key_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_events_created", "created_at"),)

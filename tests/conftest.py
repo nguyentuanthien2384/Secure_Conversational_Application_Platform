@@ -25,6 +25,7 @@ def settings(tmp_path: Path) -> Settings:
         message_max_attempts=20,
         allow_demo_ai=True,
         docs_enabled=False,
+        agent_workspace_root=str(tmp_path / "agent-workspaces"),
     )
 
 

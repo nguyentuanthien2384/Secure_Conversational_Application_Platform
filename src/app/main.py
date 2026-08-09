@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.app.agent import AgentInputError, AgentOrchestrator, ToolBroker
 from src.app.audit import client_ip, record_audit
 from src.app.audit_chain import derive_audit_key, verify_chain
 from src.app.config import Settings
@@ -30,6 +31,7 @@ from src.app.ids import (
     scan_text,
 )
 from src.app.models import (
+    AgentDocument,
     AuditEvent,
     AuthSession,
     ChatSession,
@@ -37,9 +39,17 @@ from src.app.models import (
     RevokedToken,
     SecureMessage,
     User,
+    uuid4_str,
 )
 from src.app.schemas import (
     AdminCreateUser,
+    AgentDocumentCreate,
+    AgentDocumentResponse,
+    AgentRetrievalHit,
+    AgentRetrievalRequest,
+    AgentRunRequest,
+    AgentRunResponse,
+    AgentToolManifestResponse,
     AIConsentUpdate,
     AuditResponse,
     AuthSessionResponse,
@@ -96,6 +106,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.registration_max_attempts,
             settings.message_window_seconds,
             settings.message_max_attempts,
+            settings.agent_capability_seconds,
+            settings.agent_max_tool_calls,
         )
     ):
         raise ValueError("Security duration and rate-limit settings must be positive integers.")
@@ -118,6 +130,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     refresh_limiter = limiter_type(*limiter_args)
     totp_service = TotpService()
     chat_service = ChatService(crypto_service, AIService(settings))
+    tool_broker = ToolBroker(settings)
+    agent_orchestrator = AgentOrchestrator(tool_broker)
     # Structured JSON security log on stdout for SIEM ingestion (Bài 7 §SIEM).
     configure_siem_logging(enabled=settings.siem_json_logs)
     # Application-layer IDS/IPS state (Bài 7 §7.3).
@@ -173,6 +187,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.crypto_service = crypto_service
     app.state.totp_service = totp_service
     app.state.chat_service = chat_service
+    app.state.tool_broker = tool_broker
+    app.state.agent_orchestrator = agent_orchestrator
     app.state.intrusion_state = intrusion_state
     app.state.audit_key = audit_key
 
@@ -1852,6 +1868,115 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=404, detail="Địa chỉ này không nằm trong danh sách chặn."
             )
         return Response(status_code=204)
+
+    @app.get("/api/agent/tools", response_model=list[AgentToolManifestResponse])
+    def list_agent_tools(_: Annotated[User, Depends(current_user)]):
+        """Return the signed, version-pinned allowlist visible to the agent planner."""
+        return tool_broker.manifests()
+
+    @app.post("/api/agent/documents", response_model=AgentDocumentResponse, status_code=201)
+    def ingest_agent_document(
+        payload: AgentDocumentCreate,
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        """Ingest trusted plain text into the caller's encrypted retrieval namespace."""
+        # The document ID is AAD for AES-GCM, so it must exist before encryption;
+        # relying on SQLAlchemy's insert-time default would make the ciphertext
+        # impossible to authenticate after the row receives its database ID.
+        document = AgentDocument(
+            id=uuid4_str(), owner_id=user.id, title=payload.title, ciphertext="", nonce=""
+        )
+        ciphertext, nonce, key_version = crypto_service.encrypt(payload.content, document.id, "agent-document")
+        document.ciphertext, document.nonce, document.key_version = ciphertext, nonce, key_version
+        db.add(document)
+        db.commit()
+        db.refresh(document)
+        record_audit(
+            db, request, "agent.document.ingest", actor_id=user.id, target_type="agent_document",
+            target_id=document.id, details={"content_bytes": len(payload.content.encode("utf-8"))},
+        )
+        return document
+
+    @app.post("/api/agent/retrieval/search", response_model=list[AgentRetrievalHit])
+    def search_agent_documents(
+        payload: AgentRetrievalRequest,
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        """Tenant-filtered lexical retrieval; vector retrieval must retain this ACL filter."""
+        query = payload.query.casefold().strip()
+        hits: list[dict[str, str]] = []
+        documents = db.scalars(
+            select(AgentDocument).where(AgentDocument.owner_id == user.id).limit(50)
+        )
+        for document in documents:
+            content = crypto_service.decrypt(
+                document.ciphertext, document.nonce, document.id, "agent-document", document.key_version
+            )
+            position = content.casefold().find(query)
+            if position >= 0:
+                snippet = " ".join(content[max(0, position - 120) : position + len(query) + 180].split())
+                hits.append({"document_id": document.id, "title": document.title, "snippet": snippet[:512]})
+            if len(hits) == 10:
+                break
+        record_audit(
+            db, request, "agent.retrieval.search", actor_id=user.id, target_type="agent_document",
+            details={"hits": len(hits), "query_length": len(payload.query)},
+        )
+        return hits
+
+    @app.post("/api/agent/runs", response_model=AgentRunResponse)
+    def run_agent_plan(
+        payload: AgentRunRequest,
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        """Execute an untrusted agent plan through the capability-checked broker.
+
+        This endpoint intentionally accepts proposed calls rather than exposing a
+        model with process access.  The user-approved scopes are converted to an
+        internal, short-lived tool token; neither the browser nor model receives
+        a reusable capability credential.
+        """
+        try:
+            result = agent_orchestrator.run(
+                user.id,
+                payload.approved_scopes,
+                [{"tool": call.tool, "arguments": call.arguments} for call in payload.tool_calls],
+            )
+        except AgentInputError as exc:
+            record_audit(
+                db,
+                request,
+                "agent.run",
+                actor_id=user.id,
+                target_type="agent_plan",
+                outcome="denied",
+                details={"tool_calls": len(payload.tool_calls), "reason": "invalid_plan"},
+            )
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        summary = result["summary"]
+        record_audit(
+            db,
+            request,
+            "agent.run",
+            actor_id=user.id,
+            target_type="agent_plan",
+            outcome="success" if summary["denied"] == 0 else "denied",
+            details={
+                "tool_calls": summary["tool_calls"],
+                "denied": summary["denied"],
+                "approved_scopes": ",".join(result["approved_scopes"]),
+                # Do not log tool arguments or output: those may contain source
+                # code, user content, credentials, or file paths.
+                "tools": ",".join(call.tool for call in payload.tool_calls),
+            },
+        )
+        return result
 
     # The Gradio interface is the only supported web client. Keeping the former
     # static SPA alongside it duplicated authentication and security-sensitive

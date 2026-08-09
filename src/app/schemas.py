@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -305,3 +306,83 @@ class SecurityAlertResponse(BaseModel):
     count: int
     window_minutes: int
     message: str
+
+
+class AgentToolCall(BaseModel):
+    """An untrusted proposed tool call. The broker validates it again at execution."""
+
+    tool: str = Field(min_length=2, max_length=64, pattern=r"^[a-z][a-z0-9_.-]{1,63}$")
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentRunRequest(BaseModel):
+    # This explicit list is the user approval boundary.  The model cannot add
+    # scopes: the server converts this list to an internal capability token.
+    approved_scopes: list[str] = Field(default_factory=list, max_length=8)
+    tool_calls: list[AgentToolCall] = Field(min_length=1, max_length=8)
+
+    @field_validator("approved_scopes")
+    @classmethod
+    def normalize_scopes(cls, value: list[str]) -> list[str]:
+        cleaned = [scope.strip().lower() for scope in value]
+        if any(not scope or len(scope) > 64 for scope in cleaned):
+            raise ValueError("Capability scope không hợp lệ.")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("Không được cấp trùng capability scope.")
+        return cleaned
+
+
+class AgentToolResult(BaseModel):
+    tool: str
+    status: str
+    detail: str | None = None
+    output: dict[str, Any] | None = None
+
+
+class AgentRunResponse(BaseModel):
+    status: str
+    approved_scopes: list[str]
+    results: list[AgentToolResult]
+    summary: dict[str, int]
+
+
+class AgentToolManifestResponse(BaseModel):
+    name: str
+    version: str
+    required_scope: str
+    description: str
+    timeout_seconds: int
+    max_output_bytes: int
+    manifest_signature: str
+
+
+class AgentDocumentCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1, max_length=131072)
+
+    @field_validator("title")
+    @classmethod
+    def clean_title(cls, value: str) -> str:
+        cleaned = " ".join(value.split())
+        if not cleaned:
+            raise ValueError("Tiêu đề tài liệu không được để trống.")
+        return cleaned
+
+
+class AgentDocumentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    title: str
+    key_version: int
+    created_at: datetime
+
+
+class AgentRetrievalRequest(BaseModel):
+    query: str = Field(min_length=3, max_length=200)
+
+
+class AgentRetrievalHit(BaseModel):
+    document_id: str
+    title: str
+    snippet: str

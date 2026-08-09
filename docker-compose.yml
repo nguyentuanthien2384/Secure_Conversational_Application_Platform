@@ -91,6 +91,9 @@ services:
       DOCS_ENABLED: "false"
       PASSWORD_BREACH_CHECK: "true"
       SEED_DEMO_DATA: "false"
+      # Ephemeral per-user agent workspaces live in the app's writable tmpfs.
+      # A production persistent workspace must be a separately permissioned mount.
+      AGENT_WORKSPACE_ROOT: /tmp/scap-agent-workspaces
     depends_on:
       migrate:
         condition: service_completed_successfully

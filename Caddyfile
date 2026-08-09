@@ -7,6 +7,10 @@
 }
 
 {$PUBLIC_DOMAIN} {
+	# Production policy: only TLS 1.3; HTTP is redirected below and never serves content.
+	tls {
+		protocols tls1.3
+	}
 	encode zstd gzip
 
 	# ── RFC 9116: kênh báo cáo lỗ hổng có trách nhiệm (Bài 8 §vận hành) ──

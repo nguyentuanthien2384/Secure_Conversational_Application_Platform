@@ -73,6 +73,7 @@ def _set_production_env(monkeypatch, *, database_user: str = "scap_app") -> None
         "REDIS_URL": "redis://redis:6379/0",
         "ALLOWED_ORIGINS": "https://chat.example.test",
         "ALLOWED_HOSTS": "chat.example.test",
+        "AGENT_WORKSPACE_ROOT": "/tmp/scap-agent-workspaces",
         "DOCS_ENABLED": "false",
     }
     for name, value in values.items():
@@ -90,6 +91,14 @@ def test_production_rejects_database_owner_account(monkeypatch):
     _set_production_env(monkeypatch, database_user="secure_chat")
     monkeypatch.setenv("SEED_DEMO_DATA", "false")
     with pytest.raises(RuntimeError, match="tài khoản chủ"):
+        Settings.from_env()
+
+
+def test_production_requires_dedicated_agent_workspace(monkeypatch):
+    _set_production_env(monkeypatch)
+    monkeypatch.delenv("AGENT_WORKSPACE_ROOT")
+    monkeypatch.setenv("SEED_DEMO_DATA", "false")
+    with pytest.raises(RuntimeError, match="AGENT_WORKSPACE_ROOT"):
         Settings.from_env()
 
 
