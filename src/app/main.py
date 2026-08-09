@@ -74,7 +74,7 @@ from src.app.security import (
     TotpService,
     generate_recovery_code,
 )
-from src.app.services import AIService, ChatService
+from src.app.services import AIProviderError, AIService, ChatService
 from src.app.siem import configure_siem_logging, emit_security_event
 
 logger = logging.getLogger("secure_chat")
@@ -1436,6 +1436,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details={"reason": "external_ai_consent_required"},
             )
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except AIProviderError as exc:
+            # Lỗi phía nhà cung cấp AI, không phải lỗi của người dùng: 503 kèm
+            # Retry-After. `str(exc)` đã là thông điệp chung chung an toàn;
+            # nguyên nhân thật nằm trong log máy chủ (services.AIService).
+            record_audit(
+                db,
+                request,
+                "chat.message.send",
+                actor_id=user.id,
+                target_type="chat_session",
+                target_id=session_id,
+                outcome="failure",
+                details={"reason": "ai_provider_unavailable"},
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+                headers={"Retry-After": "30"},
+            ) from exc
         row.updated_at = utcnow()
         db.commit()
         record_audit(
