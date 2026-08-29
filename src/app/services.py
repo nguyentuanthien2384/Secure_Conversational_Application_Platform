@@ -18,6 +18,9 @@ logger = logging.getLogger("secure_chat.ai")
 # Cố ý chung chung: chi tiết lỗi (tên model, mã lỗi HTTP của Google, một phần
 # API key trong URL, traceback) chỉ đi vào log phía máy chủ.
 AI_UNAVAILABLE_MESSAGE = "Dịch vụ AI tạm thời không khả dụng. Vui lòng thử lại sau."
+EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE = (
+    "Cần đồng ý trước khi gửi nội dung đến nhà cung cấp AI bên ngoài."
+)
 
 
 class AIProviderError(RuntimeError):
@@ -142,9 +145,7 @@ class AIService:
             ), redacted_labels
 
         if not allow_external_ai:
-            raise PermissionError(
-                "Cần đồng ý trước khi gửi nội dung đến nhà cung cấp AI bên ngoài."
-            )
+            raise PermissionError(EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE)
 
         sanitized_history = [
             {"role": item["role"], "content": self._redact_for_external_ai(item["content"])}

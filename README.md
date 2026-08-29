@@ -44,14 +44,6 @@ REST API qua HTTP** ([src/app/gradio_ui.py](src/app/gradio_ui.py)) — nghĩa l�
 trên giao diện đều đi qua đúng lớp JWT, RBAC, rate limit và audit như một client bên ngoài.
 Không có đường tắt nào từ UI xuống thẳng cơ sở dữ liệu.
 
-### Nền tảng Secure AI Agent (mới)
-
-SCAP có thêm Agent Orchestrator và Tool Broker theo zero-trust: model chỉ đề xuất
-tool call, còn capability ngắn hạn, allowlist manifest, workspace tách theo user,
-egress SSRF guard và audit quyết định có ở phía server. Không có tool nào được gọi
-shell hoặc subprocess trực tiếp; `sandbox.execute` mặc định từ chối đến khi có
-runner container/microVM độc lập. Xem [kiến trúc Secure AI Agent](docs/SECURE_AGENT_ARCHITECTURE.md).
-
 Mặc định hệ thống chạy **SQLite + rate limiter in-memory + AI demo ngoại tuyến**, nên clone
 về là chạy được ngay. Cấu hình production (`APP_ENV=production`) bật một loạt guard bắt buộc
 và chuyển sang PostgreSQL + Redis + Caddy.
@@ -503,7 +495,6 @@ Secure_Conversational_Application_Platform/
 │   │   ├── demo_seed.py             # Dữ liệu mẫu idempotent
 │   │   └── ui_assets/               # Ảnh tĩnh của giao diện
 │   ├── core/ai_core/gemini_ai.py    # Wrapper SDK google-genai
-│   └── utils/helpers.py
 ├── tests/                           # 106 test, tập trung vào kiểm soát an ninh
 ├── scripts/                         # secret, migration, rotate key, seed, repair, ZAP
 ├── docs/DEMO_SCRIPT.md              # Kịch bản demo trước hội đồng

@@ -17,6 +17,8 @@ from pathlib import Path
 
 import gradio as gr
 
+from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
+
 BASE_URL = os.getenv("SELF_BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
 PASSWORD_MIN = 15
 
@@ -409,16 +411,16 @@ footer { display: none !important; }
   margin: 0; font-size: 14px; font-family: var(--font-mono);
   color: var(--body-text-color-subdued);
 }
-#dlp-banner, #sec-verdict, #sec-ids-verdict {
+#chat-notice, #sec-verdict, #sec-ids-verdict {
   border-radius: 8px; padding: 12px 15px; margin-top: 6px;
   border-left: 3px solid var(--scap-warn-bd);
 }
-#dlp-banner {
+#chat-notice {
   border: 1px solid var(--scap-warn-bd);
   border-left-color: var(--scap-warn-bd);
   background: var(--scap-warn-bg);
 }
-#dlp-banner p { margin: 0; font-size: 15px; color: var(--scap-warn-fg); }
+#chat-notice p { margin: 0; font-size: 15px; color: var(--scap-warn-fg); }
 #sec-verdict, #sec-ids-verdict {
   border: 1px solid var(--scap-warn-bd);
   background: var(--scap-warn-bg);
@@ -852,9 +854,17 @@ def build_ui() -> gr.Blocks:
                                 btn_send = gr.Button(
                                     "Gửi", variant="primary", scale=1, min_width=110
                                 )
-                            # Băng thông báo DLP: hiện lên khi lớp chống rò rỉ dữ
-                            # liệu đã che thứ gì đó trước khi gửi sang AI bên ngoài.
-                            md_dlp = gr.Markdown("", visible=False, elem_id="dlp-banner")
+                            # Thông báo cố định dưới ô nhập, dùng cho consent và DLP.
+                            # Không dùng toast vì toast che nội dung hội thoại trên màn hình nhỏ.
+                            md_chat_notice = gr.Markdown(
+                                "", visible=False, elem_id="chat-notice"
+                            )
+                            # Chỉ hiện sau khi máy chủ từ chối vì chưa có consent.
+                            # Một cú bấm riêng, ghi rõ tác động, tránh coi thao tác Gửi
+                            # ban đầu là sự đồng ý chia sẻ dữ liệu.
+                            btn_consent_send = gr.Button(
+                                "Đồng ý và gửi", variant="primary", size="sm", visible=False
+                            )
                             with gr.Row():
                                 tb_search = gr.Textbox(
                                     show_label=False,
@@ -1403,11 +1413,13 @@ def build_ui() -> gr.Blocks:
                     if value == session_id:
                         title = label.replace("🔒", "").strip()
                         break
-            # Ẩn băng DLP của lượt trước khi chuyển sang hội thoại khác.
-            return history, title, gr.update(value="", visible=False)
+            # Ẩn thông báo của lượt trước khi chuyển sang hội thoại khác.
+            return history, title, gr.update(value="", visible=False), gr.update(visible=False)
 
         dd_session.input(
-            _guard(pick_session, 3), [st_token, dd_session], [chatbot, tb_rename, md_dlp]
+            _guard(pick_session, 4),
+            [st_token, dd_session],
+            [chatbot, tb_rename, md_chat_notice, btn_consent_send],
         )
 
         def create_session(token, title):
@@ -1471,19 +1483,42 @@ def build_ui() -> gr.Blocks:
         def send_message(token, session_id, message):
             message = (message or "").strip()
             if not message:
-                return gr.skip(), gr.skip(), gr.skip(), "", gr.skip()
+                return gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False)
             if not session_id:
                 title = message[:48] + ("…" if len(message) > 48 else "")
                 created = _api(token, "POST", "/api/sessions", {"title": title})
                 session_id = created["id"]
                 gr.Info("Đã tự tạo hội thoại mới.")
-            sent = _api(token, "POST", f"/api/sessions/{session_id}/messages", {"content": message})
+            try:
+                sent = _api(
+                    token, "POST", f"/api/sessions/{session_id}/messages", {"content": message}
+                )
+            except gr.Error as err:
+                # Consent là lựa chọn người dùng, không phải lỗi kỹ thuật. Hiển thị
+                # ngay cạnh ô nhập và giữ nguyên nội dung để họ có thể gửi lại sau.
+                if EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err):
+                    consent_notice = gr.update(
+                        value=(
+                            "⚠️ **Tin nhắn chưa được gửi.** Bấm **Đồng ý và gửi** bên dưới "
+                            "để lưu lựa chọn cho tài khoản này. Trước khi gửi tới AI bên ngoài, "
+                            "nội dung vẫn được lớp DLP kiểm tra và che dữ liệu nhạy cảm."
+                        ),
+                        visible=True,
+                    )
+                    return (
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        consent_notice,
+                        gr.update(visible=True),
+                    )
+                raise
             dd1, dd2, history = refresh_sessions(token, session_id)
             # Nếu DLP đã che dữ liệu nhạy cảm, nói rõ cho người dùng biết đã che
             # NHÓM nào — không bao giờ hiện lại giá trị gốc.
             labels = (sent or {}).get("dlp_redacted") or []
             if labels:
-                gr.Warning("Đã che dữ liệu nhạy cảm trước khi gửi sang AI: " + ", ".join(labels))
                 banner = gr.update(
                     value=(
                         "🛡️ **Lớp DLP đã can thiệp.** Trước khi gửi sang nhà cung cấp AI "
@@ -1494,11 +1529,29 @@ def build_ui() -> gr.Blocks:
                 )
             else:
                 banner = gr.update(value="", visible=False)
-            return dd1, dd2, history, "", banner
+            return dd1, dd2, history, "", banner, gr.update(visible=False)
 
-        SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_dlp]
-        btn_send.click(_guard(send_message, 5), [st_token, dd_session, tb_msg], SEND_OUTS)
-        tb_msg.submit(_guard(send_message, 5), [st_token, dd_session, tb_msg], SEND_OUTS)
+        SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_chat_notice, btn_consent_send]
+        btn_send.click(_guard(send_message, 6), [st_token, dd_session, tb_msg], SEND_OUTS)
+        tb_msg.submit(_guard(send_message, 6), [st_token, dd_session, tb_msg], SEND_OUTS)
+
+        def consent_and_resend(token, session_id, message):
+            """Persist explicit consent, then retry the still-visible message once."""
+            if not (message or "").strip():
+                return (
+                    gr.skip(),
+                    gr.skip(),
+                    gr.skip(),
+                    "",
+                    gr.update(value="", visible=False),
+                    gr.update(visible=False),
+                )
+            _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
+            return send_message(token, session_id, message)
+
+        btn_consent_send.click(
+            _guard(consent_and_resend, 6), [st_token, dd_session, tb_msg], SEND_OUTS
+        )
 
         def search_in_session(token, session_id, query):
             if not session_id:

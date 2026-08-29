@@ -94,3 +94,16 @@ def test_dashboard_uses_metric_cards_for_report_ready_security_overview():
     assert "metric-card" in source
     assert "Trung tâm vận hành &amp; bảo mật" in source
     assert "Trung tâm giám sát an ninh" in source
+
+
+def test_ai_consent_notice_is_inline_and_can_retry_the_composer():
+    """Consent là lựa chọn riêng tư, không được thành toast che hội thoại."""
+    source = UI_SOURCE.read_text(encoding="utf-8")
+    assert "md_chat_notice = gr.Markdown" in source
+    assert "btn_consent_send = gr.Button(" in source
+    assert '"Đồng ý và gửi"' in source
+    assert "EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err)" in source
+    assert "Bấm **Đồng ý và gửi** bên dưới" in source
+    assert "def consent_and_resend(token, session_id, message):" in source
+    assert '"/api/auth/ai-consent", {"ai_data_consent": True}' in source
+    assert 'gr.Warning("Đã che dữ liệu nhạy cảm' not in source

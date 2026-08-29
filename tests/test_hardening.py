@@ -32,6 +32,12 @@ def test_common_security_headers_present(client: TestClient):
     assert headers["Referrer-Policy"] == "no-referrer"
 
 
+def test_lean_api_excludes_the_removed_agent_surface(client: TestClient):
+    """Giữ phạm vi app ở chat bảo mật; không vô tình đưa Agent API trở lại."""
+    paths = client.get("/openapi.json").json()["paths"]
+    assert not any(path.startswith("/api/agent") for path in paths)
+
+
 def test_password_policy_enforces_length(client: TestClient):
     short = client.post(
         "/api/auth/register", json={"username": "shortpw", "password": "Sh0rtPass12"}
@@ -73,7 +79,6 @@ def _set_production_env(monkeypatch, *, database_user: str = "scap_app") -> None
         "REDIS_URL": "redis://redis:6379/0",
         "ALLOWED_ORIGINS": "https://chat.example.test",
         "ALLOWED_HOSTS": "chat.example.test",
-        "AGENT_WORKSPACE_ROOT": "/tmp/scap-agent-workspaces",
         "DOCS_ENABLED": "false",
     }
     for name, value in values.items():
@@ -91,14 +96,6 @@ def test_production_rejects_database_owner_account(monkeypatch):
     _set_production_env(monkeypatch, database_user="secure_chat")
     monkeypatch.setenv("SEED_DEMO_DATA", "false")
     with pytest.raises(RuntimeError, match="tài khoản chủ"):
-        Settings.from_env()
-
-
-def test_production_requires_dedicated_agent_workspace(monkeypatch):
-    _set_production_env(monkeypatch)
-    monkeypatch.delenv("AGENT_WORKSPACE_ROOT")
-    monkeypatch.setenv("SEED_DEMO_DATA", "false")
-    with pytest.raises(RuntimeError, match="AGENT_WORKSPACE_ROOT"):
         Settings.from_env()
 
 
