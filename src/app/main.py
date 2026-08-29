@@ -28,6 +28,8 @@ from src.app.ids import (
     Detection,
     IntrusionState,
     detect_anomalies,
+    mitre_technique_for_rule,
+    run_safe_detection_verification,
     scan_text,
 )
 from src.app.models import (
@@ -263,6 +265,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         path=request.url.path[:200],
                         method=request.method,
                         evidence=evidence,
+                        mitre_technique=mitre_technique_for_rule(rule_id),
                     )
                 )
             user_agent = request.headers.get("user-agent", "")
@@ -309,6 +312,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             details={
                                 "rule": detection.rule_id,
                                 "severity": detection.severity,
+                                "mitre_technique": detection.mitre_technique,
                                 "path": detection.path,
                                 "method": detection.method,
                                 "evidence": detection.evidence,
@@ -1841,6 +1845,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [
             anomaly.as_dict() for anomaly in detect_anomalies(db, window_minutes=window_minutes)
         ]
+
+    @app.post("/api/admin/ids/verify-detection")
+    def verify_ids_detection(
+        admin: Annotated[User, Depends(admin_user)],
+        request: Request,
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        """Run the safe, deterministic Purple Team check for IDS signatures.
+
+        This never sends a request to a target and never executes a command.
+        It validates the application's T1190 signature controls only; the
+        response names the boundary so it is not mistaken for a full pentest.
+        """
+        report = run_safe_detection_verification()
+        outcome = "success" if report["missed_scenarios"] == 0 else "failure"
+        record_audit(
+            db,
+            request,
+            "ids.verification",
+            actor_id=admin.id,
+            target_type="mitre_technique",
+            target_id="T1190",
+            outcome=outcome,
+            details={
+                "technique": "T1190",
+                "total_scenarios": report["total_scenarios"],
+                "detected_scenarios": report["detected_scenarios"],
+                "missed_scenarios": report["missed_scenarios"],
+                "detection_rate": report["detection_rate"],
+            },
+        )
+        report["checked_at"] = utcnow().isoformat()
+        report["checked_by"] = admin.username
+        return report
 
     @app.get("/api/admin/ids/blocklist")
     def ids_blocklist(_: Annotated[User, Depends(admin_user)]):

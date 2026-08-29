@@ -60,6 +60,12 @@ CUSTOM_CSS = """
   --scap-warn-bg: #fffbeb; --scap-warn-bd: #fcd34d; --scap-warn-fg: #78350f;
   --scap-bad-bg: #fef2f2;  --scap-bad-bd: #fca5a5;  --scap-bad-fg: #7f1d1d;
   --scap-rail-bg: #f8fafc;
+  --scap-ink: #0f172a;
+  --scap-muted: #64748b;
+  --scap-panel: #ffffff;
+  --scap-line: #e2e8f0;
+  --scap-navy: #0b1324;
+  --scap-blue: #2563eb;
 }
 /* CSS cũ hardcode màu sáng nên ở chế độ tối thành chữ xanh trên nền xanh.
    Khai báo lại token cho dark mode để mọi khối trạng thái vẫn đọc được. */
@@ -68,6 +74,12 @@ CUSTOM_CSS = """
   --scap-warn-bg: rgba(245,158,11,.12); --scap-warn-bd: #b45309; --scap-warn-fg: #fcd34d;
   --scap-bad-bg: rgba(239,68,68,.12);   --scap-bad-bd: #b91c1c;  --scap-bad-fg: #fca5a5;
   --scap-rail-bg: rgba(148,163,184,.08);
+  --scap-ink: #e5edf8;
+  --scap-muted: #94a3b8;
+  --scap-panel: #101a2e;
+  --scap-line: #26344d;
+  --scap-navy: #091120;
+  --scap-blue: #60a5fa;
 }
 
 footer { display: none !important; }
@@ -77,6 +89,9 @@ footer { display: none !important; }
   max-width: var(--scap-shell) !important;
   margin: 0 auto !important;
   padding: 22px 28px 56px !important;
+  background:
+    radial-gradient(circle at 6% 0%, rgba(16,185,129,.07), transparent 28rem),
+    radial-gradient(circle at 95% 8%, rgba(37,99,235,.06), transparent 24rem);
 }
 
 /* ── Trang đăng nhập ─────────────────────────────────────────────────────
@@ -256,13 +271,14 @@ footer { display: none !important; }
    thái chuỗi audit. tabular-nums để chữ số không nhảy khi đếm ngược. */
 #topbar {
   min-height: var(--scap-rail-h);
-  border: 1px solid var(--border-color-primary);
+  border: 1px solid #1e3a5f;
   border-radius: 10px;
   padding: 0 18px;
-  background: var(--scap-rail-bg);
+  background: linear-gradient(105deg, var(--scap-navy), #10284a 70%, #0f766e);
   align-items: center;
   gap: 16px;
   overflow: hidden;
+  box-shadow: 0 14px 30px -22px rgba(15,23,42,.8);
 }
 #topbar .md p {
   margin: 0;
@@ -270,13 +286,22 @@ footer { display: none !important; }
   font-size: 14px;
   font-variant-numeric: tabular-nums;
   letter-spacing: .01em;
-  color: var(--body-text-color-subdued);
+  color: #cbd5e1;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #topbar .md strong, #topbar .md code {
-  color: var(--body-text-color); font-weight: 600; background: none; padding: 0;
+  color: #f8fafc; font-weight: 600; background: none; padding: 0;
 }
 #topbar button { font-size: 14px !important; }
+.app-wordmark { min-width: 170px; }
+.app-wordmark .app-kicker {
+  display: block; color: #5eead4; font-family: var(--font-mono); font-size: 10px;
+  font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
+}
+.app-wordmark .app-name {
+  display: block; margin-top: 2px; color: #fff; font-size: 15px; font-weight: 680;
+  letter-spacing: .01em;
+}
 
 /* ── Thẻ nội dung ──────────────────────────────────────────────────────── */
 .section-card {
@@ -284,6 +309,7 @@ footer { display: none !important; }
   border-radius: 10px;
   padding: 16px;
   background: var(--background-fill-primary);
+  box-shadow: 0 10px 26px -25px rgba(15,23,42,.7);
 }
 
 /* ── Tab ───────────────────────────────────────────────────────────────── */
@@ -293,6 +319,51 @@ footer { display: none !important; }
   padding: 10px 16px !important;
   letter-spacing: .01em;
 }
+.tab-nav button.selected {
+  color: var(--scap-ok-fg) !important;
+  font-weight: 650 !important;
+}
+
+/* ── Dashboard theo phong cách SOC/Purple Team ───────────────────────────
+   Khối số liệu lớn, ngắn và có nhãn rõ tạo nhịp đọc giống dashboard trong
+   tài liệu tham khảo; toàn bộ dữ liệu vẫn lấy từ API của SCAP. */
+.dashboard-hero {
+  margin: 4px 0 16px; padding: 20px 22px;
+  border: 1px solid var(--scap-line); border-radius: 12px;
+  background: linear-gradient(120deg, rgba(15,23,42,.98), rgba(15,50,76,.96));
+  box-shadow: 0 18px 34px -28px rgba(15,23,42,.9);
+}
+.dashboard-hero h3 { margin: 0 0 6px; color: #fff; font-size: 22px; font-weight: 680; }
+.dashboard-hero p { margin: 0; max-width: 780px; color: #cbd5e1; line-height: 1.6; }
+.dashboard-hero strong { color: #5eead4; }
+.dashboard-eyebrow {
+  margin: 0 0 6px !important; color: #5eead4 !important; font-family: var(--font-mono);
+  font-size: 11px !important; font-weight: 700; letter-spacing: .13em; text-transform: uppercase;
+}
+.metric-grid { gap: 12px !important; margin: 0 0 14px !important; }
+.metric-card {
+  min-height: 122px; padding: 15px 16px !important;
+  border: 1px solid var(--scap-line) !important; border-radius: 10px !important;
+  background: var(--scap-panel) !important;
+  box-shadow: 0 10px 24px -24px rgba(15,23,42,.9);
+}
+.metric-card p { margin: 0 !important; color: var(--scap-muted); font-size: 12px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+.metric-card h1, .metric-card h2 { margin: 7px 0 3px !important; color: var(--scap-ink); font-size: 29px !important; font-weight: 720; line-height: 1.1; }
+.metric-card strong { color: var(--scap-ink); }
+.metric-card-green { border-top: 3px solid #10b981 !important; }
+.metric-card-blue { border-top: 3px solid #3b82f6 !important; }
+.metric-card-amber { border-top: 3px solid #f59e0b !important; }
+.metric-card-red { border-top: 3px solid #ef4444 !important; }
+.dashboard-panel {
+  margin: 10px 0 14px; padding: 14px 16px !important; border: 1px solid var(--scap-line);
+  border-radius: 10px; background: var(--scap-panel);
+}
+.dashboard-panel p:first-child { margin-top: 0; }
+.dashboard-panel p:last-child { margin-bottom: 0; }
+.dashboard-section-title { margin: 20px 0 8px !important; color: var(--scap-ink); font-size: 16px !important; font-weight: 700; }
+.dashboard-table { border: 1px solid var(--scap-line); border-radius: 10px; overflow: hidden; }
+.dashboard-table table { border-collapse: collapse; }
+.dashboard-table th { background: rgba(148,163,184,.12) !important; }
 
 /* ── Bảng dữ liệu: mọi thứ liên quan mật mã đều monospace ──────────────── */
 .mono-df table {
@@ -338,7 +409,7 @@ footer { display: none !important; }
   margin: 0; font-size: 14px; font-family: var(--font-mono);
   color: var(--body-text-color-subdued);
 }
-#dlp-banner, #sec-verdict {
+#dlp-banner, #sec-verdict, #sec-ids-verdict {
   border-radius: 8px; padding: 12px 15px; margin-top: 6px;
   border-left: 3px solid var(--scap-warn-bd);
 }
@@ -348,12 +419,12 @@ footer { display: none !important; }
   background: var(--scap-warn-bg);
 }
 #dlp-banner p { margin: 0; font-size: 15px; color: var(--scap-warn-fg); }
-#sec-verdict {
+#sec-verdict, #sec-ids-verdict {
   border: 1px solid var(--scap-warn-bd);
   background: var(--scap-warn-bg);
   color: var(--scap-warn-fg);
 }
-#sec-verdict p { margin: 0; font-size: 15px; }
+#sec-verdict p, #sec-ids-verdict p { margin: 0; font-size: 15px; }
 
 /* ── Bố cục ngang ──────────────────────────────────────────────────────── */
 @media (min-width: 1000px) {
@@ -538,6 +609,13 @@ MFA_HEAD_HTML = (
     "</div>"
 )
 
+APP_WORDMARK_HTML = (
+    '<div class="app-wordmark">'
+    '<span class="app-kicker">Security console</span>'
+    '<span class="app-name">SCAP · Secure Workspace</span>'
+    "</div>"
+)
+
 
 def _static_html(markup: str, **kwargs) -> gr.Markdown:
     """Đổ một khối markup tĩnh mà không cần 'unsafe-eval'.
@@ -707,6 +785,7 @@ def build_ui() -> gr.Blocks:
         # ============ ỨNG DỤNG ============
         with gr.Column(visible=False) as app_sec:
             with gr.Row(elem_id="topbar"):
+                _static_html(APP_WORDMARK_HTML)
                 md_banner = gr.Markdown("", elem_classes="md")
                 md_countdown = gr.Markdown("", elem_classes="md")
                 btn_extend = gr.Button("Gia hạn phiên", scale=0, size="sm")
@@ -890,13 +969,28 @@ def build_ui() -> gr.Blocks:
 
                 # ---------- QUẢN TRỊ ----------
                 with gr.Tab("Quản trị", visible=False) as adm_tab:
-                    btn_adm_refresh = gr.Button("Làm mới toàn bộ", size="sm")
-                    md_stats = gr.Markdown("")
-                    md_alerts = gr.Markdown("")
+                    gr.Markdown(
+                        "<p class=\"dashboard-eyebrow\">Operations overview</p>"
+                        "<h3>Trung tâm vận hành &amp; bảo mật</h3>"
+                        "<p>Theo dõi nhanh tình trạng nền tảng, tín hiệu rủi ro và quản lý tài khoản "
+                        "trong cùng một không gian.</p>",
+                        sanitize_html=False,
+                        elem_classes="dashboard-hero",
+                    )
+                    with gr.Row(equal_height=True, elem_classes="metric-grid"):
+                        md_metric_users = gr.Markdown("**Người dùng**\n\n## —\n\nĐang hoạt động —", elem_classes=["metric-card", "metric-card-green"])
+                        md_metric_sessions = gr.Markdown("**Hội thoại**\n\n## —\n\nTin nhắn đã mã hóa —", elem_classes=["metric-card", "metric-card-blue"])
+                        md_metric_login = gr.Markdown("**Đăng nhập lỗi**\n\n## —\n\nTrong 60 phút", elem_classes=["metric-card", "metric-card-amber"])
+                        md_metric_denials = gr.Markdown("**Từ chối quyền**\n\n## —\n\nTrong 60 phút", elem_classes=["metric-card", "metric-card-red"])
+                    btn_adm_refresh = gr.Button("Làm mới dashboard", variant="primary", size="sm")
+                    md_stats = gr.Markdown("*Đang chờ nạp dữ liệu vận hành.*", elem_classes="dashboard-panel")
+                    md_alerts = gr.Markdown("*Đang chờ nạp cảnh báo.*", elem_classes="dashboard-panel")
+                    gr.Markdown("#### Danh mục tài khoản", elem_classes="dashboard-section-title")
                     df_users = gr.Dataframe(
                         headers=["Tên", "Vai trò", "Trạng thái", "2FA", "Ngày tạo"],
                         interactive=False,
                         wrap=True,
+                        elem_classes="dashboard-table",
                     )
                     with gr.Row():
                         dd_user_pick = gr.Dropdown(label="Người dùng", choices=[], scale=2)
@@ -947,10 +1041,17 @@ def build_ui() -> gr.Blocks:
                 # (Bài 1 §Accounting) và theo dõi IDS/IPS (Bài 7 §7.3).
                 with gr.Tab("Bảo mật", visible=False) as sec_tab:
                     gr.Markdown(
-                        "### Trung tâm giám sát\n"
-                        "Xác minh tính toàn vẹn của nhật ký kiểm toán và theo dõi "
-                        "hệ thống phát hiện xâm nhập."
+                        "<p class=\"dashboard-eyebrow\">SOC monitoring</p>"
+                        "<h3>Trung tâm giám sát an ninh</h3>"
+                        "<p>Xác minh tính toàn vẹn audit, theo dõi phát hiện IDS/IPS và thực hiện "
+                        "đối soát HIT/MISS theo phạm vi MITRE ATT&amp;CK.</p>",
+                        sanitize_html=False,
+                        elem_classes="dashboard-hero",
                     )
+                    with gr.Row(equal_height=True, elem_classes="metric-grid"):
+                        md_sec_detections = gr.Markdown("**Dấu hiệu IDS**\n\n## —\n\nTrong bộ nhớ", elem_classes=["metric-card", "metric-card-blue"])
+                        md_sec_anomalies = gr.Markdown("**Bất thường**\n\n## —\n\nTheo audit log", elem_classes=["metric-card", "metric-card-amber"])
+                        md_sec_blocks = gr.Markdown("**Nguồn bị chặn**\n\n## —\n\nĐang hiệu lực", elem_classes=["metric-card", "metric-card-red"])
                     btn_sec_all = gr.Button("Làm mới toàn bộ", variant="primary", size="sm")
 
                     with gr.Accordion("1 · Toàn vẹn nhật ký kiểm toán (hash chain)", open=True):
@@ -967,10 +1068,10 @@ def build_ui() -> gr.Blocks:
 
                     with gr.Accordion("2 · IDS — mẫu tấn công đã phát hiện", open=True):
                         df_sec_det = gr.Dataframe(
-                            headers=["Luật", "Mức", "Mô tả", "Nguồn", "Đường dẫn", "Dấu hiệu"],
+                            headers=["Luật", "MITRE", "Mức", "Mô tả", "Nguồn", "Đường dẫn", "Dấu hiệu"],
                             interactive=False,
                             wrap=True,
-                            elem_classes="mono-df",
+                            elem_classes=["mono-df", "dashboard-table"],
                         )
 
                     with gr.Accordion("3 · IDS — hành vi bất thường", open=True):
@@ -986,7 +1087,20 @@ def build_ui() -> gr.Blocks:
                             elem_classes="mono-df",
                         )
 
-                    with gr.Accordion("4 · IPS — nguồn đang bị chặn", open=True):
+                    with gr.Accordion("4 · Purple Team — kiểm chứng luật phát hiện", open=False):
+                        gr.Markdown(
+                            "Kiểm tra an toàn tại chỗ các luật IDS cho **MITRE ATT&CK T1190** "
+                            "(SQLi, XSS, path traversal, command injection). Không gửi payload "
+                            "ra mạng và không khai thác hệ thống. *Cần vai trò admin.*"
+                        )
+                        btn_sec_verify_ids = gr.Button(
+                            "Chạy kiểm chứng Hit/Miss", variant="primary", size="sm"
+                        )
+                        md_sec_ids_verdict = gr.Markdown(
+                            "*Chưa kiểm chứng trong phiên làm việc này.*", elem_id="sec-ids-verdict"
+                        )
+
+                    with gr.Accordion("5 · IPS — nguồn đang bị chặn", open=True):
                         gr.Markdown("*Xem và gỡ chặn cần vai trò admin.*")
                         df_sec_block = gr.Dataframe(
                             headers=["Địa chỉ IP", "Còn bị chặn (giây)"],
@@ -1579,12 +1693,15 @@ def build_ui() -> gr.Blocks:
         # ---- quản trị ----
         def refresh_admin(token):
             stats = _api(token, "GET", "/api/admin/stats")
+            metrics = (
+                f"**Người dùng**\n\n## {stats['total_users']}\n\nĐang hoạt động {stats['active_users']}",
+                f"**Hội thoại**\n\n## {stats['total_sessions']}\n\nTin nhắn đã mã hóa {stats['total_messages']}",
+                f"**Đăng nhập lỗi**\n\n## {stats['recent_login_failures']}\n\nTrong 60 phút gần nhất",
+                f"**Từ chối quyền**\n\n## {stats['recent_auth_denials']}\n\nTrong 60 phút gần nhất",
+            )
             stats_md = (
-                "| Người dùng | Đang hoạt động | Hội thoại | Tin nhắn "
-                "| Đăng nhập lỗi /1h | Truy cập chặn /1h |\n|---|---|---|---|---|---|\n"
-                f"| {stats['total_users']} | {stats['active_users']} "
-                f"| {stats['total_sessions']} | {stats['total_messages']} "
-                f"| {stats['recent_login_failures']} | {stats['recent_auth_denials']} |"
+                "**Tóm tắt phiên quan sát** · Các chỉ số được làm mới trực tiếp từ API quản trị. "
+                "Ưu tiên rà soát hai chỉ số cuối khi chuẩn bị trình diễn hoặc báo cáo."
             )
             alerts = _api(
                 token, "GET", "/api/admin/security-alerts", params={"window_minutes": "60"}
@@ -1610,11 +1727,20 @@ def build_ui() -> gr.Blocks:
                 for u in users
             ]
             choices = [(f"{u['username']} ({u['role']})", u["id"]) for u in users]
-            return stats_md, alerts_md, table, gr.update(choices=choices, value=None)
+            return (*metrics, stats_md, alerts_md, table, gr.update(choices=choices, value=None))
 
-        ADMIN_OUTS = [md_stats, md_alerts, df_users, dd_user_pick]
-        btn_adm_refresh.click(_guard(refresh_admin, 4), [st_token], ADMIN_OUTS)
-        adm_tab.select(_guard(refresh_admin, 4), [st_token], ADMIN_OUTS)
+        ADMIN_OUTS = [
+            md_metric_users,
+            md_metric_sessions,
+            md_metric_login,
+            md_metric_denials,
+            md_stats,
+            md_alerts,
+            df_users,
+            dd_user_pick,
+        ]
+        btn_adm_refresh.click(_guard(refresh_admin, 8), [st_token], ADMIN_OUTS)
+        adm_tab.select(_guard(refresh_admin, 8), [st_token], ADMIN_OUTS)
 
         def set_role(token, user_id, role):
             if not user_id:
@@ -1752,6 +1878,7 @@ def build_ui() -> gr.Blocks:
             return [
                 [
                     r.get("rule_id", ""),
+                    r.get("mitre_technique") or "—",
                     _SEV_ICON.get(r.get("severity"), r.get("severity", "")),
                     r.get("description", ""),
                     r.get("source_ip", ""),
@@ -1778,6 +1905,34 @@ def build_ui() -> gr.Blocks:
                 ]
                 for r in (rows or [])
             ]
+
+        def verify_ids_detection_ui(token):
+            if not token:
+                return "**Không thể kiểm chứng:** phiên đăng nhập đã hết hạn. Hãy đăng nhập lại."
+            try:
+                data = _api(token, "POST", "/api/admin/ids/verify-detection")
+            except gr.Error as err:
+                return f"**Không thể chạy kiểm chứng:** {err}"
+            total = data.get("total_scenarios", 0)
+            detected = data.get("detected_scenarios", 0)
+            missed = data.get("missed_scenarios", 0)
+            rate = data.get("detection_rate", 0)
+            if missed == 0:
+                return (
+                    f"**Đạt: {detected}/{total} Hit ({rate}%).** Các luật chữ ký đang nhận diện "
+                    "được nhóm kịch bản T1190 đã hỗ trợ. Kết quả đã được ghi vào audit/SIEM.\n\n"
+                    "*Phạm vi: kiểm tra nội bộ engine IDS; không thay thế pentest hay kiểm thử "
+                    "pipeline SIEM bên ngoài.*"
+                )
+            misses = ", ".join(
+                item.get("name", "kịch bản")
+                for item in data.get("scenarios", [])
+                if item.get("result") == "miss"
+            )
+            return (
+                f"**Cần xử lý: {detected}/{total} Hit ({rate}%), bỏ sót {missed}.** "
+                f"Kịch bản chưa phát hiện: {misses or 'không xác định'}."
+            )
 
         def load_blocklist(token):
             rows = _api(token, "GET", "/api/admin/ids/blocklist")
@@ -1809,12 +1964,26 @@ def build_ui() -> gr.Blocks:
             det = safe(lambda: load_detections(token), [])
             anom = safe(lambda: load_anomalies(token, window), [])
             block = safe(lambda: load_blocklist(token), [])
-            return verdict, det, anom, block
+            metrics = (
+                f"**Dấu hiệu IDS**\n\n## {len(det)}\n\nTrong bộ nhớ hiện tại",
+                f"**Bất thường**\n\n## {len(anom)}\n\nCửa sổ {int(window)} phút",
+                f"**Nguồn bị chặn**\n\n## {len(block)}\n\nĐang hiệu lực",
+            )
+            return (*metrics, verdict, det, anom, block)
 
-        SEC_OUTS = [md_sec_verdict, df_sec_det, df_sec_anom, df_sec_block]
-        btn_sec_all.click(_guard(refresh_security, 4), [st_token, sl_sec_win], SEC_OUTS)
-        sec_tab.select(_guard(refresh_security, 4), [st_token, sl_sec_win], SEC_OUTS)
+        SEC_OUTS = [
+            md_sec_detections,
+            md_sec_anomalies,
+            md_sec_blocks,
+            md_sec_verdict,
+            df_sec_det,
+            df_sec_anom,
+            df_sec_block,
+        ]
+        btn_sec_all.click(_guard(refresh_security, 7), [st_token, sl_sec_win], SEC_OUTS)
+        sec_tab.select(_guard(refresh_security, 7), [st_token, sl_sec_win], SEC_OUTS)
         btn_sec_verify.click(verify_chain_ui, [st_token], [md_sec_verdict])
+        btn_sec_verify_ids.click(verify_ids_detection_ui, [st_token], [md_sec_ids_verdict])
         btn_sec_anom.click(_guard(load_anomalies, 1), [st_token, sl_sec_win], [df_sec_anom])
         btn_sec_unblock.click(
             _guard(unblock_ip, 2), [st_token, tb_sec_ip], [df_sec_block, tb_sec_ip]

@@ -204,7 +204,17 @@ Ngoài ra dữ liệu người dùng được bọc trong JSON `UNTRUSTED_USER_D
   hoặc nút *Xác minh chuỗi* trên tab Bảo mật.
 - Song song, mỗi sự kiện được in ra stdout dạng JSON một dòng cho Loki/ELK/Splunk/Wazuh.
 
-### 4.6 Cứng hóa tầng HTTP
+### 4.6 Kiểm chứng Purple Team an toàn (MITRE ATT&CK)
+- Mỗi phát hiện chữ ký ứng dụng đều gắn `mitre_technique: T1190` khi phù hợp, nên bản ghi
+  audit và JSON SIEM có thể được lọc/đối soát theo kỹ thuật ATT&CK.
+- Admin có thể gọi `POST /api/admin/ids/verify-detection` hoặc nút *Chạy kiểm chứng Hit/Miss*
+  tại tab **Bảo mật**. Bộ kiểm chứng chạy hoàn toàn trong tiến trình (không có HTTP, shell,
+  database mutation ngoài audit result), đo Hit/Miss cho SQLi, XSS, path traversal và command
+  injection, rồi ghi tỉ lệ phát hiện vào audit/SIEM.
+- Kết quả chỉ xác nhận engine chữ ký T1190, không phải kết luận "an toàn tuyệt đối" và không
+  thay thế pentest, telemetry hệ điều hành, hay xác minh pipeline ELK/Wazuh bên ngoài.
+
+### 4.7 Cứng hóa tầng HTTP
 `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
 `Permissions-Policy`, `Cache-Control: no-store`, HSTS ở production, và **CSP tách theo nhóm đường dẫn**:
 `/api/*` dùng `default-src 'none'`; `/docs`, `/redoc` nới đúng phần Swagger cần; UI Gradio bỏ
@@ -272,6 +282,7 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | :--- | :--- | :--- |
 | `GET` | `/api/admin/audit` | moderator, admin |
 | `GET` | `/api/admin/ids/detections` · `/ids/anomalies` | moderator, admin |
+| `POST` | `/api/admin/ids/verify-detection` | admin — kiểm chứng Hit/Miss T1190 an toàn |
 | `GET`/`POST`/`DELETE` | `/api/admin/users[/{id}]` | admin |
 | `PATCH` | `/api/admin/users/{id}/role` · `/status` | admin |
 | `GET` | `/api/admin/stats` · `/security-alerts` | admin |

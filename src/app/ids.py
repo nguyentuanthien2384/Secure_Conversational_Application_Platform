@@ -122,6 +122,36 @@ DECOY_PATHS = re.compile(
     r"config\.php|\.aws/|\.ssh/|actuator|solr/|cgi-bin/)"
 )
 
+# The reference project is organised around MITRE ATT&CK techniques.  Keep the
+# mapping close to the controls instead of hiding it in a dashboard: this makes
+# every SIEM event useful to an analyst and gives the project a testable,
+# honest coverage boundary.  These request signatures are all evidence of
+# exploitation attempts against a public-facing application (T1190).
+_T1190_RULES = frozenset(
+    {
+        "SQLI-001",
+        "SQLI-002",
+        "SQLI-003",
+        "XSS-001",
+        "XSS-002",
+        "TRAV-001",
+        "CMDI-001",
+        "SSTI-001",
+        "LOGI-001",
+        "NOSQ-001",
+    }
+)
+
+
+def mitre_technique_for_rule(rule_id: str) -> str | None:
+    """Return the ATT&CK technique represented by an IDS rule, when scoped.
+
+    Scanner and decoy-path rules intentionally return ``None``.  They are
+    reconnaissance signals, but this application does not claim that a
+    user-agent string alone proves a particular ATT&CK technique.
+    """
+    return "T1190" if rule_id in _T1190_RULES else None
+
 
 @dataclass
 class Detection:
@@ -135,6 +165,7 @@ class Detection:
     path: str
     method: str
     evidence: str
+    mitre_technique: str | None = None
     detected_at: float = field(default_factory=time.time)
 
     def as_dict(self) -> dict[str, Any]:
@@ -147,6 +178,7 @@ class Detection:
             "path": self.path,
             "method": self.method,
             "evidence": self.evidence,
+            "mitre_technique": self.mitre_technique,
             "detected_at": self.detected_at,
         }
 
@@ -173,6 +205,56 @@ def scan_text(text: str) -> list[tuple[str, str, str, str]]:
                 seen.add(rule_id)
                 hits.append((rule_id, severity, description, match.group(0)[:120]))
     return hits
+
+
+# ─────────────────── Purple Team safe verification ───────────────────
+
+# These are *in-process test strings*, not HTTP requests and not executable
+# exploits.  They exercise the same signature engine that middleware uses,
+# giving an admin a repeatable Hit/Miss check without touching a target,
+# database, shell, or external network.
+SAFE_VERIFICATION_SCENARIOS: tuple[tuple[str, str, str, str], ...] = (
+    ("SQL injection", "T1190", "id=1%20UNION%20SELECT%20username,password", "SQLI-001"),
+    ("Cross-site scripting", "T1190", "q=%3Cscript%3Ealert(1)%3C/script%3E", "XSS-001"),
+    ("Path traversal", "T1190", "file=%252e%252e%252f%252e%252e%252fetc%252fpasswd", "TRAV-001"),
+    ("Command injection", "T1190", "host=127.0.0.1%3Bwhoami", "CMDI-001"),
+)
+
+
+def run_safe_detection_verification() -> dict[str, Any]:
+    """Measure deterministic IDS rule coverage for the supported ATT&CK scope.
+
+    The report deliberately distinguishes a rule-engine check from a full
+    penetration test or SIEM-pipeline test.  That prevents a 100% result here
+    from being misrepresented as proof that the whole deployment is secure.
+    """
+    scenarios: list[dict[str, Any]] = []
+    for name, technique, sample, expected_rule in SAFE_VERIFICATION_SCENARIOS:
+        observed_rules = [rule_id for rule_id, *_rest in scan_text(sample)]
+        scenarios.append(
+            {
+                "name": name,
+                "mitre_technique": technique,
+                "expected_rule": expected_rule,
+                "observed_rules": observed_rules,
+                "result": "hit" if expected_rule in observed_rules else "miss",
+            }
+        )
+    detected = sum(item["result"] == "hit" for item in scenarios)
+    total = len(scenarios)
+    return {
+        "verification_type": "safe_in_process_signature_check",
+        "scope": "Application IDS signature rules for MITRE ATT&CK T1190.",
+        "not_covered": (
+            "This does not execute attacks, test operating-system telemetry, or verify an "
+            "external SIEM ingestion pipeline."
+        ),
+        "total_scenarios": total,
+        "detected_scenarios": detected,
+        "missed_scenarios": total - detected,
+        "detection_rate": round((detected / total) * 100, 2) if total else 0.0,
+        "scenarios": scenarios,
+    }
 
 
 # ─────────────────────────── prevention state ───────────────────────────

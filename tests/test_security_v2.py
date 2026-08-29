@@ -14,7 +14,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select, text
 
 from src.app.audit_chain import GENESIS_HASH, derive_audit_key, verify_chain
-from src.app.ids import Detection, IntrusionState, detect_anomalies, scan_text
+from src.app.ids import (
+    Detection,
+    IntrusionState,
+    detect_anomalies,
+    run_safe_detection_verification,
+    scan_text,
+)
 from src.app.models import AuditEvent
 from src.app.security import CryptoService
 from src.app.services import AIService
@@ -158,6 +164,38 @@ def test_signature_engine_has_no_false_positive_on_normal_traffic():
         "/api/admin/audit?limit=50",
     ):
         assert scan_text(benign) == [], f"cảnh báo giả trên {benign!r}"
+
+
+def test_safe_purple_team_verification_covers_t1190_without_executing_requests():
+    report = run_safe_detection_verification()
+    assert report["verification_type"] == "safe_in_process_signature_check"
+    assert report["total_scenarios"] == 4
+    assert report["detected_scenarios"] == 4
+    assert report["missed_scenarios"] == 0
+    assert report["detection_rate"] == 100.0
+    assert {item["mitre_technique"] for item in report["scenarios"]} == {"T1190"}
+
+
+def test_admin_can_run_safe_purple_team_verification(client: TestClient, app):
+    register_and_login(client, "purple-admin")
+    from src.app.models import User
+
+    db = app.state.database.session_factory()
+    try:
+        user = db.scalar(select(User).where(User.username == "purple-admin"))
+        user.role = "admin"
+        db.commit()
+    finally:
+        db.close()
+    token = client.post(
+        "/api/auth/login",
+        json={"username": "purple-admin", "password": "Correct Horse Battery1"},
+    ).json()["access_token"]
+    response = client.post(
+        "/api/admin/ids/verify-detection", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 200
+    assert response.json()["detection_rate"] == 100.0
 
 
 def test_ips_blocks_a_source_after_repeated_high_severity_hits():
