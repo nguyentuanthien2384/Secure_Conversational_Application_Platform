@@ -32,6 +32,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", \
          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)"]
 
-# Chỉ image Compose chuẩn mới bật proxy headers: cổng ứng dụng không publish ra
-# host và Caddy là peer duy nhất trên mạng edge, nên client không thể tự chèn XFF.
-CMD ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
+# Không tin các proxy header theo mặc định. Bản Compose production bật chúng
+# riêng sau Caddy, còn bản local được publish thẳng nên không thể bị giả IP qua
+# X-Forwarded-For.
+CMD ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1684,7 +1684,8 @@ def build_ui() -> gr.Blocks:
             try:
                 _api(token, "POST", "/api/auth/logout-all")
             except Exception:
-                pass
+                gr.Warning("Không thể thu hồi phiên lúc này. Vui lòng thử lại.")
+                return tuple(gr.skip() for _ in RESET_OUTS)
             gr.Info("Đã thu hồi mọi phiên đăng nhập.")
             return _reset_tuple()
 

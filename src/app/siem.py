@@ -129,4 +129,5 @@ def emit_security_event(
             extra={"security_event": document},
         )
     except Exception:  # pragma: no cover - logging must never break the request
-        pass
+        # Không log lại bằng chính handler này: có thể tạo vòng lặp lỗi logging.
+        return

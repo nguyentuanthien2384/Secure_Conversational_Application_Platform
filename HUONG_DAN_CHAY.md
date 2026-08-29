@@ -79,8 +79,9 @@ python scripts/generate_secrets.py
 ## 3. Tài khoản đăng nhập
 
 `.env` đang bật `SEED_DEMO_DATA=true`, nên khi server khởi động lần đầu sẽ tự tạo
-3 tài khoản demo, 4 hội thoại đã mã hóa và một chuỗi sự kiện audit mô phỏng
-(brute-force, IDOR bị chặn) để trang quản trị có dữ liệu.
+3 tài khoản demo chính, thêm 8 tài khoản lab (tổng 11), 24 hội thoại đã mã hóa
+và một chuỗi sự kiện audit mô phỏng (brute-force, IDOR bị chặn) để trang quản trị
+có dữ liệu.
 
 **Mật khẩu chung:** `Phenikaa-Vault#2026-Lab`
 
@@ -190,7 +191,7 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 ```
 
 Xong. Vào <http://localhost:8000>, đăng nhập `demo.user` / `Phenikaa-Vault#2026-Lab`
-— **3 tài khoản demo, 4 hội thoại đã mã hoá và chuỗi audit đều được nạp tự động**,
+— **11 tài khoản demo/lab, 24 hội thoại đã mã hoá và chuỗi audit đều được nạp tự động**,
 Swagger có ở `/docs`. Không phải tạo tài khoản thủ công.
 
 Overlay local hạ `APP_ENV` xuống `development` vì guard trong `src/app/config.py`
@@ -257,9 +258,9 @@ Hoặc dùng `make`: `make install`, `make run`, `make test`, `make security`.
 ## 7. Chuẩn bị cho buổi demo
 
 **Dữ liệu mẫu** đã tự tạo khi server khởi động lần đầu (`SEED_DEMO_DATA=true`):
-3 tài khoản, 4 hội thoại đã mã hóa, và một chuỗi sự kiện audit mô phỏng
-brute-force + IDOR bị chặn — để trang quản trị có dữ liệu thật mà xem. Muốn làm
-lại sạch:
+3 tài khoản RBAC, 8 tài khoản lab, 24 hội thoại đã mã hóa, và một chuỗi sự kiện
+audit mô phỏng brute-force + IDOR bị chặn — để trang quản trị có dữ liệu thật mà
+xem. Muốn làm lại sạch:
 
 ```bash
 uv run python scripts/seed_demo_data.py --reset

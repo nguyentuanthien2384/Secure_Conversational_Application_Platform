@@ -54,8 +54,8 @@ from src.app.models import (  # noqa: E402
 )
 from src.app.security import CryptoService, PasswordService, TotpService  # noqa: E402
 
-# Thỏa chính sách mật khẩu: >= 15 ký tự, đủ đa dạng, không chứa chuỗi phổ biến.
-LEARN_PASSWORD = "Phenikaa-Learn#2026-Lab"
+# Passphrase công khai chỉ dành cho dữ liệu học tập, không bao giờ được seed production.
+LEARN_PASSPHRASE = "Phenikaa-Learn#2026-Lab"  # nosec B105
 TAG = "learn-"  # tiền tố request_id để có thể xóa lại đúng dữ liệu mẫu
 
 # (username, role, ghi chú dạy điều gì)
@@ -245,7 +245,7 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
                 continue
             user = User(
                 username=username,
-                password_hash=passwords.hash(LEARN_PASSWORD),
+                password_hash=passwords.hash(LEARN_PASSPHRASE),
                 role=role,
                 ai_data_consent=(username == "learn.user"),
                 created_at=utcnow() - timedelta(days=21),
@@ -425,8 +425,9 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
         # 5h. Phản ứng sự cố: thu hồi phiên, đổi mật khẩu, đổi vai trò.
         ev(55, "auth.session_revoke", "success", actor=u_user, ip=FAKE_IPS[0],
            target=("auth_session", str(uuid.uuid4())), details={"reason": "unknown_device"})
+        # `token_version_bumped` là cờ telemetry boolean, không mang token thật.
         ev(50, "auth.password_change", "success", actor=u_user, ip=FAKE_IPS[0],
-           details={"token_version_bumped": True})
+           details={"token_version_bumped": True})  # nosec B105
         ev(45, "auth.logout_all", "success", actor=u_user, ip=FAKE_IPS[0],
            details={"sessions_revoked": 3})
         ev(30, "admin.user_role_change", "success", actor=u_boss, ip=FAKE_IPS[0],
@@ -479,7 +480,7 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
 
 def _print_tour(info: dict | None, notes: list[str]) -> None:
     line = "─" * 68
-    print(f"\n{line}\nTÀI KHOẢN MẪU — mật khẩu chung: {LEARN_PASSWORD}\n{line}")
+    print(f"\n{line}\nTÀI KHOẢN MẪU — mật khẩu chung: {LEARN_PASSPHRASE}\n{line}")
     for username, role, why in LEARN_USERS:
         print(f"  {username:<14} {role:<10} {why}")
 

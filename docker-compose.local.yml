@@ -8,15 +8,13 @@
 # CÁCH DÙNG:
 #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 #
-# CẢNH BÁO BẢO MẬT (nên nói rõ khi bảo vệ đồ án):
-#   Ở đây app bị publish trực tiếp trong khi CMD vẫn bật
-#   --proxy-headers --forwarded-allow-ips=* . Ngoài môi trường có Caddy làm
-#   peer duy nhất, client có thể tự chèn X-Forwarded-For để làm sai lệch
-#   nguồn IP trong rate limit / IDS / audit log. Chỉ dùng file này để demo
-#   cục bộ, KHÔNG dùng khi phơi ra Internet.
+# BẢO MẬT: bản local ghi đè lệnh production và KHÔNG nhận proxy header, nên
+# X-Forwarded-For từ trình duyệt không thể giả nguồn IP cho rate limit, IDS
+# hoặc audit. Cổng vẫn chỉ bind vào loopback để phục vụ demo trên laptop.
 # =====================================================================
 services:
   app:
+    command: ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       # ── APP_ENV: production -> development ────────────────────────────────
       # BẮT BUỘC phải hạ xuống development, không phải để cho tiện. Guard trong
@@ -35,18 +33,18 @@ services:
       # Swagger cho bước demo IDOR. Production tắt (không lộ schema API) — nhớ
       # nói rõ điểm khác biệt này với giảng viên.
       DOCS_ENABLED: "true"
-      # Tự nạp 3 tài khoản + 4 hội thoại đã mã hoá + chuỗi audit mô phỏng ngay
-      # lúc khởi động. Idempotent nên `up` lại nhiều lần không tạo trùng.
+      # Tự nạp 3 tài khoản RBAC + 8 tài khoản lab, các hội thoại mã hoá và
+      # chuỗi audit mô phỏng ngay lúc khởi động. Idempotent nên `up` lại nhiều
+      # lần không tạo trùng; telemetry IDS được làm mới cho cửa sổ 60 phút.
       SEED_DEMO_DATA: "true"
       # Script vận hành nằm ngoài /app nên cần PYTHONPATH để `import src` chạy.
       PYTHONPATH: /app
     # Chỉ bind vào loopback, không phơi ra LAN.
     ports:
       - "127.0.0.1:8000:8000"
-    # Dockerfile chỉ COPY scripts/migrate_database.py vào image, nên các script
-    # vận hành khác (seed dữ liệu mẫu, xoay khóa) không có sẵn trong container.
-    # Mount read-only để chạy được mà không phải build lại image.
-    # CHỈ DÙNG KHI HỌC/DEMO: bản production cố ý giữ image bất biến.
+  # Dockerfile chỉ COPY script migration cần cho runtime. Script seed được mount
+  # read-only vào môi trường local để ứng dụng tự nạp dữ liệu demo lúc khởi động.
+  # CHỈ DÙNG KHI HỌC/DEMO: image production vẫn giữ bất biến.
     volumes:
       - ./scripts:/opt/scap-scripts:ro
 
@@ -102,7 +100,9 @@ services:
   #   docker compose -f docker-compose.yml -f docker-compose.local.yml \
   #     run --rm seed
   seed:
-    build: .
+    # Dùng đúng image vừa được build cho service app. Nhờ vậy `run --rm seed`
+    # không thể chạy mã cũ khác phiên bản với API đang phục vụ.
+    image: scap-app
     env_file: .env
     environment:
       # Tài khoản chủ schema, giống service `migrate`.
@@ -117,6 +117,7 @@ services:
     command:
       - /app/.venv/bin/python
       - /opt/scap-scripts/seed_demo_data.py
+      - --refresh-telemetry
     depends_on:
       db:
         condition: service_healthy

@@ -104,9 +104,18 @@ def test_production_requires_dedicated_agent_workspace(monkeypatch):
 
 def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    local_compose = Path("docker-compose.local.yml").read_text(encoding="utf-8")
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     caddy = Path("Caddyfile").read_text(encoding="utf-8")
     sql = Path("scripts/db_least_privilege.sql").read_text(encoding="utf-8")
     assert "DATABASE_URL: postgresql+psycopg://scap_app:" in compose
     assert "service_completed_successfully" in compose
     assert "change-me-app-password" not in sql
     assert "Expires: {$SECURITY_TXT_EXPIRES}" in caddy
+    # Chỉ mô hình sau Caddy mới tin X-Forwarded-For. Khi demo local app được
+    # publish trực tiếp, Uvicorn phải giữ IP socket thật để rate-limit/audit.
+    assert '"--proxy-headers"' in compose
+    assert '"--proxy-headers"' not in local_compose
+    assert '"--proxy-headers"' not in dockerfile
+    assert "--refresh-telemetry" in local_compose
+    assert "image: scap-app" in local_compose

@@ -1,17 +1,17 @@
 """Sinh dữ liệu mẫu cho nền tảng — dùng chung bởi scripts/seed_demo_data.py
 và cơ chế auto-seed khi khởi động (biến môi trường SEED_DEMO_DATA=true).
 
-Tạo 3 tài khoản demo (3 vai trò RBAC), các hội thoại đã mã hóa AES-256-GCM mà
-nội dung giải thích chính cơ chế bảo mật của dự án, và chuỗi sự kiện audit mô
-phỏng (brute-force, IDOR bị chặn) để bảng quản trị có dữ liệu.
+Tạo 3 tài khoản demo chính theo RBAC, 8 tài khoản lab bổ sung, các hội thoại
+đã mã hóa AES-256-GCM và chuỗi sự kiện audit mô phỏng (brute-force, IDOR bị
+chặn) để dashboard có dữ liệu đủ cho buổi báo cáo.
 """
 
 from __future__ import annotations
 
 import json
-import random
 import uuid
 from datetime import timedelta
+from random import SystemRandom
 
 from sqlalchemy import select
 
@@ -34,15 +34,31 @@ def _seed_audit_key() -> bytes | None:
         return None
     return derive_audit_key(settings.secret_key)
 
-# Mật khẩu chung cho các tài khoản demo — thỏa chính sách mật khẩu của dự án:
-# >= 15 ký tự, không chứa chuỗi phổ biến, >= 5 ký tự khác nhau.
-DEMO_PASSWORD = "Phenikaa-Vault#2026-Lab"
+# Passphrase công khai chỉ dành cho development; production cấm seed demo.
+# Nó phải thỏa chính sách mật khẩu để phục vụ kiểm thử luồng đăng nhập.
+DEMO_PASSPHRASE = "Phenikaa-Vault#2026-Lab"  # nosec B105
+_DEMO_RANDOM = SystemRandom()
 
 DEMO_USERS = (
     ("demo.user", "user"),
     ("demo.mod", "moderator"),
     ("demo.boss", "admin"),
 )
+
+# Các tài khoản phụ làm đầy bảng quản trị, kiểm tra phân trang/tìm kiếm và tạo
+# phân bố dữ liệu thực tế hơn khi trình diễn. Chúng chỉ được sinh ở development
+# (production bị Settings.from_env() từ chối SEED_DEMO_DATA=true).
+SAMPLE_USERS = (
+    ("lab.alice", "user"),
+    ("lab.binh", "user"),
+    ("lab.chi", "user"),
+    ("lab.dung", "user"),
+    ("lab.em", "user"),
+    ("lab.giang", "user"),
+    ("lab.hanh", "user"),
+    ("lab.iris", "moderator"),
+)
+ALL_DEMO_USERS = DEMO_USERS + SAMPLE_USERS
 
 # (tiêu đề, [(role, nội dung), ...]) — nội dung giải thích chính dự án này.
 DEMO_CONVERSATIONS: list[tuple[str, list[tuple[str, str]]]] = [
@@ -125,6 +141,84 @@ DEMO_CONVERSATIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ),
 ]
 
+# Các hội thoại ngắn cho moderator/admin và tài khoản thử nghiệm. Nội dung là
+# mô tả kiểm soát bảo mật, không chứa mật khẩu, khóa hoặc thông tin cá nhân.
+ROLE_CONVERSATIONS: dict[str, list[tuple[str, list[tuple[str, str]]]]] = {
+    "demo.mod": [
+        (
+            "Rà soát audit log",
+            [
+                ("user", "Tôi cần xem các lần đăng nhập thất bại ở đâu?"),
+                (
+                    "assistant",
+                    "Mở tab Nhật ký kiểm toán để xem event, outcome, IP và request ID. "
+                    "Bản ghi được liên kết bằng chuỗi HMAC để phát hiện sửa đổi.",
+                ),
+            ],
+        ),
+        (
+            "Triage cảnh báo IDS",
+            [
+                ("user", "Một địa chỉ IP bị chặn thì nên xử lý thế nào?"),
+                (
+                    "assistant",
+                    "Kiểm tra chữ ký, thời điểm và chuỗi audit trước. Chỉ admin mới có thể "
+                    "gỡ chặn sau khi xác nhận đây là false positive.",
+                ),
+            ],
+        ),
+    ],
+    "demo.boss": [
+        (
+            "Báo cáo trạng thái bảo mật",
+            [
+                ("user", "Dashboard quản trị cho biết những gì?"),
+                (
+                    "assistant",
+                    "Dashboard tổng hợp số người dùng, hội thoại, tin nhắn, đăng nhập lỗi "
+                    "và các lần bị từ chối quyền trong cửa sổ quan sát.",
+                ),
+            ],
+        ),
+        (
+            "Kiểm chứng MITRE T1190",
+            [
+                ("user", "Kết quả Hit/Miss có ý nghĩa gì?"),
+                (
+                    "assistant",
+                    "Nó xác nhận các luật IDS nội bộ nhận diện được kịch bản an toàn cho "
+                    "T1190. Đây không phải là kết luận thay thế pentest hoặc SIEM ngoài hệ thống.",
+                ),
+            ],
+        ),
+    ],
+}
+
+SAMPLE_CONVERSATIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "Thực hành bảo vệ tài khoản",
+        [
+            ("user", "Tôi nên bật những lớp bảo vệ nào cho tài khoản?"),
+            (
+                "assistant",
+                "Dùng mật khẩu dài, bật TOTP, không chia sẻ recovery code và thu hồi phiên "
+                "trên thiết bị không còn sử dụng.",
+            ),
+        ],
+    ),
+    (
+        "Dữ liệu được mã hóa",
+        [
+            ("user", "Tin nhắn có được lưu ở dạng rõ không?"),
+            (
+                "assistant",
+                "Không. Nội dung được AES-256-GCM mã hóa trước khi ghi vào cơ sở dữ liệu; "
+                "mỗi bản ghi có nonce riêng và AAD gắn với phiên hội thoại.",
+            ),
+        ],
+    ),
+]
+
 FAKE_IPS = ("203.113.131.10", "14.161.20.88", "118.70.126.45", "42.114.53.201")
 
 
@@ -134,14 +228,21 @@ def seed_demo_data(
     crypto_service: CryptoService,
     *,
     reset: bool = False,
+    refresh_telemetry: bool = False,
     log=print,
 ) -> None:
-    """Idempotent: tài khoản/hội thoại demo đã tồn tại sẽ được bỏ qua."""
+    """Nạp dữ liệu demo, có thể làm mới telemetry hiển thị trên dashboard.
+
+    Mặc định thao tác này idempotent: tài khoản, hội thoại và audit đã có sẽ
+    không bị nhân bản. ``refresh_telemetry`` chỉ thêm 12 sự kiện gần hiện tại
+    (brute-force và IDOR bị chặn) để cửa sổ IDS 60 phút luôn có kịch bản để
+    trình diễn; không đụng đến dữ liệu hội thoại hay các sự kiện lịch sử.
+    """
     database.create_all()
     with database.session_factory() as db:
         if reset:
             removed = 0
-            for username, _ in DEMO_USERS:
+            for username, _ in ALL_DEMO_USERS:
                 user = db.scalar(select(User).where(User.username == username))
                 if user is not None:
                     db.delete(user)  # cascade xóa hội thoại + tin nhắn
@@ -155,17 +256,17 @@ def seed_demo_data(
         # ---------- 1. Người dùng ----------
         users: dict[str, User] = {}
         created_any = False
-        for username, role in DEMO_USERS:
+        for username, role in ALL_DEMO_USERS:
             existing = db.scalar(select(User).where(User.username == username))
             if existing is not None:
                 users[username] = existing
                 continue
             user = User(
                 username=username,
-                password_hash=password_service.hash(DEMO_PASSWORD),
+                password_hash=password_service.hash(DEMO_PASSPHRASE),
                 role=role,
                 ai_data_consent=False,
-                created_at=utcnow() - timedelta(days=random.randint(7, 30)),
+                created_at=utcnow() - timedelta(days=_DEMO_RANDOM.randint(7, 30)),
             )
             db.add(user)
             users[username] = user
@@ -176,19 +277,30 @@ def seed_demo_data(
             db.refresh(user)
 
         # ---------- 2. Hội thoại + tin nhắn mã hóa ----------
-        owner = users["demo.user"]
-        has_sessions = (
-            db.scalar(select(ChatSession.id).where(ChatSession.owner_id == owner.id).limit(1))
-            is not None
-        )
-        if not has_sessions:
-            base_time = utcnow() - timedelta(days=3)
-            for idx, (title, turns) in enumerate(DEMO_CONVERSATIONS):
+        # Có dữ liệu cho mỗi vai trò để kiểm tra RBAC, tìm kiếm tenant-scoped,
+        # bảng quản trị và bản mã mà không cần tự nhập tay khi bảo vệ đồ án.
+        conversations_by_user = {
+            "demo.user": DEMO_CONVERSATIONS,
+            "demo.mod": ROLE_CONVERSATIONS["demo.mod"],
+            "demo.boss": ROLE_CONVERSATIONS["demo.boss"],
+            **{username: SAMPLE_CONVERSATIONS for username, _ in SAMPLE_USERS},
+        }
+        base_time = utcnow() - timedelta(days=6)
+        for owner_index, (username, conversations) in enumerate(conversations_by_user.items()):
+            owner = users[username]
+            has_sessions = (
+                db.scalar(select(ChatSession.id).where(ChatSession.owner_id == owner.id).limit(1))
+                is not None
+            )
+            if has_sessions:
+                continue
+            for idx, (title, turns) in enumerate(conversations):
+                session_time = base_time + timedelta(hours=owner_index * 5 + idx * 2)
                 session_row = ChatSession(
                     owner_id=owner.id,
                     title=title,
-                    created_at=base_time + timedelta(hours=idx * 7),
-                    updated_at=base_time + timedelta(hours=idx * 7 + 1),
+                    created_at=session_time,
+                    updated_at=session_time + timedelta(minutes=len(turns) * 3),
                 )
                 db.add(session_row)
                 db.flush()
@@ -197,7 +309,7 @@ def seed_demo_data(
                     ciphertext, nonce, key_version = crypto_service.encrypt(
                         content, session_row.id, role
                     )
-                    msg_time += timedelta(minutes=random.randint(1, 4))
+                    msg_time += timedelta(minutes=_DEMO_RANDOM.randint(1, 4))
                     db.add(
                         SecureMessage(
                             session_id=session_row.id,
@@ -208,11 +320,14 @@ def seed_demo_data(
                             created_at=msg_time,
                         )
                     )
-                log(f"[chat] “{title}” — {len(turns)} tin nhắn đã mã hóa.")
+                log(f"[chat] {username} · “{title}” — {len(turns)} tin nhắn đã mã hóa.")
             db.commit()
 
         # ---------- 3. Sự kiện audit mô phỏng ----------
-        if created_any or reset:
+        # Khi cần trình diễn lại sau hơn 60 phút, chỉ làm mới cụm tín hiệu
+        # vừa xảy ra. Không thêm lại lịch sử 7 ngày để số liệu không phình to
+        # mỗi lần khởi động ứng dụng local.
+        if created_any or reset or refresh_telemetry:
 
             def audit(minutes_ago, event, outcome, actor, ip, details, target=None):
                 return AuditEvent(
@@ -253,7 +368,9 @@ def seed_demo_data(
                 )
             )
             # Thử truy cập hội thoại của người khác (IDOR) → bị từ chối.
-            for i in range(4):
+            # Ngưỡng IDS-IDOR-PROBE mặc định là 5, nên tạo đúng 5 lần bị chặn
+            # để dashboard minh họa được cả kiểm soát BOLA/IDOR.
+            for i in range(5):
                 events.append(
                     audit(
                         30 - i * 5,
@@ -265,31 +382,35 @@ def seed_demo_data(
                         target=("chat_session", uuid.uuid4().hex[:8]),
                     )
                 )
-            # Hoạt động bình thường rải trong vài ngày.
-            for day in range(3):
-                for username in ("demo.user", "demo.boss"):
-                    actor = users[username]
-                    events.append(
-                        audit(
-                            day * 1440 + random.randint(60, 600),
-                            "auth.login",
-                            "success",
-                            actor,
-                            random.choice(FAKE_IPS),
-                            {},
-                            target=("user", actor.id),
+            # Hoạt động bình thường rải trong nhiều ngày để dashboard có phân
+            # bố dữ liệu thay vì chỉ một cụm sự kiện ở hiện tại. Phần lịch sử
+            # chỉ sinh khi tạo lại dữ liệu, còn refresh chỉ sinh 12 tín hiệu
+            # cần cho việc xem IDS ngay lúc đó.
+            if created_any or reset:
+                for day in range(7):
+                    for username, _ in ALL_DEMO_USERS:
+                        actor = users[username]
+                        events.append(
+                            audit(
+                                day * 1440 + _DEMO_RANDOM.randint(60, 600),
+                                "auth.login",
+                                "success",
+                                actor,
+                                _DEMO_RANDOM.choice(FAKE_IPS),
+                                {},
+                                target=("user", actor.id),
+                            )
                         )
-                    )
-                    events.append(
-                        audit(
-                            day * 1440 + random.randint(30, 500),
-                            "chat.message.send",
-                            "success",
-                            actor,
-                            random.choice(FAKE_IPS),
-                            {"content_length": random.randint(20, 300)},
+                        events.append(
+                            audit(
+                                day * 1440 + _DEMO_RANDOM.randint(30, 500),
+                                "chat.message.send",
+                                "success",
+                                actor,
+                                _DEMO_RANDOM.choice(FAKE_IPS),
+                                {"content_length": _DEMO_RANDOM.randint(20, 300)},
+                            )
                         )
-                    )
             # Trước đây các bản ghi này được INSERT trực tiếp, không đi qua
             # seal_event, nên entry_hash = NULL và GET /api/admin/audit/verify
             # báo "đã xác minh 97/120". Bây giờ mỗi bản ghi được niêm phong đúng
@@ -307,6 +428,7 @@ def seed_demo_data(
                     # flush từng bản ghi để bản kế tiếp nối vào đúng mắt xích.
                     db.flush()
                 db.commit()
-            log(f"[audit] Đã ghi {len(events)} sự kiện kiểm toán mô phỏng (đã niêm phong).")
+            mode = "làm mới cảnh báo trong 60 phút" if refresh_telemetry and not (created_any or reset) else "tạo dữ liệu"
+            log(f"[audit] Đã ghi {len(events)} sự kiện kiểm toán mô phỏng ({mode}, đã niêm phong).")
 
-    log("[seed] Dữ liệu mẫu sẵn sàng — mật khẩu chung: " + DEMO_PASSWORD)
+    log("[seed] Dữ liệu mẫu sẵn sàng — mật khẩu chung: " + DEMO_PASSPHRASE)

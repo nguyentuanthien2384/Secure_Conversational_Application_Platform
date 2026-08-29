@@ -328,6 +328,8 @@ Tài liệu đi kèm: [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md) (từng bước đ�
 ```bash
 uv run python scripts/seed_demo_data.py           # tạo dữ liệu mẫu (idempotent)
 uv run python scripts/seed_demo_data.py --reset   # xóa và tạo lại
+uv run python scripts/seed_demo_data.py --refresh-telemetry
+                                                  # làm mới cảnh báo IDS trong 60 phút
 ```
 
 Hoặc đặt `SEED_DEMO_DATA=true` trong `.env` để seed ngay lúc khởi động (guard production sẽ
@@ -340,6 +342,11 @@ Mật khẩu chung: **`Phenikaa-Vault#2026-Lab`**
 | `demo.user` | `user` | Trò chuyện, soi bản mã, tìm kiếm, 2FA & thiết bị |
 | `demo.mod` | `moderator` | Như trên + Nhật ký kiểm toán, phát hiện IDS & bất thường |
 | `demo.boss` | `admin` | Toàn quyền: thống kê, quản lý user, danh sách chặn IDS, xác minh chuỗi audit |
+
+Mỗi lần seed sạch có thêm 8 tài khoản `lab.*` (tổng 11 tài khoản) và 24 hội thoại
+AES-256-GCM để bảng quản trị, phân trang và tìm kiếm có dữ liệu đủ khi trình diễn.
+Lệnh `--refresh-telemetry` chỉ thêm các sự kiện brute-force/IDOR gần hiện tại, nên
+không nhân bản người dùng hoặc hội thoại.
 
 [scripts/seed_learning_data.py](scripts/seed_learning_data.py) sinh khối lượng dữ liệu lớn hơn
 để bảng thống kê và biểu đồ có gì để nhìn khi demo.

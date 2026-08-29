@@ -6,6 +6,8 @@ mã hóa bằng đúng MASTER_ENCRYPTION_KEY mà server sẽ dùng để giải 
 
     uv run python scripts/seed_demo_data.py           # tạo dữ liệu mẫu
     uv run python scripts/seed_demo_data.py --reset   # xóa demo cũ rồi tạo lại
+    uv run python scripts/seed_demo_data.py --refresh-telemetry
+                                                    # làm mới cảnh báo IDS 60 phút
 
 Ngoài ra có thể auto-seed khi khởi động server bằng SEED_DEMO_DATA=true trong .env.
 """
@@ -19,7 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.app.config import Settings  # noqa: E402
 from src.app.db import Database  # noqa: E402
-from src.app.demo_seed import DEMO_PASSWORD, DEMO_USERS, seed_demo_data  # noqa: E402
+from src.app.demo_seed import (  # noqa: E402
+    ALL_DEMO_USERS,
+    DEMO_PASSPHRASE,
+    DEMO_USERS,
+    SAMPLE_USERS,
+    seed_demo_data,
+)
 from src.app.security import CryptoService, PasswordService  # noqa: E402
 
 if __name__ == "__main__":
@@ -29,11 +37,14 @@ if __name__ == "__main__":
         PasswordService(),
         CryptoService(settings.master_encryption_key),
         reset="--reset" in sys.argv,
+        refresh_telemetry="--refresh-telemetry" in sys.argv,
     )
     print("\n=== TÀI KHOẢN DEMO ===")
-    print(f"Mật khẩu chung : {DEMO_PASSWORD}")
+    print(f"Mật khẩu chung : {DEMO_PASSPHRASE}")
     for username, role in DEMO_USERS:
         print(f"  {username:<12} → vai trò {role}")
+    print(f"\nĐã nạp thêm {len(SAMPLE_USERS)} tài khoản mẫu để kiểm thử dashboard, ")
+    print(f"tổng cộng {len(ALL_DEMO_USERS)} tài khoản demo.")
     print(
         "\nGợi ý khám phá:\n"
         "  1. Đăng nhập demo.user  → tab Trò chuyện có sẵn 4 hội thoại giải thích dự án.\n"

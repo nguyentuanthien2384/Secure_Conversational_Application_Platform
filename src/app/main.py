@@ -170,7 +170,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.seed_demo_data:
             from src.app.demo_seed import seed_demo_data
 
-            seed_demo_data(database, password_service, crypto_service, log=logger.info)
+            # Local demo cần có tín hiệu gần hiện tại để dashboard IDS (mặc
+            # định quan sát 60 phút) không rỗng sau khi máy đã chạy lâu.
+            seed_demo_data(
+                database,
+                password_service,
+                crypto_service,
+                refresh_telemetry=True,
+                log=logger.info,
+            )
         yield
         database.engine.dispose()
 

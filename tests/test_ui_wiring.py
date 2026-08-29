@@ -86,3 +86,11 @@ def test_assistant_avatar_asset_is_shipped():
 def test_session_labels_carry_the_lock_marker():
     source = UI_SOURCE.read_text(encoding="utf-8")
     assert "🔒" in source, "Nhãn phiên hội thoại cần ổ khoá nhắc trạng thái mã hoá"
+
+
+def test_dashboard_uses_metric_cards_for_report_ready_security_overview():
+    """Khoá lại bố cục KPI của tab Quản trị/Bảo mật để refactor không làm mất dashboard."""
+    source = UI_SOURCE.read_text(encoding="utf-8")
+    assert "metric-card" in source
+    assert "Trung tâm vận hành &amp; bảo mật" in source
+    assert "Trung tâm giám sát an ninh" in source
