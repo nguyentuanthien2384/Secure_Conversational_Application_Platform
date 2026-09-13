@@ -448,6 +448,9 @@ Bộ test ([tests/](tests/)) không chỉ kiểm chức năng mà kiểm **chín
 | [tests/test_e2ee_core.py](tests/test_e2ee_core.py) | Canonical JSON, Ed25519 proofs, fingerprint, opaque envelope |
 | [tests/test_high_security_features.py](tests/test_high_security_features.py) | E2EE routes, prekey một lần, replay guard, streaming export |
 | [tests/test_envelope_and_audit.py](tests/test_envelope_and_audit.py) | Per-session DEK/AAD swap, rewrap, audit anchor, retention |
+| [tests/test_security_lifecycle.py](tests/test_security_lifecycle.py) | Thu hồi E2EE, xóa tài khoản và khóa giao dịch chống race condition ở ranh giới bảo mật |
+| [tests/test_database_rotation.py](tests/test_database_rotation.py) | Xoay mật khẩu Postgres bằng file secret, không lộ qua argv/log |
+| [tests/test_supply_chain_ci.py](tests/test_supply_chain_ci.py) | Cổng image digest, Semgrep cục bộ, Trivy/SBOM và probe runtime CI |
 
 ### 10.2 Pipeline GitHub Actions
 

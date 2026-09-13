@@ -1648,7 +1648,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=429,
                 detail="Thử tắt MFA quá nhiều lần.",
                 headers={"Retry-After": str(retry_after)},
-        )
+            )
         if not user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA chưa được bật.")
         expected_token_version = user.token_version

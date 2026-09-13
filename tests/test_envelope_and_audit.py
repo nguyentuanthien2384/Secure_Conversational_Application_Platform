@@ -333,3 +333,5 @@ def test_consent_can_be_renewed_after_policy_version_changes(client: TestClient,
 def test_sqlite_enforces_declared_foreign_keys(app):
     with app.state.database.engine.connect() as connection:
         assert connection.scalar(text("PRAGMA foreign_keys")) == 1
+        assert connection.scalar(text("PRAGMA journal_mode")) == "wal"
+        assert connection.scalar(text("PRAGMA busy_timeout")) >= 10_000

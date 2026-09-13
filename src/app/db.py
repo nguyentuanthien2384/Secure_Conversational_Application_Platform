@@ -17,7 +17,11 @@ class Base(DeclarativeBase):
 
 class Database:
     def __init__(self, database_url: str):
-        connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+        connect_args = (
+            {"check_same_thread": False, "timeout": 10}
+            if database_url.startswith("sqlite")
+            else {}
+        )
         self.engine = create_engine(
             database_url,
             pool_pre_ping=True,
@@ -32,8 +36,18 @@ class Database:
                 cursor = dbapi_connection.cursor()
                 try:
                     cursor.execute("PRAGMA foreign_keys=ON")
+                    # Give a concurrent writer a bounded chance to finish
+                    # instead of surfacing a transient lock as HTTP 500.
+                    cursor.execute("PRAGMA busy_timeout=10000")
                 finally:
                     cursor.close()
+
+            # WAL lets an existing reader finish while a policy/security writer
+            # commits. This avoids the read-to-write upgrade deadlock inherent
+            # in SQLite's rollback journal. High-security production still
+            # requires PostgreSQL; this keeps local/teaching mode deterministic.
+            with self.engine.connect() as connection:
+                connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         self.session_factory = sessionmaker(
             bind=self.engine,
             autoflush=False,
