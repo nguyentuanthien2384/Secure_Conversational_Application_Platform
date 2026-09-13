@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from src.app.db import utcnow
@@ -23,6 +23,7 @@ from src.app.models import (
 @dataclass(frozen=True)
 class RetentionResult:
     expired_sessions: int = 0
+    retention_deadlines_backfilled: int = 0
     encrypted_messages: int = 0
     e2ee_envelopes: int = 0
     wrapped_deks_destroyed: int = 0
@@ -36,12 +37,75 @@ class RetentionResult:
         return asdict(self)
 
 
+def _retention_deadline(
+    chat_session: ChatSession,
+    *,
+    now: datetime,
+    secure_retention_days: int,
+    confidential_retention_days: int,
+) -> datetime:
+    """Derive a legacy row's deadline from creation time, never migration time.
+
+    Any unexpected/unknown mode receives the shorter confidential period. This
+    keeps a partially migrated or manually corrupted row on the fail-closed
+    side of the policy.
+    """
+    retention_days = (
+        secure_retention_days
+        if chat_session.security_mode == "secure"
+        else confidential_retention_days
+    )
+    return (chat_session.created_at or now) + timedelta(days=retention_days)
+
+
+def _backfill_retention_deadlines(
+    db: Session,
+    *,
+    now: datetime,
+    secure_retention_days: int,
+    confidential_retention_days: int,
+    batch_size: int,
+) -> int:
+    """Backfill every legacy NULL deadline in bounded-memory batches.
+
+    A keyset cursor makes the operation portable across SQLite and PostgreSQL
+    and idempotent when a deployment or scheduled sweep is repeated.
+    """
+    backfilled = 0
+    last_id: str | None = None
+    while True:
+        statement = (
+            select(ChatSession)
+            .where(ChatSession.retention_expires_at.is_(None))
+            .order_by(ChatSession.id.asc())
+            .limit(batch_size)
+        )
+        if last_id is not None:
+            statement = statement.where(ChatSession.id > last_id)
+        rows = list(db.scalars(statement))
+        if not rows:
+            break
+        for row in rows:
+            row.retention_expires_at = _retention_deadline(
+                row,
+                now=now,
+                secure_retention_days=secure_retention_days,
+                confidential_retention_days=confidential_retention_days,
+            )
+        db.flush()
+        backfilled += len(rows)
+        last_id = rows[-1].id
+    return backfilled
+
+
 def enforce_retention(
     db: Session,
     *,
     now: datetime | None = None,
     dry_run: bool = False,
     batch_size: int = 500,
+    secure_retention_days: int = 90,
+    confidential_retention_days: int = 7,
 ) -> RetentionResult:
     """Delete expired conversations plus short-lived security artifacts.
 
@@ -52,15 +116,66 @@ def enforce_retention(
     """
     if batch_size < 1 or batch_size > 5_000:
         raise ValueError("Retention batch_size must be between 1 and 5000.")
+    if secure_retention_days < 1 or confidential_retention_days < 1:
+        raise ValueError("Retention periods must be positive integers.")
     now = now or utcnow()
+
+    # Older SCAP releases added this column as nullable, leaving existing rows
+    # without an enforceable deadline. Derive the deadline from ``created_at``
+    # (not from today's migration date) so an upgrade cannot silently extend
+    # retention. A dry run computes the same policy without changing the rows.
+    if dry_run:
+        retention_deadlines_backfilled = int(
+            db.scalar(
+                select(func.count())
+                .select_from(ChatSession)
+                .where(ChatSession.retention_expires_at.is_(None))
+            )
+            or 0
+        )
+        legacy_expired = and_(
+            ChatSession.retention_expires_at.is_(None),
+            or_(
+                and_(
+                    ChatSession.security_mode == "secure",
+                    ChatSession.created_at
+                    <= now - timedelta(days=secure_retention_days),
+                ),
+                and_(
+                    or_(
+                        ChatSession.security_mode != "secure",
+                        ChatSession.security_mode.is_(None),
+                    ),
+                    ChatSession.created_at
+                    <= now - timedelta(days=confidential_retention_days),
+                ),
+            ),
+        )
+        expired_clause = or_(
+            ChatSession.retention_expires_at <= now,
+            legacy_expired,
+        )
+    else:
+        retention_deadlines_backfilled = _backfill_retention_deadlines(
+            db,
+            now=now,
+            secure_retention_days=secure_retention_days,
+            confidential_retention_days=confidential_retention_days,
+            batch_size=batch_size,
+        )
+        # The NULL arm catches a corrupt/concurrently inserted legacy row after
+        # the backfill pass. Such a row has no provable retention permission and
+        # is therefore erased instead of being retained indefinitely.
+        expired_clause = or_(
+            ChatSession.retention_expires_at.is_(None),
+            ChatSession.retention_expires_at <= now,
+        )
+
     sessions = list(
         db.scalars(
             select(ChatSession)
-            .where(
-                ChatSession.retention_expires_at.is_not(None),
-                ChatSession.retention_expires_at <= now,
-            )
-            .order_by(ChatSession.retention_expires_at.asc())
+            .where(expired_clause)
+            .order_by(ChatSession.retention_expires_at.asc(), ChatSession.id.asc())
             .limit(batch_size)
         )
     )
@@ -134,6 +249,7 @@ def enforce_retention(
         db.commit()
     return RetentionResult(
         expired_sessions=len(sessions),
+        retention_deadlines_backfilled=retention_deadlines_backfilled,
         encrypted_messages=encrypted_messages,
         e2ee_envelopes=e2ee_envelopes,
         wrapped_deks_destroyed=wrapped_deks,

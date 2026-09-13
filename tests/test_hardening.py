@@ -213,6 +213,8 @@ def _set_valid_high_env(monkeypatch, tmp_path: Path) -> None:
         "VAULT_ADDR": "https://vault.example.test",
         "VAULT_TOKEN_FILE": "/run/secrets/vault_token",
         "VAULT_ALLOW_INSECURE_HTTP": "false",
+        "GOOGLE_GENAI_API_KEY": "",
+        "GOOGLE_GENAI_API_KEY_FILE": "",
         "APP_SECRET_KEY": "",
         "APP_SECRET_KEY_FILE": str(app_secret),
         "DATABASE_PASSWORD_FILE": str(database_password),
@@ -358,6 +360,21 @@ def test_high_profile_secret_files_are_single_source_bounded_and_single_line(
         Settings.from_env()
 
 
+def test_high_profile_allows_file_backed_ai_key_but_rejects_environment_key(
+    monkeypatch, tmp_path: Path
+):
+    _set_valid_high_env(monkeypatch, tmp_path)
+    ai_key_file = tmp_path / "google-ai-key"
+    ai_key_file.write_text("approved-provider-key-material", encoding="utf-8")
+    monkeypatch.setenv("GOOGLE_GENAI_API_KEY_FILE", str(ai_key_file))
+    assert Settings.from_env().google_genai_api_key == "approved-provider-key-material"
+
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("GOOGLE_GENAI_API_KEY", "inspectable-environment-provider-key")
+    with pytest.raises(RuntimeError, match="environment/URL"):
+        Settings.from_env()
+
+
 def test_high_profile_accepts_strict_internal_transport_settings(
     monkeypatch, tmp_path: Path
 ):
@@ -416,6 +433,7 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     caddy = Path("Caddyfile").read_text(encoding="utf-8")
     sql = Path("scripts/db_least_privilege.sql").read_text(encoding="utf-8")
+    init_roles = Path("scripts/init_db_roles.sh").read_text(encoding="utf-8")
     assert "DATABASE_URL: postgresql+psycopg://scap_app:" in compose
     assert "service_completed_successfully" in compose
     assert "change-me-app-password" not in sql
@@ -431,6 +449,15 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     assert '"--no-access-log"' in compose
     assert '"--no-access-log"' in local_compose
     assert '"--no-access-log"' in dockerfile
+    assert "headers={'Host':host}" in dockerfile
+    db_service = compose.split("\n  redis:", maxsplit=1)[0]
+    assert "read_only: true" in db_service
+    assert "/var/run/postgresql" in db_service
+    assert "SET log_statement = 'none'" in sql
+    assert "SET log_min_duration_statement = -1" in sql
+    assert "SET log_min_error_statement = 'panic'" in sql
+    assert "--set app_password" not in init_roles
+    assert "SCAP_APP_DB_PASSWORD" in init_roles
     assert "sslmode=verify-full" in high_compose
     assert "rediss://scap@redis:6379" in high_compose
     assert '"--tls-port"' in high_compose

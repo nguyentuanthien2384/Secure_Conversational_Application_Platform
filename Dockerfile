@@ -34,6 +34,7 @@ COPY scripts/migrate_database.py ./scripts/migrate_database.py
 COPY scripts/enforce_retention.py ./scripts/enforce_retention.py
 COPY scripts/migrate_envelope_encryption.py ./scripts/migrate_envelope_encryption.py
 COPY scripts/rewrap_deks.py ./scripts/rewrap_deks.py
+COPY scripts/rotate_database_credentials.py ./scripts/rotate_database_credentials.py
 COPY scripts/high_security_app_entrypoint.sh ./scripts/high_security_app_entrypoint.sh
 COPY run_app.py ./run_app.py
 RUN chown -R app:app /app
@@ -46,7 +47,7 @@ EXPOSE 8000
 # phục vụ tính Sẵn sàng (Availability) trong C.I.A — Bài 1.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", \
-         "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)"]
+         "import os,urllib.request,sys; host=os.environ.get('ALLOWED_HOSTS','').split(',')[0].strip() or '127.0.0.1'; request=urllib.request.Request('http://127.0.0.1:8000/api/health',headers={'Host':host}); sys.exit(0 if urllib.request.urlopen(request,timeout=3).status==200 else 1)"]
 
 # Không tin các proxy header theo mặc định. Bản Compose production bật chúng
 # riêng sau Caddy, còn bản local được publish thẳng nên không thể bị giả IP qua

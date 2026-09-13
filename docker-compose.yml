@@ -42,6 +42,10 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init_db_roles.sh:/docker-entrypoint-initdb.d/10-init-roles.sh:ro
       - ./scripts/db_least_privilege.sql:/opt/scap/db_least_privilege.sql:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U secure_chat -d secure_chat"]
       interval: 5s

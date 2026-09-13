@@ -451,16 +451,17 @@ Bộ test ([tests/](tests/)) không chỉ kiểm chức năng mà kiểm **chín
 
 ### 10.2 Pipeline GitHub Actions
 
-[.github/workflows/security.yml](.github/workflows/security.yml) chạy 5 job song song trên mỗi
-push vào `main` và mỗi pull request:
+[.github/workflows/security.yml](.github/workflows/security.yml) chạy sáu cổng kiểm tra trên mỗi
+push vào `main` và mỗi pull request; bước attestation chỉ chạy sau khi toàn bộ cổng đạt:
 
 | Job | Nội dung | Chặn merge khi |
 | :--- | :--- | :--- |
 | `test` | `uv lock --check` → pytest + coverage → ruff → bandit → `uv export` → pip-audit | test đỏ, lint đỏ, hoặc dependency có CVE |
 | `secret-scan` | gitleaks trên **toàn bộ lịch sử** (`fetch-depth: 0`) | có secret bị commit |
-| `sast` | Semgrep `config: auto` | phát hiện mẫu mã nguy hiểm |
-| `filesystem-scan` | Trivy quét cây mã + sinh SBOM CycloneDX | có CVE HIGH/CRITICAL đã có bản vá |
-| `image-scan` | Build Docker image rồi Trivy quét **chính image đó** + SBOM | như trên |
+| `sast` | Semgrep CLI pin phiên bản với bộ luật `.semgrep.yml` đã review trong repository | phát hiện mẫu mã nguy hiểm |
+| `filesystem-scan` | Trivy quét cây mã + sinh SBOM CycloneDX | có CVE HIGH/CRITICAL, kể cả chưa có bản vá |
+| `image-scan` | Build Docker image, chạy probe quyền/secret rồi Trivy quét **chính image đó** + SBOM | runtime probe lỗi hoặc có CVE HIGH/CRITICAL |
+| `deployment-config` | Render high-security Compose, kiểm tra shell và validate Caddy bằng image pin digest | cấu hình triển khai/edge không hợp lệ |
 
 Artifact tải về được: `coverage.xml`, `reports-bandit.json`, `reports-pip-audit.json`,
 `sbom-source.cdx.json`, `sbom-image.cdx.json`.
@@ -483,6 +484,7 @@ Xem thêm [SECURITY.md](SECURITY.md) (chính sách báo lỗi) và
 | Xoay khóa mã hóa | `uv run python scripts/rotate_encryption_key.py` (đặt `MASTER_ENCRYPTION_KEYS` + `ACTIVE_KEY_VERSION` trước) |
 | Migrate legacy sang envelope | `uv run python scripts/migrate_envelope_encryption.py --dry-run` rồi chạy thật |
 | Rewrap DEK sau khi xoay KEK | `uv run python scripts/rewrap_deks.py --dry-run` rồi chạy thật |
+| Xoay mật khẩu ba role Postgres | `uv run python scripts/rotate_database_credentials.py` với current/new password file — xem runbook high-security |
 | Enforce retention | `uv run python scripts/enforce_retention.py --dry-run` rồi chạy theo scheduler |
 | Nối lại chuỗi audit sau sự cố | `uv run python scripts/repair_audit_chain.py` — xem [docker-compose.repair.yml](docker-compose.repair.yml) |
 | Cấp quyền tối thiểu cho Postgres | [scripts/db_least_privilege.sql](scripts/db_least_privilege.sql), chạy tự động bởi [scripts/init_db_roles.sh](scripts/init_db_roles.sh) |

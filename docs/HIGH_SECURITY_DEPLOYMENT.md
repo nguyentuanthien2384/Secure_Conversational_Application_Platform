@@ -110,6 +110,13 @@ High profile tắt tự đăng ký (`ALLOW_SELF_REGISTRATION=false`). Tài kho�
 được cấp qua quản trị viên/quy trình IdP đã phê duyệt; không mở lại endpoint tự
 đăng ký trên hệ thống chứa hội thoại rất nhạy cảm.
 
+Reference overlay cố ý không bật cloud AI. Nếu tổ chức đã phê duyệt DPA, vùng dữ
+liệu và paid/ZDR policy của provider, hãy mount key bằng secret tên
+`google_genai_api_key` trong một overlay riêng; bootstrap wrapper sẽ tự đặt
+`GOOGLE_GENAI_API_KEY_FILE`. High profile từ chối `GOOGLE_GENAI_API_KEY` dạng
+environment. Không bật secret này cho Private E2EE; disclosure ở mode đó phải do
+client tin cậy chọn, làm sạch và xác nhận rõ ràng.
+
 Overlay tham chiếu bật TLS cho cả PostgreSQL và Redis. Khóa riêng của server chỉ
 được đọc từ Docker secret; wrapper PostgreSQL chép khóa vào vùng tạm với mode
 `0600` và chép ba mật khẩu vào vùng tạm chỉ tài khoản `postgres` đọc được trước
@@ -163,6 +170,29 @@ Xoay KEK định kỳ hoặc khi nghi lộ bằng provider, sau đó chạy
 `scripts/rewrap_deks.py`. Rewrap chỉ thay ciphertext của DEK; không giải mã lại
 toàn bộ nội dung hội thoại. Sự cố lộ DEK của riêng một phiên cần xoay DEK phiên
 và cân nhắc tái mã hóa dữ liệu, không chỉ rewrap.
+
+## Xoay credential PostgreSQL trên volume hiện hữu
+
+Init hook chỉ tạo role lần đầu. Khi xoay mật khẩu, dùng maintenance workload cô
+lập với secret hiện tại để kết nối và ba secret mới; không thay file đang phục
+vụ app trước khi transaction thành công:
+
+```sh
+DATABASE_URL='postgresql+psycopg://secure_chat@db:5432/secure_chat?sslmode=verify-full&sslrootcert=/run/secrets/internal_ca.crt' \
+DATABASE_PASSWORD_FILE=/run/secrets/current_postgres_password \
+NEW_POSTGRES_PASSWORD_FILE=/run/secrets/new_postgres_password \
+NEW_APP_DB_PASSWORD_FILE=/run/secrets/new_app_db_password \
+NEW_AUDITOR_DB_PASSWORD_FILE=/run/secrets/new_auditor_db_password \
+python scripts/rotate_database_credentials.py
+```
+
+Các giá trị phải là file một dòng, tối thiểu 32 ký tự. Script tắt statement,
+duration và error-statement logging trong transaction, đổi runtime/auditor rồi
+owner sau cùng, và không in secret. Sau khi thành công, cập nhật atomically các
+secret chính, rolling-restart app/migration, kiểm tra cả ba role qua
+`verify-full`, rồi thu hồi bản cũ. Bootstrap wrapper cũng nhận ba mount tùy chọn
+`/run/secrets/new_postgres_password`, `new_app_db_password` và
+`new_auditor_db_password` để chạy job với source secret host mode `0600`.
 
 ## Retention và xóa mật mã
 

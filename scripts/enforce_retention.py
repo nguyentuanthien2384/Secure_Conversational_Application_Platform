@@ -23,6 +23,8 @@ def main() -> int:
             db,
             dry_run=args.dry_run,
             batch_size=args.batch_size,
+            secure_retention_days=settings.secure_retention_days,
+            confidential_retention_days=settings.confidential_retention_days,
         )
     print(json.dumps(result.as_dict(), sort_keys=True))
     return 0

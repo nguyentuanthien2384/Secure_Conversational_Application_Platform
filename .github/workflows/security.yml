@@ -77,9 +77,10 @@ jobs:
           version: "0.11.15"
           enable-cache: true
       # The former semgrep-action is archived. Run the official Semgrep CLI at
-      # an explicit release instead of executing the deprecated wrapper action.
+      # an explicit release and a reviewed repository-local ruleset instead of
+      # executing the deprecated wrapper or downloading mutable registry rules.
       - name: Run Semgrep SAST
-        run: uvx --from "semgrep==1.172.0" semgrep scan --config auto --error --metrics=off .
+        run: uvx --from "semgrep==1.172.0" semgrep scan --config .semgrep.yml --error --metrics=off .
 
   filesystem-scan:
     runs-on: ubuntu-latest
@@ -94,7 +95,6 @@ jobs:
           scan-ref: .
           severity: HIGH,CRITICAL
           exit-code: "1"
-          ignore-unfixed: true
       - name: Generate CycloneDX SBOM from source tree
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -135,6 +135,8 @@ jobs:
           --label org.opencontainers.image.revision="${GITHUB_SHA}"
           --label org.opencontainers.image.source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           -t secure-chat:ci .
+      - name: Exercise the high-security secret boundary in the scanned image
+        run: sh scripts/verify_high_security_app_runtime.sh secure-chat:ci
       - name: Scan built image (not just the source tree)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -142,7 +144,6 @@ jobs:
           image-ref: secure-chat:ci
           severity: HIGH,CRITICAL
           exit-code: "1"
-          ignore-unfixed: true
       - name: Generate CycloneDX SBOM from built image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -174,6 +175,21 @@ jobs:
             sbom-image.cdx.json
             SHA256SUMS
 
+  deployment-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASE_IMAGE: ${{ vars.PYTHON_BASE_IMAGE }}
+      POSTGRES_IMAGE: ${{ vars.POSTGRES_IMAGE }}
+      REDIS_IMAGE: ${{ vars.REDIS_IMAGE }}
+      CADDY_IMAGE: ${{ vars.CADDY_IMAGE }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate high-security Compose, entrypoints, and edge policy
+        run: sh scripts/validate_high_security_deployment.sh
+
   attest-image:
     # Public repositories support attestations on all current plans. Private or
     # internal repositories require Enterprise Cloud and explicit opt-in here.
@@ -181,7 +197,7 @@ jobs:
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
       (github.event.repository.visibility == 'public' || vars.ENABLE_PRIVATE_ATTESTATIONS == 'true')
-    needs: [test, secret-scan, sast, filesystem-scan, image-scan]
+    needs: [test, secret-scan, sast, filesystem-scan, image-scan, deployment-config]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

@@ -187,6 +187,15 @@ class Database:
                 connection.execute(
                     text("ALTER TABLE chat_sessions ADD COLUMN retention_expires_at TIMESTAMP")
                 )
+            # Compatibility migrations cannot make the legacy column NOT NULL
+            # on SQLite. Runtime access therefore fails closed on NULL and the
+            # retention sweep backfills it from the original creation time.
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_sessions_retention_expires_at "
+                    "ON chat_sessions (retention_expires_at)"
+                )
+            )
 
             # Stronger, message-specific AAD for new envelope-encrypted rows.
             if "message_uuid" not in message_columns:
@@ -278,6 +287,7 @@ class Database:
                 "wrapped_dek",
                 "kek_uri",
                 "kek_version",
+                "retention_expires_at",
             },
             "secure_messages": {
                 "message_uuid",

@@ -243,6 +243,9 @@ class Settings:
             _secret_setting("APP_SECRET_KEY", "APP_SECRET_KEY_FILE")
             or "development-only-change-me"  # nosec B105
         )
+        google_genai_api_key = _secret_setting(
+            "GOOGLE_GENAI_API_KEY", "GOOGLE_GENAI_API_KEY_FILE"
+        )
         master_key = os.getenv("MASTER_ENCRYPTION_KEY", "").strip()
         keyring = _keyring_env()
         if (
@@ -377,11 +380,12 @@ class Settings:
                     )
                 if (
                     os.getenv("APP_SECRET_KEY", "").strip()
+                    or os.getenv("GOOGLE_GENAI_API_KEY", "").strip()
                     or urlparse(raw_database_url).password not in (None, "")
                     or urlparse(raw_redis_url).password not in (None, "")
                 ):
                     raise RuntimeError(
-                        "SECURITY_PROFILE=high không cho phép secret nhúng trong environment URL."
+                        "SECURITY_PROFILE=high không cho phép secret nhúng trong environment/URL."
                     )
                 if _bool_env("ALLOW_SELF_REGISTRATION", True):
                     raise RuntimeError(
@@ -494,7 +498,7 @@ class Settings:
             password_min_length=int(os.getenv("PASSWORD_MIN_LENGTH", "15")),
             password_breach_check=_bool_env("PASSWORD_BREACH_CHECK", False),
             allow_demo_ai=_bool_env("ALLOW_DEMO_AI", True),
-            google_genai_api_key=os.getenv("GOOGLE_GENAI_API_KEY", ""),
+            google_genai_api_key=google_genai_api_key,
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest"),
             bootstrap_admin_username=os.getenv("BOOTSTRAP_ADMIN_USERNAME", ""),
             bootstrap_admin_password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD", ""),

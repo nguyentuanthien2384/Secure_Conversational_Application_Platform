@@ -14,15 +14,27 @@
 --   scap_auditor (read-only) - chỉ đọc audit_events, cho SOC/giảng viên chấm bài
 --
 -- CÁCH DÙNG:
---   psql -U secure_chat -d secure_chat \
---     -v app_password="..." -v auditor_password="..." \
---     -f scripts/db_least_privilege.sql
+--   SCAP_APP_DB_PASSWORD="..." SCAP_AUDITOR_DB_PASSWORD="..." \
+--     psql -U secure_chat -d secure_chat -f scripts/db_least_privilege.sql
 --
 -- Docker gọi file này qua init_db_roles.sh. Không có mật khẩu dự phòng:
 -- thiếu biến là lỗi dừng triển khai, không tạo credential có thể đoán.
 -- ============================================================================
 
 \set ON_ERROR_STOP on
+-- Role passwords must never appear in PostgreSQL statement/duration logs.
+-- Session-local settings are restored after the two ALTER ROLE statements.
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = 'panic';
+\if :{?app_password}
+\else
+  \getenv app_password SCAP_APP_DB_PASSWORD
+\endif
+\if :{?auditor_password}
+\else
+  \getenv auditor_password SCAP_AUDITOR_DB_PASSWORD
+\endif
 \if :{?app_password}
 \else
   \echo 'ERROR: app_password is required'
@@ -57,6 +69,12 @@ $$;
 ALTER ROLE scap_auditor WITH PASSWORD :'auditor_password'
     NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION
     CONNECTION LIMIT 5;
+
+RESET log_min_error_statement;
+RESET log_min_duration_statement;
+RESET log_statement;
+\unset app_password
+\unset auditor_password
 
 -- ── 3. Thu hồi quyền mặc định của PUBLIC ───────────────────────────────────
 -- Mặc định Postgres cho MỌI vai trò quyền CREATE trên schema public. Đây là

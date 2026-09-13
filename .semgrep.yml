@@ -1,0 +1,75 @@
+rules:
+  - id: scap.python.dynamic-code-execution
+    message: Dynamic eval/exec can turn untrusted text into server-side code.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: scap.python.subprocess-shell-true
+    message: Avoid shell=True; pass an argument vector to the child process.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+
+  - id: scap.python.unsafe-pickle-deserialization
+    message: Pickle deserialization can execute attacker-controlled code.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+
+  - id: scap.python.unsafe-yaml-loader
+    message: Use yaml.safe_load instead of an executable YAML loader.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: yaml.load(...)
+      - pattern: yaml.unsafe_load(...)
+
+  - id: scap.python.tls-verification-disabled
+    message: TLS peer verification must remain enabled for outbound requests.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: requests.$METHOD(..., verify=False, ...)
+      - pattern: httpx.$METHOD(..., verify=False, ...)
+      - pattern: httpx.Client(..., verify=False, ...)
+      - pattern: httpx.AsyncClient(..., verify=False, ...)
+
+  - id: scap.python.jwt-signature-verification-disabled
+    message: Never decode an authentication token with signature verification disabled.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: jwt.decode(..., options=$OPTIONS, ...)
+      - metavariable-pattern:
+          metavariable: $OPTIONS
+          language: generic
+          pattern: '{..., "verify_signature": False, ...}'
+
+  - id: scap.python.sqlalchemy-interpolated-text
+    message: Bind SQL values as parameters instead of interpolating an f-string.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: sqlalchemy.text(f"...")
+      - pattern: sqlalchemy.text(f'...')
+      - pattern: text(f"...")
+      - pattern: text(f'...')
+
+  - id: scap.fastapi.wildcard-cors
+    message: A sensitive application must use an explicit origin allow-list.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: $APP.add_middleware(CORSMiddleware, ..., allow_origins=["*"], ...)
+
+  - id: scap.python.insecure-md5
+    message: MD5 is not suitable for password, credential, or integrity protection.
+    severity: ERROR
+    languages: [python]
+    pattern: hashlib.md5(...)

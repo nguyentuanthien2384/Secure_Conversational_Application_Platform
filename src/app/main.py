@@ -306,9 +306,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database.create_all()
         if settings.retention_sweep_on_startup:
             with database.session_factory() as retention_db:
-                retention_result = enforce_retention(retention_db)
+                retention_result = enforce_retention(
+                    retention_db,
+                    secure_retention_days=settings.secure_retention_days,
+                    confidential_retention_days=settings.confidential_retention_days,
+                )
             envelope_crypto_service.clear_cache()
-            if retention_result.expired_sessions:
+            if (
+                retention_result.expired_sessions
+                or retention_result.retention_deadlines_backfilled
+            ):
                 emit_security_event(
                     "retention.sweep",
                     details=retention_result.as_dict(),
@@ -661,10 +668,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def retained_session_clause(now: datetime | None = None):
         cutoff = now or utcnow()
-        return or_(
-            ChatSession.retention_expires_at.is_(None),
-            ChatSession.retention_expires_at > cutoff,
-        )
+        # A legacy NULL is an unknown/unenforced deadline, never an implicit
+        # legal hold. The startup sweeper backfills/purges these rows, while
+        # every access path fails closed if one is encountered meanwhile.
+        return ChatSession.retention_expires_at > cutoff
 
     def sensitive_session_clause():
         return or_(
@@ -709,6 +716,99 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return membership is not None
 
+    def lock_user_row(
+        db: Session,
+        user: User,
+        *,
+        require_active: bool = True,
+    ) -> User | None:
+        """Acquire a portable transaction lock and refresh security state.
+
+        PostgreSQL row locks are required in the high-security profile. A
+        same-value UPDATE also serializes correctly on SQLite, where SELECT
+        FOR UPDATE is ignored, so local/test deployments fail closed too.
+        """
+
+        conditions = [User.id == user.id]
+        if require_active:
+            conditions.append(User.is_active.is_(True))
+        locked = db.execute(
+            update(User)
+            .where(*conditions)
+            .values(token_version=User.token_version)
+            .execution_options(synchronize_session=False)
+        )
+        if locked.rowcount != 1:
+            return None
+        db.refresh(user)
+        return user
+
+    def lock_chat_session_row(db: Session, chat_session: ChatSession) -> ChatSession | None:
+        """Serialize policy, membership, epoch, and content mutations.
+
+        Explicitly preserve ``updated_at`` to avoid firing SQLAlchemy's
+        application-side on-update timestamp for this lock-only statement.
+        """
+
+        locked = db.execute(
+            update(ChatSession)
+            .where(ChatSession.id == chat_session.id)
+            .values(
+                current_crypto_epoch=ChatSession.current_crypto_epoch,
+                updated_at=ChatSession.updated_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if locked.rowcount != 1:
+            return None
+        db.refresh(chat_session)
+        return chat_session
+
+    def revoke_active_e2ee_memberships(db: Session, user_id: str) -> tuple[int, int]:
+        """Revoke memberships and advance each affected routing epoch once.
+
+        The caller must hold the user's row lock. Member addition takes that
+        same lock before a session lock, so the initial enumeration cannot miss
+        a concurrently added membership.
+        """
+
+        session_ids = list(
+            db.scalars(
+                select(ConversationMember.session_id)
+                .join(ChatSession, ChatSession.id == ConversationMember.session_id)
+                .where(
+                    ConversationMember.user_id == user_id,
+                    ConversationMember.removed_at.is_(None),
+                    ChatSession.security_mode == "private_e2ee",
+                )
+                .order_by(ConversationMember.session_id.asc())
+            )
+        )
+        revoked = 0
+        advanced_sessions = 0
+        now = utcnow()
+        for affected_session_id in session_ids:
+            chat_session = db.get(ChatSession, affected_session_id)
+            if chat_session is None or lock_chat_session_row(db, chat_session) is None:
+                continue
+            membership = db.scalar(
+                select(ConversationMember)
+                .where(
+                    ConversationMember.session_id == affected_session_id,
+                    ConversationMember.user_id == user_id,
+                    ConversationMember.removed_at.is_(None),
+                )
+                .execution_options(populate_existing=True)
+            )
+            if membership is None or chat_session.security_mode != "private_e2ee":
+                continue
+            chat_session.current_crypto_epoch += 1
+            membership.removed_epoch = chat_session.current_crypto_epoch
+            membership.removed_at = now
+            revoked += 1
+            advanced_sessions += 1
+        return revoked, advanced_sessions
+
     def reject_expired_session(
         chat_session: ChatSession,
         user: User,
@@ -716,7 +816,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
     ) -> None:
         expires_at = chat_session.retention_expires_at
-        if expires_at is None or as_utc(expires_at) > utcnow():
+        if expires_at is not None and as_utc(expires_at) > utcnow():
             return
         session_id = chat_session.id
         security_mode = chat_session.security_mode
@@ -780,6 +880,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: User,
         db: Session,
         request: Request,
+        *,
+        for_update: bool = False,
+        account_locked: bool = False,
     ) -> ChatSession:
         chat_session = chat_service.get_owned_session(db, user, session_id)
         if chat_session is None:
@@ -795,6 +898,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Return 404 to reduce resource enumeration.
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
         reject_expired_session(chat_session, user, db, request)
+
+        # Mutations always lock the account before the conversation. This is
+        # the common order used by MFA disable, suspension and E2EE lifecycle
+        # operations, preventing both stale authorization and deadlocks.
+        must_lock_user = not account_locked and (
+            for_update
+            or (settings.security_profile == "high" and session_is_sensitive(chat_session))
+        )
+        if must_lock_user and lock_user_row(db, user) is None:
+            record_audit(
+                db,
+                request,
+                "authorization.denied",
+                actor_id=user.id,
+                target_type="chat_session",
+                target_id=session_id,
+                outcome="denied",
+                details={"reason": "account_state_changed"},
+            )
+            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+        if for_update:
+            if lock_chat_session_row(db, chat_session) is None:
+                raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
+            # The row may have changed while this request waited for its lock.
+            if chat_session.owner_id != user.id:
+                raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
+            reject_expired_session(chat_session, user, db, request)
         if (
             settings.security_profile == "high"
             and session_is_sensitive(chat_session)
@@ -823,15 +953,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
     ) -> tuple[ChatSession, ConversationMember]:
         """Authorize one active member without revealing whether another session exists."""
-        chat_session = db.get(ChatSession, session_id)
-        member = db.scalar(
-            select(ConversationMember).where(
-                ConversationMember.session_id == session_id,
-                ConversationMember.user_id == user.id,
-                ConversationMember.removed_at.is_(None),
+
+        # Suspension/deletion lock the same account first, then every affected
+        # conversation. Whichever transaction wins defines a clean boundary:
+        # the request either completes before revocation or sees it afterwards.
+        if lock_user_row(db, user) is None:
+            record_audit(
+                db,
+                request,
+                "authorization.denied",
+                actor_id=user.id,
+                target_type="e2ee_session",
+                target_id=session_id,
+                outcome="denied",
+                details={"reason": "account_state_changed"},
             )
-        )
-        if chat_session is None or chat_session.security_mode != "private_e2ee" or member is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy phiên E2EE.")
+        chat_session = db.get(ChatSession, session_id)
+        if (
+            chat_session is None
+            or lock_chat_session_row(db, chat_session) is None
+            or chat_session.security_mode != "private_e2ee"
+        ):
             record_audit(
                 db,
                 request,
@@ -843,6 +986,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên E2EE.")
         reject_expired_session(chat_session, user, db, request)
+
+        # Re-query only after acquiring the session lock. ``populate_existing``
+        # defeats the identity-map copy loaded before a concurrent removal.
+        member = db.scalar(
+            select(ConversationMember)
+            .where(
+                ConversationMember.session_id == session_id,
+                ConversationMember.user_id == user.id,
+                ConversationMember.removed_at.is_(None),
+            )
+            .execution_options(populate_existing=True)
+        )
+        if member is None:
+            record_audit(
+                db,
+                request,
+                "authorization.denied",
+                actor_id=user.id,
+                target_type="e2ee_session",
+                target_id=session_id,
+                outcome="denied",
+                details={"reason": "membership_revoked"},
+            )
+            raise HTTPException(status_code=404, detail="Không tìm thấy phiên E2EE.")
         if settings.security_profile == "high" and not user.mfa_enabled:
             record_audit(
                 db,
@@ -1481,27 +1648,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=429,
                 detail="Thử tắt MFA quá nhiều lần.",
                 headers={"Retry-After": str(retry_after)},
-            )
+        )
         if not user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA chưa được bật.")
-        if settings.security_profile == "high" and has_active_sensitive_session(db, user.id):
-            record_audit(
-                db,
-                request,
-                "auth.mfa.disable",
-                actor_id=user.id,
-                target_type="user",
-                target_id=user.id,
-                outcome="denied",
-                details={"reason": "active_sensitive_session"},
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Không thể tắt MFA khi tài khoản còn tham gia hội thoại nhạy cảm; "
-                    "hãy xóa, hạ cấp hoặc rời các hội thoại đó trước."
-                ),
-            )
+        expected_token_version = user.token_version
         secret = load_mfa_secret(user)
         password_ok = password_service.verify(user.password_hash, payload.password)
         # Validate the password before attempting a recovery code. Otherwise an
@@ -1523,9 +1673,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else None
         )
         if matched_counter is not None:
-            code_ok = claim_totp_counter(db, user, matched_counter)
+            code_ok = claim_totp_counter(
+                db,
+                user,
+                matched_counter,
+                expected_token_version=expected_token_version,
+            )
         else:
-            code_ok = consume_recovery_code(db, user, payload.code)
+            code_ok = consume_recovery_code(
+                db,
+                user,
+                payload.code,
+                expected_token_version=expected_token_version,
+            )
         if not code_ok:
             # A zero-row conditional update means another request consumed the
             # same TOTP time step (or already disabled MFA).
@@ -1540,9 +1700,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=401, detail="Không xác thực được yêu cầu tắt MFA.")
 
+        # The factor claim above holds the user-row lock. Refresh before the
+        # policy query so account changes and sensitive-session creation are
+        # serialized with this decision. Rollback preserves the one-time factor
+        # when policy (rather than bad credentials) denies the operation.
+        db.refresh(user)
+        if (
+            not user.mfa_enabled
+            or user.token_version != expected_token_version
+            or (
+                settings.security_profile == "high"
+                and has_active_sensitive_session(db, user.id)
+            )
+        ):
+            policy_denied = (
+                user.mfa_enabled
+                and user.token_version == expected_token_version
+                and settings.security_profile == "high"
+            )
+            db.rollback()
+            record_audit(
+                db,
+                request,
+                "auth.mfa.disable",
+                actor_id=user.id,
+                target_type="user",
+                target_id=user.id,
+                outcome="denied" if policy_denied else "failure",
+                details={
+                    "reason": "active_sensitive_session" if policy_denied else "state_changed"
+                },
+            )
+            if policy_denied:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Không thể tắt MFA khi tài khoản còn tham gia hội thoại nhạy cảm; "
+                        "hãy xóa, hạ cấp hoặc rời các hội thoại đó trước."
+                    ),
+                )
+            raise HTTPException(status_code=409, detail="Trạng thái MFA vừa thay đổi; hãy thử lại.")
+
         disabled = db.execute(
             update(User)
-            .where(User.id == user.id, User.mfa_enabled.is_(True))
+            .where(
+                User.id == user.id,
+                User.mfa_enabled.is_(True),
+                User.token_version == expected_token_version,
+            )
             .values(
                 mfa_enabled=False,
                 mfa_secret_ciphertext=None,
@@ -1990,15 +2195,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "categories": title_findings,
                 },
             )
-        if (
-            settings.security_profile == "high"
-            and payload.security_mode in {"confidential", "private_e2ee"}
-            and not user.mfa_enabled
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Chế độ hội thoại nhạy cảm bắt buộc tài khoản đã bật MFA.",
-            )
+        if settings.security_profile == "high" and payload.security_mode in {
+            "confidential",
+            "private_e2ee",
+        }:
+            # Serialize against MFA disable. Refreshing after the lock prevents
+            # a request authenticated just before MFA was disabled from creating
+            # a new sensitive trust boundary.
+            if lock_user_row(db, user) is None or not user.mfa_enabled:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Chế độ hội thoại nhạy cảm bắt buộc tài khoản đã bật MFA.",
+                )
         # Cap the number of sessions per user so a single account cannot exhaust
         # database/storage resources by creating unlimited sessions.
         session_count = (
@@ -2119,7 +2327,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "categories": title_findings,
                 },
             )
-        row = require_owned_session(session_id, user, db, request)
+        row = require_owned_session(session_id, user, db, request, for_update=True)
         row.title = payload.title
         row.updated_at = utcnow()
         db.commit()
@@ -2147,7 +2355,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, user, db)
-        row = require_owned_session(session_id, user, db, request)
+        # The lock is acquired before checking content. Plaintext and E2EE send
+        # paths take the same lock, so a trust-boundary transition can never
+        # observe an empty conversation and then race a concurrent insert.
+        row = require_owned_session(session_id, user, db, request, for_update=True)
         if (
             settings.security_profile == "high"
             and payload.security_mode in {"confidential", "private_e2ee"}
@@ -2235,10 +2446,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        row = require_owned_session(session_id, user, db, request)
-        db.delete(row)
-        db.commit()
+        row = require_owned_session(session_id, user, db, request, for_update=True)
+        # Zeroize cached plaintext key material on both sides of the cascade.
         envelope_crypto_service.clear_cache()
+        try:
+            db.delete(row)
+            db.commit()
+        finally:
+            envelope_crypto_service.clear_cache()
         record_audit(
             db,
             request,
@@ -2356,7 +2571,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, user, db)
-        row = require_owned_session(session_id, user, db, request)
+        row = require_owned_session(session_id, user, db, request, for_update=True)
         record_audit(
             db,
             request,
@@ -2532,11 +2747,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        row = require_owned_session(session_id, user, db, request)
+        row = require_owned_session(session_id, user, db, request, for_update=True)
         # Serialize index allocation and quota checks for a conversation. The
         # UNIQUE(session_id, message_index) constraint remains the final replay
         # barrier if two application instances race.
-        db.refresh(row, with_for_update=True)
         existing_messages = (
             db.scalar(
                 select(func.count())
@@ -3026,6 +3240,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, user, db)
+        if lock_user_row(db, user) is None:
+            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
         device = db.scalar(
             select(E2eeDevice)
             .where(E2eeDevice.id == device_id, E2eeDevice.user_id == user.id)
@@ -3062,14 +3278,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Clients must publish a corresponding MLS commit. Incrementing the
         # server routing epoch prevents the revoked device from injecting data
         # under the old membership epoch.
-        for member in db.scalars(
-            select(ConversationMember).where(
-                ConversationMember.user_id == user.id,
-                ConversationMember.removed_at.is_(None),
+        affected_session_ids = list(
+            db.scalars(
+                select(ConversationMember.session_id)
+                .join(ChatSession, ChatSession.id == ConversationMember.session_id)
+                .where(
+                    ConversationMember.user_id == user.id,
+                    ConversationMember.removed_at.is_(None),
+                    ChatSession.security_mode == "private_e2ee",
+                )
+                .order_by(ConversationMember.session_id.asc())
             )
-        ):
-            session = db.get(ChatSession, member.session_id)
-            if session is not None and session.security_mode == "private_e2ee":
+        )
+        for affected_session_id in affected_session_ids:
+            session = db.get(ChatSession, affected_session_id)
+            if session is None or lock_chat_session_row(db, session) is None:
+                continue
+            # Membership may have been removed while this request waited for
+            # the conversation lock. Only an active member changes the epoch.
+            still_active = db.scalar(
+                select(ConversationMember.id).where(
+                    ConversationMember.session_id == session.id,
+                    ConversationMember.user_id == user.id,
+                    ConversationMember.removed_at.is_(None),
+                )
+            )
+            if still_active is not None and session.security_mode == "private_e2ee":
                 session.current_crypto_epoch += 1
         db.commit()
         record_audit(
@@ -3207,15 +3441,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, owner, db)
-        row = require_owned_session(session_id, owner, db, request)
-        if row.security_mode != "private_e2ee":
-            raise HTTPException(status_code=409, detail="Phiên này không ở chế độ Private E2EE.")
-        db.refresh(row, with_for_update=True)
         target = db.scalar(
             select(User).where(User.username == payload.username, User.is_active.is_(True))
         )
         if target is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
+        # Membership addition participates in account suspension/deletion. Lock
+        # both accounts in stable id order before locking the conversation so a
+        # concurrently suspended target can never be added after the revocation
+        # sweep has enumerated memberships.
+        accounts = sorted({owner.id: owner, target.id: target}.values(), key=lambda item: item.id)
+        for account in accounts:
+            if lock_user_row(db, account) is None:
+                raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
+        row = require_owned_session(
+            session_id,
+            owner,
+            db,
+            request,
+            for_update=True,
+            account_locked=True,
+        )
+        if row.security_mode != "private_e2ee":
+            raise HTTPException(status_code=409, detail="Phiên này không ở chế độ Private E2EE.")
         membership = db.scalar(
             select(ConversationMember).where(
                 ConversationMember.session_id == row.id,
@@ -3260,10 +3508,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, owner, db)
-        row = require_owned_session(session_id, owner, db, request)
+        row = require_owned_session(session_id, owner, db, request, for_update=True)
         if row.security_mode != "private_e2ee":
             raise HTTPException(status_code=409, detail="Phiên này không ở chế độ Private E2EE.")
-        db.refresh(row, with_for_update=True)
         target = db.scalar(select(User).where(User.username == username.strip().lower()))
         if target is None or target.id == owner.id:
             raise HTTPException(status_code=404, detail="Không tìm thấy thành viên có thể xóa.")
@@ -3319,7 +3566,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         row, membership = require_private_member_session(session_id, user, db, request)
-        db.refresh(row, with_for_update=True)
         sender_device = db.scalar(
             select(E2eeDevice).where(
                 E2eeDevice.id == payload.sender_device_id,
@@ -3568,12 +3814,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target = db.get(User, user_id)
         if target is None:
             raise HTTPException(status_code=404, detail="User not found.")
+        if lock_user_row(db, target, require_active=False) is None:
+            raise HTTPException(status_code=404, detail="User not found.")
         if target.id == admin.id:
             raise HTTPException(status_code=400, detail="Admin không thể tự xóa chính mình.")
         if target.role == "admin":
             raise HTTPException(status_code=400, detail="Không thể xóa tài khoản admin khác.")
-        db.delete(target)
-        db.commit()
+        revoked_memberships, advanced_sessions = revoke_active_e2ee_memberships(db, target.id)
+        # Lock every owned conversation before its cascade removes wrapped key
+        # metadata. Content writers use the same account/session order.
+        owned_session_ids = list(
+            db.scalars(
+                select(ChatSession.id)
+                .where(ChatSession.owner_id == target.id)
+                .order_by(ChatSession.id.asc())
+            )
+        )
+        for owned_session_id in owned_session_ids:
+            owned_session = db.get(ChatSession, owned_session_id)
+            if owned_session is not None:
+                lock_chat_session_row(db, owned_session)
+
+        # A pre-delete wipe removes currently cached account/session DEKs; the
+        # post-commit wipe catches any cache entry populated by an older in-flight
+        # read before it observed the account lock.
+        envelope_crypto_service.clear_cache()
+        try:
+            db.delete(target)
+            db.commit()
+        finally:
+            envelope_crypto_service.clear_cache()
         record_audit(
             db,
             request,
@@ -3581,6 +3851,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             actor_id=admin.id,
             target_type="user",
             target_id=user_id,
+            details={
+                "e2ee_memberships_revoked": revoked_memberships,
+                "e2ee_epochs_advanced": advanced_sessions,
+                "owned_sessions_deleted": len(owned_session_ids),
+            },
         )
         return Response(status_code=204)
 
@@ -3626,13 +3901,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         target = db.get(User, user_id)
         if target is None:
             raise HTTPException(status_code=404, detail="User account was not found.")
+        if lock_user_row(db, target, require_active=False) is None:
+            raise HTTPException(status_code=404, detail="User account was not found.")
         if target.id == admin.id and not payload.is_active:
             raise HTTPException(
                 status_code=400, detail="The active administrator cannot lock itself."
             )
-        if target.is_active != payload.is_active:
+        revoked_memberships = 0
+        advanced_sessions = 0
+        if not payload.is_active:
+            revoked_memberships, advanced_sessions = revoke_active_e2ee_memberships(
+                db, target.id
+            )
+        if target.is_active != payload.is_active or revoked_memberships:
+            status_changed = target.is_active != payload.is_active
             target.is_active = payload.is_active
-            revoke_all_auth_sessions(db, target)
+            if status_changed:
+                revoke_all_auth_sessions(db, target)
             db.commit()
             record_audit(
                 db,
@@ -3641,7 +3926,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 actor_id=admin.id,
                 target_type="user",
                 target_id=target.id,
-                details={"is_active": target.is_active, "token_version": target.token_version},
+                details={
+                    "is_active": target.is_active,
+                    "token_version": target.token_version,
+                    "e2ee_memberships_revoked": revoked_memberships,
+                    "e2ee_epochs_advanced": advanced_sessions,
+                },
             )
         return target
 

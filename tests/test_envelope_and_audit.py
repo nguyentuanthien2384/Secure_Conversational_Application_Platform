@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select, text
 
+from src.app.db import utcnow
 from src.app.envelope import ENVELOPE_SCHEME, EnvelopeEncryptionError
 from src.app.models import (
     AuditCheckpoint,
@@ -118,6 +119,91 @@ def test_retention_deletes_ciphertext_and_wrapped_dek(client: TestClient, app):
         )
 
 
+def test_legacy_null_retention_is_backfilled_from_creation_time_by_mode(
+    client: TestClient, app
+):
+    token = register_and_login(client, "legacy-retention-policy")
+    secure_id = client.post(
+        "/api/sessions",
+        headers=auth(token),
+        json={"title": "Legacy secure"},
+    ).json()["id"]
+    confidential_id = client.post(
+        "/api/sessions",
+        headers=auth(token),
+        json={"title": "Legacy confidential", "security_mode": "confidential"},
+    ).json()["id"]
+    policy_now = utcnow()
+
+    with app.state.database.session_factory() as db:
+        secure = db.get(ChatSession, secure_id)
+        confidential = db.get(ChatSession, confidential_id)
+        assert secure is not None and confidential is not None
+        secure.created_at = policy_now - timedelta(days=20)
+        secure.retention_expires_at = None
+        confidential.created_at = policy_now - timedelta(days=8)
+        confidential.retention_expires_at = None
+        db.commit()
+
+        result = enforce_retention(
+            db,
+            now=policy_now,
+            batch_size=1,
+            secure_retention_days=30,
+            confidential_retention_days=7,
+        )
+
+        assert result.retention_deadlines_backfilled == 2
+        assert result.expired_sessions == 1
+        assert db.get(ChatSession, confidential_id) is None
+        retained = db.get(ChatSession, secure_id)
+        assert retained is not None
+        assert retained.retention_expires_at == retained.created_at + timedelta(days=30)
+
+        # A repeat is a no-op: the migration is idempotent even when the
+        # backfill itself had to process more rows than the delete batch size.
+        repeated = enforce_retention(
+            db,
+            now=policy_now,
+            batch_size=1,
+            secure_retention_days=30,
+            confidential_retention_days=7,
+        )
+        assert repeated.retention_deadlines_backfilled == 0
+        assert repeated.expired_sessions == 0
+
+
+def test_retention_dry_run_counts_legacy_null_deadline_without_mutating(
+    client: TestClient, app
+):
+    token = register_and_login(client, "legacy-retention-dry-run")
+    session_id = client.post(
+        "/api/sessions", headers=auth(token), json={"title": "Legacy dry run"}
+    ).json()["id"]
+    policy_now = utcnow()
+    with app.state.database.session_factory() as db:
+        chat_session = db.get(ChatSession, session_id)
+        assert chat_session is not None
+        chat_session.created_at = policy_now - timedelta(days=31)
+        chat_session.retention_expires_at = None
+        db.commit()
+
+        result = enforce_retention(
+            db,
+            now=policy_now,
+            dry_run=True,
+            secure_retention_days=30,
+            confidential_retention_days=7,
+        )
+
+        assert result.dry_run is True
+        assert result.retention_deadlines_backfilled == 1
+        assert result.expired_sessions == 1
+        unchanged = db.get(ChatSession, session_id)
+        assert unchanged is not None
+        assert unchanged.retention_expires_at is None
+
+
 def test_expired_session_is_hidden_and_purged_on_direct_access(client: TestClient, app):
     token = register_and_login(client, "retention-on-access")
     session_id = client.post(
@@ -127,6 +213,28 @@ def test_expired_session_is_hidden_and_purged_on_direct_access(client: TestClien
         chat_session = db.get(ChatSession, session_id)
         assert chat_session is not None
         chat_session.retention_expires_at = chat_session.created_at - timedelta(seconds=1)
+        db.commit()
+
+    listed = client.get("/api/sessions", headers=auth(token))
+    assert listed.status_code == 200
+    assert session_id not in {item["id"] for item in listed.json()}
+    assert client.get(f"/api/sessions/{session_id}", headers=auth(token)).status_code == 404
+
+    with app.state.database.session_factory() as db:
+        assert db.get(ChatSession, session_id) is None
+
+
+def test_null_retention_session_fails_closed_and_is_purged_on_direct_access(
+    client: TestClient, app
+):
+    token = register_and_login(client, "null-retention-on-access")
+    session_id = client.post(
+        "/api/sessions", headers=auth(token), json={"title": "Unknown deadline"}
+    ).json()["id"]
+    with app.state.database.session_factory() as db:
+        chat_session = db.get(ChatSession, session_id)
+        assert chat_session is not None
+        chat_session.retention_expires_at = None
         db.commit()
 
     listed = client.get("/api/sessions", headers=auth(token))

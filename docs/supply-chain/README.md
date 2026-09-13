@@ -22,13 +22,37 @@ This directory documents the controls required by the high-sensitivity deploymen
 
 `docker-compose.yml` and the image-scanning CI job set `REQUIRE_BASE_IMAGE_DIGEST=true`. The Dockerfile therefore rejects a tag-only value in those paths. `docker-compose.local.yml` explicitly disables this guard for local demonstrations so contributors can still use the moving tag without claiming a production-grade build.
 
-The PostgreSQL, Redis and Caddy service images are monitored by Docker Compose Dependabot but are still tag-based. A high-assurance release should separately verify and pin their multi-architecture digests after confirming platform compatibility.
+The base Compose file keeps convenient tags for development. The high-security
+overlay requires verified, immutable `name@sha256:<digest>` references for
+PostgreSQL, Redis, and Caddy as well as the Python base image. Store those four
+references in the matching repository variables so CI validates exactly the
+same class of deployment input used in production: `PYTHON_BASE_IMAGE`,
+`POSTGRES_IMAGE`, `REDIS_IMAGE`, and `CADDY_IMAGE`. A missing or tag-only value
+fails with the variable name before Compose validation begins.
 
 ## CI trust boundaries
 
 Every GitHub Action in `security.yml` is pinned to a full 40-character commit SHA with the reviewed release in a comment. Dependabot may propose a new SHA, but a reviewer must verify that the commit belongs to the expected upstream release before merging it.
 
-The archived Semgrep wrapper action is not used. CI invokes an explicit Semgrep CLI release through `uvx`; changing that version is a security-sensitive dependency update.
+The archived Semgrep wrapper action is not used. CI invokes an explicit Semgrep
+CLI release through `uvx` and scans with the reviewed, repository-local
+`.semgrep.yml`. It never resolves the mutable `auto` ruleset at run time.
+Changing either the CLI version or a local rule is therefore a visible,
+security-sensitive code review. Trivy fails the workflow for every HIGH or
+CRITICAL source/image finding, including findings for which the vendor has not
+yet published a fix; an exception requires a reviewed, time-bounded risk record
+instead of a global `ignore-unfixed` switch.
+
+The `deployment-config` job also runs
+`scripts/validate_high_security_deployment.sh`. It renders the combined Compose
+files without printing them, checks every shell entrypoint, and validates the
+real Caddy policy in the digest-pinned, network-isolated Caddy image. After the
+application image is built, `scripts/verify_high_security_app_runtime.sh`
+executes its production entrypoint in a read-only container with no network and
+asserts that the final process is the unprivileged `app` account, has
+`NoNewPrivs`, has no effective/permitted/inheritable/ambient capabilities, and
+uses owner-only staged secret files. These probes catch failures that a YAML or
+Dockerfile text check cannot detect.
 
 Workflow permissions default to `contents: read`. Only the main-branch attestation job receives `id-token: write`, `attestations: write` and `artifact-metadata: write`. Concurrent runs for the same ref are cancelled, and every job has a time limit.
 
