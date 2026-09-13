@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from datetime import datetime, timezone
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -23,6 +23,17 @@ class Database:
             pool_pre_ping=True,
             connect_args=connect_args,
         )
+        if database_url.startswith("sqlite"):
+            # SQLite does not enforce declared foreign keys unless each
+            # connection opts in. Security-relevant ownership/cascade
+            # guarantees must therefore be enabled at the driver boundary.
+            @event.listens_for(self.engine, "connect")
+            def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA foreign_keys=ON")
+                finally:
+                    cursor.close()
         self.session_factory = sessionmaker(
             bind=self.engine,
             autoflush=False,
@@ -41,6 +52,17 @@ class Database:
         auth_session_columns = {
             column["name"] for column in inspector.get_columns("auth_sessions")
         }
+        chat_session_columns = {
+            column["name"] for column in inspector.get_columns("chat_sessions")
+        }
+        message_columns = {
+            column["name"] for column in inspector.get_columns("secure_messages")
+        }
+        e2ee_envelope_columns = (
+            {column["name"] for column in inspector.get_columns("e2ee_envelopes")}
+            if "e2ee_envelopes" in inspector.get_table_names()
+            else set()
+        )
         with self.engine.begin() as connection:
             # Hash-chain columns for the tamper-evident audit trail.
             if "prev_hash" not in audit_columns:
@@ -65,6 +87,12 @@ class Database:
                 connection.execute(
                     text("ALTER TABLE users ADD COLUMN ai_data_consent BOOLEAN NOT NULL DEFAULT 0")
                 )
+            if "ai_consent_at" not in columns:
+                connection.execute(text("ALTER TABLE users ADD COLUMN ai_consent_at TIMESTAMP"))
+            if "ai_consent_version" not in columns:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN ai_consent_version VARCHAR(32)")
+                )
             if "locked_until" not in columns:
                 connection.execute(text("ALTER TABLE users ADD COLUMN locked_until TIMESTAMP"))
             if "mfa_enabled" not in columns:
@@ -76,6 +104,23 @@ class Database:
             if "mfa_secret_nonce" not in columns:
                 connection.execute(
                     text("ALTER TABLE users ADD COLUMN mfa_secret_nonce VARCHAR(64)")
+                )
+            if "secret_wrapped_dek" not in columns:
+                connection.execute(text("ALTER TABLE users ADD COLUMN secret_wrapped_dek TEXT"))
+            if "secret_kek_uri" not in columns:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN secret_kek_uri VARCHAR(512)")
+                )
+            if "secret_kek_version" not in columns:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN secret_kek_version VARCHAR(128)")
+                )
+            if "secret_crypto_epoch" not in columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN secret_crypto_epoch "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
                 )
             if "mfa_last_counter" not in columns:
                 connection.execute(
@@ -94,6 +139,114 @@ class Database:
                         "WHERE root_issued_at IS NULL"
                     )
                 )
+            if "last_step_up_at" not in auth_session_columns:
+                connection.execute(
+                    text("ALTER TABLE auth_sessions ADD COLUMN last_step_up_at TIMESTAMP")
+                )
+
+            # Conversation security policy and active envelope metadata.
+            if "security_mode" not in chat_session_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE chat_sessions ADD COLUMN security_mode "
+                        "VARCHAR(24) NOT NULL DEFAULT 'secure'"
+                    )
+                )
+            if "data_classification" not in chat_session_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE chat_sessions ADD COLUMN data_classification "
+                        "VARCHAR(32) NOT NULL DEFAULT 'internal'"
+                    )
+                )
+            if "current_crypto_epoch" not in chat_session_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE chat_sessions ADD COLUMN current_crypto_epoch "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
+            if "crypto_suite" not in chat_session_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE chat_sessions ADD COLUMN crypto_suite "
+                        "VARCHAR(32) NOT NULL DEFAULT 'legacy-aes-256-gcm'"
+                    )
+                )
+            if "wrapped_dek" not in chat_session_columns:
+                connection.execute(text("ALTER TABLE chat_sessions ADD COLUMN wrapped_dek TEXT"))
+            if "kek_uri" not in chat_session_columns:
+                connection.execute(
+                    text("ALTER TABLE chat_sessions ADD COLUMN kek_uri VARCHAR(512)")
+                )
+            if "kek_version" not in chat_session_columns:
+                connection.execute(
+                    text("ALTER TABLE chat_sessions ADD COLUMN kek_version VARCHAR(128)")
+                )
+            if "retention_expires_at" not in chat_session_columns:
+                connection.execute(
+                    text("ALTER TABLE chat_sessions ADD COLUMN retention_expires_at TIMESTAMP")
+                )
+
+            # Stronger, message-specific AAD for new envelope-encrypted rows.
+            if "message_uuid" not in message_columns:
+                connection.execute(
+                    text("ALTER TABLE secure_messages ADD COLUMN message_uuid VARCHAR(64)")
+                )
+                connection.execute(
+                    text(
+                        "UPDATE secure_messages SET message_uuid = "
+                        "'legacy-' || CAST(id AS VARCHAR) WHERE message_uuid IS NULL"
+                    )
+                )
+            if "message_index" not in message_columns:
+                connection.execute(
+                    text("ALTER TABLE secure_messages ADD COLUMN message_index INTEGER")
+                )
+                connection.execute(
+                    text(
+                        "UPDATE secure_messages SET message_index = id "
+                        "WHERE message_index IS NULL"
+                    )
+                )
+            if "crypto_epoch" not in message_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE secure_messages ADD COLUMN crypto_epoch "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
+            if "encryption_scheme" not in message_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE secure_messages ADD COLUMN encryption_scheme "
+                        "VARCHAR(24) NOT NULL DEFAULT 'legacy-v1'"
+                    )
+                )
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_secure_message_index "
+                    "ON secure_messages (session_id, message_index)"
+                )
+            )
+            if e2ee_envelope_columns and "replay_key" not in e2ee_envelope_columns:
+                connection.execute(
+                    text("ALTER TABLE e2ee_envelopes ADD COLUMN replay_key VARCHAR(96)")
+                )
+                # Existing development rows predate the public E2EE API. Bind a
+                # deterministic legacy value before creating the unique index.
+                connection.execute(
+                    text(
+                        "UPDATE e2ee_envelopes SET replay_key = "
+                        "'legacy:' || CAST(id AS VARCHAR) WHERE replay_key IS NULL"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS uq_e2ee_replay_guard_v2 "
+                        "ON e2ee_envelopes (replay_key)"
+                    )
+                )
 
     def assert_schema_ready(self) -> None:
         """Fail closed when the runtime account sees an incomplete schema.
@@ -107,6 +260,43 @@ class Database:
         if missing:
             raise RuntimeError(
                 "Database schema chưa được migrate; thiếu bảng: " + ", ".join(missing)
+            )
+        required_columns = {
+            "users": {
+                "ai_consent_at",
+                "ai_consent_version",
+                "secret_wrapped_dek",
+                "secret_kek_uri",
+                "secret_kek_version",
+                "secret_crypto_epoch",
+            },
+            "auth_sessions": {"last_step_up_at"},
+            "chat_sessions": {
+                "security_mode",
+                "data_classification",
+                "current_crypto_epoch",
+                "wrapped_dek",
+                "kek_uri",
+                "kek_version",
+            },
+            "secure_messages": {
+                "message_uuid",
+                "message_index",
+                "crypto_epoch",
+                "encryption_scheme",
+            },
+            "e2ee_envelopes": {"replay_key"},
+        }
+        incomplete: list[str] = []
+        inspector = inspect(self.engine)
+        for table, expected in required_columns.items():
+            present = {column["name"] for column in inspector.get_columns(table)}
+            missing_columns = sorted(expected - present)
+            if missing_columns:
+                incomplete.append(f"{table}({', '.join(missing_columns)})")
+        if incomplete:
+            raise RuntimeError(
+                "Database schema chưa được migrate; thiếu cột: " + "; ".join(incomplete)
             )
 
     def apply_postgres_least_privilege(self) -> None:
@@ -130,9 +320,12 @@ class Database:
             "GRANT USAGE, SELECT ON SEQUENCES TO scap_app",
             "REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_events FROM scap_app",
             "GRANT SELECT, INSERT ON TABLE audit_events TO scap_app",
+            "REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_checkpoints FROM scap_app",
+            "GRANT SELECT, INSERT ON TABLE audit_checkpoints TO scap_app",
             "GRANT CONNECT ON DATABASE " + quoted_db + " TO scap_auditor",
             "GRANT USAGE ON SCHEMA public TO scap_auditor",
             "GRANT SELECT ON TABLE audit_events TO scap_auditor",
+            "GRANT SELECT ON TABLE audit_checkpoints TO scap_auditor",
         )
         with self.engine.begin() as connection:
             for statement in statements:

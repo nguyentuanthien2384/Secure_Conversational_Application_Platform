@@ -99,6 +99,27 @@ def test_production_rejects_database_owner_account(monkeypatch):
         Settings.from_env()
 
 
+def test_high_profile_rejects_mutable_infrastructure_images(monkeypatch):
+    _set_production_env(monkeypatch)
+    values = {
+        "SECURITY_PROFILE": "high",
+        "KEY_PROVIDER": "vault",
+        "MASTER_ENCRYPTION_KEY": "",
+        "MASTER_ENCRYPTION_KEYS": "",
+        "VAULT_ADDR": "https://vault.example.test",
+        "VAULT_TOKEN_FILE": "/run/secrets/vault_token",
+        "BASE_IMAGE": "python:3.12-slim",
+        "POSTGRES_IMAGE": "postgres:17-alpine",
+        "REDIS_IMAGE": "redis:7.4-alpine",
+        "CADDY_IMAGE": "caddy:2.10-alpine",
+        "SEED_DEMO_DATA": "false",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match="BASE_IMAGE"):
+        Settings.from_env()
+
+
 def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
     local_compose = Path("docker-compose.local.yml").read_text(encoding="utf-8")
@@ -109,6 +130,9 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     assert "service_completed_successfully" in compose
     assert "change-me-app-password" not in sql
     assert "Expires: {$SECURITY_TXT_EXPIRES}" in caddy
+    assert "trusted_proxies static private_ranges" not in caddy
+    assert "log_skip @export_download" in caddy
+    assert "request>headers>Authorization delete" in caddy
     # Chỉ mô hình sau Caddy mới tin X-Forwarded-For. Khi demo local app được
     # publish trực tiếp, Uvicorn phải giữ IP socket thật để rate-limit/audit.
     assert '"--proxy-headers"' in compose

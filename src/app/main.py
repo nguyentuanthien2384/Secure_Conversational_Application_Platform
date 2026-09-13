@@ -1,8 +1,13 @@
+import hashlib
+import json
 import logging
 import re
+import secrets
 import uuid
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated
 
 import gradio as gr
@@ -10,7 +15,7 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -18,8 +23,22 @@ from sqlalchemy.orm import Session
 
 from src.app.audit import client_ip, record_audit
 from src.app.audit_chain import derive_audit_key, verify_chain
+from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
 from src.app.config import Settings
 from src.app.db import Database, utcnow
+from src.app.e2ee import (
+    PROTOCOL_DOUBLE_RATCHET,
+    PROTOCOL_MLS,
+    E2EEValidationError,
+    decode_base64_strict,
+    encode_base64url,
+    safety_fingerprint,
+    validate_opaque_envelope,
+    verify_device_approval,
+    verify_device_possession,
+    verify_ed25519_signature,
+)
+from src.app.envelope import EnvelopeCryptoService, EnvelopeEncryptionError
 from src.app.gradio_ui import CUSTOM_CSS, THEME, build_ui
 from src.app.ids import (
     DECOY_PATHS,
@@ -31,20 +50,41 @@ from src.app.ids import (
     run_safe_detection_verification,
     scan_text,
 )
+from src.app.key_management import (
+    AwsKmsKeyProvider,
+    GcpKmsKeyProvider,
+    KeyProvider,
+    LocalAesKeyProvider,
+    VaultTransitKeyProvider,
+)
 from src.app.models import (
     AuditEvent,
     AuthSession,
     ChatSession,
+    ConversationMember,
+    E2eeDevice,
+    E2eeDeviceChallenge,
+    E2eeEnvelope,
+    E2eePreKey,
     MfaRecoveryCode,
     RevokedToken,
     SecureMessage,
     User,
 )
+from src.app.retention import enforce_retention
 from src.app.schemas import (
     AdminCreateUser,
     AIConsentUpdate,
     AuditResponse,
     AuthSessionResponse,
+    E2eeChallengeResponse,
+    E2eeDeviceRegisterRequest,
+    E2eeDeviceResponse,
+    E2eeEnvelopeResponse,
+    E2eeEnvelopeSend,
+    E2eeMemberUpdate,
+    E2eePreKeyBundleResponse,
+    ExportTicketResponse,
     LoginRequest,
     MessageResponse,
     MessageSend,
@@ -60,7 +100,10 @@ from src.app.schemas import (
     SecurityAlertResponse,
     SessionCreate,
     SessionResponse,
+    SessionSecurityUpdate,
     SessionUpdate,
+    StepUpRequest,
+    StepUpResponse,
     TokenResponse,
     UserResponse,
     UserRoleUpdate,
@@ -76,13 +119,59 @@ from src.app.security import (
     TotpService,
     generate_recovery_code,
 )
-from src.app.services import AIProviderError, AIService, ChatService
+from src.app.services import AIProviderError, AIService, ChatService, DLPPolicyViolation
 from src.app.siem import configure_siem_logging, emit_security_event
 
 logger = logging.getLogger("secure_chat")
 
 bearer = HTTPBearer(auto_error=False)
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _build_crypto_services(
+    settings: Settings,
+) -> tuple[CryptoService | None, KeyProvider, EnvelopeCryptoService]:
+    """Build legacy decrypt support plus the selected external/local KEK provider."""
+    encoded_keyring = dict(settings.master_encryption_keys)
+    if settings.master_encryption_key:
+        encoded_keyring.setdefault(1, settings.master_encryption_key)
+    active_version = settings.active_key_version or (max(encoded_keyring) if encoded_keyring else 1)
+
+    legacy_crypto = (
+        CryptoService(keyring=encoded_keyring, active_key_version=active_version)
+        if encoded_keyring
+        else None
+    )
+    if settings.key_provider == "local":
+        if not encoded_keyring:
+            raise RuntimeError("Local key provider requires a configured keyring.")
+        provider: KeyProvider = LocalAesKeyProvider.from_base64_keyring(
+            encoded_keyring,
+            active_version=active_version,
+        )
+    elif settings.key_provider == "vault":
+        provider = VaultTransitKeyProvider(
+            address=settings.vault_addr,
+            token_file=settings.vault_token_file,
+            key_name=settings.vault_transit_key,
+            mount=settings.vault_transit_mount,
+            namespace=settings.vault_namespace,
+            allow_insecure_http=settings.vault_allow_insecure_http,
+        )
+    elif settings.key_provider == "aws-kms":
+        provider = AwsKmsKeyProvider(
+            key_id=settings.aws_kms_key_id,
+            region=settings.aws_region,
+        )
+    else:
+        provider = GcpKmsKeyProvider(key_name=settings.gcp_kms_key_name)
+
+    envelope_crypto = EnvelopeCryptoService(
+        provider,
+        legacy_crypto=legacy_crypto,
+        cache_ttl_seconds=settings.dek_cache_seconds,
+    )
+    return legacy_crypto, provider, envelope_crypto
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -105,11 +194,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     password_service = PasswordService()
     breach_checker = PwnedPasswordChecker(enabled=settings.password_breach_check)
     token_service = TokenService(settings.secret_key, settings.access_token_minutes)
-    crypto_service = CryptoService(
-        settings.master_encryption_key,
-        keyring=dict(settings.master_encryption_keys) or None,
-        active_key_version=settings.active_key_version,
-    )
+    crypto_service, key_provider, envelope_crypto_service = _build_crypto_services(settings)
     limiter_type = RedisSlidingWindowRateLimiter if settings.redis_url else SlidingWindowRateLimiter
     limiter_args = (settings.redis_url,) if settings.redis_url else ()
     login_limiter = limiter_type(*limiter_args)
@@ -119,7 +204,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     password_change_limiter = limiter_type(*limiter_args)
     refresh_limiter = limiter_type(*limiter_args)
     totp_service = TotpService()
-    chat_service = ChatService(crypto_service, AIService(settings))
+    chat_service = ChatService(envelope_crypto_service, AIService(settings))
     # Structured JSON security log on stdout for SIEM ingestion (Bài 7 §SIEM).
     configure_siem_logging(enabled=settings.siem_json_logs)
     # Application-layer IDS/IPS state (Bài 7 §7.3).
@@ -130,6 +215,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # HMAC key for the tamper-evident audit chain, derived from the app secret
     # with a distinct label so it is never the same key that signs JWTs.
     audit_key = derive_audit_key(settings.secret_key) if settings.audit_chain_enabled else None
+    audit_checkpoint_service = (
+        AuditCheckpointService(
+            settings.secret_key,
+            interval=settings.audit_checkpoint_interval,
+            endpoint=settings.audit_worm_endpoint,
+            token_file=settings.audit_worm_token_file,
+        )
+        if settings.audit_chain_enabled
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -139,6 +234,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database.assert_schema_ready()
         else:
             database.create_all()
+        if settings.retention_sweep_on_startup:
+            with database.session_factory() as retention_db:
+                retention_result = enforce_retention(retention_db)
+            envelope_crypto_service.clear_cache()
+            if retention_result.expired_sessions:
+                emit_security_event(
+                    "retention.sweep",
+                    details=retention_result.as_dict(),
+                )
         if settings.bootstrap_admin_username and settings.bootstrap_admin_password:
             with database.session_factory() as db:
                 username = settings.bootstrap_admin_username.strip().lower()
@@ -158,6 +262,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             # Local demo cần có tín hiệu gần hiện tại để dashboard IDS (mặc
             # định quan sát 60 phút) không rỗng sau khi máy đã chạy lâu.
+            if crypto_service is None:
+                raise RuntimeError("Legacy demo seed requires an explicit migration key.")
             seed_demo_data(
                 database,
                 password_service,
@@ -166,6 +272,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 log=logger.info,
             )
         yield
+        envelope_crypto_service.clear_cache()
         database.engine.dispose()
 
     app = FastAPI(
@@ -181,10 +288,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.password_service = password_service
     app.state.token_service = token_service
     app.state.crypto_service = crypto_service
+    app.state.key_provider = key_provider
+    app.state.envelope_crypto_service = envelope_crypto_service
     app.state.totp_service = totp_service
     app.state.chat_service = chat_service
     app.state.intrusion_state = intrusion_state
     app.state.audit_key = audit_key
+    app.state.audit_checkpoint_service = audit_checkpoint_service
 
     # Reject requests whose Host header is not explicitly allowed. This blocks
     # Host-header injection and DNS-rebinding attacks. Enabled whenever
@@ -307,7 +417,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 "mitre_technique": detection.mitre_technique,
                                 "path": detection.path,
                                 "method": detection.method,
-                                "evidence": detection.evidence,
+                                # Evidence can be attacker-controlled and may
+                                # contain credentials. Keep only a correlation
+                                # hash in the long-lived audit/SIEM stream.
+                                "evidence_sha256": hashlib.sha256(
+                                    detection.evidence.encode("utf-8", errors="replace")
+                                ).hexdigest()[:16],
                             },
                         )
                     if newly_blocked:
@@ -338,6 +453,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
         response.headers["Cache-Control"] = "no-store"
         path = request.url.path
         if path in {"/docs", "/redoc"}:
@@ -372,6 +490,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
             )
         response.headers["Content-Security-Policy"] = csp
+        if settings.csp_report_only and not path.startswith("/api"):
+            # Observe whether the bundled Gradio release can run without inline
+            # script before promoting this stricter policy to enforcement.
+            report_policy = csp.replace(" 'unsafe-inline'", "").replace(
+                " 'unsafe-eval'", ""
+            )
+            response.headers["Content-Security-Policy-Report-Only"] = report_policy
         if settings.environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
@@ -428,11 +553,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def admin_user(user: Annotated[User, Depends(current_user)]) -> User:
         if user.role != "admin":
             raise HTTPException(status_code=403, detail="Không đủ quyền truy cập.")
+        if settings.security_profile == "high" and not user.mfa_enabled:
+            raise HTTPException(status_code=403, detail="Tài khoản quản trị bắt buộc bật MFA.")
         return user
 
     def moderator_or_admin(user: Annotated[User, Depends(current_user)]) -> User:
         if user.role not in ("moderator", "admin"):
             raise HTTPException(status_code=403, detail="Không đủ quyền truy cập.")
+        if settings.security_profile == "high" and not user.mfa_enabled:
+            raise HTTPException(status_code=403, detail="Tài khoản đặc quyền bắt buộc bật MFA.")
         return user
 
     def require_owned_session(
@@ -456,6 +585,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
         return chat_session
 
+    def require_private_member_session(
+        session_id: str,
+        user: User,
+        db: Session,
+        request: Request,
+    ) -> tuple[ChatSession, ConversationMember]:
+        """Authorize one active member without revealing whether another session exists."""
+        chat_session = db.get(ChatSession, session_id)
+        member = db.scalar(
+            select(ConversationMember).where(
+                ConversationMember.session_id == session_id,
+                ConversationMember.user_id == user.id,
+                ConversationMember.removed_at.is_(None),
+            )
+        )
+        if chat_session is None or chat_session.security_mode != "private_e2ee" or member is None:
+            record_audit(
+                db,
+                request,
+                "authorization.denied",
+                actor_id=user.id,
+                target_type="e2ee_session",
+                target_id=session_id,
+                outcome="denied",
+            )
+            raise HTTPException(status_code=404, detail="Không tìm thấy phiên E2EE.")
+        return chat_session, member
+
     # Gradio UI is mounted after all API routes are registered (see below).
 
     def revoke_all_auth_sessions(db: Session, user: User) -> None:
@@ -477,6 +634,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ip: str,
         *,
         root_issued_at: datetime | None = None,
+        last_step_up_at: datetime | None = None,
+        mark_step_up: bool = False,
     ) -> str:
         """Mint an access token and persist its server-side AuthSession record.
 
@@ -498,15 +657,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ip_address=ip,
                 user_agent=request.headers.get("user-agent", "")[:256] or None,
                 root_issued_at=root_issued_at or issued_at,
+                last_step_up_at=issued_at if mark_step_up else last_step_up_at,
             )
         )
         return token
 
+    def require_recent_step_up(
+        credentials: HTTPAuthorizationCredentials,
+        user: User,
+        db: Session,
+    ) -> AuthSession:
+        try:
+            payload = token_service.decode(credentials.credentials)
+        except jwt.PyJWTError as exc:
+            raise HTTPException(status_code=401, detail="Token không hợp lệ.") from exc
+        auth_session = db.get(AuthSession, str(payload["jti"]))
+        if auth_session is None or auth_session.user_id != user.id:
+            raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
+        verified_at = auth_session.last_step_up_at
+        if verified_at is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Cần xác thực lại trước thao tác nhạy cảm.",
+                headers={"X-Step-Up-Required": "true"},
+            )
+        if verified_at.tzinfo is None:
+            verified_at = verified_at.replace(tzinfo=timezone.utc)
+        if utcnow() - verified_at > timedelta(minutes=settings.step_up_minutes):
+            raise HTTPException(
+                status_code=403,
+                detail="Xác thực lại đã hết hạn; vui lòng xác minh mật khẩu/MFA.",
+                headers={"X-Step-Up-Required": "true"},
+            )
+        return auth_session
+
     def load_mfa_secret(user: User) -> str | None:
         if not user.mfa_secret_ciphertext or not user.mfa_secret_nonce:
             return None
-        return crypto_service.decrypt_secret(
-            user.mfa_secret_ciphertext, user.mfa_secret_nonce, context=f"mfa:{user.id}"
+        return envelope_crypto_service.decrypt_user_secret(
+            user,
+            ciphertext_b64=user.mfa_secret_ciphertext,
+            nonce_b64=user.mfa_secret_nonce,
+            field=f"mfa:{user.id}",
         )
 
     def consume_recovery_code(db: Session, user: User, candidate: str) -> bool:
@@ -685,7 +877,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expires_in=settings.mfa_challenge_minutes * 60,
             )
 
-        token = issue_access_session(db, request, user, ip)
+        token = issue_access_session(db, request, user, ip, mark_step_up=True)
         db.commit()
         record_audit(
             db, request, "auth.login", actor_id=user.id, target_type="user", target_id=user.id
@@ -787,7 +979,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 reason="mfa_challenge_used",
             )
         )
-        token = issue_access_session(db, request, user, ip)
+        token = issue_access_session(db, request, user, ip, mark_step_up=True)
         db.commit()
         record_audit(
             db,
@@ -803,13 +995,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/auth/mfa/enroll", response_model=MfaEnrollResponse)
     def mfa_enroll(
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, user, db)
         if user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA đã được bật cho tài khoản này.")
         secret = totp_service.generate_secret()
-        ciphertext, nonce = crypto_service.encrypt_secret(secret, context=f"mfa:{user.id}")
+        ciphertext, nonce = envelope_crypto_service.encrypt_user_secret(
+            user,
+            plaintext=secret,
+            field=f"mfa:{user.id}",
+        )
         # Store as pending (mfa_enabled stays False) until a valid code proves the
         # user copied the seed correctly into their authenticator app.
         user.mfa_secret_ciphertext = ciphertext
@@ -927,6 +1125,79 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def me(user: Annotated[User, Depends(current_user)]):
         return user
 
+    @app.post("/api/auth/step-up", response_model=StepUpResponse)
+    def step_up_authentication(
+        payload: StepUpRequest,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        """Re-prove password and, when enabled, MFA for sensitive operations."""
+        allowed, retry_after = password_change_limiter.allow(
+            f"step-up:{user.id}",
+            settings.password_change_max_attempts,
+            settings.password_change_window_seconds,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Xác thực lại quá nhiều lần.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        valid = password_service.verify(user.password_hash, payload.password)
+        matched_counter: int | None = None
+        used_recovery = False
+        if valid and user.mfa_enabled:
+            secret = load_mfa_secret(user)
+            if secret is None or not payload.code:
+                valid = False
+            else:
+                matched_counter = totp_service.verify(
+                    secret,
+                    payload.code,
+                    after_counter=user.mfa_last_counter,
+                )
+                used_recovery = matched_counter is None and consume_recovery_code(
+                    db, user, payload.code
+                )
+                valid = matched_counter is not None or used_recovery
+        if not valid:
+            db.commit()
+            record_audit(
+                db,
+                request,
+                "auth.step_up",
+                actor_id=user.id,
+                outcome="failure",
+                details={"reason": "invalid_credentials"},
+            )
+            raise HTTPException(status_code=401, detail="Không xác thực được yêu cầu.")
+
+        token_payload = token_service.decode(credentials.credentials)
+        auth_session = db.get(AuthSession, str(token_payload["jti"]))
+        if auth_session is None or auth_session.user_id != user.id:
+            raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
+        if matched_counter is not None:
+            user.mfa_last_counter = matched_counter
+        verified_at = utcnow()
+        auth_session.last_step_up_at = verified_at
+        db.commit()
+        password_change_limiter.reset(f"step-up:{user.id}")
+        record_audit(
+            db,
+            request,
+            "auth.step_up",
+            actor_id=user.id,
+            target_type="auth_session",
+            target_id=auth_session.jti,
+            details={"method": "recovery_code" if used_recovery else "password_mfa"},
+        )
+        return StepUpResponse(
+            verified_at=verified_at,
+            valid_for_seconds=settings.step_up_minutes * 60,
+        )
+
     @app.patch("/api/auth/ai-consent", response_model=UserResponse)
     def update_ai_consent(
         payload: AIConsentUpdate,
@@ -934,8 +1205,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        if user.ai_data_consent != payload.ai_data_consent:
+        consent_version_changed = (
+            payload.ai_data_consent
+            and user.ai_consent_version != settings.ai_consent_version
+        )
+        if user.ai_data_consent != payload.ai_data_consent or consent_version_changed:
             user.ai_data_consent = payload.ai_data_consent
+            user.ai_consent_at = utcnow() if payload.ai_data_consent else None
+            user.ai_consent_version = (
+                settings.ai_consent_version if payload.ai_data_consent else None
+            )
             db.commit()
             db.refresh(user)
             record_audit(
@@ -945,7 +1224,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 actor_id=user.id,
                 target_type="user",
                 target_id=user.id,
-                details={"consented": payload.ai_data_consent},
+                details={
+                    "consented": payload.ai_data_consent,
+                    "policy_version": settings.ai_consent_version,
+                },
             )
         return user
 
@@ -1041,7 +1323,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     ),
                 )
 
-        token = issue_access_session(db, request, user, ip, root_issued_at=root_issued_at)
+        token = issue_access_session(
+            db,
+            request,
+            user,
+            ip,
+            root_issued_at=root_issued_at,
+            last_step_up_at=old_session.last_step_up_at if old_session is not None else None,
+        )
         # Thu hồi token cũ SAU khi đã cấp token mới, trong cùng transaction.
         db.add(
             RevokedToken(
@@ -1226,6 +1515,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        _, title_findings = chat_service.ai.redact_with_report(payload.title)
+        if title_findings:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "sensitive_metadata",
+                    "message": "Tiêu đề hội thoại không được chứa bí mật hoặc dữ liệu định danh.",
+                    "categories": title_findings,
+                },
+            )
+        if (
+            settings.security_profile == "high"
+            and payload.security_mode in {"confidential", "private_e2ee"}
+            and not user.mfa_enabled
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Chế độ hội thoại nhạy cảm bắt buộc tài khoản đã bật MFA.",
+            )
         # Cap the number of sessions per user so a single account cannot exhaust
         # database/storage resources by creating unlimited sessions.
         session_count = (
@@ -1247,8 +1555,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=409,
                 detail=f"Đã đạt giới hạn {settings.max_sessions_per_user} phiên hội thoại. Vui lòng xóa bớt phiên cũ.",
             )
-        row = ChatSession(owner_id=user.id, title=payload.title)
+        retention_days = (
+            settings.confidential_retention_days
+            if payload.security_mode in {"confidential", "private_e2ee"}
+            else settings.secure_retention_days
+        )
+        row = ChatSession(
+            owner_id=user.id,
+            title=payload.title,
+            security_mode=payload.security_mode,
+            data_classification=payload.data_classification,
+            retention_expires_at=utcnow() + timedelta(days=retention_days),
+            current_crypto_epoch=1 if payload.security_mode == "private_e2ee" else 0,
+            crypto_suite=(
+                "Double-Ratchet/MLS-client"
+                if payload.security_mode == "private_e2ee"
+                else "AES-256-GCM"
+            ),
+        )
         db.add(row)
+        db.flush()
+        if row.security_mode == "private_e2ee":
+            db.add(
+                ConversationMember(
+                    session_id=row.id,
+                    user_id=user.id,
+                    role="owner",
+                    joined_epoch=1,
+                )
+            )
+        else:
+            try:
+                envelope_crypto_service.ensure_session_key(db, row)
+            except EnvelopeEncryptionError as exc:
+                db.rollback()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Không thể khởi tạo khóa hội thoại an toàn.",
+                ) from exc
         db.commit()
         db.refresh(row)
         record_audit(
@@ -1258,6 +1602,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             actor_id=user.id,
             target_type="chat_session",
             target_id=row.id,
+            details={
+                "security_mode": row.security_mode,
+                "data_classification": row.data_classification,
+            },
         )
         return row
 
@@ -1291,6 +1639,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        _, title_findings = chat_service.ai.redact_with_report(payload.title)
+        if title_findings:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "sensitive_metadata",
+                    "message": "Tiêu đề hội thoại không được chứa bí mật hoặc dữ liệu định danh.",
+                    "categories": title_findings,
+                },
+            )
         row = require_owned_session(session_id, user, db, request)
         row.title = payload.title
         row.updated_at = utcnow()
@@ -1303,7 +1661,84 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             actor_id=user.id,
             target_type="chat_session",
             target_id=session_id,
-            details={"new_title": payload.title},
+            # Audit is long-lived and externally anchored; never duplicate
+            # user-controlled conversation metadata into it.
+            details={"title_length": len(payload.title)},
+        )
+        return row
+
+    @app.patch("/api/sessions/{session_id}/security", response_model=SessionResponse)
+    def update_session_security(
+        session_id: str,
+        payload: SessionSecurityUpdate,
+        request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        require_recent_step_up(credentials, user, db)
+        row = require_owned_session(session_id, user, db, request)
+        has_messages = db.scalar(
+            select(SecureMessage.id)
+            .where(SecureMessage.session_id == row.id)
+            .limit(1)
+        )
+        has_e2ee = db.scalar(
+            select(E2eeEnvelope.id).where(E2eeEnvelope.session_id == row.id).limit(1)
+        )
+        mode_changed = row.security_mode != payload.security_mode
+        if mode_changed and (has_messages is not None or has_e2ee is not None):
+            raise HTTPException(
+                status_code=409,
+                detail="Không thể đổi trust boundary sau khi hội thoại đã có dữ liệu.",
+            )
+        if mode_changed and payload.security_mode == "private_e2ee":
+            for key_epoch in list(row.key_epochs):
+                db.delete(key_epoch)
+            row.wrapped_dek = None
+            row.kek_uri = None
+            row.kek_version = None
+            row.current_crypto_epoch = 1
+            row.crypto_suite = "Double-Ratchet/MLS-client"
+            if not any(member.user_id == user.id for member in row.members):
+                db.add(
+                    ConversationMember(
+                        session_id=row.id,
+                        user_id=user.id,
+                        role="owner",
+                        joined_epoch=1,
+                    )
+                )
+        elif mode_changed:
+            for member in list(row.members):
+                db.delete(member)
+            row.current_crypto_epoch = 0
+            row.crypto_suite = "AES-256-GCM"
+            row.security_mode = payload.security_mode
+            envelope_crypto_service.ensure_session_key(db, row)
+
+        row.security_mode = payload.security_mode
+        row.data_classification = payload.data_classification
+        retention_days = (
+            settings.confidential_retention_days
+            if row.security_mode in {"confidential", "private_e2ee"}
+            else settings.secure_retention_days
+        )
+        row.retention_expires_at = utcnow() + timedelta(days=retention_days)
+        row.updated_at = utcnow()
+        db.commit()
+        db.refresh(row)
+        record_audit(
+            db,
+            request,
+            "chat.session.security_policy",
+            actor_id=user.id,
+            target_type="chat_session",
+            target_id=row.id,
+            details={
+                "security_mode": row.security_mode,
+                "data_classification": row.data_classification,
+            },
         )
         return row
 
@@ -1317,6 +1752,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         row = require_owned_session(session_id, user, db, request)
         db.delete(row)
         db.commit()
+        envelope_crypto_service.clear_cache()
         record_audit(
             db,
             request,
@@ -1327,15 +1763,117 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return Response(status_code=204)
 
+    def stream_session_export(db: Session, row: ChatSession) -> Iterator[bytes]:
+        """Yield a valid JSON export while holding at most one plaintext row.
+
+        No plaintext export is ever written to the server filesystem. Private
+        E2EE sessions export the opaque client ciphertext exactly as stored.
+        """
+        metadata = {
+            "format": "scap-session-export-v2",
+            "session_id": row.id,
+            "title": row.title,
+            "owner_id": row.owner_id,
+            "security_mode": row.security_mode,
+            "data_classification": row.data_classification,
+            "created_at": row.created_at.isoformat(),
+        }
+        prefix = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))[:-1]
+        yield (prefix + ',"messages":[').encode("utf-8")
+        first = True
+        if row.security_mode == "private_e2ee":
+            last_created: datetime | None = None
+            last_id = ""
+            while True:
+                stmt = (
+                    select(E2eeEnvelope)
+                    .where(E2eeEnvelope.session_id == row.id)
+                    .order_by(E2eeEnvelope.created_at.asc(), E2eeEnvelope.id.asc())
+                    .limit(100)
+                )
+                if last_created is not None:
+                    stmt = stmt.where(
+                        (E2eeEnvelope.created_at > last_created)
+                        | (
+                            (E2eeEnvelope.created_at == last_created)
+                            & (E2eeEnvelope.id > last_id)
+                        )
+                    )
+                page = list(db.scalars(stmt))
+                if not page:
+                    break
+                for envelope in page:
+                    item = {
+                        "opaque_e2ee": True,
+                        "id": envelope.id,
+                        "sender_device_id": envelope.sender_device_id,
+                        "recipient_device_id": envelope.recipient_device_id,
+                        "protocol": envelope.protocol,
+                        "message_kind": envelope.message_kind,
+                        "client_message_id": envelope.client_message_id,
+                        "epoch": envelope.group_epoch,
+                        "header": envelope.header_b64,
+                        "ciphertext": envelope.ciphertext_b64,
+                        "created_at": envelope.created_at.isoformat(),
+                    }
+                    chunk = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                    yield (("" if first else ",") + chunk).encode("utf-8")
+                    first = False
+                last_created, last_id = page[-1].created_at, page[-1].id
+        else:
+            last_message_id = 0
+            while True:
+                page = list(
+                    db.scalars(
+                        select(SecureMessage)
+                        .where(
+                            SecureMessage.session_id == row.id,
+                            SecureMessage.id > last_message_id,
+                        )
+                        .order_by(SecureMessage.id.asc())
+                        .limit(100)
+                    )
+                )
+                if not page:
+                    break
+                for message in page:
+                    content = envelope_crypto_service.decrypt_message(db, row, message)
+                    item = {
+                        "role": message.role,
+                        "content": content,
+                        "created_at": message.created_at.isoformat(),
+                    }
+                    chunk = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                    yield (("" if first else ",") + chunk).encode("utf-8")
+                    first = False
+                    # Reduce the lifetime of the plaintext reference before the
+                    # next database page is loaded.
+                    del content
+                last_message_id = page[-1].id
+        yield b"]}"
+
+    def export_response(db: Session, row: ChatSession) -> StreamingResponse:
+        filename = f"scap-export-{row.id}.json"
+        return StreamingResponse(
+            stream_session_export(db, row),
+            media_type="application/json; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            },
+        )
+
     @app.get("/api/sessions/{session_id}/export")
     def export_session_endpoint(
         session_id: str,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, user, db)
         row = require_owned_session(session_id, user, db, request)
-        messages = chat_service.list_messages(db, row)
         record_audit(
             db,
             request,
@@ -1343,21 +1881,87 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             actor_id=user.id,
             target_type="chat_session",
             target_id=session_id,
+            details={"streamed": True, "security_mode": row.security_mode},
         )
-        return {
-            "session_id": row.id,
-            "title": row.title,
-            "owner_id": row.owner_id,
-            "created_at": row.created_at.isoformat(),
-            "messages": [
-                {
-                    "role": m["role"],
-                    "content": m["content"],
-                    "created_at": m["created_at"].isoformat(),
-                }
-                for m in messages
-            ],
-        }
+        return export_response(db, row)
+
+    @app.post(
+        "/api/sessions/{session_id}/export-ticket",
+        response_model=ExportTicketResponse,
+    )
+    def create_export_ticket(
+        session_id: str,
+        request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        """Issue a 60-second one-use browser download capability after step-up."""
+        require_recent_step_up(credentials, user, db)
+        row = require_owned_session(session_id, user, db, request)
+        ticket = token_service.issue_export_ticket(user.id, row.id, seconds=60)
+        claims = token_service.decode_export_ticket(ticket)
+        expires_at = datetime.fromtimestamp(int(claims["exp"]), tz=timezone.utc)
+        record_audit(
+            db,
+            request,
+            "chat.session.export_ticket",
+            actor_id=user.id,
+            target_type="chat_session",
+            target_id=row.id,
+            details={"expires_in_seconds": 60},
+        )
+        return ExportTicketResponse(
+            download_url=f"/api/exports/{ticket}",
+            expires_at=expires_at,
+        )
+
+    @app.get("/api/exports/{ticket}")
+    def consume_export_ticket(
+        ticket: str,
+        request: Request,
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        try:
+            claims = token_service.decode_export_ticket(ticket)
+        except jwt.PyJWTError as exc:
+            raise HTTPException(status_code=404, detail="Vé tải xuống không hợp lệ.") from exc
+        ticket_jti = str(claims["jti"])
+        # Reuse the durable denylist as a one-time-token ledger. A row-level
+        # insert/primary key makes simultaneous redemption fail closed.
+        if db.get(RevokedToken, ticket_jti) is not None:
+            raise HTTPException(status_code=410, detail="Vé tải xuống đã được sử dụng.")
+        row = db.scalar(
+            select(ChatSession).where(
+                ChatSession.id == str(claims["sid"]),
+                ChatSession.owner_id == str(claims["sub"]),
+            )
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy dữ liệu xuất.")
+        db.add(
+            RevokedToken(
+                jti=ticket_jti,
+                user_id=str(claims["sub"]),
+                expires_at=datetime.fromtimestamp(int(claims["exp"]), tz=timezone.utc),
+                reason="export_consumed",
+            )
+        )
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=410, detail="Vé tải xuống đã được sử dụng.") from exc
+        record_audit(
+            db,
+            request,
+            "chat.session.export_download",
+            actor_id=str(claims["sub"]),
+            target_type="chat_session",
+            target_id=row.id,
+            details={"streamed": True},
+        )
+        return export_response(db, row)
 
     @app.get("/api/sessions/{session_id}/messages", response_model=list[MessageResponse])
     def get_messages_endpoint(
@@ -1368,7 +1972,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         query: Annotated[str | None, Query(min_length=1, max_length=120)] = None,
     ):
         row = require_owned_session(session_id, user, db, request)
-        return chat_service.list_messages(db, row, query=query)
+        try:
+            return chat_service.list_messages(db, row, query=query)
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Dùng API bản mã E2EE cho phiên Private E2EE.",
+            ) from exc
 
     @app.get("/api/sessions/{session_id}/ciphertexts", response_model=list[RawMessageResponse])
     def get_ciphertexts_endpoint(
@@ -1393,6 +2003,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 + ("…" if len(item.ciphertext) > 72 else ""),
                 nonce=item.nonce,
                 key_version=item.key_version,
+                crypto_epoch=item.crypto_epoch,
+                encryption_scheme=item.encryption_scheme,
                 created_at=item.created_at,
             )
             for item in messages
@@ -1409,6 +2021,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         row = require_owned_session(session_id, user, db, request)
+        # Serialize index allocation and quota checks for a conversation. The
+        # UNIQUE(session_id, message_index) constraint remains the final replay
+        # barrier if two application instances race.
+        db.refresh(row, with_for_update=True)
+        existing_messages = (
+            db.scalar(
+                select(func.count())
+                .select_from(SecureMessage)
+                .where(SecureMessage.session_id == row.id)
+            )
+            or 0
+        )
+        if existing_messages + 2 > settings.max_messages_per_session:
+            record_audit(
+                db,
+                request,
+                "chat.message.send",
+                actor_id=user.id,
+                target_type="chat_session",
+                target_id=session_id,
+                outcome="blocked",
+                details={
+                    "reason": "message_quota",
+                    "limit": settings.max_messages_per_session,
+                },
+            )
+            raise HTTPException(status_code=409, detail="Phiên đã đạt giới hạn tin nhắn.")
         limiter_key = f"message:{user.id}"
         allowed, retry_after = message_limiter.allow(
             limiter_key,
@@ -1437,8 +2076,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 db,
                 row,
                 payload.content,
-                allow_external_ai=user.ai_data_consent,
+                allow_external_ai=(
+                    user.ai_data_consent
+                    and user.ai_consent_version == settings.ai_consent_version
+                ),
+                confirm_external_ai=payload.confirm_external_ai,
+                consent_since=user.ai_consent_at,
             )
+        except DLPPolicyViolation as exc:
+            record_audit(
+                db,
+                request,
+                "dlp.policy",
+                actor_id=user.id,
+                target_type="chat_session",
+                target_id=session_id,
+                outcome="blocked" if exc.action.value != "confirm" else "denied",
+                details={
+                    "action": exc.action.value,
+                    "categories": list(exc.categories),
+                },
+            )
+            raise HTTPException(
+                status_code=409 if exc.action.value == "confirm" else 422,
+                detail={
+                    "code": f"dlp_{exc.action.value}",
+                    "message": str(exc),
+                    "categories": list(exc.categories),
+                },
+            ) from exc
         except PermissionError as exc:
             record_audit(
                 db,
@@ -1448,7 +2114,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 target_type="chat_session",
                 target_id=session_id,
                 outcome="denied",
-                details={"reason": "external_ai_consent_required"},
+                details={"reason": "policy_or_consent_required"},
             )
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except AIProviderError as exc:
@@ -1527,6 +2193,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         results: list[dict] = []
         for chat_session in sessions:
+            if chat_session.security_mode == "private_e2ee":
+                # The server has no plaintext index for E2EE conversations.
+                continue
             for message in chat_service.list_messages(db, chat_session, query=q):
                 results.append(
                     {
@@ -1550,6 +2219,725 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             details={"query_length": len(q), "results": len(results)},
         )
         return results
+
+    # ------------------------------------------------------------------
+    # Private E2EE control plane. The server stores public identity material,
+    # one-time prekeys, membership metadata and opaque ciphertext only. Double
+    # Ratchet / RFC 9420 MLS state and every private key remain in an audited
+    # client implementation.
+
+    @app.post("/api/e2ee/devices/challenge", response_model=E2eeChallengeResponse)
+    def create_e2ee_device_challenge(
+        request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        require_recent_step_up(credentials, user, db)
+        raw_challenge = secrets.token_urlsafe(32)
+        challenge_bytes = decode_base64_strict(
+            raw_challenge,
+            field="challenge",
+            min_bytes=32,
+            max_bytes=32,
+        )
+        expires_at = utcnow() + timedelta(minutes=5)
+        challenge = E2eeDeviceChallenge(
+            user_id=user.id,
+            challenge_hash=hashlib.sha256(challenge_bytes).hexdigest(),
+            expires_at=expires_at,
+        )
+        db.add(challenge)
+        db.commit()
+        db.refresh(challenge)
+        record_audit(
+            db,
+            request,
+            "e2ee.device.challenge",
+            actor_id=user.id,
+            target_type="e2ee_challenge",
+            target_id=challenge.id,
+            details={"expires_in_seconds": 300},
+        )
+        return E2eeChallengeResponse(
+            id=challenge.id,
+            challenge=raw_challenge,
+            expires_at=expires_at,
+        )
+
+    @app.post("/api/e2ee/devices", response_model=E2eeDeviceResponse, status_code=201)
+    def register_e2ee_device(
+        payload: E2eeDeviceRegisterRequest,
+        request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        require_recent_step_up(credentials, user, db)
+        now = utcnow()
+        challenge = db.scalar(
+            select(E2eeDeviceChallenge)
+            .where(
+                E2eeDeviceChallenge.id == payload.challenge_id,
+                E2eeDeviceChallenge.user_id == user.id,
+            )
+            .with_for_update()
+        )
+        expires_at = challenge.expires_at if challenge is not None else None
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        try:
+            challenge_bytes = decode_base64_strict(
+                payload.challenge,
+                field="challenge",
+                min_bytes=16,
+                max_bytes=64,
+            )
+        except E2EEValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if (
+            challenge is None
+            or challenge.consumed_at is not None
+            or expires_at is None
+            or expires_at <= now
+            or not secrets.compare_digest(
+                challenge.challenge_hash,
+                hashlib.sha256(challenge_bytes).hexdigest(),
+            )
+        ):
+            raise HTTPException(status_code=409, detail="Challenge không hợp lệ hoặc đã hết hạn.")
+
+        # Burn the challenge even when a following signature is invalid. This
+        # prevents online probing and makes the proof strictly single-use.
+        challenge.consumed_at = now
+        if db.get(E2eeDevice, payload.device_id) is not None:
+            record_audit(
+                db,
+                request,
+                "e2ee.device.register",
+                actor_id=user.id,
+                outcome="denied",
+                details={"reason": "duplicate_device_id"},
+            )
+            raise HTTPException(status_code=409, detail="Thiết bị đã tồn tại.")
+
+        possession_ok = verify_device_possession(
+            payload.identity_key,
+            payload.possession_signature,
+            account_id=user.id,
+            device_id=payload.device_id,
+            challenge_b64=payload.challenge,
+        )
+        try:
+            identity_key = encode_base64url(
+                decode_base64_strict(
+                    payload.identity_key,
+                    field="identity_key",
+                    exact_bytes=32,
+                )
+            )
+            signed_prekey_bytes = decode_base64_strict(
+                payload.signed_prekey,
+                field="signed_prekey",
+                exact_bytes=32,
+            )
+            signed_prekey = encode_base64url(signed_prekey_bytes)
+            prekeys = [
+                encode_base64url(
+                    decode_base64_strict(
+                        item,
+                        field="one_time_prekey",
+                        exact_bytes=32,
+                    )
+                )
+                for item in payload.one_time_prekeys
+            ]
+        except E2EEValidationError as exc:
+            record_audit(
+                db,
+                request,
+                "e2ee.device.register",
+                actor_id=user.id,
+                outcome="denied",
+                details={"reason": "invalid_public_material"},
+            )
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        prekey_signature_ok = verify_ed25519_signature(
+            identity_key,
+            payload.signed_prekey_signature,
+            signed_prekey_bytes,
+        )
+        if not possession_ok or not prekey_signature_ok or len(set(prekeys)) != len(prekeys):
+            record_audit(
+                db,
+                request,
+                "e2ee.device.register",
+                actor_id=user.id,
+                outcome="denied",
+                details={"reason": "invalid_public_key_proof"},
+            )
+            raise HTTPException(status_code=422, detail="Bằng chứng khóa công khai không hợp lệ.")
+
+        trusted_devices = list(
+            db.scalars(
+                select(E2eeDevice).where(
+                    E2eeDevice.user_id == user.id,
+                    E2eeDevice.trust_state == "trusted",
+                )
+            )
+        )
+        approver: E2eeDevice | None = None
+        if trusted_devices:
+            if not payload.approver_device_id or not payload.approval_signature:
+                record_audit(
+                    db,
+                    request,
+                    "e2ee.device.register",
+                    actor_id=user.id,
+                    outcome="denied",
+                    details={"reason": "trusted_device_approval_required"},
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="Thiết bị mới phải được một thiết bị đã tin cậy phê duyệt.",
+                )
+            approver = next(
+                (
+                    item
+                    for item in trusted_devices
+                    if item.id == payload.approver_device_id
+                ),
+                None,
+            )
+            if approver is None or not verify_device_approval(
+                approver.identity_key_b64,
+                payload.approval_signature,
+                account_id=user.id,
+                approver_device_id=approver.id,
+                new_device_id=payload.device_id,
+                new_device_public_key_b64=identity_key,
+                approval_challenge_b64=payload.challenge,
+            ):
+                record_audit(
+                    db,
+                    request,
+                    "e2ee.device.register",
+                    actor_id=user.id,
+                    outcome="denied",
+                    details={"reason": "invalid_device_approval"},
+                )
+                raise HTTPException(status_code=403, detail="Chữ ký phê duyệt không hợp lệ.")
+
+        device = E2eeDevice(
+            id=payload.device_id,
+            user_id=user.id,
+            display_name=payload.display_name,
+            identity_key_b64=identity_key,
+            signed_prekey_b64=signed_prekey,
+            signed_prekey_signature_b64=payload.signed_prekey_signature,
+            fingerprint=safety_fingerprint(identity_key),
+            trust_state="trusted",
+            approved_by_device_id=approver.id if approver is not None else None,
+            approved_at=now,
+        )
+        db.add(device)
+        db.add_all(
+            E2eePreKey(
+                device_id=device.id,
+                key_id=str(uuid.uuid4()),
+                public_key_b64=prekey,
+            )
+            for prekey in prekeys
+        )
+        try:
+            db.commit()
+            db.refresh(device)
+        except IntegrityError as exc:
+            db.rollback()
+            consumed = db.get(E2eeDeviceChallenge, payload.challenge_id)
+            if consumed is not None and consumed.consumed_at is None:
+                consumed.consumed_at = now
+                db.commit()
+            raise HTTPException(status_code=409, detail="Khóa hoặc thiết bị đã tồn tại.") from exc
+        record_audit(
+            db,
+            request,
+            "e2ee.device.register",
+            actor_id=user.id,
+            target_type="e2ee_device",
+            target_id=device.id,
+            details={
+                "trust_state": device.trust_state,
+                "prekey_count": len(prekeys),
+                "approved_by_existing_device": approver is not None,
+            },
+        )
+        return device
+
+    @app.get("/api/e2ee/devices", response_model=list[E2eeDeviceResponse])
+    def list_e2ee_devices(
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        return list(
+            db.scalars(
+                select(E2eeDevice)
+                .where(E2eeDevice.user_id == user.id)
+                .order_by(E2eeDevice.created_at.asc())
+            )
+        )
+
+    @app.delete("/api/e2ee/devices/{device_id}", status_code=204)
+    def revoke_e2ee_device(
+        device_id: str,
+        request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        require_recent_step_up(credentials, user, db)
+        device = db.scalar(
+            select(E2eeDevice)
+            .where(E2eeDevice.id == device_id, E2eeDevice.user_id == user.id)
+            .with_for_update()
+        )
+        if device is None or device.trust_state == "revoked":
+            raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị.")
+        trusted_count = (
+            db.scalar(
+                select(func.count())
+                .select_from(E2eeDevice)
+                .where(
+                    E2eeDevice.user_id == user.id,
+                    E2eeDevice.trust_state == "trusted",
+                )
+            )
+            or 0
+        )
+        if trusted_count <= 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Không thể thu hồi thiết bị E2EE tin cậy cuối cùng.",
+            )
+        now = utcnow()
+        device.trust_state = "revoked"
+        device.revoked_at = now
+        for prekey in db.scalars(
+            select(E2eePreKey).where(
+                E2eePreKey.device_id == device.id,
+                E2eePreKey.consumed_at.is_(None),
+            )
+        ):
+            prekey.consumed_at = now
+        # Clients must publish a corresponding MLS commit. Incrementing the
+        # server routing epoch prevents the revoked device from injecting data
+        # under the old membership epoch.
+        for member in db.scalars(
+            select(ConversationMember).where(
+                ConversationMember.user_id == user.id,
+                ConversationMember.removed_at.is_(None),
+            )
+        ):
+            session = db.get(ChatSession, member.session_id)
+            if session is not None and session.security_mode == "private_e2ee":
+                session.current_crypto_epoch += 1
+        db.commit()
+        record_audit(
+            db,
+            request,
+            "e2ee.device.revoke",
+            actor_id=user.id,
+            target_type="e2ee_device",
+            target_id=device.id,
+        )
+        return Response(status_code=204)
+
+    @app.get(
+        "/api/e2ee/users/{username}/prekey-bundle",
+        response_model=E2eePreKeyBundleResponse,
+    )
+    def consume_prekey_bundle(
+        username: str,
+        request: Request,
+        requester: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+        device_id: Annotated[str | None, Query(max_length=36)] = None,
+    ):
+        allowed, retry_after = message_limiter.allow(
+            f"prekey:{requester.id}",
+            settings.message_max_attempts,
+            settings.message_window_seconds,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Tần suất lấy prekey quá cao.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        target = db.scalar(
+            select(User).where(User.username == username.strip().lower(), User.is_active.is_(True))
+        )
+        if target is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy prekey bundle.")
+        device_stmt = select(E2eeDevice).where(
+            E2eeDevice.user_id == target.id,
+            E2eeDevice.trust_state == "trusted",
+        )
+        if device_id:
+            device_stmt = device_stmt.where(E2eeDevice.id == device_id)
+        device = db.scalar(device_stmt.order_by(E2eeDevice.created_at.asc()).limit(1))
+        if device is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy prekey bundle.")
+        prekey = db.scalar(
+            select(E2eePreKey)
+            .where(
+                E2eePreKey.device_id == device.id,
+                E2eePreKey.consumed_at.is_(None),
+            )
+            .order_by(E2eePreKey.created_at.asc())
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        if prekey is not None:
+            prekey.consumed_at = utcnow()
+            prekey.consumed_by_user_id = requester.id
+        db.commit()
+        record_audit(
+            db,
+            request,
+            "e2ee.prekey.consume",
+            actor_id=requester.id,
+            target_type="e2ee_device",
+            target_id=device.id,
+            details={"one_time_prekey_available": prekey is not None},
+        )
+        return E2eePreKeyBundleResponse(
+            user_id=target.id,
+            device_id=device.id,
+            display_name=device.display_name,
+            fingerprint=device.fingerprint,
+            identity_key=device.identity_key_b64,
+            signed_prekey=device.signed_prekey_b64,
+            signed_prekey_signature=device.signed_prekey_signature_b64,
+            one_time_prekey_id=prekey.key_id if prekey is not None else None,
+            one_time_prekey=prekey.public_key_b64 if prekey is not None else None,
+        )
+
+    @app.get("/api/sessions/{session_id}/e2ee/members")
+    def list_e2ee_members(
+        session_id: str,
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        row, _ = require_private_member_session(session_id, user, db, request)
+        members = db.execute(
+            select(ConversationMember, User)
+            .join(User, User.id == ConversationMember.user_id)
+            .where(ConversationMember.session_id == row.id)
+            .order_by(ConversationMember.joined_at.asc())
+        ).all()
+        return [
+            {
+                "user_id": member.user_id,
+                "username": member_user.username,
+                "role": member.role,
+                "joined_epoch": member.joined_epoch,
+                "removed_epoch": member.removed_epoch,
+                "active": member.removed_at is None,
+            }
+            for member, member_user in members
+        ]
+
+    @app.post("/api/sessions/{session_id}/e2ee/members", status_code=201)
+    def add_e2ee_member(
+        session_id: str,
+        payload: E2eeMemberUpdate,
+        request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        owner: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        require_recent_step_up(credentials, owner, db)
+        row = require_owned_session(session_id, owner, db, request)
+        if row.security_mode != "private_e2ee":
+            raise HTTPException(status_code=409, detail="Phiên này không ở chế độ Private E2EE.")
+        db.refresh(row, with_for_update=True)
+        target = db.scalar(
+            select(User).where(User.username == payload.username, User.is_active.is_(True))
+        )
+        if target is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
+        membership = db.scalar(
+            select(ConversationMember).where(
+                ConversationMember.session_id == row.id,
+                ConversationMember.user_id == target.id,
+            )
+        )
+        if membership is not None and membership.removed_at is None:
+            raise HTTPException(status_code=409, detail="Người dùng đã là thành viên.")
+        row.current_crypto_epoch += 1
+        if membership is None:
+            membership = ConversationMember(
+                session_id=row.id,
+                user_id=target.id,
+                role="member",
+                joined_epoch=row.current_crypto_epoch,
+            )
+            db.add(membership)
+        else:
+            membership.joined_epoch = row.current_crypto_epoch
+            membership.removed_epoch = None
+            membership.removed_at = None
+            membership.joined_at = utcnow()
+        db.commit()
+        record_audit(
+            db,
+            request,
+            "e2ee.member.add",
+            actor_id=owner.id,
+            target_type="chat_session",
+            target_id=row.id,
+            details={"member_id": target.id, "epoch": row.current_crypto_epoch},
+        )
+        return {"member_id": target.id, "epoch": row.current_crypto_epoch}
+
+    @app.delete("/api/sessions/{session_id}/e2ee/members/{username}", status_code=204)
+    def remove_e2ee_member(
+        session_id: str,
+        username: str,
+        request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        owner: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        require_recent_step_up(credentials, owner, db)
+        row = require_owned_session(session_id, owner, db, request)
+        if row.security_mode != "private_e2ee":
+            raise HTTPException(status_code=409, detail="Phiên này không ở chế độ Private E2EE.")
+        db.refresh(row, with_for_update=True)
+        target = db.scalar(select(User).where(User.username == username.strip().lower()))
+        if target is None or target.id == owner.id:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thành viên có thể xóa.")
+        membership = db.scalar(
+            select(ConversationMember).where(
+                ConversationMember.session_id == row.id,
+                ConversationMember.user_id == target.id,
+                ConversationMember.removed_at.is_(None),
+            )
+        )
+        if membership is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thành viên có thể xóa.")
+        row.current_crypto_epoch += 1
+        membership.removed_epoch = row.current_crypto_epoch
+        membership.removed_at = utcnow()
+        db.commit()
+        record_audit(
+            db,
+            request,
+            "e2ee.member.remove",
+            actor_id=owner.id,
+            target_type="chat_session",
+            target_id=row.id,
+            details={"member_id": target.id, "epoch": row.current_crypto_epoch},
+        )
+        return Response(status_code=204)
+
+    def e2ee_envelope_response(item: E2eeEnvelope) -> E2eeEnvelopeResponse:
+        return E2eeEnvelopeResponse(
+            id=item.id,
+            session_id=item.session_id,
+            sender_device_id=item.sender_device_id,
+            recipient_device_id=item.recipient_device_id,
+            protocol=item.protocol,
+            message_kind=item.message_kind,
+            client_message_id=item.client_message_id,
+            header=item.header_b64,
+            ciphertext=item.ciphertext_b64,
+            group_epoch=item.group_epoch,
+            created_at=item.created_at,
+        )
+
+    @app.post(
+        "/api/sessions/{session_id}/e2ee/envelopes",
+        response_model=E2eeEnvelopeResponse,
+        status_code=201,
+    )
+    def send_e2ee_envelope(
+        session_id: str,
+        payload: E2eeEnvelopeSend,
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        row, membership = require_private_member_session(session_id, user, db, request)
+        db.refresh(row, with_for_update=True)
+        sender_device = db.scalar(
+            select(E2eeDevice).where(
+                E2eeDevice.id == payload.sender_device_id,
+                E2eeDevice.user_id == user.id,
+                E2eeDevice.trust_state == "trusted",
+            )
+        )
+        if sender_device is None:
+            raise HTTPException(status_code=403, detail="Thiết bị gửi chưa được tin cậy.")
+        if payload.epoch < membership.joined_epoch or payload.epoch != row.current_crypto_epoch:
+            raise HTTPException(status_code=409, detail="Epoch E2EE không còn hiện hành.")
+
+        expected_recipient: str
+        recipient_device: E2eeDevice | None = None
+        if payload.protocol == PROTOCOL_DOUBLE_RATCHET:
+            if payload.message_kind != "application" or not payload.recipient_device_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Double Ratchet cần recipient_device_id và message_kind=application.",
+                )
+            expected_recipient = payload.recipient_device_id
+        elif payload.protocol == PROTOCOL_MLS:
+            if payload.message_kind == "welcome":
+                if not payload.recipient_device_id:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="MLS welcome cần recipient_device_id.",
+                    )
+                expected_recipient = payload.recipient_device_id
+            else:
+                if payload.recipient_device_id is not None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="MLS application/commit phải định tuyến tới session.",
+                    )
+                expected_recipient = row.id
+        else:
+            raise HTTPException(status_code=422, detail="Giao thức E2EE không được hỗ trợ.")
+
+        if payload.recipient_device_id:
+            recipient_device = db.scalar(
+                select(E2eeDevice).where(
+                    E2eeDevice.id == payload.recipient_device_id,
+                    E2eeDevice.trust_state == "trusted",
+                )
+            )
+            recipient_membership = (
+                db.scalar(
+                    select(ConversationMember).where(
+                        ConversationMember.session_id == row.id,
+                        ConversationMember.user_id == recipient_device.user_id,
+                        ConversationMember.removed_at.is_(None),
+                    )
+                )
+                if recipient_device is not None
+                else None
+            )
+            if recipient_device is None or recipient_membership is None:
+                raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị nhận.")
+
+        try:
+            envelope = validate_opaque_envelope(
+                {
+                    "version": payload.version,
+                    "protocol": payload.protocol,
+                    "recipient": payload.recipient,
+                    "epoch": payload.epoch,
+                    "client_message_id": payload.client_message_id,
+                    "sender_device_id": payload.sender_device_id,
+                    "header": payload.header,
+                    "ciphertext": payload.ciphertext,
+                },
+                expected_recipient=expected_recipient,
+            )
+        except E2EEValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        envelope_count = (
+            db.scalar(
+                select(func.count())
+                .select_from(E2eeEnvelope)
+                .where(E2eeEnvelope.session_id == row.id)
+            )
+            or 0
+        )
+        if envelope_count >= settings.max_messages_per_session:
+            raise HTTPException(status_code=409, detail="Phiên đã đạt giới hạn bản mã.")
+        stored = E2eeEnvelope(
+            session_id=row.id,
+            sender_user_id=user.id,
+            sender_device_id=sender_device.id,
+            recipient_device_id=(recipient_device.id if recipient_device is not None else None),
+            protocol=envelope.protocol,
+            message_kind=payload.message_kind,
+            client_message_id=envelope.client_message_id,
+            replay_key=envelope.replay_key,
+            header_b64=envelope.header_b64,
+            ciphertext_b64=envelope.ciphertext_b64,
+            group_epoch=envelope.epoch,
+        )
+        db.add(stored)
+        row.updated_at = utcnow()
+        try:
+            db.commit()
+            db.refresh(stored)
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="Bản mã trùng hoặc đã được phát lại.") from exc
+        record_audit(
+            db,
+            request,
+            "e2ee.envelope.send",
+            actor_id=user.id,
+            target_type="chat_session",
+            target_id=row.id,
+            details={
+                "protocol": stored.protocol,
+                "kind": stored.message_kind,
+                "header_bytes": envelope.header_size,
+                "ciphertext_bytes": envelope.ciphertext_size,
+                "epoch": envelope.epoch,
+            },
+        )
+        return e2ee_envelope_response(stored)
+
+    @app.get(
+        "/api/sessions/{session_id}/e2ee/envelopes",
+        response_model=list[E2eeEnvelopeResponse],
+    )
+    def receive_e2ee_envelopes(
+        session_id: str,
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+        recipient_device_id: Annotated[str, Query(min_length=36, max_length=36)],
+        after: Annotated[datetime | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ):
+        row, membership = require_private_member_session(session_id, user, db, request)
+        device = db.scalar(
+            select(E2eeDevice).where(
+                E2eeDevice.id == recipient_device_id,
+                E2eeDevice.user_id == user.id,
+                E2eeDevice.trust_state == "trusted",
+            )
+        )
+        if device is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị nhận.")
+        stmt = (
+            select(E2eeEnvelope)
+            .where(
+                E2eeEnvelope.session_id == row.id,
+                E2eeEnvelope.group_epoch >= membership.joined_epoch,
+                (
+                    (E2eeEnvelope.recipient_device_id == device.id)
+                    | (
+                        (E2eeEnvelope.recipient_device_id.is_(None))
+                        & (E2eeEnvelope.protocol == PROTOCOL_MLS)
+                    )
+                ),
+            )
+            .order_by(E2eeEnvelope.created_at.asc(), E2eeEnvelope.id.asc())
+            .limit(limit)
+        )
+        if after is not None:
+            stmt = stmt.where(E2eeEnvelope.created_at > after)
+        return [e2ee_envelope_response(item) for item in db.scalars(stmt)]
 
     @app.get("/api/admin/audit", response_model=list[AuditResponse])
     def admin_audit(
@@ -1815,9 +3203,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details={"reason": result.reason},
             )
         payload = result.as_dict()
+        checkpoint_verification = (
+            audit_checkpoint_service.verify_latest(db)
+            if audit_checkpoint_service is not None
+            else None
+        )
+        if checkpoint_verification is not None:
+            payload.update(checkpoint_verification.as_dict())
+            checkpoint_required = bool(settings.audit_worm_endpoint)
+            payload["external_checkpoint_required"] = checkpoint_required
+            payload["high_assurance_intact"] = bool(
+                result.intact
+                and checkpoint_verification.intact
+                and (
+                    checkpoint_verification.externally_delivered
+                    if checkpoint_required
+                    else True
+                )
+            )
         payload["checked_at"] = utcnow().isoformat()
         payload["checked_by"] = admin.username
         return payload
+
+    @app.post("/api/admin/audit/checkpoint")
+    def create_audit_checkpoint(
+        request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        admin: Annotated[User, Depends(admin_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        if audit_checkpoint_service is None:
+            raise HTTPException(status_code=409, detail="Audit chain đang tắt.")
+        require_recent_step_up(credentials, admin, db)
+        record_audit(
+            db,
+            request,
+            "audit.checkpoint.request",
+            actor_id=admin.id,
+            target_type="audit_event",
+        )
+        try:
+            checkpoint = audit_checkpoint_service.anchor(db)
+        except AuditCheckpointError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Không thể neo chuỗi audit tới kho WORM.",
+                headers={"Retry-After": "30"},
+            ) from exc
+        if checkpoint is None:
+            raise HTTPException(status_code=409, detail="Chưa có audit event đã niêm phong.")
+        return {
+            "checkpoint_id": checkpoint.id,
+            "last_event_id": checkpoint.last_event_id,
+            "root_hash": checkpoint.root_hash,
+            "externally_delivered": checkpoint.delivered_at is not None,
+            "created_at": checkpoint.created_at,
+        }
 
     @app.get("/api/admin/ids/detections")
     def ids_detections(
@@ -1903,14 +3344,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # static SPA alongside it duplicated authentication and security-sensitive
     # client code without serving the production workflow.
     gradio_demo = build_ui()
-    # Từ Gradio 6, theme/css thuộc về ứng dụng chứ không thuộc về Blocks. Khi
-    # nhúng vào FastAPI thì mount_gradio_app mới là chỗ nhận chúng — truyền lại
-    # ở đây để giao diện không bị rơi về theme mặc định. try/except giữ tương
-    # thích ngược với các bản Gradio chưa có tham số này.
-    try:
-        app = gr.mount_gradio_app(app, gradio_demo, path="/", theme=THEME, css=CUSTOM_CSS)
-    except TypeError:
-        app = gr.mount_gradio_app(app, gradio_demo, path="/")
+    gradio_auth_dependency = None
+    if settings.gradio_auth_mode == "oidc":
+        try:
+            proxy_secret = Path(settings.oidc_proxy_secret_file).read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError as exc:
+            raise RuntimeError("Không đọc được bí mật xác thực reverse proxy OIDC.") from exc
+        if len(proxy_secret) < 32 or len(proxy_secret) > 4096:
+            raise RuntimeError("Bí mật reverse proxy OIDC phải dài 32-4096 ký tự.")
+
+        def verified_proxy_identity(request: Request) -> str | None:
+            supplied_secret = request.headers.get(settings.oidc_proxy_secret_header, "")
+            identity = request.headers.get(settings.oidc_user_header, "").strip()
+            if not supplied_secret or not secrets.compare_digest(
+                supplied_secret,
+                proxy_secret,
+            ):
+                return None
+            if not identity or len(identity) > 128 or any(
+                character in identity for character in ("\r", "\n", "\x00")
+            ):
+                return None
+            return identity
+
+        gradio_auth_dependency = verified_proxy_identity
+
+    # Gradio 6 supports these parameters. Security controls must fail closed if
+    # an incompatible version is installed, rather than silently mounting an
+    # unauthenticated or unlimited upload surface.
+    app = gr.mount_gradio_app(
+        app,
+        gradio_demo,
+        path="/",
+        theme=THEME,
+        css=CUSTOM_CSS,
+        auth_dependency=gradio_auth_dependency,
+        max_file_size=settings.gradio_max_file_size,
+    )
 
     return app
 

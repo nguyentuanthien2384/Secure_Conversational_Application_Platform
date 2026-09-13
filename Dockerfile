@@ -1,13 +1,24 @@
-# Pin the base image by digest for supply-chain integrity. Obtain the current digest with:
-#   docker buildx imagetools inspect python:3.12-slim --format '{{println .Manifest.Digest}}'
-# then build with:  docker build --build-arg BASE_IMAGE=python:3.12-slim@sha256:<digest> .
-# The tag default keeps local builds working; production/CI should pass a digest-pinned ref.
+# Local builds retain a convenient tag default. Production and CI also set
+# REQUIRE_BASE_IMAGE_DIGEST=true, which makes the build fail unless BASE_IMAGE
+# is an immutable sha256 reference. See docs/supply-chain/README.md.
 ARG BASE_IMAGE=python:3.12-slim
 FROM ${BASE_IMAGE} AS runtime
+
+ARG BASE_IMAGE
+ARG REQUIRE_BASE_IMAGE_DIGEST=false
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
+
+# Validate the reference inside the build as a second line of defence. The
+# production Compose file and security workflow turn this guard on; no digest is
+# hard-coded here because it must be selected and verified by the operator.
+RUN if [ "$REQUIRE_BASE_IMAGE_DIGEST" = "true" ]; then \
+        printf '%s' "$BASE_IMAGE" \
+          | grep -Eq '^[^[:space:]@]+@sha256:[0-9a-f]{64}$' \
+          || { echo >&2 'BASE_IMAGE must be a digest-pinned sha256 reference'; exit 1; }; \
+    fi
 
 WORKDIR /app
 RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
@@ -20,6 +31,9 @@ RUN uv sync --no-dev --frozen
 
 COPY src ./src
 COPY scripts/migrate_database.py ./scripts/migrate_database.py
+COPY scripts/enforce_retention.py ./scripts/enforce_retention.py
+COPY scripts/migrate_envelope_encryption.py ./scripts/migrate_envelope_encryption.py
+COPY scripts/rewrap_deks.py ./scripts/rewrap_deks.py
 COPY run_app.py ./run_app.py
 RUN chown -R app:app /app
 USER app

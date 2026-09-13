@@ -7,11 +7,8 @@ trò chuyện, bản mã, tìm kiếm toàn cục, tài khoản, thiết bị, q
 
 from __future__ import annotations
 
-import json
 import os
-import tempfile
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +17,7 @@ import gradio as gr
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
 
 BASE_URL = os.getenv("SELF_BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", BASE_URL).rstrip("/")
 PASSWORD_MIN = 15
 
 # Ảnh tĩnh của giao diện (avatar trợ lý). Đặt cạnh module để không phụ thuộc
@@ -527,6 +525,8 @@ def _api(token, method, path, body=None, *, params=None):
         detail = data.get("detail") if isinstance(data, dict) else None
         if isinstance(detail, list):
             detail = " · ".join(item.get("msg", str(item)) for item in detail)
+        elif isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("code") or "Yêu cầu bị từ chối."
         message = detail or f"HTTP {resp.status_code}"
         if resp.status_code in (429, 503):
             retry = resp.headers.get("Retry-After")
@@ -563,12 +563,27 @@ def _guard(fn, n_outputs):
 
 def _session_choices(token):
     """Nhãn có ổ khoá để nhắc rằng nội dung phiên được mã hoá khi lưu."""
-    return [(f"🔒  {row['title']}", row["id"]) for row in _api(token, "GET", "/api/sessions")]
+    icons = {"secure": "🔒", "confidential": "🛡️", "private_e2ee": "🔐"}
+    return [
+        (f"{icons.get(row.get('security_mode'), '🔒')}  {row['title']}", row["id"])
+        for row in _api(token, "GET", "/api/sessions")
+    ]
 
 
 def _chat_history(token, session_id):
     if not session_id:
         return []
+    session = _api(token, "GET", f"/api/sessions/{session_id}")
+    if session.get("security_mode") == "private_e2ee":
+        return [
+            {
+                "role": "assistant",
+                "content": (
+                    "🔐 Phiên này ở chế độ Private E2EE. Gradio không giữ khóa riêng; "
+                    "hãy dùng client Double Ratchet/MLS đã được kiểm toán."
+                ),
+            }
+        ]
     rows = _api(token, "GET", f"/api/sessions/{session_id}/messages")
     return [{"role": row["role"], "content": row["content"]} for row in rows]
 
@@ -822,18 +837,48 @@ def build_ui() -> gr.Blocks:
                                 max_lines=1,
                                 placeholder="Tiêu đề cho hội thoại mới…",
                             )
+                            dd_new_security = gr.Dropdown(
+                                choices=[
+                                    ("Secure — mã hóa phía máy chủ", "secure"),
+                                    ("Confidential — DLP/xác nhận nghiêm ngặt", "confidential"),
+                                ],
+                                value="secure",
+                                label="Chế độ bảo mật",
+                            )
+                            dd_new_class = gr.Dropdown(
+                                choices=[
+                                    ("Public", "public"),
+                                    ("Internal", "internal"),
+                                    ("Confidential", "confidential"),
+                                    ("Highly confidential", "highly_confidential"),
+                                ],
+                                value="internal",
+                                label="Phân loại dữ liệu",
+                            )
                             with gr.Accordion("Quản lý hội thoại đang chọn", open=False):
                                 tb_rename = gr.Textbox(label="Đổi tên", max_lines=1)
                                 btn_rename = gr.Button("Lưu tên mới", size="sm")
+                                tb_export_password = gr.Textbox(
+                                    label="Mật khẩu (chỉ nhập khi hệ thống yêu cầu xác thực lại)",
+                                    type="password",
+                                    max_length=128,
+                                )
+                                tb_export_code = gr.Textbox(
+                                    label="Mã 2FA (nếu tài khoản đã bật)",
+                                    max_length=32,
+                                )
                                 with gr.Row():
                                     btn_export = gr.Button("Xuất JSON", size="sm")
                                     btn_delete = gr.Button("Xóa", variant="stop", size="sm")
-                            file_export = gr.File(label="Tệp đã xuất", visible=False)
+                            file_export = gr.DownloadButton(
+                                label="Tải tệp JSON", visible=False, size="sm"
+                            )
                         with gr.Column(scale=3, min_width=600):
                             # Nhắc trạng thái mã hoá ngay trên khung chat.
                             gr.Markdown(
-                                "🔒 **Đã mã hoá** — nội dung lưu dưới dạng AES-256-GCM, "
-                                "khoá không nằm trong cơ sở dữ liệu.",
+                                "🔒 **Secure/Confidential:** DEK riêng từng phiên, được KEK bọc. "
+                                "🔐 **Private E2EE:** dùng client Double Ratchet/MLS riêng; "
+                                "Gradio không giữ khóa và chỉ hiển thị trạng thái.",
                                 elem_id="enc-note",
                             )
                             chatbot = gr.Chatbot(
@@ -1411,7 +1456,7 @@ def build_ui() -> gr.Blocks:
             if session_id:
                 for label, value in _session_choices(token):
                     if value == session_id:
-                        title = label.replace("🔒", "").strip()
+                        title = label.lstrip("🔒🛡️🔐 ").strip()
                         break
             # Ẩn thông báo của lượt trước khi chuyển sang hội thoại khác.
             return history, title, gr.update(value="", visible=False), gr.update(visible=False)
@@ -1422,12 +1467,16 @@ def build_ui() -> gr.Blocks:
             [chatbot, tb_rename, md_chat_notice, btn_consent_send],
         )
 
-        def create_session(token, title):
+        def create_session(token, title, security_mode, data_classification):
             created = _api(
                 token,
                 "POST",
                 "/api/sessions",
-                {"title": (title or "").strip() or "Cuộc hội thoại mới"},
+                {
+                    "title": (title or "").strip() or "Cuộc hội thoại mới",
+                    "security_mode": security_mode or "secure",
+                    "data_classification": data_classification or "internal",
+                },
             )
             gr.Info("Đã tạo hội thoại.")
             dd1, dd2, history = refresh_sessions(token, created["id"])
@@ -1435,7 +1484,7 @@ def build_ui() -> gr.Blocks:
 
         btn_create.click(
             _guard(create_session, 4),
-            [st_token, tb_new_title],
+            [st_token, tb_new_title, dd_new_security, dd_new_class],
             [dd_session, dd_cipher, chatbot, tb_new_title],
         )
 
@@ -1466,37 +1515,75 @@ def build_ui() -> gr.Blocks:
             _guard(delete_session, 3), [st_token, dd_session], [dd_session, dd_cipher, chatbot]
         )
 
-        def export_session(token, session_id):
+        def export_session(token, session_id, password, code):
             if not session_id:
                 gr.Warning("Chọn một hội thoại trước.")
-                return gr.skip()
-            data = _api(token, "GET", f"/api/sessions/{session_id}/export")
-            path = (
-                Path(tempfile.gettempdir()) / f"scap-{session_id[:8]}-{uuid.uuid4().hex[:6]}.json"
-            )
-            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            gr.Info("Đã xuất — bấm vào tệp bên dưới để tải về.")
-            return gr.update(value=str(path), visible=True)
+                return gr.skip(), gr.skip(), gr.skip()
+            try:
+                grant = _api(token, "POST", f"/api/sessions/{session_id}/export-ticket")
+            except gr.Error as err:
+                if "xác thực lại" not in str(err).lower():
+                    raise
+                if not password:
+                    raise gr.Error(
+                        "Phiên xác thực lại đã hết hạn. Nhập mật khẩu và mã 2FA rồi bấm Xuất JSON lần nữa."
+                    ) from err
+                _api(
+                    token,
+                    "POST",
+                    "/api/auth/step-up",
+                    {"password": password, "code": (code or "").strip() or None},
+                )
+                grant = _api(
+                    token,
+                    "POST",
+                    f"/api/sessions/{session_id}/export-ticket",
+                )
+            download_url = grant["download_url"]
+            if download_url.startswith("/"):
+                download_url = PUBLIC_BASE_URL + download_url
+            gr.Info("Vé tải có hiệu lực 60 giây và chỉ dùng được một lần.")
+            return gr.update(value=download_url, visible=True), "", ""
 
-        btn_export.click(_guard(export_session, 1), [st_token, dd_session], [file_export])
+        btn_export.click(
+            _guard(export_session, 3),
+            [st_token, dd_session, tb_export_password, tb_export_code],
+            [file_export, tb_export_password, tb_export_code],
+        )
 
-        def send_message(token, session_id, message):
+        def send_message(token, session_id, message, confirm_external=False):
             message = (message or "").strip()
             if not message:
                 return gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False)
             if not session_id:
-                title = message[:48] + ("…" if len(message) > 48 else "")
-                created = _api(token, "POST", "/api/sessions", {"title": title})
+                # Never copy plaintext message content into the unencrypted
+                # conversation-title metadata column.
+                created = _api(
+                    token,
+                    "POST",
+                    "/api/sessions",
+                    {"title": "Cuộc hội thoại mới"},
+                )
                 session_id = created["id"]
                 gr.Info("Đã tự tạo hội thoại mới.")
             try:
+                session_metadata = _api(token, "GET", f"/api/sessions/{session_id}")
+                if session_metadata.get("security_mode") == "private_e2ee":
+                    raise gr.Error(
+                        "Phiên Private E2EE chỉ nhận bản mã từ client Double Ratchet/MLS."
+                    )
                 sent = _api(
-                    token, "POST", f"/api/sessions/{session_id}/messages", {"content": message}
+                    token,
+                    "POST",
+                    f"/api/sessions/{session_id}/messages",
+                    {"content": message, "confirm_external_ai": bool(confirm_external)},
                 )
             except gr.Error as err:
                 # Consent là lựa chọn người dùng, không phải lỗi kỹ thuật. Hiển thị
                 # ngay cạnh ô nhập và giữ nguyên nội dung để họ có thể gửi lại sau.
-                if EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err):
+                if EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err) or (
+                    "xác nhận riêng" in str(err).lower()
+                ):
                     consent_notice = gr.update(
                         value=(
                             "⚠️ **Tin nhắn chưa được gửi.** Bấm **Đồng ý và gửi** bên dưới "
@@ -1547,7 +1634,7 @@ def build_ui() -> gr.Blocks:
                     gr.update(visible=False),
                 )
             _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
-            return send_message(token, session_id, message)
+            return send_message(token, session_id, message, True)
 
         btn_consent_send.click(
             _guard(consent_and_resend, 6), [st_token, dd_session, tb_msg], SEND_OUTS

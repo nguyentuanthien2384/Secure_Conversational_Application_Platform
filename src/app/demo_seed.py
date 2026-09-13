@@ -305,7 +305,7 @@ def seed_demo_data(
                 db.add(session_row)
                 db.flush()
                 msg_time = session_row.created_at
-                for role, content in turns:
+                for message_index, (role, content) in enumerate(turns, start=1):
                     ciphertext, nonce, key_version = crypto_service.encrypt(
                         content, session_row.id, role
                     )
@@ -314,6 +314,7 @@ def seed_demo_data(
                         SecureMessage(
                             session_id=session_row.id,
                             role=role,
+                            message_index=message_index,
                             ciphertext=ciphertext,
                             nonce=nonce,
                             key_version=key_version,

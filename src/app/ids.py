@@ -24,6 +24,7 @@ is safe. Pattern matching on request text is trivially bypassable.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections import defaultdict, deque
@@ -177,7 +178,12 @@ class Detection:
             "source_ip": self.source_ip,
             "path": self.path,
             "method": self.method,
-            "evidence": self.evidence,
+            # Matched URL/header fragments are attacker-controlled and may
+            # contain credentials. Analysts receive a stable correlation hash,
+            # while raw content stays out of API responses and screenshots.
+            "evidence_sha256": hashlib.sha256(
+                self.evidence.encode("utf-8", errors="replace")
+            ).hexdigest()[:16],
             "mitre_technique": self.mitre_technique,
             "detected_at": self.detected_at,
         }

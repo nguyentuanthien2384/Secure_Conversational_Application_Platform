@@ -1,0 +1,44 @@
+# High-assurance Vault reference overlay.
+# An identity-aware OIDC proxy must sit between Caddy and app and inject both
+# configured headers. The app validates a shared secret mounted only into those
+# two workloads; direct/spoofed Gradio requests receive HTTP 401.
+services:
+  db:
+    image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE to an immutable name@sha256 digest}
+
+  redis:
+    image: ${REDIS_IMAGE:?set REDIS_IMAGE to an immutable name@sha256 digest}
+
+  caddy:
+    image: ${CADDY_IMAGE:?set CADDY_IMAGE to an immutable name@sha256 digest}
+
+  app:
+    environment:
+      SECURITY_PROFILE: high
+      KEY_PROVIDER: vault
+      ALLOW_DEMO_AI: "false"
+      GRADIO_AUTH_MODE: oidc
+      OIDC_USER_HEADER: x-auth-request-user
+      OIDC_PROXY_SECRET_HEADER: x-scap-proxy-secret
+      OIDC_PROXY_SECRET_FILE: /run/secrets/oidc_proxy_secret
+      VAULT_ADDR: ${VAULT_ADDR:?set VAULT_ADDR in .env}
+      VAULT_TOKEN_FILE: /run/secrets/vault_token
+      VAULT_TRANSIT_MOUNT: ${VAULT_TRANSIT_MOUNT:-transit}
+      VAULT_TRANSIT_KEY: ${VAULT_TRANSIT_KEY:-scap-conversations}
+      VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
+      AUDIT_WORM_ENDPOINT: ${AUDIT_WORM_ENDPOINT:?set AUDIT_WORM_ENDPOINT in .env}
+      AUDIT_WORM_TOKEN_FILE: /run/secrets/audit_worm_token
+      AUDIT_CHECKPOINT_INTERVAL: ${AUDIT_CHECKPOINT_INTERVAL:-100}
+      RETENTION_SWEEP_ON_STARTUP: "true"
+    secrets:
+      - vault_token
+      - oidc_proxy_secret
+      - audit_worm_token
+
+secrets:
+  vault_token:
+    file: ${VAULT_TOKEN_FILE_HOST:?set VAULT_TOKEN_FILE_HOST in .env}
+  oidc_proxy_secret:
+    file: ${OIDC_PROXY_SECRET_FILE_HOST:?set OIDC_PROXY_SECRET_FILE_HOST in .env}
+  audit_worm_token:
+    file: ${AUDIT_WORM_TOKEN_FILE_HOST:?set AUDIT_WORM_TOKEN_FILE_HOST in .env}

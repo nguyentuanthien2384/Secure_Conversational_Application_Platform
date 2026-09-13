@@ -70,9 +70,10 @@ python scripts/generate_secrets.py
 # rồi dán 2 dòng kết quả vào .env, ghi đè APP_SECRET_KEY và MASTER_ENCRYPTION_KEY
 ```
 
-> Lưu ý: đổi `MASTER_ENCRYPTION_KEY` sẽ làm **dữ liệu chat cũ không giải mã được**
-> — đúng theo thiết kế AES-256-GCM. Muốn đổi khóa mà giữ dữ liệu thì dùng
-> `scripts/rotate_encryption_key.py` với `MASTER_ENCRYPTION_KEYS`.
+> Local/demo dùng khóa này để bọc DEK riêng của từng hội thoại; dữ liệu legacy
+> vẫn có thể phụ thuộc trực tiếp vào keyring. Muốn chuyển/đổi khóa mà giữ dữ liệu,
+> dùng `scripts/migrate_envelope_encryption.py` và `scripts/rewrap_deks.py` theo
+> `docs/HIGH_SECURITY_DEPLOYMENT.md`, không thay khóa đột ngột.
 
 ---
 
@@ -135,10 +136,10 @@ Kiểm tra nhanh key trước khi chạy cả app:
 uv run python src/core/ai_core/gemini_ai.py
 ```
 
-**Lưu ý về DLP:** trước khi rời biên tin cậy, `_REDACTION_RULES` trong
-`src/app/services.py` che email, số điện thoại, số thẻ và mọi dãy 9–12 chữ số.
-Bot sẽ không "nhìn thấy" các giá trị đó — đúng thiết kế, nhưng nên biết trước
-khi demo trực tiếp.
+**Lưu ý về DLP:** engine trong `src/app/dlp.py` chuẩn hóa Unicode, phát hiện
+secret/token/private key, email, điện thoại, thẻ Luhn, CCCD, mã số thuế, dữ liệu
+sức khỏe và từ điển nội bộ. Policy có thể che, yêu cầu xác nhận, chặn hoặc ép
+local-only; audit chỉ ghi tên category, không ghi giá trị khớp.
 
 **Khi nhà cung cấp AI lỗi** (key sai, hết quota, mất mạng): API trả **503** kèm
 `Retry-After: 30` và thông điệp chung chung; chi tiết lỗi chỉ ghi vào log máy

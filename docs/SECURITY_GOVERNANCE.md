@@ -5,8 +5,8 @@
 | Asset | Location | Classification | Access boundary |
 |---|---|---|---|
 | Password hashes, MFA recovery hashes | PostgreSQL/SQLite | Restricted | App runtime only; Argon2id, RBAC |
-| Chat plaintext | Encrypted DB rows | Confidential | Owner-only API query, AES-256-GCM with AAD |
-| API/crypto/audit secrets | Environment in local lab; KMS/Vault target in production | Secret | Runtime process; never Git/logs |
+| Chat plaintext | Envelope-encrypted DB rows; absent in E2EE mode | Confidential/Restricted | Owner API; per-session DEK + message-bound AAD |
+| API/crypto/audit secrets | Environment only for local legacy; Vault/KMS adapter in high profile | Secret | Workload identity/token file; never Git/logs |
 | Source, CI definitions, manifests | Git repository | Internal | Protected branch/review + secret scan |
 | Audit events/SIEM stream | DB + stdout JSON | Restricted evidence | Moderator/admin API; remote immutable sink required in production |
 
@@ -18,8 +18,9 @@ Risk is scored as **Threat likelihood (1–5) × exposure/vulnerability (1–5) 
 |---|---:|---|---|
 | Credential stuffing (Spoofing) | 4×3×4=48 | Argon2id, generic errors, IP/account limits, lockout, TOTP | Enforce MFA for privileged accounts in production operations |
 | IDOR / cross-tenant chat access (Tampering/Info disclosure) | 3×2×5=30 | Owner-filtered queries, 404 anti-enumeration tests | Keep ownership filter on every new resource |
-| DB theft (Info disclosure) | 3×3×5=45 | AES-256-GCM, AAD, separate key version | Move keys to KMS/HSM; test restore drills |
-| Audit alteration (Repudiation) | 3×3×5=45 | HMAC chain and SIEM JSON | Export to WORM/immutable remote sink |
+| DB theft (Info disclosure) | 3×2×5=30 | Per-session DEK, message-bound AAD, Vault/KMS adapters | Deploy KMS IAM/HSM; test restore drills |
+| Audit alteration (Repudiation) | 3×2×5=30 | HMAC chain, signed external checkpoints, SIEM JSON | Provision retention-locked WORM + SOC alerts |
+| E2EE device compromise (Disclosure/Spoofing) | 3×3×5=45 | Possession/approval proofs, fingerprints, revoke + epoch | Audited client, secure hardware storage, recovery drill |
 | Resource exhaustion (DoS) | 3×3×4=36 | body/message/session quotas, Docker limits, Redis production limiter | load-test and tune quotas |
 
 ## 3. Architecture acceptance criteria
@@ -27,7 +28,7 @@ Risk is scored as **Threat likelihood (1–5) × exposure/vulnerability (1–5) 
 - **Zero Trust:** authenticate every API call; authorize each object action; no trust in forwarded client headers.
 - **Defense in depth:** Caddy/TLS → container/network segmentation → FastAPI headers/rate-limit/IDS → RBAC → AES-GCM/audit.
 - **Least privilege:** `scap_app` lacks schema ownership; administrative actions require their own role checks.
-- **Cryptography:** AES-256-GCM at rest; Caddy production policy requires TLS 1.3 in transit.
+- **Cryptography:** per-session AES-256-GCM DEK wrapped by Vault/KMS; ciphertext-only E2EE boundary; Caddy production policy requires TLS 1.3 in transit.
 
 ## 4. Incident response plan (six steps)
 
@@ -51,6 +52,11 @@ Maintain three copies: production PostgreSQL backup, encrypted backup on separat
 | ISO 27001-style ISMS | Policies, security CI, disclosure endpoint, audit records | Formal scope, risk-owner approval, supplier review, evidence retention |
 | DevSecOps | pytest, Ruff, Bandit, pip-audit, Gitleaks, Semgrep, Trivy/SBOM, ZAP script | Branch protection and required CI checks in Git hosting |
 
-## 7. External dependencies that cannot be claimed as implemented
+## 7. External assurance boundary
 
-SSO/OIDC (e.g. Keycloak), centralized SIEM (ELK/Splunk/Wazuh), KMS/HSM, immutable/WORM storage and independent pentest/Red Team require deployed services and organizational authority. They are production exit criteria, not features this repository can honestly simulate. Conduct security-awareness/phishing training and an independent code review/pentest at least annually and after material changes.
+Repository đã có adapter/guard cho OIDC proxy, Vault/managed KMS, SIEM JSON và
+HTTPS audit checkpoint/WORM. Tuy nhiên IdP, IAM/HSM, retention lock, SIEM rule,
+data residency/DPA và credential thật phải do môi trường triển khai cung cấp.
+Double Ratchet/MLS cũng phải chạy trong client dùng thư viện đã kiểm toán; server
+chỉ relay ciphertext. Những bằng chứng này cùng pentest/Red Team độc lập là cổng
+production, không thể được mô phỏng rồi tuyên bố đạt chỉ bằng unit test.

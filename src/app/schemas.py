@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 VALID_ROLES = {"user", "moderator", "admin"}
+VALID_SECURITY_MODES = {"secure", "confidential", "private_e2ee"}
+VALID_DATA_CLASSES = {
+    "public",
+    "internal",
+    "confidential",
+    "highly_confidential",
+    "e2ee_private",
+}
 
 # NIST SP 800-63B-4 favours length and blocklists over composition rules. We require a
 # long secret, accept passphrases up to 128 chars, and screen obvious weak/known tokens
@@ -77,6 +86,21 @@ class PasswordChangeRequest(BaseModel):
     @classmethod
     def validate_new_password(cls, value: str) -> str:
         return RegisterRequest.validate_password(value)
+
+
+class StepUpRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+    code: str | None = Field(default=None, min_length=6, max_length=32)
+
+    @field_validator("code")
+    @classmethod
+    def clean_code(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+
+class StepUpResponse(BaseModel):
+    verified_at: datetime
+    valid_for_seconds: int
 
 
 class UserStatusUpdate(BaseModel):
@@ -209,6 +233,8 @@ class UserResponse(BaseModel):
     role: str
     is_active: bool
     ai_data_consent: bool
+    ai_consent_at: datetime | None = None
+    ai_consent_version: str | None = None
     mfa_enabled: bool
     token_version: int
     created_at: datetime
@@ -216,6 +242,8 @@ class UserResponse(BaseModel):
 
 class SessionCreate(BaseModel):
     title: str = Field(default="Cuộc hội thoại mới", min_length=1, max_length=120)
+    security_mode: str = "secure"
+    data_classification: str = "internal"
 
     @field_validator("title")
     @classmethod
@@ -224,6 +252,30 @@ class SessionCreate(BaseModel):
         if not cleaned:
             raise ValueError("Tiêu đề không được để trống.")
         return cleaned
+
+    @field_validator("security_mode")
+    @classmethod
+    def validate_security_mode(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if cleaned not in VALID_SECURITY_MODES:
+            raise ValueError("Chế độ bảo mật không hợp lệ.")
+        return cleaned
+
+    @field_validator("data_classification")
+    @classmethod
+    def validate_data_classification(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if cleaned not in VALID_DATA_CLASSES:
+            raise ValueError("Phân loại dữ liệu không hợp lệ.")
+        return cleaned
+
+    @model_validator(mode="after")
+    def align_private_mode(self) -> SessionCreate:
+        if self.security_mode == "private_e2ee":
+            self.data_classification = "e2ee_private"
+        elif self.data_classification == "e2ee_private":
+            raise ValueError("e2ee_private chỉ dùng với chế độ private_e2ee.")
+        return self
 
 
 class SessionUpdate(BaseModel):
@@ -238,18 +290,47 @@ class SessionUpdate(BaseModel):
         return cleaned
 
 
+class SessionSecurityUpdate(BaseModel):
+    security_mode: str
+    data_classification: str
+
+    @field_validator("security_mode")
+    @classmethod
+    def validate_security_mode(cls, value: str) -> str:
+        return SessionCreate.validate_security_mode(value)
+
+    @field_validator("data_classification")
+    @classmethod
+    def validate_data_classification(cls, value: str) -> str:
+        return SessionCreate.validate_data_classification(value)
+
+    @model_validator(mode="after")
+    def align_private_mode(self) -> SessionSecurityUpdate:
+        if self.security_mode == "private_e2ee":
+            self.data_classification = "e2ee_private"
+        elif self.data_classification == "e2ee_private":
+            raise ValueError("e2ee_private chỉ dùng với chế độ private_e2ee.")
+        return self
+
+
 class SessionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
     owner_id: str
     title: str
+    security_mode: str
+    data_classification: str
+    current_crypto_epoch: int
+    crypto_suite: str
+    retention_expires_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
 
 class MessageSend(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
+    confirm_external_ai: bool = False
 
     @field_validator("content")
     @classmethod
@@ -280,6 +361,8 @@ class RawMessageResponse(BaseModel):
     ciphertext_preview: str
     nonce: str
     key_version: int
+    crypto_epoch: int = 0
+    encryption_scheme: str = "legacy-v1"
     created_at: datetime
 
 
@@ -305,3 +388,115 @@ class SecurityAlertResponse(BaseModel):
     count: int
     window_minutes: int
     message: str
+
+
+class E2eeChallengeResponse(BaseModel):
+    id: str
+    challenge: str
+    expires_at: datetime
+
+
+class E2eeDeviceRegisterRequest(BaseModel):
+    challenge_id: str = Field(min_length=36, max_length=36)
+    challenge: str = Field(min_length=22, max_length=96)
+    device_id: str = Field(min_length=36, max_length=36)
+    display_name: str = Field(min_length=1, max_length=80)
+    identity_key: str = Field(min_length=40, max_length=64)
+    possession_signature: str = Field(min_length=80, max_length=128)
+    signed_prekey: str = Field(min_length=40, max_length=512)
+    signed_prekey_signature: str = Field(min_length=80, max_length=128)
+    one_time_prekeys: list[str] = Field(default_factory=list, max_length=100)
+    approver_device_id: str | None = Field(default=None, max_length=64)
+    approval_signature: str | None = Field(default=None, max_length=128)
+
+    @field_validator("display_name")
+    @classmethod
+    def clean_display_name(cls, value: str) -> str:
+        cleaned = " ".join(value.split())
+        if not cleaned:
+            raise ValueError("Tên thiết bị không được để trống.")
+        return cleaned
+
+    @field_validator("challenge_id", "device_id")
+    @classmethod
+    def validate_uuid(cls, value: str) -> str:
+        try:
+            parsed = uuid.UUID(value)
+        except ValueError as exc:
+            raise ValueError("Định danh phải là UUID canonical.") from exc
+        canonical = str(parsed)
+        if canonical != value.lower():
+            raise ValueError("Định danh phải là UUID canonical.")
+        return canonical
+
+
+class E2eeDeviceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    display_name: str
+    fingerprint: str
+    trust_state: str
+    approved_at: datetime | None
+    revoked_at: datetime | None
+    created_at: datetime
+
+
+class E2eePreKeyBundleResponse(BaseModel):
+    user_id: str
+    device_id: str
+    display_name: str
+    fingerprint: str
+    identity_key: str
+    signed_prekey: str
+    signed_prekey_signature: str
+    one_time_prekey_id: str | None
+    one_time_prekey: str | None
+
+
+class E2eeEnvelopeSend(BaseModel):
+    version: int = 1
+    protocol: str
+    recipient: str
+    recipient_device_id: str | None = Field(default=None, max_length=64)
+    epoch: int = Field(ge=0)
+    client_message_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$",
+    )
+    sender_device_id: str = Field(min_length=1, max_length=64)
+    message_kind: str = Field(default="application", pattern=r"^(application|commit|welcome)$")
+    header: str = Field(min_length=2, max_length=25_000)
+    ciphertext: str = Field(min_length=20, max_length=1_500_000)
+
+
+class E2eeEnvelopeResponse(BaseModel):
+    id: str
+    session_id: str
+    sender_device_id: str
+    recipient_device_id: str | None
+    protocol: str
+    message_kind: str
+    client_message_id: str
+    header: str
+    ciphertext: str
+    group_epoch: int | None
+    created_at: datetime
+
+
+class E2eeMemberUpdate(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+
+    @field_validator("username")
+    @classmethod
+    def clean_username(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if not USERNAME_RE.fullmatch(cleaned):
+            raise ValueError("Tên đăng nhập không hợp lệ.")
+        return cleaned
+
+
+class ExportTicketResponse(BaseModel):
+    download_url: str
+    expires_at: datetime

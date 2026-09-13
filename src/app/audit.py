@@ -90,4 +90,17 @@ def record_audit(
         entry_hash=event.entry_hash,
         details=details,
     )
+    checkpoint_service = getattr(request.app.state, "audit_checkpoint_service", None)
+    if checkpoint_service is not None:
+        try:
+            checkpoint_service.maybe_anchor(db, event)
+        except Exception:  # noqa: BLE001 - audit anchoring must not break requests
+            logger.exception("Could not anchor the audit chain to the configured WORM sink.")
+            emit_security_event(
+                "audit.checkpoint.delivery_failed",
+                outcome="failure",
+                audit_id=event.id,
+                entry_hash=event.entry_hash,
+                request_id=request_id,
+            )
     return event

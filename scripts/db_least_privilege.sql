@@ -85,9 +85,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 -- one-shot sẽ áp quyền này sau khi tạo schema; nhánh dưới vẫn hỗ trợ chạy tay
 -- trên database đã có bảng.
 SELECT to_regclass('public.audit_events') IS NOT NULL AS audit_table_exists \gset
+SELECT to_regclass('public.audit_checkpoints') IS NOT NULL AS checkpoint_table_exists \gset
 \if :audit_table_exists
   REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_events FROM scap_app;
   GRANT  SELECT, INSERT            ON TABLE audit_events TO   scap_app;
+\endif
+\if :checkpoint_table_exists
+  REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_checkpoints FROM scap_app;
+  GRANT  SELECT, INSERT            ON TABLE audit_checkpoints TO   scap_app;
 \endif
 
 -- ── 6. Vai trò kiểm toán chỉ đọc ───────────────────────────────────────────
@@ -95,6 +100,9 @@ GRANT CONNECT ON DATABASE secure_chat TO scap_auditor;
 GRANT USAGE   ON SCHEMA public        TO scap_auditor;
 \if :audit_table_exists
   GRANT SELECT ON TABLE audit_events TO scap_auditor;
+\endif
+\if :checkpoint_table_exists
+  GRANT SELECT ON TABLE audit_checkpoints TO scap_auditor;
 \endif
 -- KHÔNG cấp quyền đọc secure_messages: kiểm toán viên xem được "ai làm gì",
 -- không xem được nội dung hội thoại (dù có đọc cũng chỉ thấy bản mã AES-GCM).

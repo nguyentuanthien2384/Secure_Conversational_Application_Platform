@@ -309,13 +309,14 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
                 if owner.username == "learn.mod":
                     idor_target = session_row.id
                 stamp = session_row.created_at
-                for role, content in turns:
+                for message_index, (role, content) in enumerate(turns, start=1):
                     ct, nc, kv = crypto.encrypt(content, session_row.id, role)
                     stamp += timedelta(minutes=3)
                     db.add(
                         SecureMessage(
                             session_id=session_row.id,
                             role=role,
+                            message_index=message_index,
                             ciphertext=ct,
                             nonce=nc,
                             key_version=kv,

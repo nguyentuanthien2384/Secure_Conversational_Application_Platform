@@ -1,7 +1,7 @@
 # 🛡️ Secure Conversational Application Platform (SCAP)
 
 > **Đồ án môn học:** Bảo mật Ứng dụng và Hệ thống
-> **Kiến trúc:** FastAPI + Gradio 6 (SPA thuần Python) + AES-256-GCM at rest + chuỗi audit HMAC-SHA256 + IDS/IPS tầng ứng dụng
+> **Kiến trúc:** FastAPI + Gradio 6 + envelope encryption (Vault/KMS) + DLP phân loại + E2EE ciphertext relay + audit anchor/WORM + IDS/IPS
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.140%2B-009688.svg)](https://fastapi.tiangolo.com/)
@@ -38,6 +38,18 @@ phân quyền RBAC kèm kiểm tra quyền sở hữu, mã hóa nội dung khi l
 có AAD), DLP trước khi gửi dữ liệu ra nhà cung cấp AI bên ngoài, IDS/IPS tầng ứng dụng,
 và nhật ký kiểm toán chống giả mạo bằng chuỗi băm HMAC.
 
+Bản nâng cấp bổ sung ba trust boundary (`secure`, `confidential`,
+`private_e2ee`), DEK riêng cho từng hội thoại được Vault/KMS bọc, AAD ràng buộc
+từng message, export streaming không tạo tệp plaintext tạm, consent AI phiên bản
+hóa, DLP chính thức, device/prekey/replay control cho E2EE, retention và audit
+checkpoint ngoài hệ thống. Xem [hướng dẫn triển khai bảo mật cao](docs/HIGH_SECURITY_DEPLOYMENT.md),
+[hợp đồng E2EE client](docs/E2EE_CLIENT_CONTRACT.md) và
+[bảng truy vết yêu cầu](docs/SECURITY_REQUIREMENTS_TRACEABILITY.md).
+
+> `SECURITY_PROFILE=high` là guard fail-closed, không phải nhãn chứng nhận. E2EE
+> hoàn chỉnh còn cần client dùng thư viện Double Ratchet/RFC 9420 MLS đã kiểm
+> toán; repository này chủ đích chỉ cung cấp server ciphertext boundary.
+
 Toàn bộ ứng dụng là **một tiến trình FastAPI duy nhất** ([src/app/main.py](src/app/main.py)).
 Giao diện Gradio được `mount` vào chính ứng dụng đó tại `/`, và bản thân UI **gọi ngược lại
 REST API qua HTTP** ([src/app/gradio_ui.py](src/app/gradio_ui.py)) — nghĩa là mọi thao tác
@@ -57,10 +69,16 @@ và chuyển sang PostgreSQL + Redis + Caddy.
 | [src/app/main.py](src/app/main.py) | Tạo app, middleware bảo mật (security headers/CSP/IDS), toàn bộ route REST, mount Gradio |
 | [src/app/config.py](src/app/config.py) | `Settings` đọc từ biến môi trường + **guard production** (từ chối khởi động nếu cấu hình yếu) |
 | [src/app/security.py](src/app/security.py) | `PasswordService` (Argon2id), `TokenService` (JWT), `CryptoService` (AES-256-GCM + key ring), `TotpService` (TOTP tự cài đặt), `PwnedPasswordChecker`, hai bản rate limiter |
-| [src/app/services.py](src/app/services.py) | **DLP redaction**, `AIService` (Gemini/demo), `ChatService` (mã hóa & giải mã hội thoại) |
+| [src/app/key_management.py](src/app/key_management.py) | Adapter Local/Vault Transit/AWS KMS/GCP KMS để sinh, unwrap và rewrap DEK |
+| [src/app/envelope.py](src/app/envelope.py) | DEK riêng từng hội thoại/tài khoản, AAD canonical theo message, cache DEK ngắn hạn |
+| [src/app/e2ee.py](src/app/e2ee.py) | Xác minh Ed25519, canonical JSON, fingerprint và validation opaque envelope; không giữ khóa riêng |
+| [src/app/dlp.py](src/app/dlp.py) | Detector + policy allow/redact/confirm/block/local-only độc lập với provider |
+| [src/app/services.py](src/app/services.py) | Tích hợp DLP, consent/context minimization, AIService và ChatService |
 | [src/app/ids.py](src/app/ids.py) | IDS/IPS: engine `signature` (SQLi/XSS/traversal/scanner UA) + engine `anomaly` (dò trên chính audit log), trạng thái chặn nguồn |
 | [src/app/audit.py](src/app/audit.py) | Ghi sự kiện audit, xác định IP nguồn |
 | [src/app/audit_chain.py](src/app/audit_chain.py) | Chuỗi băm chống giả mạo: `entry_hash = HMAC-SHA256(key, prev_hash ‖ canonical(entry))` |
+| [src/app/audit_checkpoint.py](src/app/audit_checkpoint.py) | Ký mốc cuối chuỗi và giao qua HTTPS tới WORM/SIEM ngoài máy chủ |
+| [src/app/retention.py](src/app/retention.py) | Retention theo mode và cryptographic erasure bằng xóa wrapped DEK |
 | [src/app/siem.py](src/app/siem.py) | Xuất sự kiện an ninh ra stdout dạng JSON một dòng (ECS-like) cho SIEM |
 | [src/app/models.py](src/app/models.py) | ORM: `User`, `AuthSession`, `ChatSession`, `SecureMessage`, `AuditEvent`, `RevokedToken`, `MfaRecoveryCode` |
 | [src/app/schemas.py](src/app/schemas.py) | Pydantic request/response, ràng buộc đầu vào |
@@ -104,10 +122,10 @@ và chuyển sang PostgreSQL + Redis + Caddy.
 └─────────────────────────────┬────────────────────────────────────┘
 ┌─────────────────────────────▼────────────────────────────────────┐
 │  LƯU TRỮ & KIỂM TOÁN                                             │
-│   • AES-256-GCM, AAD = secure-chat|session_id|role|v{key}        │
-│   • Key ring nhiều phiên bản → xoay khóa không downtime          │
-│   • audit_events nối chuỗi HMAC-SHA256, verify qua API           │
-│   • SIEM: JSON một dòng ra stdout                                │
+│   • DEK AES-256-GCM riêng/session, bọc bởi Vault/KMS             │
+│   • AAD = owner/session/message UUID/index/role/crypto epoch     │
+│   • Private E2EE: chỉ public key/prekey/opaque ciphertext        │
+│   • audit HMAC chain + checkpoint HTTPS tới WORM/SIEM            │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -166,18 +184,22 @@ sequenceDiagram
 
 ### 4.2 Mã hóa dữ liệu khi lưu trữ
 - Mọi tin nhắn lưu dưới dạng **AES-256-GCM**, nonce 96-bit ngẫu nhiên cho từng bản ghi.
-- **AAD** ràng buộc `session_id`, `role`, `key_version`: bê một bản mã sang phiên khác hoặc đổi
-  vai trò sẽ hỏng xác thực thay vì giải mã thành công.
-- Bí mật TOTP dùng namespace AAD riêng (`secure-chat|field|...`) nên không thể hoán đổi với bản mã tin nhắn.
-- **Key ring**: `MASTER_ENCRYPTION_KEYS=1:...,2:...` + `ACTIVE_KEY_VERSION` — khóa cũ vẫn giải mã
-  được dữ liệu cũ trong khi dữ liệu mới đã ghi bằng khóa mới.
+- Mỗi session có **DEK 256-bit riêng**; CSDL chỉ giữ wrapped DEK + KEK URI/version.
+  High profile bắt buộc Vault/managed KMS và từ chối master key trong web runtime.
+- **AAD canonical** ràng buộc owner, session, message UUID, message index, role và crypto epoch;
+  hoán đổi hai ciphertext cùng role trong cùng session cũng thất bại xác thực.
+- Bí mật TOTP dùng DEK riêng theo user và AAD namespace riêng nên không thể hoán đổi với message.
+- Xoay KEK dùng rewrap không giải mã lại nội dung; script migration chuyển dòng legacy từng dòng
+  trong RAM và không tạo plaintext file.
 
 ### 4.3 DLP trước khi ra khỏi biên tin cậy
-Áp dụng ở [src/app/services.py](src/app/services.py) cho **cả prompt lẫn phản hồi**, và trả về
+Áp dụng ở [src/app/dlp.py](src/app/dlp.py) và [src/app/services.py](src/app/services.py) cho **cả prompt lẫn phản hồi**, và trả về
 *tên danh mục* đã che (không bao giờ trả lại giá trị gốc) để UI và audit log hiển thị an toàn.
 Ngoài ra dữ liệu người dùng được bọc trong JSON `UNTRUSTED_USER_DATA_JSON` kèm system instruction
 để giảm rủi ro prompt injection. Việc gọi AI ngoài **chỉ xảy ra khi người dùng bật đồng ý**
-(`PATCH /api/auth/ai-consent`); chưa đồng ý thì trả 403.
+(`PATCH /api/auth/ai-consent`); consent có timestamp/policy version và context chỉ lấy tối đa tám
+message sau thời điểm consent. Policy hỗ trợ allow/redact/confirm/block/local-only; Private E2EE
+không bao giờ gọi AI phía server.
 
 ### 4.4 IDS/IPS tầng ứng dụng
 - Engine **signature**: 10 nhóm luật (SQLi, XSS, path traversal, command injection, SSTI,
@@ -195,6 +217,8 @@ Ngoài ra dữ liệu người dùng được bọc trong JSON `UNTRUSTED_USER_D
 - Sửa/xóa một dòng làm gãy toàn bộ chuỗi phía sau; kiểm chứng bằng `GET /api/admin/audit/verify`
   hoặc nút *Xác minh chuỗi* trên tab Bảo mật.
 - Song song, mỗi sự kiện được in ra stdout dạng JSON một dòng cho Loki/ELK/Splunk/Wazuh.
+- Checkpoint ký `last_event_id + root_hash` được đẩy qua HTTPS tới WORM. Đây là mốc ngoài máy
+  chủ để phát hiện cả việc xóa phần đuôi; API verify trả thêm `high_assurance_intact`.
 
 ### 4.6 Kiểm chứng Purple Team an toàn (MITRE ATT&CK)
 - Mỗi phát hiện chữ ký ứng dụng đều gắn `mitre_technique: T1190` khi phù hợp, nên bản ghi
@@ -251,6 +275,7 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | `POST` | `/api/auth/login` | Trả `access_token`, **hoặc** `mfa_token` nếu tài khoản bật 2FA |
 | `POST` | `/api/auth/mfa/verify` | Bước hai: mã TOTP hoặc recovery code |
 | `POST` | `/api/auth/mfa/enroll` · `/activate` · `/disable` | Ghi danh (QR + secret), kích hoạt, tắt 2FA |
+| `POST` | `/api/auth/step-up` | Xác minh lại password + MFA trước export/device/key operation |
 | `GET` | `/api/auth/me` | Hồ sơ người gọi |
 | `PATCH` | `/api/auth/ai-consent` | Bật/tắt đồng ý gửi nội dung cho AI bên ngoài |
 | `PATCH` | `/api/auth/password` | Đổi mật khẩu (có rate limit riêng) |
@@ -265,9 +290,19 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | `GET`/`PATCH`/`DELETE` | `/api/sessions/{id}` | Truy cập sai chủ sở hữu → **404** (giảm enumeration) |
 | `GET` | `/api/sessions/{id}/messages` | Nội dung đã giải mã |
 | `GET` | `/api/sessions/{id}/ciphertexts` | Bản mã thô + nonce + key version |
-| `GET` | `/api/sessions/{id}/export` | Xuất hội thoại ra JSON |
+| `PATCH` | `/api/sessions/{id}/security` | Chọn secure/confidential/private_e2ee trước khi có dữ liệu |
+| `GET` | `/api/sessions/{id}/export` | Stream JSON trực tiếp, không tạo plaintext temp; cần recent step-up |
+| `POST` | `/api/sessions/{id}/export-ticket` | Vé tải 60 giây single-use cho trình duyệt |
 | `POST` | `/api/sessions/{id}/messages` | Gửi tin nhắn; 403 nếu chưa đồng ý AI, 503 + `Retry-After` nếu provider lỗi |
 | `GET` | `/api/search/messages` | Tìm kiếm toàn cục trong phạm vi sở hữu |
+
+### Private E2EE control plane
+| Method | Đường dẫn | Ghi chú |
+| :--- | :--- | :--- |
+| `POST`/`GET`/`DELETE` | `/api/e2ee/devices[/challenge][/{id}]` | Proof Ed25519, trusted-device approval, revoke |
+| `GET` | `/api/e2ee/users/{username}/prekey-bundle` | Tiêu thụ one-time public prekey trong transaction |
+| `GET`/`POST`/`DELETE` | `/api/sessions/{id}/e2ee/members[/{username}]` | Membership + routing epoch cho MLS |
+| `GET`/`POST` | `/api/sessions/{id}/e2ee/envelopes` | Relay opaque Double Ratchet/MLS ciphertext + replay guard |
 
 ### Quản trị & giám sát
 | Method | Đường dẫn | Quyền |
@@ -279,6 +314,7 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | `PATCH` | `/api/admin/users/{id}/role` · `/status` | admin |
 | `GET` | `/api/admin/stats` · `/security-alerts` | admin |
 | `GET` | `/api/admin/audit/verify` | admin — xác minh chuỗi HMAC |
+| `POST` | `/api/admin/audit/checkpoint` | admin + step-up — ký/giao mốc chuỗi tới WORM |
 | `GET`/`DELETE` | `/api/admin/ids/blocklist[/{ip}]` | admin |
 | `GET` | `/api/health` | công khai, cố ý tối giản |
 
@@ -408,6 +444,9 @@ Bộ test ([tests/](tests/)) không chỉ kiểm chức năng mà kiểm **chín
 | [tests/test_ai_provider_errors.py](tests/test_ai_provider_errors.py) | Lỗi provider → 503, không rò rỉ chi tiết |
 | [tests/test_fixes_2026_07.py](tests/test_fixes_2026_07.py) | Regression cho từng lỗi đã sửa |
 | [tests/test_ui_wiring.py](tests/test_ui_wiring.py) | UI gọi đúng API, không đi tắt |
+| [tests/test_e2ee_core.py](tests/test_e2ee_core.py) | Canonical JSON, Ed25519 proofs, fingerprint, opaque envelope |
+| [tests/test_high_security_features.py](tests/test_high_security_features.py) | E2EE routes, prekey một lần, replay guard, streaming export |
+| [tests/test_envelope_and_audit.py](tests/test_envelope_and_audit.py) | Per-session DEK/AAD swap, rewrap, audit anchor, retention |
 
 ### 10.2 Pipeline GitHub Actions
 
@@ -441,6 +480,9 @@ Xem thêm [SECURITY.md](SECURITY.md) (chính sách báo lỗi) và
 | Sinh secret mới | `uv run python scripts/generate_secrets.py` |
 | Tạo/cập nhật schema | `uv run python scripts/migrate_database.py` |
 | Xoay khóa mã hóa | `uv run python scripts/rotate_encryption_key.py` (đặt `MASTER_ENCRYPTION_KEYS` + `ACTIVE_KEY_VERSION` trước) |
+| Migrate legacy sang envelope | `uv run python scripts/migrate_envelope_encryption.py --dry-run` rồi chạy thật |
+| Rewrap DEK sau khi xoay KEK | `uv run python scripts/rewrap_deks.py --dry-run` rồi chạy thật |
+| Enforce retention | `uv run python scripts/enforce_retention.py --dry-run` rồi chạy theo scheduler |
 | Nối lại chuỗi audit sau sự cố | `uv run python scripts/repair_audit_chain.py` — xem [docker-compose.repair.yml](docker-compose.repair.yml) |
 | Cấp quyền tối thiểu cho Postgres | [scripts/db_least_privilege.sql](scripts/db_least_privilege.sql), chạy tự động bởi [scripts/init_db_roles.sh](scripts/init_db_roles.sh) |
 | Kiểm tra nhanh các bản vá | `bash kiem-tra-ban-va.sh` |
@@ -457,19 +499,23 @@ Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Nh
 
 | Nhóm | Biến tiêu biểu |
 | :--- | :--- |
-| Bí mật | `APP_SECRET_KEY`, `MASTER_ENCRYPTION_KEY`, `MASTER_ENCRYPTION_KEYS`, `ACTIVE_KEY_VERSION` |
+| Hồ sơ/KMS | `SECURITY_PROFILE`, `KEY_PROVIDER`, `VAULT_*`, `AWS_KMS_KEY_ID`, `GCP_KMS_KEY_NAME`, `DEK_CACHE_SECONDS` |
+| Bí mật local/legacy | `APP_SECRET_KEY`, `MASTER_ENCRYPTION_KEY`, `MASTER_ENCRYPTION_KEYS`, `ACTIVE_KEY_VERSION` |
 | Hạ tầng | `DATABASE_URL`, `REDIS_URL`, `ALLOWED_ORIGINS`, `ALLOWED_HOSTS`, `PUBLIC_DOMAIN` |
 | Phiên & token | `ACCESS_TOKEN_MINUTES`, `SESSION_ABSOLUTE_HOURS`, `REFRESH_WINDOW_SECONDS`, `REFRESH_MAX_ATTEMPTS` |
-| Hạn mức tài nguyên | `MAX_SESSIONS_PER_USER` (số hội thoại tối đa mỗi người dùng) |
+| Hạn mức/retention | `MAX_SESSIONS_PER_USER`, `MAX_MESSAGES_PER_SESSION`, `SECURE_RETENTION_DAYS`, `CONFIDENTIAL_RETENTION_DAYS` |
 | Chống lạm dụng | `LOGIN_*`, `REGISTRATION_*`, `MESSAGE_*`, `PASSWORD_CHANGE_*` |
 | 2FA | `MFA_ISSUER`, `MFA_CHALLENGE_MINUTES`, `MFA_RECOVERY_CODES`, `MFA_*_ATTEMPTS` |
-| IDS/Audit/SIEM | `IDS_ENABLED`, `IDS_BLOCK_THRESHOLD`, `IDS_BLOCK_SECONDS`, `AUDIT_CHAIN_ENABLED`, `SIEM_JSON_LOGS` |
-| AI | `GOOGLE_GENAI_API_KEY`, `GEMINI_MODEL`, `ALLOW_DEMO_AI` |
+| IDS/Audit/SIEM | `IDS_*`, `AUDIT_CHAIN_ENABLED`, `AUDIT_WORM_*`, `AUDIT_CHECKPOINT_INTERVAL`, `SIEM_JSON_LOGS` |
+| UI/SSO | `GRADIO_AUTH_MODE`, `OIDC_*`, `GRADIO_MAX_FILE_SIZE`, `CSP_*` |
+| AI/DLP | `GOOGLE_GENAI_API_KEY`, `GEMINI_MODEL`, `ALLOW_DEMO_AI`, `AI_CONSENT_VERSION`, `DLP_CUSTOM_TERMS` |
 
 Đặt `APP_ENV=production` sẽ kích hoạt các guard trong [src/app/config.py](src/app/config.py):
 ứng dụng **từ chối khởi động** nếu thiếu `APP_SECRET_KEY` đủ mạnh, thiếu khóa mã hóa, thiếu
 `REDIS_URL` / `ALLOWED_ORIGINS` / `ALLOWED_HOSTS`, còn bật `DOCS_ENABLED` hay `SEED_DEMO_DATA`,
 có đặt `BOOTSTRAP_ADMIN_PASSWORD`, hoặc `DATABASE_URL` dùng tài khoản chủ của Postgres.
+High profile còn bắt buộc KMS/Vault, PostgreSQL, OIDC gate, WORM audit, MFA cho tài khoản
+đặc quyền/hội thoại nhạy cảm và từ chối master key legacy trong web runtime.
 
 ---
 
@@ -483,10 +529,16 @@ Secure_Conversational_Application_Platform/
 │   │   ├── main.py                  # FastAPI app, middleware, toàn bộ route, mount Gradio
 │   │   ├── config.py                # Settings + guard production
 │   │   ├── security.py              # Argon2id, JWT, AES-256-GCM, TOTP, rate limiter
-│   │   ├── services.py              # DLP redaction, AIService, ChatService
+│   │   ├── key_management.py        # Vault/AWS/GCP/local KEK provider
+│   │   ├── envelope.py              # Per-session DEK + message-bound AAD
+│   │   ├── e2ee.py                  # Public proof/opaque ciphertext boundary
+│   │   ├── dlp.py                   # Formal detector/policy engine
+│   │   ├── services.py              # AI/DLP/Chat integration
 │   │   ├── ids.py                   # IDS/IPS: signature + anomaly engine
 │   │   ├── audit.py                 # Ghi sự kiện audit
 │   │   ├── audit_chain.py           # Chuỗi băm HMAC-SHA256 chống giả mạo
+│   │   ├── audit_checkpoint.py      # External WORM anchors
+│   │   ├── retention.py             # Retention/cryptographic erasure
 │   │   ├── siem.py                  # Log JSON một dòng cho SIEM
 │   │   ├── models.py                # ORM SQLAlchemy
 │   │   ├── schemas.py               # Pydantic schema
@@ -495,13 +547,14 @@ Secure_Conversational_Application_Platform/
 │   │   ├── demo_seed.py             # Dữ liệu mẫu idempotent
 │   │   └── ui_assets/               # Ảnh tĩnh của giao diện
 │   ├── core/ai_core/gemini_ai.py    # Wrapper SDK google-genai
-├── tests/                           # 106 test, tập trung vào kiểm soát an ninh
+├── tests/                           # Kiểm thử API, crypto, DLP, E2EE, audit, hardening
 ├── scripts/                         # secret, migration, rotate key, seed, repair, ZAP
 ├── docs/DEMO_SCRIPT.md              # Kịch bản demo trước hội đồng
 ├── reports/                         # Kết quả kiểm thử lưu lại
 ├── Dockerfile                       # Base image pin được bằng digest, chạy user không phải root
 ├── docker-compose.yml               # Production: db + redis + migrate + app + caddy
 ├── docker-compose.local.yml         # Lớp phủ demo trên laptop (tắt Caddy)
+├── docker-compose.high-security.yml # Vault/OIDC/WORM guard overlay
 ├── docker-compose.repair.yml        # Cụm phục hồi chuỗi audit
 ├── Caddyfile                        # TLS, security header biên, /.well-known/security.txt
 ├── HUONG_DAN_CHAY.md                # Hướng dẫn chạy chi tiết
@@ -515,9 +568,9 @@ Secure_Conversational_Application_Platform/
 
 ## 14. Giới hạn có chủ đích
 
-1. **Khóa nằm cùng tiến trình.** `MASTER_ENCRYPTION_KEY` và khóa HMAC audit đọc từ biến môi
-   trường, nên kẻ chiếm được host vẫn giả mạo được chuỗi audit. Hệ thống thật cần KMS/HSM và
-   đẩy log sang WORM storage hoặc SIEM từ xa — `siem.py` là bước chuẩn bị cho hướng đó.
+1. **Khóa audit vẫn nằm cùng tiến trình.** High profile đã đưa KEK hội thoại ra Vault/KMS,
+   nhưng khóa ký JWT/audit dẫn xuất từ app secret vẫn nằm trong web process. Checkpoint ngoài
+   WORM phát hiện rollback sau khi giao; full host compromise trước khi giao vẫn còn rủi ro.
 2. **CSP còn `'unsafe-inline'`.** Gradio sinh style/script inline. `'unsafe-eval'` đã bỏ được
    (giai đoạn 1); chuyển sang nonce/hash cần tách frontend riêng (giai đoạn 2).
 3. **IDS chữ ký là phòng thủ chiều sâu, không phải kiểm soát chính.** SQL injection đã bất khả thi
@@ -525,7 +578,10 @@ Secure_Conversational_Application_Platform/
    ý đồ tấn công, và có thể bị né bằng mã hóa/obfuscation.
 4. **Rate limiter in-memory chỉ đúng cho một tiến trình.** Nhiều worker bắt buộc dùng Redis —
    guard production đã ép điều này.
-5. **Chuỗi audit nối tiếp bằng mutex + row lock**, đúng cho một instance; Postgres nhiều writer nên
-   dùng advisory lock như ghi chú trong [src/app/audit_chain.py](src/app/audit_chain.py).
-6. **Chưa kèm file LICENSE.** Đây là đồ án môn học; hãy thêm `LICENSE` trước khi công bố lại
+5. **E2EE cần client riêng đã audit.** Server đã có public-key/prekey/membership/ciphertext relay
+   và replay guard nhưng cố ý không tự viết Double Ratchet/MLS. Chưa được tuyên bố E2EE production
+   khi chưa có client, interop vectors và pentest độc lập.
+6. **Dịch vụ ngoài chưa được provision bởi repository.** Adapter/guard cho KMS, OIDC proxy và
+   WORM đã có, nhưng IAM, retention lock, IdP policy, alerting, DPA và Red Team là cổng vận hành.
+7. **Chưa kèm file LICENSE.** Đây là đồ án môn học; hãy thêm `LICENSE` trước khi công bố lại
    dưới một giấy phép cụ thể.

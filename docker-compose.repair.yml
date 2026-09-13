@@ -26,7 +26,11 @@
 
 services:
   repair:
-    build: .
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim}
+        REQUIRE_BASE_IMAGE_DIGEST: "true"
     # Nạp .env để lấy APP_SECRET_KEY. Đây là điểm SỐNG CÒN: khóa HMAC của chuỗi
     # băm được dẫn xuất từ APP_SECRET_KEY. Nếu container này dùng khóa khác với
     # server, các bản ghi vừa vá sẽ được niêm phong bằng khóa sai và trang Bảo mật
@@ -40,6 +44,7 @@ services:
       # nhắm vào tiến trình phục vụ web, không nhắm vào tác vụ bảo trì one-shot
       # vốn buộc phải dùng quyền cao hơn. Container này không mở cổng nào.
       APP_ENV: development
+      PYTHONPATH: /app
     command: ["/app/.venv/bin/python", "scripts/repair_audit_chain.py"]
     depends_on:
       db:
@@ -51,6 +56,14 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Chỉ ở mạng nội bộ, không ra Internet.
     networks: [backend]
     # Không chạy cùng `docker compose up`; chỉ chạy khi được gọi tên qua

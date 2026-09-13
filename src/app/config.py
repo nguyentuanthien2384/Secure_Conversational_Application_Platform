@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -13,7 +14,14 @@ def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(
+        f"{name} phải là một giá trị boolean rõ ràng: true/false, yes/no, on/off hoặc 1/0."
+    )
 
 
 def _csv_env(name: str, default: str = "") -> tuple[str, ...]:
@@ -107,16 +115,58 @@ class Settings:
     siem_json_logs: bool = True
     password_change_max_attempts: int = 5
     password_change_window_seconds: int = 900
+    # High-assurance controls introduced by the security-upgrade report.
+    security_profile: str = "standard"
+    key_provider: str = "local"
+    dek_cache_seconds: int = 60
+    vault_addr: str = ""
+    vault_token_file: str = ""
+    vault_transit_mount: str = "transit"
+    vault_transit_key: str = "scap-conversations"
+    vault_namespace: str = ""
+    vault_allow_insecure_http: bool = False
+    aws_kms_key_id: str = ""
+    aws_region: str = ""
+    gcp_kms_key_name: str = ""
+    step_up_minutes: int = 5
+    max_messages_per_session: int = 10_000
+    confidential_retention_days: int = 7
+    secure_retention_days: int = 90
+    ai_consent_version: str = "2026-09"
+    dlp_custom_terms: tuple[str, ...] = ()
+    csp_report_only: bool = True
+    gradio_max_file_size: str = "5mb"
+    gradio_auth_mode: str = "application"
+    oidc_user_header: str = "x-auth-request-user"
+    oidc_proxy_secret_header: str = "x-scap-proxy-secret"
+    oidc_proxy_secret_file: str = ""
+    audit_worm_endpoint: str = ""
+    audit_worm_token_file: str = ""
+    audit_checkpoint_interval: int = 100
+    retention_sweep_on_startup: bool = True
+
     @classmethod
     def from_env(cls) -> Settings:
         load_dotenv()
         environment = os.getenv("APP_ENV", "development").strip().lower()
+        if environment not in {"development", "test", "production"}:
+            raise RuntimeError(
+                "APP_ENV không hợp lệ; chỉ chấp nhận development, test hoặc production."
+            )
+        security_profile = os.getenv("SECURITY_PROFILE", "standard").strip().lower()
+        if security_profile not in {"standard", "high"}:
+            raise RuntimeError("SECURITY_PROFILE chỉ chấp nhận standard hoặc high.")
+        key_provider = os.getenv("KEY_PROVIDER", "local").strip().lower()
+        if key_provider not in {"local", "vault", "aws-kms", "gcp-kms"}:
+            raise RuntimeError(
+                "KEY_PROVIDER chỉ chấp nhận local, vault, aws-kms hoặc gcp-kms."
+            )
         database_url = os.getenv("DATABASE_URL", "sqlite:///./secure_chat.db")
         # Development-only marker; the production guard below rejects it.
         secret_key = os.getenv("APP_SECRET_KEY", "").strip() or "development-only-change-me"  # nosec B105
         master_key = os.getenv("MASTER_ENCRYPTION_KEY", "").strip()
         keyring = _keyring_env()
-        if not master_key and not keyring and environment != "production":
+        if not master_key and not keyring and environment != "production" and key_provider == "local":
             master_key = derive_demo_key(secret_key)
         active_version_raw = os.getenv("ACTIVE_KEY_VERSION", "").strip()
         active_version = int(active_version_raw) if active_version_raw else None
@@ -127,7 +177,7 @@ class Settings:
                 raise RuntimeError(
                     "APP_SECRET_KEY phải được đặt và dài tối thiểu 32 ký tự ở production."
                 )
-            if not master_key and not keyring:
+            if key_provider == "local" and not master_key and not keyring:
                 raise RuntimeError(
                     "MASTER_ENCRYPTION_KEY hoặc MASTER_ENCRYPTION_KEYS bắt buộc ở production."
                 )
@@ -141,6 +191,8 @@ class Settings:
                 raise RuntimeError(
                     "ALLOWED_HOSTS bắt buộc ở production (chống tấn công Host header)."
                 )
+            if "*" in _csv_env("ALLOWED_ORIGINS") or "*" in _csv_env("ALLOWED_HOSTS"):
+                raise RuntimeError("Production không cho phép wildcard trong origin/host allowlist.")
             if _bool_env("DOCS_ENABLED", False):
                 raise RuntimeError("DOCS_ENABLED phải tắt ở production.")
             if os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "").strip():
@@ -158,6 +210,116 @@ class Settings:
                         "DATABASE_URL production không được dùng tài khoản chủ/superuser; "
                         "hãy dùng vai trò runtime tối thiểu (ví dụ scap_app)."
                     )
+
+            if security_profile == "high":
+                if key_provider == "local":
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high bắt buộc dùng Vault hoặc managed KMS; "
+                        "KEK không được nằm trong biến môi trường ứng dụng."
+                    )
+                if master_key or keyring:
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high không nạp MASTER_ENCRYPTION_KEY(S) vào web runtime. "
+                        "Hãy migrate dữ liệu cũ bằng maintenance job rồi gỡ khóa khỏi runtime."
+                    )
+                if not database_url.startswith(("postgresql://", "postgresql+")):
+                    raise RuntimeError("SECURITY_PROFILE=high bắt buộc dùng PostgreSQL.")
+                immutable_image = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+                mutable_images = [
+                    name
+                    for name in (
+                        "BASE_IMAGE",
+                        "POSTGRES_IMAGE",
+                        "REDIS_IMAGE",
+                        "CADDY_IMAGE",
+                    )
+                    if not immutable_image.fullmatch(os.getenv(name, "").strip())
+                ]
+                if mutable_images:
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high bắt buộc image pin theo name@sha256 cho: "
+                        + ", ".join(mutable_images)
+                    )
+                required_controls = {
+                    "IDS_ENABLED": _bool_env("IDS_ENABLED", True),
+                    "AUDIT_CHAIN_ENABLED": _bool_env("AUDIT_CHAIN_ENABLED", True),
+                    "SIEM_JSON_LOGS": _bool_env("SIEM_JSON_LOGS", True),
+                    "PASSWORD_BREACH_CHECK": _bool_env("PASSWORD_BREACH_CHECK", False),
+                }
+                disabled = [name for name, enabled in required_controls.items() if not enabled]
+                if disabled:
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high không cho phép tắt: " + ", ".join(disabled)
+                    )
+                if _bool_env("ALLOW_DEMO_AI", False):
+                    raise RuntimeError("SECURITY_PROFILE=high không cho phép ALLOW_DEMO_AI.")
+                if not _bool_env("RETENTION_SWEEP_ON_STARTUP", True):
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high không cho phép tắt retention sweep khi khởi động."
+                    )
+                worm_endpoint = os.getenv("AUDIT_WORM_ENDPOINT", "").strip()
+                worm_token_file = os.getenv("AUDIT_WORM_TOKEN_FILE", "").strip()
+                if not worm_endpoint or not worm_token_file:
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high bắt buộc AUDIT_WORM_ENDPOINT và "
+                        "AUDIT_WORM_TOKEN_FILE để neo audit ra hệ thống ngoài."
+                    )
+
+        if key_provider == "vault":
+            if not os.getenv("VAULT_ADDR", "").strip():
+                raise RuntimeError("VAULT_ADDR bắt buộc khi KEY_PROVIDER=vault.")
+            if not os.getenv("VAULT_TOKEN_FILE", "").strip():
+                raise RuntimeError("VAULT_TOKEN_FILE bắt buộc khi KEY_PROVIDER=vault.")
+        elif key_provider == "aws-kms" and not os.getenv("AWS_KMS_KEY_ID", "").strip():
+            raise RuntimeError("AWS_KMS_KEY_ID bắt buộc khi KEY_PROVIDER=aws-kms.")
+        elif key_provider == "gcp-kms" and not os.getenv("GCP_KMS_KEY_NAME", "").strip():
+            raise RuntimeError("GCP_KMS_KEY_NAME bắt buộc khi KEY_PROVIDER=gcp-kms.")
+
+        numeric_limits = {
+            "DEK_CACHE_SECONDS": int(os.getenv("DEK_CACHE_SECONDS", "60")),
+            "STEP_UP_MINUTES": int(os.getenv("STEP_UP_MINUTES", "5")),
+            "MAX_MESSAGES_PER_SESSION": int(os.getenv("MAX_MESSAGES_PER_SESSION", "10000")),
+            "CONFIDENTIAL_RETENTION_DAYS": int(
+                os.getenv("CONFIDENTIAL_RETENTION_DAYS", "7")
+            ),
+            "SECURE_RETENTION_DAYS": int(os.getenv("SECURE_RETENTION_DAYS", "90")),
+            "AUDIT_CHECKPOINT_INTERVAL": int(
+                os.getenv("AUDIT_CHECKPOINT_INTERVAL", "100")
+            ),
+        }
+        if numeric_limits["DEK_CACHE_SECONDS"] < 0:
+            raise RuntimeError("DEK_CACHE_SECONDS không được âm.")
+        for name in (
+            "STEP_UP_MINUTES",
+            "MAX_MESSAGES_PER_SESSION",
+            "CONFIDENTIAL_RETENTION_DAYS",
+            "SECURE_RETENTION_DAYS",
+            "AUDIT_CHECKPOINT_INTERVAL",
+        ):
+            if numeric_limits[name] <= 0:
+                raise RuntimeError(f"{name} phải là số nguyên dương.")
+
+        gradio_auth_mode = os.getenv("GRADIO_AUTH_MODE", "application").strip().lower()
+        if gradio_auth_mode not in {"application", "oidc"}:
+            raise RuntimeError("GRADIO_AUTH_MODE chỉ chấp nhận application hoặc oidc.")
+        if security_profile == "high" and gradio_auth_mode != "oidc":
+            raise RuntimeError(
+                "SECURITY_PROFILE=high bắt buộc GRADIO_AUTH_MODE=oidc để bảo vệ route Gradio ở tầng HTTP."
+            )
+        oidc_proxy_secret_file = os.getenv("OIDC_PROXY_SECRET_FILE", "").strip()
+        if gradio_auth_mode == "oidc" and not oidc_proxy_secret_file:
+            raise RuntimeError(
+                "OIDC_PROXY_SECRET_FILE bắt buộc ở chế độ OIDC; không tin cậy header proxy trần."
+            )
+        header_re = re.compile(r"^[a-z0-9-]{3,64}$")
+        oidc_user_header = os.getenv("OIDC_USER_HEADER", "x-auth-request-user").strip().lower()
+        oidc_proxy_secret_header = os.getenv(
+            "OIDC_PROXY_SECRET_HEADER", "x-scap-proxy-secret"
+        ).strip().lower()
+        if not header_re.fullmatch(oidc_user_header) or not header_re.fullmatch(
+            oidc_proxy_secret_header
+        ):
+            raise RuntimeError("Tên header OIDC/proxy không hợp lệ.")
 
         return cls(
             environment=environment,
@@ -203,4 +365,38 @@ class Settings:
             siem_json_logs=_bool_env("SIEM_JSON_LOGS", True),
             password_change_max_attempts=int(os.getenv("PASSWORD_CHANGE_MAX_ATTEMPTS", "5")),
             password_change_window_seconds=int(os.getenv("PASSWORD_CHANGE_WINDOW_SECONDS", "900")),
+            security_profile=security_profile,
+            key_provider=key_provider,
+            dek_cache_seconds=numeric_limits["DEK_CACHE_SECONDS"],
+            vault_addr=os.getenv("VAULT_ADDR", "").strip(),
+            vault_token_file=os.getenv("VAULT_TOKEN_FILE", "").strip(),
+            vault_transit_mount=os.getenv("VAULT_TRANSIT_MOUNT", "transit").strip()
+            or "transit",
+            vault_transit_key=os.getenv(
+                "VAULT_TRANSIT_KEY", "scap-conversations"
+            ).strip()
+            or "scap-conversations",
+            vault_namespace=os.getenv("VAULT_NAMESPACE", "").strip(),
+            vault_allow_insecure_http=_bool_env("VAULT_ALLOW_INSECURE_HTTP", False),
+            aws_kms_key_id=os.getenv("AWS_KMS_KEY_ID", "").strip(),
+            aws_region=os.getenv("AWS_REGION", "").strip(),
+            gcp_kms_key_name=os.getenv("GCP_KMS_KEY_NAME", "").strip(),
+            step_up_minutes=numeric_limits["STEP_UP_MINUTES"],
+            max_messages_per_session=numeric_limits["MAX_MESSAGES_PER_SESSION"],
+            confidential_retention_days=numeric_limits["CONFIDENTIAL_RETENTION_DAYS"],
+            secure_retention_days=numeric_limits["SECURE_RETENTION_DAYS"],
+            ai_consent_version=os.getenv("AI_CONSENT_VERSION", "2026-09").strip()
+            or "2026-09",
+            dlp_custom_terms=_csv_env("DLP_CUSTOM_TERMS"),
+            csp_report_only=_bool_env("CSP_REPORT_ONLY", True),
+            gradio_max_file_size=os.getenv("GRADIO_MAX_FILE_SIZE", "5mb").strip()
+            or "5mb",
+            gradio_auth_mode=gradio_auth_mode,
+            oidc_user_header=oidc_user_header,
+            oidc_proxy_secret_header=oidc_proxy_secret_header,
+            oidc_proxy_secret_file=oidc_proxy_secret_file,
+            audit_worm_endpoint=os.getenv("AUDIT_WORM_ENDPOINT", "").strip(),
+            audit_worm_token_file=os.getenv("AUDIT_WORM_TOKEN_FILE", "").strip(),
+            audit_checkpoint_interval=numeric_limits["AUDIT_CHECKPOINT_INTERVAL"],
+            retention_sweep_on_startup=_bool_env("RETENTION_SWEEP_ON_STARTUP", True),
         )

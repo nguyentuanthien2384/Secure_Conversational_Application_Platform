@@ -1,6 +1,6 @@
 # Hướng dẫn chạy dự án bằng Docker (thủ công, từng bước)
 
-`docker-compose.yml` của dự án là **cấu hình production thật**: 5 service, phân đoạn
+`docker-compose.yml` của dự án là **production baseline**: 5 service, phân đoạn
 mạng, PostgreSQL 3 vai trò quyền tối thiểu, Caddy tự xin chứng chỉ Let's Encrypt.
 Vì vậy không thể `docker compose up` rồi vào `localhost` là xong — tài liệu này đi
 qua đúng từng bước, kèm 3 điểm dễ vỡ nhất.
@@ -34,6 +34,9 @@ Thứ tự khởi động do Compose đảm bảo: `db` healthy → `migrate` ch
 ### 1.1. `BOOTSTRAP_ADMIN_PASSWORD` phải để trống
 
 Service `app` dùng `env_file: .env`, và nó chạy với `APP_ENV=production`.
+Đối với hội thoại rất nhạy cảm, phải ghép thêm
+`docker-compose.high-security.yml` và hoàn thành mọi cổng trong
+`docs/HIGH_SECURITY_DEPLOYMENT.md`; baseline không tự động là high-security.
 `src/app/config.py` có guard:
 
 ```
@@ -61,11 +64,13 @@ Caddy **không** gọi ACME mà tự sinh CA nội bộ, cert lưu ở
 `/data/caddy/pki/authorities/local`. Trình duyệt sẽ cảnh báo cert lạ — bình thường,
 xem mục 4.3 để cài root CA cho hết cảnh báo.
 
-### 1.3. Đổi `MASTER_ENCRYPTION_KEY` = mất dữ liệu cũ
+### 1.3. Khóa local/legacy và envelope encryption
 
-Tin nhắn mã hóa AES-256-GCM bằng khóa trong `.env`. Đổi khóa → hội thoại cũ không
-giải mã được (đúng thiết kế). Nếu muốn đổi mà giữ dữ liệu, dùng
-`MASTER_ENCRYPTION_KEYS` + `scripts/rotate_encryption_key.py`.
+Tin nhắn mới dùng DEK riêng từng hội thoại. Local/demo bọc DEK bằng khóa trong
+`.env`; high profile bắt buộc Vault/managed KMS. Dữ liệu cũ vẫn có thể phụ thuộc
+keyring legacy. Chạy `scripts/migrate_envelope_encryption.py`, kiểm tra restore,
+rồi mới gỡ master key khỏi web runtime. Xoay KEK dùng `scripts/rewrap_deks.py`
+và không cần giải mã lại toàn bộ nội dung.
 
 ---
 

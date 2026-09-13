@@ -2,7 +2,14 @@
 	email {$CADDY_EMAIL}
 	# Không quảng bá phiên bản Caddy (giảm thông tin trinh sát cho attacker).
 	servers {
-		trusted_proxies static private_ranges
+		# Bound header/body reads so slow or oversized clients cannot occupy a
+		# connection indefinitely. Keep write timeout unset for streamed exports.
+		timeouts {
+			read_header 10s
+			read_body 60s
+			idle 2m
+		}
+		max_header_size 32KB
 	}
 }
 
@@ -13,27 +20,33 @@
 	}
 	encode zstd gzip
 
+	# Enforce the same high-sensitivity upload ceiling at the Internet edge.
+	# Caddy returns 413 before FastAPI/Gradio reads more than this amount.
+	request_body {
+		max_size 5MB
+	}
+
 	# ── RFC 9116: kênh báo cáo lỗ hổng có trách nhiệm (Bài 8 §vận hành) ──
 	handle /.well-known/security.txt {
 		header Content-Type "text/plain; charset=utf-8"
 		respond `Contact: mailto:{$CADDY_EMAIL}
-Preferred-Languages: vi, en
-Canonical: https://{$PUBLIC_DOMAIN}/.well-known/security.txt
-Policy: https://{$PUBLIC_DOMAIN}/security-policy
-Expires: {$SECURITY_TXT_EXPIRES}
-` 200
+		Preferred-Languages: vi, en
+		Canonical: https://{$PUBLIC_DOMAIN}/.well-known/security.txt
+		Policy: https://{$PUBLIC_DOMAIN}/security-policy
+		Expires: {$SECURITY_TXT_EXPIRES}
+		` 200
 	}
 
 	handle /security-policy {
 		header Content-Type "text/plain; charset=utf-8"
 		respond `Vulnerability Disclosure Policy
 
-Only test systems you own or are explicitly authorized to assess.
-Do not access, alter, retain, or disclose other users' data.
-Avoid denial-of-service, social engineering, and destructive testing.
-Report findings to {$CADDY_EMAIL} with reproducible steps and impact.
-We will acknowledge a valid report and coordinate remediation in good faith.
-` 200
+		Only test systems you own or are explicitly authorized to assess.
+		Do not access, alter, retain, or disclose other users' data.
+		Avoid denial-of-service, social engineering, and destructive testing.
+		Report findings to {$CADDY_EMAIL} with reproducible steps and impact.
+		We will acknowledge a valid report and coordinate remediation in good faith.
+		` 200
 	}
 
 	# ── Chặn sớm các đường dẫn trinh sát của stack khác (WordPress/PHP/git) ──
@@ -48,6 +61,11 @@ We will acknowledge a valid report and coordinate remediation in good faith.
 	handle @bad_method {
 		respond 405
 	}
+
+	# Vé tải xuống là capability sống 60 giây và nằm trong path. Không ghi cả
+	# request này vào access log; sự kiện export vẫn được audit trong ứng dụng.
+	@export_download path /api/exports/*
+	log_skip @export_download
 
 	reverse_proxy app:8000 {
 		# Giới hạn thời gian để một backend chậm không giữ kết nối vô hạn.
@@ -73,7 +91,15 @@ We will acknowledge a valid report and coordinate remediation in good faith.
 
 	log {
 		output stdout
-		format json
+		format filter {
+			# Defense in depth: không đưa bearer token, cookie hoặc bí mật giữa
+			# identity-aware proxy và ứng dụng vào hệ thống tập trung log.
+			request>headers>Authorization delete
+			request>headers>Cookie delete
+			request>headers>X-Scap-Proxy-Secret delete
+			response>headers>Set-Cookie delete
+			wrap json
+		}
 	}
 }
 

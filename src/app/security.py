@@ -109,6 +109,37 @@ class TokenService:
             raise jwt.InvalidTokenError("Không phải token thử thách MFA.")
         return payload
 
+    def issue_export_ticket(self, user_id: str, session_id: str, seconds: int = 60) -> str:
+        """Mint a short-lived, single-purpose capability for browser downloads."""
+        if seconds < 1 or seconds > 300:
+            raise ValueError("Export ticket lifetime must be between 1 and 300 seconds.")
+        now = datetime.now(timezone.utc)
+        payload = {
+            "sub": user_id,
+            "sid": session_id,
+            "typ": "export_ticket",
+            "iat": now,
+            "nbf": now,
+            "exp": now + timedelta(seconds=seconds),
+            "jti": str(uuid.uuid4()),
+            "iss": "secure-chat-course-project",
+            "aud": "secure-chat-export",
+        }
+        return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+
+    def decode_export_ticket(self, token: str) -> dict[str, Any]:
+        payload = jwt.decode(
+            token,
+            self.secret_key,
+            algorithms=[self.algorithm],
+            audience="secure-chat-export",
+            issuer="secure-chat-course-project",
+            options={"require": ["exp", "iat", "nbf", "sub", "sid", "jti"]},
+        )
+        if payload.get("typ") != "export_ticket":
+            raise jwt.InvalidTokenError("Không phải vé xuất dữ liệu.")
+        return payload
+
 
 class CryptoService:
     """AES-256-GCM encryption with associated data bound to session and role."""
