@@ -21,16 +21,18 @@ Không thể đổi trust boundary sau khi phiên đã có dữ liệu. Không �
 
 ## Cổng bắt buộc trước khi go-live
 
-1. PostgreSQL chạy bằng role `scap_app`, không phải owner/superuser; TLS DB và
-   backup mã hóa đã được kiểm thử phục hồi.
+1. PostgreSQL chạy bằng role `scap_app`, không phải owner/superuser; kết nối bắt
+   buộc `sslmode=verify-full`, chứng chỉ đúng hostname và backup mã hóa đã được
+   kiểm thử phục hồi.
 2. `KEY_PROVIDER=vault`, `aws-kms` hoặc `gcp-kms`; web runtime không chứa
    `MASTER_ENCRYPTION_KEY(S)`. Dùng workload identity hoặc token file ngắn hạn.
 3. Identity-aware proxy đã xác thực OIDC, xóa header do client gửi và chèn
    `OIDC_USER_HEADER` cùng `OIDC_PROXY_SECRET_HEADER`. Bí mật proxy dài ít nhất
    32 ký tự, mount read-only tại `OIDC_PROXY_SECRET_FILE`; tự đăng ký bị tắt.
-4. Redis riêng cho rate limit đa instance; IDS, SIEM JSON, audit chain và kiểm
-   tra mật khẩu rò rỉ đều bật. Nếu dịch vụ kiểm tra mật khẩu không sẵn sàng,
-   thao tác tạo/đổi mật khẩu bị từ chối tạm thời thay vì bỏ qua kiểm tra.
+4. Redis riêng cho rate limit đa instance và dùng `rediss://` với xác minh CA;
+   IDS, SIEM JSON, audit chain và kiểm tra mật khẩu rò rỉ đều bật. Nếu dịch vụ
+   kiểm tra mật khẩu không sẵn sàng, thao tác tạo/đổi mật khẩu bị từ chối tạm
+   thời thay vì bỏ qua kiểm tra.
 5. `AUDIT_WORM_ENDPOINT` là HTTPS tới kho append-only/retention-lock; credential
    nằm ở `AUDIT_WORM_TOKEN_FILE`. SOC phải cảnh báo nếu checkpoint ngừng đến,
    `last_event_id` giảm hoặc cùng ID có root hash khác.
@@ -60,6 +62,13 @@ AUDIT_WORM_ENDPOINT=https://worm.internal.example/v1/scap/checkpoints
 AUDIT_WORM_TOKEN_FILE_HOST=/secure-host-path/worm-token
 AUDIT_CHECKPOINT_INTERVAL=100
 
+# CA nội bộ và chứng chỉ máy chủ; SAN phải chứa đúng tên DNS `db` / `redis`.
+INTERNAL_CA_CERT_FILE_HOST=/secure-host-path/internal-ca.crt
+POSTGRES_SERVER_CERT_FILE_HOST=/secure-host-path/postgres-server.crt
+POSTGRES_SERVER_KEY_FILE_HOST=/secure-host-path/postgres-server.key
+REDIS_SERVER_CERT_FILE_HOST=/secure-host-path/redis-server.crt
+REDIS_SERVER_KEY_FILE_HOST=/secure-host-path/redis-server.key
+
 PUBLIC_DOMAIN=chat.example.com
 PUBLIC_BASE_URL=https://chat.example.com
 BASE_IMAGE=python:3.12-slim@sha256:<digest-da-xac-minh>
@@ -84,6 +93,14 @@ mật proxy vào workload đó.
 High profile tắt tự đăng ký (`ALLOW_SELF_REGISTRATION=false`). Tài khoản phải
 được cấp qua quản trị viên/quy trình IdP đã phê duyệt; không mở lại endpoint tự
 đăng ký trên hệ thống chứa hội thoại rất nhạy cảm.
+
+Overlay tham chiếu bật TLS cho cả PostgreSQL và Redis. Khóa riêng của server chỉ
+được đọc từ Docker secret; wrapper PostgreSQL chép khóa vào vùng tạm với mode
+`0600` trước khi khởi động. Cấp chứng chỉ có SAN `db` và `redis`, giữ file khóa
+host chỉ đọc được bởi tài khoản vận hành, và xoay CA/chứng chỉ theo PKI của tổ
+chức. High profile sẽ từ chối khởi động nếu Vault cho phép HTTP, PostgreSQL
+không dùng `sslmode=verify-full`, hoặc Redis không dùng `rediss://` cùng
+`ssl_cert_reqs=required`.
 
 Không dùng Caddy cũ hơn 2.8 cho overlay này vì cấu hình chủ động bỏ access log
 ở đường dẫn vé export bằng `log_skip`. Access log thô của Uvicorn cũng bị tắt;

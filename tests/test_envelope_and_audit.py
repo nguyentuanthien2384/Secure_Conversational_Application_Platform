@@ -11,6 +11,7 @@ from src.app.envelope import ENVELOPE_SCHEME, EnvelopeEncryptionError
 from src.app.models import (
     AuditCheckpoint,
     AuditEvent,
+    AuthSession,
     ChatSession,
     SecureMessage,
     SessionKeyEpoch,
@@ -135,6 +136,20 @@ def test_expired_session_is_hidden_and_purged_on_direct_access(client: TestClien
 
     with app.state.database.session_factory() as db:
         assert db.get(ChatSession, session_id) is None
+
+
+def test_retention_prunes_expired_login_session_metadata(client: TestClient, app):
+    register_and_login(client, "expired-auth-metadata")
+    with app.state.database.session_factory() as db:
+        auth_session = db.scalar(select(AuthSession))
+        assert auth_session is not None
+        auth_session.expires_at = auth_session.issued_at - timedelta(seconds=1)
+        jti = auth_session.jti
+        db.commit()
+
+        result = enforce_retention(db)
+        assert result.expired_auth_sessions == 1
+        assert db.get(AuthSession, jti) is None
 
 
 def test_new_messages_use_envelope_scheme(client: TestClient, app):

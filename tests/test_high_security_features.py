@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from dataclasses import replace
 
@@ -14,6 +15,8 @@ from src.app.e2ee import (
     encode_base64url,
 )
 from src.app.main import create_app
+from src.app.models import User
+from src.app.security import TotpService
 from tests.conftest import register_and_login
 
 
@@ -232,3 +235,77 @@ def test_sensitive_classification_cannot_use_the_long_retention_secure_mode(
     )
     assert upgraded.status_code == 201
     assert upgraded.json()["data_classification"] == "confidential"
+
+
+def test_high_profile_cannot_drop_mfa_while_sensitive_session_is_active(settings):
+    high_settings = replace(settings, security_profile="high")
+    password = "Correct Horse Battery1"
+    totp = TotpService()
+    with TestClient(create_app(high_settings)) as high_client:
+        token = register_and_login(high_client, "sensitive-mfa-owner", password)
+        enrolled = high_client.post("/api/auth/mfa/enroll", headers=auth(token)).json()
+        activated = high_client.post(
+            "/api/auth/mfa/activate",
+            headers=auth(token),
+            json={"code": totp.now_code(enrolled["secret"])},
+        )
+        assert activated.status_code == 200, activated.text
+
+        challenge = high_client.post(
+            "/api/auth/login",
+            json={"username": "sensitive-mfa-owner", "password": password},
+        ).json()
+        verified = high_client.post(
+            "/api/auth/mfa/verify",
+            json={
+                "mfa_token": challenge["mfa_token"],
+                "code": totp.now_code(enrolled["secret"], timestamp=time.time() + totp.period),
+            },
+        )
+        access_token = verified.json()["access_token"]
+        created = high_client.post(
+            "/api/sessions",
+            headers=auth(access_token),
+            json={"title": "Sensitive", "security_mode": "confidential"},
+        )
+        assert created.status_code == 201, created.text
+
+        denied = high_client.post(
+            "/api/auth/mfa/disable",
+            headers=auth(access_token),
+            json={
+                "password": password,
+                "code": activated.json()["recovery_codes"][0],
+            },
+        )
+        assert denied.status_code == 409
+
+        # Defense in depth for imported/corrupted legacy state: even if MFA is
+        # cleared outside the endpoint, direct sensitive access remains closed.
+        with high_client.app.state.database.session_factory() as db:
+            user_id = high_client.get("/api/auth/me", headers=auth(access_token)).json()["id"]
+            user = db.get(User, user_id)
+            assert user is not None
+            user.mfa_enabled = False
+            db.commit()
+        assert (
+            high_client.get(
+                f"/api/sessions/{created.json()['id']}", headers=auth(access_token)
+            ).status_code
+            == 403
+        )
+
+
+def test_security_policy_update_never_extends_retention(client: TestClient):
+    token = register_and_login(client, "retention-no-extension")
+    created = client.post(
+        "/api/sessions", headers=auth(token), json={"title": "Fixed deadline"}
+    )
+    original_expiry = created.json()["retention_expires_at"]
+    updated = client.patch(
+        f"/api/sessions/{created.json()['id']}/security",
+        headers=auth(token),
+        json={"security_mode": "secure", "data_classification": "internal"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["retention_expires_at"] == original_expiry

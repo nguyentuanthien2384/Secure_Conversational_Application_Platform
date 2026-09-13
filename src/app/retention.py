@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from src.app.db import utcnow
 from src.app.models import (
+    AuthSession,
     ChatSession,
     E2eeDeviceChallenge,
     E2eeEnvelope,
@@ -27,6 +28,7 @@ class RetentionResult:
     wrapped_deks_destroyed: int = 0
     expired_challenges: int = 0
     expired_tokens: int = 0
+    expired_auth_sessions: int = 0
     stale_prekeys: int = 0
     dry_run: bool = False
 
@@ -97,6 +99,17 @@ def enforce_retention(
             select(RevokedToken).where(RevokedToken.expires_at <= now).limit(batch_size)
         )
     )
+    # IP address and user-agent are useful only while a bearer session can still
+    # be revoked or inspected. The immutable audit trail keeps the security
+    # event; the operational session row should not become a shadow PII archive.
+    expired_auth_sessions = list(
+        db.scalars(
+            select(AuthSession)
+            .where(AuthSession.expires_at <= now)
+            .order_by(AuthSession.expires_at.asc())
+            .limit(batch_size)
+        )
+    )
     # Consumed public prekeys need no long-term retention. A 24-hour grace
     # period is deliberately omitted: delivery protocols already copied the
     # public key into the requesting client before this state was committed.
@@ -114,6 +127,8 @@ def enforce_retention(
             db.delete(item)
         for item in expired_tokens:
             db.delete(item)
+        for item in expired_auth_sessions:
+            db.delete(item)
         for item in stale_prekeys:
             db.delete(item)
         db.commit()
@@ -124,7 +139,7 @@ def enforce_retention(
         wrapped_deks_destroyed=wrapped_deks,
         expired_challenges=len(expired_challenges),
         expired_tokens=len(expired_tokens),
+        expired_auth_sessions=len(expired_auth_sessions),
         stale_prekeys=len(stale_prekeys),
         dry_run=dry_run,
     )
-

@@ -139,6 +139,43 @@ def _set_production_env(monkeypatch, *, database_user: str = "scap_app") -> None
         monkeypatch.setenv(name, value)
 
 
+def _set_valid_high_env(monkeypatch) -> None:
+    _set_production_env(monkeypatch)
+    digest = "a" * 64
+    values = {
+        "SECURITY_PROFILE": "high",
+        "KEY_PROVIDER": "vault",
+        "MASTER_ENCRYPTION_KEY": "",
+        "MASTER_ENCRYPTION_KEYS": "",
+        "VAULT_ADDR": "https://vault.example.test",
+        "VAULT_TOKEN_FILE": "/run/secrets/vault_token",
+        "VAULT_ALLOW_INSECURE_HTTP": "false",
+        "DATABASE_URL": (
+            "postgresql+psycopg://scap_app:pw@db:5432/secure_chat"
+            "?sslmode=verify-full&sslrootcert=/run/secrets/internal_ca_cert"
+        ),
+        "REDIS_URL": (
+            "rediss://redis:6379/0?ssl_cert_reqs=required"
+            "&ssl_ca_certs=/run/secrets/internal_ca_cert"
+        ),
+        "BASE_IMAGE": f"python:3.12-slim@sha256:{digest}",
+        "POSTGRES_IMAGE": f"postgres:17-alpine@sha256:{digest}",
+        "REDIS_IMAGE": f"redis:7.4-alpine@sha256:{digest}",
+        "CADDY_IMAGE": f"caddy:2.10-alpine@sha256:{digest}",
+        "ALLOW_SELF_REGISTRATION": "false",
+        "ALLOW_DEMO_AI": "false",
+        "SEED_DEMO_DATA": "false",
+        "BOOTSTRAP_ADMIN_PASSWORD": "",
+        "PASSWORD_BREACH_CHECK": "true",
+        "AUDIT_WORM_ENDPOINT": "https://worm.example.test/checkpoints",
+        "AUDIT_WORM_TOKEN_FILE": "/run/secrets/audit_worm_token",
+        "GRADIO_AUTH_MODE": "oidc",
+        "OIDC_PROXY_SECRET_FILE": "/run/secrets/oidc_proxy_secret",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
 def test_production_rejects_public_demo_accounts(monkeypatch):
     _set_production_env(monkeypatch)
     monkeypatch.setenv("SEED_DEMO_DATA", "true")
@@ -174,9 +211,38 @@ def test_high_profile_rejects_mutable_infrastructure_images(monkeypatch):
         Settings.from_env()
 
 
+def test_high_profile_rejects_vault_cleartext_override(monkeypatch):
+    _set_valid_high_env(monkeypatch)
+    monkeypatch.setenv("VAULT_ALLOW_INSECURE_HTTP", "true")
+    with pytest.raises(RuntimeError, match="VAULT_ALLOW_INSECURE_HTTP"):
+        Settings.from_env()
+
+
+def test_high_profile_requires_verified_tls_for_postgres_and_redis(monkeypatch):
+    _set_valid_high_env(monkeypatch)
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://scap_app:pw@db:5432/secure_chat"
+    )
+    with pytest.raises(RuntimeError, match="sslmode=verify-full"):
+        Settings.from_env()
+
+    _set_valid_high_env(monkeypatch)
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    with pytest.raises(RuntimeError, match="Redis TLS"):
+        Settings.from_env()
+
+
+def test_high_profile_accepts_strict_internal_transport_settings(monkeypatch):
+    _set_valid_high_env(monkeypatch)
+    settings = Settings.from_env()
+    assert "sslmode=verify-full" in settings.database_url
+    assert settings.redis_url.startswith("rediss://")
+
+
 def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
     local_compose = Path("docker-compose.local.yml").read_text(encoding="utf-8")
+    high_compose = Path("docker-compose.high-security.yml").read_text(encoding="utf-8")
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     caddy = Path("Caddyfile").read_text(encoding="utf-8")
     sql = Path("scripts/db_least_privilege.sql").read_text(encoding="utf-8")
@@ -195,5 +261,9 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     assert '"--no-access-log"' in compose
     assert '"--no-access-log"' in local_compose
     assert '"--no-access-log"' in dockerfile
+    assert "sslmode=verify-full" in high_compose
+    assert "rediss://redis:6379" in high_compose
+    assert '"--tls-port"' in high_compose
+    assert "postgres_tls_entrypoint.sh" in high_compose
     assert "--refresh-telemetry" in local_compose
     assert "image: scap-app" in local_compose

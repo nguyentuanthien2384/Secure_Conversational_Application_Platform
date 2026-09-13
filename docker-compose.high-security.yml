@@ -5,9 +5,73 @@
 services:
   db:
     image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE to an immutable name@sha256 digest}
+    entrypoint: ["/bin/sh", "/opt/scap/postgres-tls-entrypoint.sh"]
+    command:
+      - postgres
+      - "-c"
+      - "log_connections=on"
+      - "-c"
+      - "log_disconnections=on"
+      - "-c"
+      - "log_statement=ddl"
+      - "-c"
+      - "log_min_duration_statement=1000"
+      - "-c"
+      - "ssl=on"
+      - "-c"
+      - "ssl_ca_file=/tmp/scap-postgres-tls/ca.crt"
+      - "-c"
+      - "ssl_cert_file=/tmp/scap-postgres-tls/server.crt"
+      - "-c"
+      - "ssl_key_file=/tmp/scap-postgres-tls/server.key"
+    volumes:
+      - ./scripts/postgres_tls_entrypoint.sh:/opt/scap/postgres-tls-entrypoint.sh:ro
+    secrets:
+      - internal_ca_cert
+      - postgres_server_cert
+      - postgres_server_key
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "PGSSLMODE=require pg_isready -U secure_chat -d secure_chat"]
 
   redis:
     image: ${REDIS_IMAGE:?set REDIS_IMAGE to an immutable name@sha256 digest}
+    command:
+      - redis-server
+      - "--port"
+      - "0"
+      - "--tls-port"
+      - "6379"
+      - "--tls-cert-file"
+      - /run/secrets/redis_server_cert
+      - "--tls-key-file"
+      - /run/secrets/redis_server_key
+      - "--tls-ca-cert-file"
+      - /run/secrets/internal_ca_cert
+      - "--tls-auth-clients"
+      - "no"
+      - "--appendonly"
+      - "no"
+      - "--save"
+      - ""
+    secrets:
+      - internal_ca_cert
+      - redis_server_cert
+      - redis_server_key
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-cli --tls --cacert /run/secrets/internal_ca_cert
+          --sni redis ping | grep -q PONG
+
+  migrate:
+    environment:
+      DATABASE_URL: >-
+        postgresql+psycopg://secure_chat:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/secure_chat?sslmode=verify-full&sslrootcert=/run/secrets/internal_ca_cert
+    secrets:
+      - internal_ca_cert
 
   caddy:
     image: ${CADDY_IMAGE:?set CADDY_IMAGE to an immutable name@sha256 digest}
@@ -31,10 +95,15 @@ services:
       AUDIT_WORM_TOKEN_FILE: /run/secrets/audit_worm_token
       AUDIT_CHECKPOINT_INTERVAL: ${AUDIT_CHECKPOINT_INTERVAL:-100}
       RETENTION_SWEEP_ON_STARTUP: "true"
+      DATABASE_URL: >-
+        postgresql+psycopg://scap_app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}@db:5432/secure_chat?sslmode=verify-full&sslrootcert=/run/secrets/internal_ca_cert
+      REDIS_URL: >-
+        rediss://redis:6379/0?ssl_cert_reqs=required&ssl_ca_certs=/run/secrets/internal_ca_cert
     secrets:
       - vault_token
       - oidc_proxy_secret
       - audit_worm_token
+      - internal_ca_cert
 
 secrets:
   vault_token:
@@ -43,3 +112,13 @@ secrets:
     file: ${OIDC_PROXY_SECRET_FILE_HOST:?set OIDC_PROXY_SECRET_FILE_HOST in .env}
   audit_worm_token:
     file: ${AUDIT_WORM_TOKEN_FILE_HOST:?set AUDIT_WORM_TOKEN_FILE_HOST in .env}
+  internal_ca_cert:
+    file: ${INTERNAL_CA_CERT_FILE_HOST:?set INTERNAL_CA_CERT_FILE_HOST in .env}
+  postgres_server_cert:
+    file: ${POSTGRES_SERVER_CERT_FILE_HOST:?set POSTGRES_SERVER_CERT_FILE_HOST in .env}
+  postgres_server_key:
+    file: ${POSTGRES_SERVER_KEY_FILE_HOST:?set POSTGRES_SERVER_KEY_FILE_HOST in .env}
+  redis_server_cert:
+    file: ${REDIS_SERVER_CERT_FILE_HOST:?set REDIS_SERVER_CERT_FILE_HOST in .env}
+  redis_server_key:
+    file: ${REDIS_SERVER_KEY_FILE_HOST:?set REDIS_SERVER_KEY_FILE_HOST in .env}

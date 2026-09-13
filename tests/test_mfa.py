@@ -161,6 +161,37 @@ def test_disable_requires_password_and_code(client: TestClient):
     assert "access_token" in plain.json()
 
 
+def test_disable_accepts_only_a_fresh_totp_counter(client: TestClient, monkeypatch):
+    secret, _, _ = enroll_and_enable(client, "mfa-disable-totp")
+
+    body = client.post(
+        "/api/auth/login", json={"username": "mfa-disable-totp", "password": PASSWORD}
+    ).json()
+    login_code = future_code(secret)
+    next_code = future_code(secret, 2)
+    token = client.post(
+        "/api/auth/mfa/verify",
+        json={"mfa_token": body["mfa_token"], "code": login_code},
+    ).json()["access_token"]
+
+    replay = client.post(
+        "/api/auth/mfa/disable",
+        headers=auth(token),
+        json={"password": PASSWORD, "code": login_code},
+    )
+    assert replay.status_code == 401
+
+    # Advance the verifier by one 30-second step without making the test sleep.
+    advanced_counter = int(time.time() // totp.period) + 1
+    monkeypatch.setattr(TotpService, "_counter", lambda self, timestamp=None: advanced_counter)
+    disabled = client.post(
+        "/api/auth/mfa/disable",
+        headers=auth(token),
+        json={"password": PASSWORD, "code": next_code},
+    )
+    assert disabled.status_code == 204
+
+
 def test_mfa_challenge_token_cannot_access_the_api(client: TestClient):
     enroll_and_enable(client, "mfa-scope")
     body = client.post(
@@ -187,3 +218,38 @@ def test_mfa_challenge_token_is_single_use(client: TestClient):
         json={"mfa_token": body["mfa_token"], "code": future_code(secret, 2)},
     )
     assert replay.status_code == 401
+
+
+def test_mfa_challenge_is_invalidated_by_password_change(client: TestClient):
+    secret, _, recovery_codes = enroll_and_enable(client, "mfa-version-bound")
+
+    first_challenge = client.post(
+        "/api/auth/login",
+        json={"username": "mfa-version-bound", "password": PASSWORD},
+    ).json()["mfa_token"]
+    stale_challenge = client.post(
+        "/api/auth/login",
+        json={"username": "mfa-version-bound", "password": PASSWORD},
+    ).json()["mfa_token"]
+    access_token = client.post(
+        "/api/auth/mfa/verify",
+        json={"mfa_token": first_challenge, "code": future_code(secret)},
+    ).json()["access_token"]
+
+    changed = client.patch(
+        "/api/auth/password",
+        headers=auth(access_token),
+        json={
+            "current_password": PASSWORD,
+            "new_password": "A completely new strong passphrase 2",
+        },
+    )
+    assert changed.status_code == 204
+
+    # Recovery codes are valid second factors, but an old password challenge
+    # must not be allowed to mint a current-version bearer session.
+    rejected = client.post(
+        "/api/auth/mfa/verify",
+        json={"mfa_token": stale_challenge, "code": recovery_codes[0]},
+    )
+    assert rejected.status_code == 401

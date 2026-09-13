@@ -14,9 +14,9 @@ cổng vận hành. “Có trong repository” không đồng nghĩa “đã đ�
 | Private E2EE server | device challenge, possession/approval proof, trusted-device list, prekey một lần, membership epoch, opaque envelopes, replay UNIQUE | `test_e2ee_core.py`, `test_high_security_features.py` | client Double Ratchet/MLS đã audit và interop/pentest |
 | Gradio/HTTP | API JWT/RBAC, high profile OIDC proxy gate + tắt tự đăng ký, upload cap, CSP enforce + stricter report-only, headers | hardening/UI tests | OIDC IdP/proxy thật, nonce/hash CSP nếu Gradio hỗ trợ |
 | Audit/WORM | HMAC chain, externally deliverable signed checkpoints, local+anchor verification, append-only DB grants | audit tests | WORM/retention-lock receiver, SOC alert/rule ownership |
-| Retention | mode-specific expiry, startup sweep, xóa khi truy cập sau hạn, scheduler command, wrapped-DEK deletion | retention tests | backup/snapshot lifecycle và legal hold |
+| Retention | mode-specific expiry, policy edit không được gia hạn, startup/on-access sweep, xóa wrapped DEK và metadata phiên đăng nhập hết hạn | retention tests | backup/snapshot lifecycle và legal hold |
 | Supply chain | frozen `uv.lock`, SHA-pinned actions, SAST/secret/dependency/image scan, CycloneDX SBOM, attestation | GitHub workflow | pin digest mọi image, protected branch, registry signature enforcement |
-| Runtime hardening | fail-closed high profile, Redis, trusted hosts/CORS, Caddy TLS, read-only/cap-drop/resource limits, DB least privilege | config/security tests | TLS/mTLS nội bộ, orchestrator policies, load/chaos tests |
+| Runtime hardening | fail-closed high profile, TLS xác minh CA cho PostgreSQL/Redis/Vault, trusted hosts/CORS, Caddy TLS, read-only/cap-drop/resource limits, DB least privilege | config/security tests | mTLS nội bộ nếu threat model yêu cầu, orchestrator policies, load/chaos tests |
 | IR/DR/governance | runbook high-security, key/DLP/device/audit procedures | tài liệu review | tabletop, restore drill, pentest/Red Team, owner/SLA |
 
 ## Trạng thái tuyên bố

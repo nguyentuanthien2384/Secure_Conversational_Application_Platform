@@ -91,7 +91,12 @@ class TokenService:
             options={"require": ["exp", "iat", "nbf", "sub", "jti", "ver"]},
         )
 
-    def issue_mfa_challenge(self, user_id: str, minutes: int = 5) -> str:
+    def issue_mfa_challenge(
+        self,
+        user_id: str,
+        token_version: int,
+        minutes: int = 5,
+    ) -> str:
         """Short-lived token proving password step succeeded, pending a TOTP code.
 
         It uses a distinct audience so it can never be presented as an API access
@@ -100,6 +105,7 @@ class TokenService:
         now = datetime.now(timezone.utc)
         payload = {
             "sub": user_id,
+            "ver": token_version,
             "typ": "mfa_challenge",
             "iat": now,
             "nbf": now,
@@ -117,9 +123,9 @@ class TokenService:
             algorithms=[self.algorithm],
             audience="secure-chat-mfa",
             issuer="secure-chat-course-project",
-            options={"require": ["exp", "iat", "nbf", "sub", "jti"]},
+            options={"require": ["exp", "iat", "nbf", "sub", "jti", "ver"]},
         )
-        if payload.get("typ") != "mfa_challenge":
+        if payload.get("typ") != "mfa_challenge" or not isinstance(payload.get("ver"), int):
             raise jwt.InvalidTokenError("Không phải token thử thách MFA.")
         return payload
 

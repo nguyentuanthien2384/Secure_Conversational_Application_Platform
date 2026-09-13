@@ -22,7 +22,7 @@ RUN if [ "$REQUIRE_BASE_IMAGE_DIGEST" = "true" ]; then \
 
 WORKDIR /app
 RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
-    && pip install --no-cache-dir uv==0.10.0
+    && pip install --no-cache-dir uv==0.11.15
 
 # uv.lock được COPY để cài đặt tái lập được (Bài 8 §chuỗi cung ứng).
 # Build dừng ngay nếu lockfile thiếu hoặc không còn khớp pyproject.toml.

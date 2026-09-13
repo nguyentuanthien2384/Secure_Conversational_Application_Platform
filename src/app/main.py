@@ -573,6 +573,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ChatSession.retention_expires_at > cutoff,
         )
 
+    def sensitive_session_clause():
+        return or_(
+            ChatSession.security_mode.in_(("confidential", "private_e2ee")),
+            ChatSession.data_classification.in_(
+                ("confidential", "highly_confidential", "e2ee_private")
+            ),
+        )
+
+    def session_is_sensitive(chat_session: ChatSession) -> bool:
+        return chat_session.security_mode in {
+            "confidential",
+            "private_e2ee",
+        } or chat_session.data_classification in {
+            "confidential",
+            "highly_confidential",
+            "e2ee_private",
+        }
+
+    def has_active_sensitive_session(db: Session, user_id: str) -> bool:
+        owned = db.scalar(
+            select(ChatSession.id)
+            .where(
+                ChatSession.owner_id == user_id,
+                retained_session_clause(),
+                sensitive_session_clause(),
+            )
+            .limit(1)
+        )
+        if owned is not None:
+            return True
+        membership = db.scalar(
+            select(ConversationMember.id)
+            .join(ChatSession, ChatSession.id == ConversationMember.session_id)
+            .where(
+                ConversationMember.user_id == user_id,
+                ConversationMember.removed_at.is_(None),
+                retained_session_clause(),
+                sensitive_session_clause(),
+            )
+            .limit(1)
+        )
+        return membership is not None
+
     def reject_expired_session(
         chat_session: ChatSession,
         user: User,
@@ -659,6 +702,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Return 404 to reduce resource enumeration.
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
         reject_expired_session(chat_session, user, db, request)
+        if (
+            settings.security_profile == "high"
+            and session_is_sensitive(chat_session)
+            and not user.mfa_enabled
+        ):
+            record_audit(
+                db,
+                request,
+                "authorization.denied",
+                actor_id=user.id,
+                target_type="chat_session",
+                target_id=session_id,
+                outcome="denied",
+                details={"reason": "sensitive_session_requires_mfa"},
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Hội thoại nhạy cảm bắt buộc tài khoản đã bật MFA.",
+            )
         return chat_session
 
     def require_private_member_session(
@@ -688,6 +750,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên E2EE.")
         reject_expired_session(chat_session, user, db, request)
+        if settings.security_profile == "high" and not user.mfa_enabled:
+            record_audit(
+                db,
+                request,
+                "authorization.denied",
+                actor_id=user.id,
+                target_type="e2ee_session",
+                target_id=session_id,
+                outcome="denied",
+                details={"reason": "sensitive_session_requires_mfa"},
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Hội thoại E2EE bắt buộc tài khoản đã bật MFA.",
+            )
         return chat_session, member
 
     # Gradio UI is mounted after all API routes are registered (see below).
@@ -778,7 +855,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             field=f"mfa:{user.id}",
         )
 
-    def consume_recovery_code(db: Session, user: User, candidate: str) -> bool:
+    def claim_mfa_account_version(db: Session, user: User, expected_version: int) -> bool:
+        """Lock and re-check account state before consuming a challenge factor."""
+        claimed = db.execute(
+            update(User)
+            .where(
+                User.id == user.id,
+                User.mfa_enabled.is_(True),
+                User.token_version == expected_version,
+            )
+            # A same-value UPDATE is portable to SQLite and PostgreSQL and takes
+            # the row lock needed to serialize against password/session resets.
+            .values(token_version=expected_version)
+            .execution_options(synchronize_session=False)
+        )
+        return claimed.rowcount == 1
+
+    def consume_recovery_code(
+        db: Session,
+        user: User,
+        candidate: str,
+        *,
+        expected_token_version: int | None = None,
+    ) -> bool:
         """Match a submitted backup code against unused hashes; burn it if valid."""
         normalized = candidate.strip().lower().replace(" ", "")
         for record in db.scalars(
@@ -788,6 +887,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         ):
             if password_service.verify(record.code_hash, normalized):
+                if expected_token_version is not None and not claim_mfa_account_version(
+                    db, user, expected_token_version
+                ):
+                    return False
                 consumed = db.execute(
                     update(MfaRecoveryCode)
                     .where(
@@ -801,14 +904,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     return True
         return False
 
-    def claim_totp_counter(db: Session, user: User, counter: int) -> bool:
+    def claim_totp_counter(
+        db: Session,
+        user: User,
+        counter: int,
+        *,
+        expected_token_version: int | None = None,
+    ) -> bool:
         """Atomically consume one TOTP time step across concurrent requests."""
+        conditions = [
+            User.id == user.id,
+            User.mfa_enabled.is_(True),
+            User.mfa_last_counter < counter,
+        ]
+        if expected_token_version is not None:
+            conditions.append(User.token_version == expected_token_version)
         consumed = db.execute(
             update(User)
-            .where(
-                User.id == user.id,
-                User.mfa_last_counter < counter,
-            )
+            .where(*conditions)
             .values(mfa_last_counter=counter)
             .execution_options(synchronize_session=False)
         )
@@ -978,7 +1091,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # challenge instead of an access token; the session is created only after
         # the second factor is verified at /api/auth/mfa/verify.
         if user.mfa_enabled:
-            challenge = token_service.issue_mfa_challenge(user.id, settings.mfa_challenge_minutes)
+            challenge = token_service.issue_mfa_challenge(
+                user.id,
+                user.token_version,
+                settings.mfa_challenge_minutes,
+            )
             db.commit()
             record_audit(
                 db,
@@ -1053,15 +1170,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         user = db.get(User, user_id)
-        secret = load_mfa_secret(user) if user is not None else None
-        if user is None or not user.is_active or not user.mfa_enabled or secret is None:
+        if (
+            user is None
+            or not user.is_active
+            or challenge.get("ver") != user.token_version
+            or not user.mfa_enabled
+        ):
             record_audit(
                 db,
                 request,
                 "auth.mfa.verify",
                 actor_id=user_id,
                 outcome="failure",
-                details={"reason": "not_enrolled"},
+                details={"reason": "account_state_changed"},
+            )
+            raise HTTPException(status_code=401, detail="Không xác thực được mã.")
+        secret = load_mfa_secret(user)
+        if secret is None:
+            record_audit(
+                db,
+                request,
+                "auth.mfa.verify",
+                actor_id=user_id,
+                outcome="failure",
+                details={"reason": "mfa_secret_unavailable"},
             )
             raise HTTPException(status_code=401, detail="Không xác thực được mã.")
 
@@ -1070,7 +1202,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         used_recovery = False
         if matched_counter is None:
-            used_recovery = consume_recovery_code(db, user, payload.code)
+            used_recovery = consume_recovery_code(
+                db,
+                user,
+                payload.code,
+                expected_token_version=int(challenge["ver"]),
+            )
             if not used_recovery:
                 db.commit()
                 record_audit(
@@ -1083,7 +1220,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 raise HTTPException(status_code=401, detail="Không xác thực được mã.")
         else:
-            if not claim_totp_counter(db, user, matched_counter):
+            if not claim_totp_counter(
+                db,
+                user,
+                matched_counter,
+                expected_token_version=int(challenge["ver"]),
+            ):
                 db.rollback()
                 record_audit(
                     db,
@@ -1104,6 +1246,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 reason="mfa_challenge_used",
             )
         )
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            # Two valid factors racing on one challenge must produce one login,
+            # not an unhandled uniqueness error or two bearer sessions.
+            db.rollback()
+            record_audit(
+                db,
+                request,
+                "auth.mfa.verify",
+                actor_id=user.id,
+                outcome="failure",
+                details={"reason": "challenge_replayed"},
+            )
+            raise HTTPException(status_code=401, detail="Phiên MFA đã được sử dụng.") from exc
         token = issue_access_session(db, request, user, ip, mark_step_up=True)
         db.commit()
         record_audit(
@@ -1196,6 +1353,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if activated.rowcount != 1:
             db.rollback()
             raise HTTPException(status_code=409, detail="Mã TOTP đã được sử dụng.")
+        # The conditional UPDATE deliberately bypasses ORM synchronization so
+        # concurrent activation attempts cannot both win. Refresh before the
+        # remaining ORM work to avoid carrying the pre-activation state.
+        db.refresh(user)
         plain_codes = [generate_recovery_code() for _ in range(settings.mfa_recovery_codes)]
         db.add_all(
             MfaRecoveryCode(user_id=user.id, code_hash=password_service.hash(code))
@@ -1230,6 +1391,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         if not user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA chưa được bật.")
+        if settings.security_profile == "high" and has_active_sensitive_session(db, user.id):
+            record_audit(
+                db,
+                request,
+                "auth.mfa.disable",
+                actor_id=user.id,
+                target_type="user",
+                target_id=user.id,
+                outcome="denied",
+                details={"reason": "active_sensitive_session"},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Không thể tắt MFA khi tài khoản còn tham gia hội thoại nhạy cảm; "
+                    "hãy xóa, hạ cấp hoặc rời các hội thoại đó trước."
+                ),
+            )
         secret = load_mfa_secret(user)
         password_ok = password_service.verify(user.password_hash, payload.password)
         # Validate the password before attempting a recovery code. Otherwise an
@@ -1245,13 +1424,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details={"reason": "invalid_credentials"},
             )
             raise HTTPException(status_code=401, detail="Không xác thực được yêu cầu tắt MFA.")
-        code_ok = secret is not None and (
+        matched_counter = (
             totp_service.verify(secret, payload.code, after_counter=user.mfa_last_counter)
-            is not None
-            or consume_recovery_code(db, user, payload.code)
+            if secret is not None
+            else None
         )
+        if matched_counter is not None:
+            code_ok = claim_totp_counter(db, user, matched_counter)
+        else:
+            code_ok = consume_recovery_code(db, user, payload.code)
         if not code_ok:
-            db.commit()
+            # A zero-row conditional update means another request consumed the
+            # same TOTP time step (or already disabled MFA).
+            db.rollback()
             record_audit(
                 db,
                 request,
@@ -1262,10 +1447,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=401, detail="Không xác thực được yêu cầu tắt MFA.")
 
-        user.mfa_enabled = False
-        user.mfa_secret_ciphertext = None
-        user.mfa_secret_nonce = None
-        user.mfa_last_counter = 0
+        disabled = db.execute(
+            update(User)
+            .where(User.id == user.id, User.mfa_enabled.is_(True))
+            .values(
+                mfa_enabled=False,
+                mfa_secret_ciphertext=None,
+                mfa_secret_nonce=None,
+                mfa_last_counter=0,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if disabled.rowcount != 1:
+            db.rollback()
+            record_audit(
+                db,
+                request,
+                "auth.mfa.disable",
+                actor_id=user.id,
+                outcome="failure",
+                details={"reason": "state_changed"},
+            )
+            raise HTTPException(status_code=409, detail="Trạng thái MFA vừa thay đổi; hãy thử lại.")
+        db.refresh(user)
         for record in db.scalars(select(MfaRecoveryCode).where(MfaRecoveryCode.user_id == user.id)):
             db.delete(record)
         revoke_all_auth_sessions(db, user)
@@ -1791,6 +1995,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .order_by(ChatSession.updated_at.desc())
             .limit(100)
         )
+        if settings.security_profile == "high" and not user.mfa_enabled:
+            stmt = stmt.where(~sensitive_session_clause())
         return list(db.scalars(stmt))
 
     @app.get("/api/sessions/{session_id}", response_model=SessionResponse)
@@ -1902,8 +2108,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if row.security_mode in {"confidential", "private_e2ee"}
             else settings.secure_retention_days
         )
-        row.retention_expires_at = utcnow() + timedelta(days=retention_days)
-        row.updated_at = utcnow()
+        policy_updated_at = utcnow()
+        policy_deadline = policy_updated_at + timedelta(days=retention_days)
+        # Editing labels or policy must never become an unprivileged retention
+        # extension. A stricter mode may shorten the deadline; only a separate,
+        # governed legal-hold workflow should ever extend it.
+        row.retention_expires_at = (
+            min(as_utc(row.retention_expires_at), policy_deadline)
+            if row.retention_expires_at is not None
+            else policy_deadline
+        )
+        row.updated_at = policy_updated_at
         db.commit()
         db.refresh(row)
         record_audit(
@@ -2137,6 +2352,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy dữ liệu xuất.")
         reject_expired_session(row, user, db, request)
+        if (
+            settings.security_profile == "high"
+            and session_is_sensitive(row)
+            and not user.mfa_enabled
+        ):
+            raise HTTPException(status_code=404, detail="Vé tải xuống không hợp lệ.")
         db.add(
             RevokedToken(
                 jti=ticket_jti,
@@ -2380,14 +2601,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         Decryption happens server-side per message; results never include other
         users' sessions because the query is scoped to ``owner_id``.
         """
-        sessions = list(
-            db.scalars(
-                select(ChatSession)
-                .where(ChatSession.owner_id == user.id, retained_session_clause())
-                .order_by(ChatSession.updated_at.desc())
-                .limit(100)
-            )
+        session_stmt = (
+            select(ChatSession)
+            .where(ChatSession.owner_id == user.id, retained_session_clause())
+            .order_by(ChatSession.updated_at.desc())
+            .limit(100)
         )
+        if settings.security_profile == "high" and not user.mfa_enabled:
+            session_stmt = session_stmt.where(~sensitive_session_clause())
+        sessions = list(db.scalars(session_stmt))
         results: list[dict] = []
         for chat_session in sessions:
             if chat_session.security_mode == "private_e2ee":

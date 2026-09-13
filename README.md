@@ -42,7 +42,7 @@ Bản nâng cấp bổ sung ba trust boundary (`secure`, `confidential`,
 `private_e2ee`), DEK riêng cho từng hội thoại được Vault/KMS bọc, AAD ràng buộc
 từng message, export streaming không tạo tệp plaintext tạm, consent AI phiên bản
 hóa, DLP chính thức, device/prekey/replay control cho E2EE, retention và audit
-checkpoint ngoài hệ thống. Xem [hướng dẫn triển khai bảo mật cao](docs/HIGH_SECURITY_DEPLOYMENT.md),
+checkpoint ngoài hệ thống, cùng TLS xác minh CA cho kết nối nội bộ ở high profile. Xem [hướng dẫn triển khai bảo mật cao](docs/HIGH_SECURITY_DEPLOYMENT.md),
 [hợp đồng E2EE client](docs/E2EE_CLIENT_CONTRACT.md) và
 [bảng truy vết yêu cầu](docs/SECURITY_REQUIREMENTS_TRACEABILITY.md).
 
@@ -78,7 +78,7 @@ và chuyển sang PostgreSQL + Redis + Caddy.
 | [src/app/audit.py](src/app/audit.py) | Ghi sự kiện audit, xác định IP nguồn |
 | [src/app/audit_chain.py](src/app/audit_chain.py) | Chuỗi băm chống giả mạo: `entry_hash = HMAC-SHA256(key, prev_hash ‖ canonical(entry))` |
 | [src/app/audit_checkpoint.py](src/app/audit_checkpoint.py) | Ký mốc cuối chuỗi và giao qua HTTPS tới WORM/SIEM ngoài máy chủ |
-| [src/app/retention.py](src/app/retention.py) | Retention theo mode và cryptographic erasure bằng xóa wrapped DEK |
+| [src/app/retention.py](src/app/retention.py) | Retention theo mode, không gia hạn ngầm, xóa wrapped DEK và metadata phiên hết hạn |
 | [src/app/siem.py](src/app/siem.py) | Xuất sự kiện an ninh ra stdout dạng JSON một dòng (ECS-like) cho SIEM |
 | [src/app/models.py](src/app/models.py) | ORM: `User`, `AuthSession`, `ChatSession`, `SecureMessage`, `AuditEvent`, `RevokedToken`, `MfaRecoveryCode` |
 | [src/app/schemas.py](src/app/schemas.py) | Pydantic request/response, ràng buộc đầu vào |
@@ -516,7 +516,8 @@ Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Nh
 có đặt `BOOTSTRAP_ADMIN_PASSWORD`, hoặc `DATABASE_URL` dùng tài khoản chủ của Postgres.
 High profile còn bắt buộc KMS/Vault, PostgreSQL, OIDC gate, WORM audit, kiểm tra mật khẩu
 rò rỉ fail-closed, MFA cho tài khoản đặc quyền/hội thoại nhạy cảm, tắt tự đăng ký và từ
-chối master key legacy trong web runtime.
+chối master key legacy trong web runtime. Nó cũng từ chối Vault qua HTTP, PostgreSQL
+không `sslmode=verify-full`, hoặc Redis không dùng `rediss://` với xác minh chứng chỉ.
 
 ---
 
@@ -555,7 +556,7 @@ Secure_Conversational_Application_Platform/
 ├── Dockerfile                       # Base image pin được bằng digest, chạy user không phải root
 ├── docker-compose.yml               # Production: db + redis + migrate + app + caddy
 ├── docker-compose.local.yml         # Lớp phủ demo trên laptop (tắt Caddy)
-├── docker-compose.high-security.yml # Vault/OIDC/WORM guard overlay
+├── docker-compose.high-security.yml # Vault/OIDC/WORM + TLS DB/Redis guard overlay
 ├── docker-compose.repair.yml        # Cụm phục hồi chuỗi audit
 ├── Caddyfile                        # TLS, security header biên, /.well-known/security.txt
 ├── HUONG_DAN_CHAY.md                # Hướng dẫn chạy chi tiết

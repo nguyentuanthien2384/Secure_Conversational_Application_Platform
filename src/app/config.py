@@ -5,7 +5,7 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 
@@ -245,6 +245,32 @@ class Settings:
                     raise RuntimeError(
                         "SECURITY_PROFILE=high bắt buộc image pin theo name@sha256 cho: "
                         + ", ".join(mutable_images)
+                    )
+                if _bool_env("VAULT_ALLOW_INSECURE_HTTP", False):
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high không cho phép VAULT_ALLOW_INSECURE_HTTP."
+                    )
+                if key_provider == "vault":
+                    vault_url = urlparse(os.getenv("VAULT_ADDR", "").strip())
+                    if vault_url.scheme.lower() != "https":
+                        raise RuntimeError("SECURITY_PROFILE=high bắt buộc Vault dùng HTTPS.")
+
+                database_tls = parse_qs(urlparse(database_url).query).get("sslmode", [])
+                if not database_tls or database_tls[-1].lower() != "verify-full":
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high bắt buộc PostgreSQL TLS với sslmode=verify-full."
+                    )
+                redis_url = os.getenv("REDIS_URL", "").strip()
+                parsed_redis = urlparse(redis_url)
+                redis_tls = parse_qs(parsed_redis.query).get("ssl_cert_reqs", [])
+                if (
+                    parsed_redis.scheme.lower() != "rediss"
+                    or not redis_tls
+                    or redis_tls[-1].lower() != "required"
+                ):
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high bắt buộc Redis TLS (rediss:// và "
+                        "ssl_cert_reqs=required)."
                     )
                 if _bool_env("ALLOW_SELF_REGISTRATION", True):
                     raise RuntimeError(
