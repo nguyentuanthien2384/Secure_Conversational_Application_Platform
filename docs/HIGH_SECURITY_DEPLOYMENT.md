@@ -55,6 +55,14 @@ VAULT_TRANSIT_MOUNT=transit
 VAULT_TRANSIT_KEY=scap-conversations
 VAULT_TOKEN_FILE_HOST=/secure-host-path/scap-vault-token
 
+# Không đặt giá trị APP_SECRET_KEY/POSTGRES_PASSWORD/APP_DB_PASSWORD/
+# AUDITOR_DB_PASSWORD/REDIS_PASSWORD trực tiếp trong .env của high profile.
+APP_SECRET_KEY_FILE_HOST=/secure-host-path/scap-app-secret
+POSTGRES_PASSWORD_FILE_HOST=/secure-host-path/postgres-owner-password
+APP_DB_PASSWORD_FILE_HOST=/secure-host-path/postgres-app-password
+AUDITOR_DB_PASSWORD_FILE_HOST=/secure-host-path/postgres-auditor-password
+REDIS_PASSWORD_FILE_HOST=/secure-host-path/redis-password
+
 GRADIO_AUTH_MODE=oidc
 OIDC_PROXY_SECRET_FILE_HOST=/secure-host-path/oidc-proxy-secret
 
@@ -81,14 +89,22 @@ CADDY_IMAGE=caddy:2.10-alpine@sha256:<digest-da-xac-minh>
 động bằng overlay tham chiếu:
 
 ```sh
-docker compose -f docker-compose.yml -f docker-compose.high-security.yml config
+docker compose -f docker-compose.yml -f docker-compose.high-security.yml config --quiet
 docker compose -f docker-compose.yml -f docker-compose.high-security.yml up -d --build
 ```
 
-Lệnh `config` phải được review để chắc rằng không có secret xuất hiện trong
-environment đã render. Overlay không tự cài một nhà cung cấp danh tính; đội vận
-hành phải đặt OIDC proxy/gateway đã được phê duyệt trước Caddy và mount cùng bí
-mật proxy vào workload đó.
+Dùng `config --quiet` trong CI nếu chỉ cần xác thực cú pháp. Không in bản render
+đầy đủ vào log vì mọi giá trị environment từ lớp triển khai khác đều có thể bị
+bung ra. Overlay high-security đã xóa `env_file` khỏi app, bỏ mật khẩu khỏi URL
+và staging file secrets vào tmpfs rồi hạ quyền trước khi chạy Python; `docker
+inspect` vì vậy không chứa các mật khẩu/JWT secret này. Overlay không tự cài một
+nhà cung cấp danh tính; đội vận hành phải đặt OIDC proxy/gateway đã được phê
+duyệt trước Caddy và mount cùng bí mật proxy vào workload đó.
+
+Các wrapper chỉ giữ `DAC_READ_SEARCH` trong giai đoạn bootstrap để đọc bind
+mount `0600` do tài khoản vận hành sở hữu. Sau khi sao chép vào tmpfs, tiến trình
+PostgreSQL, Redis và ứng dụng đều chạy non-root với `CapEff=0` và
+`no-new-privileges`; không nới mode của file bí mật trên host.
 
 High profile tắt tự đăng ký (`ALLOW_SELF_REGISTRATION=false`). Tài khoản phải
 được cấp qua quản trị viên/quy trình IdP đã phê duyệt; không mở lại endpoint tự
@@ -96,11 +112,17 @@ High profile tắt tự đăng ký (`ALLOW_SELF_REGISTRATION=false`). Tài kho�
 
 Overlay tham chiếu bật TLS cho cả PostgreSQL và Redis. Khóa riêng của server chỉ
 được đọc từ Docker secret; wrapper PostgreSQL chép khóa vào vùng tạm với mode
-`0600` trước khi khởi động. Cấp chứng chỉ có SAN `db` và `redis`, giữ file khóa
-host chỉ đọc được bởi tài khoản vận hành, và xoay CA/chứng chỉ theo PKI của tổ
-chức. High profile sẽ từ chối khởi động nếu Vault cho phép HTTP, PostgreSQL
+`0600` và chép ba mật khẩu vào vùng tạm chỉ tài khoản `postgres` đọc được trước
+khi khởi động. Vì vậy các file bí mật trên host vẫn có thể giữ mode `0600` của
+tài khoản vận hành. Mỗi lần khởi động cũng áp lại các dòng
+`hostnossl ... reject` theo cách idempotent, nên volume PostgreSQL đã tồn tại
+không thể giữ đường kết nối TCP không mã hóa từ cấu hình cũ. Cấp chứng chỉ có
+SAN `db` và `redis`, giữ file khóa host chỉ đọc được bởi tài khoản vận hành, và
+xoay CA/chứng chỉ theo PKI của tổ chức. Wrapper ứng dụng ghép CA nội bộ với trust
+store hệ thống để cùng xác minh PostgreSQL, Redis, Vault và WORM HTTPS dùng PKI
+nội bộ. High profile sẽ từ chối khởi động nếu Vault cho phép HTTP, PostgreSQL
 không dùng `sslmode=verify-full`, hoặc Redis không dùng `rediss://` cùng
-`ssl_cert_reqs=required`.
+`ssl_cert_reqs=required` và xác minh hostname.
 
 Không dùng Caddy cũ hơn 2.8 cho overlay này vì cấu hình chủ động bỏ access log
 ở đường dẫn vé export bằng `log_skip`. Access log thô của Uvicorn cũng bị tắt;

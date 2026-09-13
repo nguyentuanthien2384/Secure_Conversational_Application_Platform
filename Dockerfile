@@ -34,8 +34,10 @@ COPY scripts/migrate_database.py ./scripts/migrate_database.py
 COPY scripts/enforce_retention.py ./scripts/enforce_retention.py
 COPY scripts/migrate_envelope_encryption.py ./scripts/migrate_envelope_encryption.py
 COPY scripts/rewrap_deks.py ./scripts/rewrap_deks.py
+COPY scripts/high_security_app_entrypoint.sh ./scripts/high_security_app_entrypoint.sh
 COPY run_app.py ./run_app.py
 RUN chown -R app:app /app
+ENV HOME=/app
 USER app
 
 EXPOSE 8000

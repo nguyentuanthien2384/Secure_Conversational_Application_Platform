@@ -107,7 +107,7 @@ services:
     env_file: .env
     environment:
       # Tài khoản chủ schema, giống service `migrate`.
-      DATABASE_URL: postgresql+psycopg://secure_chat:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/secure_chat
+      DATABASE_URL: postgresql+psycopg://secure_chat:${POSTGRES_PASSWORD:-}@db:5432/secure_chat
       # Guard production từ chối DATABASE_URL dùng tài khoản chủ; ràng buộc đó
       # nhắm vào tiến trình phục vụ web, không nhắm vào tác vụ bảo trì one-shot.
       APP_ENV: development

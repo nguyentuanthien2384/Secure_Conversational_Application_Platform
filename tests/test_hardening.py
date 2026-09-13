@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from scripts import migrate_database
 from src.app.audit import safe_user_agent
 from src.app.config import Settings
 from src.app.main import _audit_safe_path, create_app
@@ -139,8 +140,16 @@ def _set_production_env(monkeypatch, *, database_user: str = "scap_app") -> None
         monkeypatch.setenv(name, value)
 
 
-def _set_valid_high_env(monkeypatch) -> None:
+def _set_valid_high_env(monkeypatch, tmp_path: Path) -> None:
     _set_production_env(monkeypatch)
+    app_secret = tmp_path / "app-secret"
+    database_password = tmp_path / "database-password"
+    redis_password = tmp_path / "redis-password"
+    app_secret.write_text(
+        "production-secret-key-loaded-from-a-protected-file", encoding="utf-8"
+    )
+    database_password.write_text("database password:with/specials", encoding="utf-8")
+    redis_password.write_text("redis password:with/specials and spaces", encoding="utf-8")
     digest = "a" * 64
     values = {
         "SECURITY_PROFILE": "high",
@@ -150,12 +159,17 @@ def _set_valid_high_env(monkeypatch) -> None:
         "VAULT_ADDR": "https://vault.example.test",
         "VAULT_TOKEN_FILE": "/run/secrets/vault_token",
         "VAULT_ALLOW_INSECURE_HTTP": "false",
+        "APP_SECRET_KEY": "",
+        "APP_SECRET_KEY_FILE": str(app_secret),
+        "DATABASE_PASSWORD_FILE": str(database_password),
+        "REDIS_PASSWORD_FILE": str(redis_password),
         "DATABASE_URL": (
-            "postgresql+psycopg://scap_app:pw@db:5432/secure_chat"
+            "postgresql+psycopg://scap_app@db:5432/secure_chat"
             "?sslmode=verify-full&sslrootcert=/run/secrets/internal_ca_cert"
         ),
         "REDIS_URL": (
-            "rediss://redis:6379/0?ssl_cert_reqs=required"
+            "rediss://scap@redis:6379/0?ssl_cert_reqs=required"
+            "&ssl_check_hostname=true"
             "&ssl_ca_certs=/run/secrets/internal_ca_cert"
         ),
         "BASE_IMAGE": f"python:3.12-slim@sha256:{digest}",
@@ -211,32 +225,97 @@ def test_high_profile_rejects_mutable_infrastructure_images(monkeypatch):
         Settings.from_env()
 
 
-def test_high_profile_rejects_vault_cleartext_override(monkeypatch):
-    _set_valid_high_env(monkeypatch)
+def test_high_profile_rejects_vault_cleartext_override(monkeypatch, tmp_path: Path):
+    _set_valid_high_env(monkeypatch, tmp_path)
     monkeypatch.setenv("VAULT_ALLOW_INSECURE_HTTP", "true")
     with pytest.raises(RuntimeError, match="VAULT_ALLOW_INSECURE_HTTP"):
         Settings.from_env()
 
 
-def test_high_profile_requires_verified_tls_for_postgres_and_redis(monkeypatch):
-    _set_valid_high_env(monkeypatch)
+def test_high_profile_requires_verified_tls_for_postgres_and_redis(
+    monkeypatch, tmp_path: Path
+):
+    _set_valid_high_env(monkeypatch, tmp_path)
     monkeypatch.setenv(
-        "DATABASE_URL", "postgresql+psycopg://scap_app:pw@db:5432/secure_chat"
+        "DATABASE_URL", "postgresql+psycopg://scap_app@db:5432/secure_chat"
     )
     with pytest.raises(RuntimeError, match="sslmode=verify-full"):
         Settings.from_env()
 
-    _set_valid_high_env(monkeypatch)
-    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("REDIS_URL", "redis://scap@redis:6379/0")
     with pytest.raises(RuntimeError, match="Redis TLS"):
         Settings.from_env()
 
 
-def test_high_profile_accepts_strict_internal_transport_settings(monkeypatch):
-    _set_valid_high_env(monkeypatch)
+def test_high_profile_rejects_redis_tls_query_bypasses(monkeypatch, tmp_path: Path):
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "REDIS_URL",
+        "rediss://scap@redis:6379/0?ssl_cert_reqs=none&ssl_cert_reqs=required"
+        "&ssl_check_hostname=true",
+    )
+    with pytest.raises(RuntimeError, match="Redis TLS"):
+        Settings.from_env()
+
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "REDIS_URL",
+        "rediss://scap@redis:6379/0?ssl_cert_reqs=required&ssl_check_hostname=false",
+    )
+    with pytest.raises(RuntimeError, match="Redis TLS"):
+        Settings.from_env()
+
+
+def test_high_profile_accepts_strict_internal_transport_settings(
+    monkeypatch, tmp_path: Path
+):
+    _set_valid_high_env(monkeypatch, tmp_path)
     settings = Settings.from_env()
     assert "sslmode=verify-full" in settings.database_url
     assert settings.redis_url.startswith("rediss://")
+    assert "database%20password%3Awith%2Fspecials" in settings.database_url
+    assert "redis%20password%3Awith%2Fspecials%20and%20spaces" in settings.redis_url
+
+
+def test_migration_uses_file_backed_database_password(monkeypatch, tmp_path: Path):
+    password_file = tmp_path / "database-password"
+    password_file.write_text("owner password:with/specials", encoding="utf-8")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://secure_chat@db:5432/secure_chat?sslmode=verify-full",
+    )
+    monkeypatch.setenv("DATABASE_PASSWORD_FILE", str(password_file))
+    observed: dict[str, object] = {}
+
+    class FakeEngine:
+        def dispose(self) -> None:
+            observed["disposed"] = True
+
+    class FakeDatabase:
+        def __init__(self, database_url: str) -> None:
+            observed["database_url"] = database_url
+            self.engine = FakeEngine()
+
+        def create_all(self) -> None:
+            observed["created"] = True
+
+        def apply_postgres_least_privilege(self) -> None:
+            observed["grants"] = True
+
+    monkeypatch.setattr(migrate_database, "Database", FakeDatabase)
+    migrate_database.main()
+
+    assert "owner%20password%3Awith%2Fspecials" in str(observed["database_url"])
+    assert observed == {
+        "database_url": (
+            "postgresql+psycopg://secure_chat:owner%20password%3Awith%2Fspecials"
+            "@db:5432/secure_chat?sslmode=verify-full"
+        ),
+        "created": True,
+        "grants": True,
+        "disposed": True,
+    }
 
 
 def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
@@ -262,8 +341,25 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     assert '"--no-access-log"' in local_compose
     assert '"--no-access-log"' in dockerfile
     assert "sslmode=verify-full" in high_compose
-    assert "rediss://redis:6379" in high_compose
+    assert "rediss://scap@redis:6379" in high_compose
     assert '"--tls-port"' in high_compose
+    assert "/usr/bin/setpriv --reuid redis --regid redis --clear-groups" in high_compose
     assert "postgres_tls_entrypoint.sh" in high_compose
+    assert "/opt/scap/enforce-postgres-tls.sh" in high_compose
+    postgres_wrapper = Path("scripts/postgres_tls_entrypoint.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "export POSTGRES_PASSWORD_FILE=" in postgres_wrapper
+    assert "export APP_DB_PASSWORD_FILE=" in postgres_wrapper
+    assert "export AUDITOR_DB_PASSWORD_FILE=" in postgres_wrapper
+    assert "hostnossl all all 0.0.0.0/0 reject" in Path(
+        "scripts/enforce_postgres_tls.sh"
+    ).read_text(encoding="utf-8")
+    assert "PGSSLMODE=verify-full" in high_compose
+    assert "env_file: !reset []" in high_compose
+    assert "uv==0.11.15" in dockerfile
+    assert "ENV HOME=/app" in dockerfile
+    for image_variable in ("BASE_IMAGE", "POSTGRES_IMAGE", "REDIS_IMAGE", "CADDY_IMAGE"):
+        assert f"{image_variable}: ${{{image_variable}:?" in high_compose
     assert "--refresh-telemetry" in local_compose
     assert "image: scap-app" in local_compose

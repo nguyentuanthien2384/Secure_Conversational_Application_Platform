@@ -12,6 +12,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import gradio as gr
+
 UI_SOURCE = Path(__file__).resolve().parents[1] / "src" / "app" / "gradio_ui.py"
 
 
@@ -107,3 +109,23 @@ def test_ai_consent_notice_is_inline_and_can_retry_the_composer():
     assert "def consent_and_resend(token, session_id, message):" in source
     assert '"/api/auth/ai-consent", {"ai_data_consent": True}' in source
     assert 'gr.Warning("Đã che dữ liệu nhạy cảm' not in source
+
+
+def test_export_download_button_never_caches_the_plaintext_response(monkeypatch):
+    """The browser must redeem the stream ticket; Gradio must not prefetch it."""
+    source = UI_SOURCE.read_text(encoding="utf-8")
+    assert "file_export = gr.DownloadButton(" in source
+    assert "file_export = gr.File(" not in source
+
+    def reject_server_side_fetch(*args, **kwargs):
+        raise AssertionError("Gradio attempted to copy the export into its cache")
+
+    monkeypatch.setattr(
+        "gradio.processing_utils.save_url_to_cache",
+        reject_server_side_fetch,
+    )
+    button = gr.DownloadButton()
+    capability = "https://chat.example.test/api/exports/one-use-capability"
+    rendered = button.postprocess(capability)
+    assert rendered is not None
+    assert rendered.path == capability

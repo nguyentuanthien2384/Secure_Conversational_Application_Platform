@@ -5,6 +5,13 @@
 services:
   db:
     image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE to an immutable name@sha256 digest}
+    environment:
+      POSTGRES_PASSWORD: !reset null
+      APP_DB_PASSWORD: !reset null
+      AUDITOR_DB_PASSWORD: !reset null
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      APP_DB_PASSWORD_FILE: /run/secrets/app_db_password
+      AUDITOR_DB_PASSWORD_FILE: /run/secrets/auditor_db_password
     entrypoint: ["/bin/sh", "/opt/scap/postgres-tls-entrypoint.sh"]
     command:
       - postgres
@@ -26,17 +33,28 @@ services:
       - "ssl_key_file=/tmp/scap-postgres-tls/server.key"
     volumes:
       - ./scripts/postgres_tls_entrypoint.sh:/opt/scap/postgres-tls-entrypoint.sh:ro
+      - ./scripts/enforce_postgres_tls.sh:/opt/scap/enforce-postgres-tls.sh:ro
+      - ./scripts/enforce_postgres_tls.sh:/docker-entrypoint-initdb.d/05-enforce-tls.sh:ro
     secrets:
       - internal_ca_cert
       - postgres_server_cert
       - postgres_server_key
+      - postgres_password
+      - app_db_password
+      - auditor_db_password
     tmpfs:
       - /tmp
     healthcheck:
-      test: ["CMD-SHELL", "PGSSLMODE=require pg_isready -U secure_chat -d secure_chat"]
+      test:
+        - CMD-SHELL
+        - >-
+          PGSSLMODE=verify-full PGSSLROOTCERT=/tmp/scap-postgres-tls/ca.crt
+          pg_isready -h db -U secure_chat -d secure_chat
 
   redis:
     image: ${REDIS_IMAGE:?set REDIS_IMAGE to an immutable name@sha256 digest}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/opt/scap/redis-tls-entrypoint.sh"]
     command:
       - redis-server
       - "--port"
@@ -44,13 +62,15 @@ services:
       - "--tls-port"
       - "6379"
       - "--tls-cert-file"
-      - /run/secrets/redis_server_cert
+      - /tmp/scap-redis-tls/server.crt
       - "--tls-key-file"
-      - /run/secrets/redis_server_key
+      - /tmp/scap-redis-tls/server.key
       - "--tls-ca-cert-file"
-      - /run/secrets/internal_ca_cert
+      - /tmp/scap-redis-tls/ca.crt
       - "--tls-auth-clients"
       - "no"
+      - "--aclfile"
+      - /tmp/scap-redis-tls/users.acl
       - "--appendonly"
       - "no"
       - "--save"
@@ -59,25 +79,49 @@ services:
       - internal_ca_cert
       - redis_server_cert
       - redis_server_key
+      - redis_password
+    volumes:
+      - ./scripts/redis_tls_entrypoint.sh:/opt/scap/redis-tls-entrypoint.sh:ro
+    tmpfs:
+      - /tmp
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_READ_SEARCH
     healthcheck:
       test:
         - CMD-SHELL
         - >-
-          redis-cli --tls --cacert /run/secrets/internal_ca_cert
+          /usr/bin/setpriv --reuid redis --regid redis --clear-groups
+          redis-cli --tls --cacert /tmp/scap-redis-tls/ca.crt
           --sni redis ping | grep -q PONG
 
   migrate:
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/app/scripts/high_security_app_entrypoint.sh"]
     environment:
       DATABASE_URL: >-
-        postgresql+psycopg://secure_chat:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/secure_chat?sslmode=verify-full&sslrootcert=/run/secrets/internal_ca_cert
+        postgresql+psycopg://secure_chat@db:5432/secure_chat?sslmode=verify-full&sslrootcert=/tmp/scap-runtime-secrets/internal_ca.crt
+      DATABASE_PASSWORD_SECRET_NAME: postgres_password
     secrets:
       - internal_ca_cert
+      - postgres_password
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_READ_SEARCH
 
   caddy:
     image: ${CADDY_IMAGE:?set CADDY_IMAGE to an immutable name@sha256 digest}
 
   app:
+    env_file: !reset []
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/app/scripts/high_security_app_entrypoint.sh"]
     environment:
+      APP_ENV: production
       SECURITY_PROFILE: high
       KEY_PROVIDER: vault
       ALLOW_DEMO_AI: "false"
@@ -85,27 +129,49 @@ services:
       GRADIO_AUTH_MODE: oidc
       OIDC_USER_HEADER: x-auth-request-user
       OIDC_PROXY_SECRET_HEADER: x-scap-proxy-secret
-      OIDC_PROXY_SECRET_FILE: /run/secrets/oidc_proxy_secret
       VAULT_ADDR: ${VAULT_ADDR:?set VAULT_ADDR in .env}
-      VAULT_TOKEN_FILE: /run/secrets/vault_token
+      VAULT_ALLOW_INSECURE_HTTP: "false"
       VAULT_TRANSIT_MOUNT: ${VAULT_TRANSIT_MOUNT:-transit}
       VAULT_TRANSIT_KEY: ${VAULT_TRANSIT_KEY:-scap-conversations}
       VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
       AUDIT_WORM_ENDPOINT: ${AUDIT_WORM_ENDPOINT:?set AUDIT_WORM_ENDPOINT in .env}
-      AUDIT_WORM_TOKEN_FILE: /run/secrets/audit_worm_token
       AUDIT_CHECKPOINT_INTERVAL: ${AUDIT_CHECKPOINT_INTERVAL:-100}
       RETENTION_SWEEP_ON_STARTUP: "true"
+      BASE_IMAGE: ${BASE_IMAGE:?set BASE_IMAGE to an immutable name@sha256 digest}
+      POSTGRES_IMAGE: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE to an immutable name@sha256 digest}
+      REDIS_IMAGE: ${REDIS_IMAGE:?set REDIS_IMAGE to an immutable name@sha256 digest}
+      CADDY_IMAGE: ${CADDY_IMAGE:?set CADDY_IMAGE to an immutable name@sha256 digest}
       DATABASE_URL: >-
-        postgresql+psycopg://scap_app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}@db:5432/secure_chat?sslmode=verify-full&sslrootcert=/run/secrets/internal_ca_cert
+        postgresql+psycopg://scap_app@db:5432/secure_chat?sslmode=verify-full&sslrootcert=/tmp/scap-runtime-secrets/internal_ca.crt
       REDIS_URL: >-
-        rediss://redis:6379/0?ssl_cert_reqs=required&ssl_ca_certs=/run/secrets/internal_ca_cert
+        rediss://scap@redis:6379/0?ssl_cert_reqs=required&ssl_check_hostname=true&ssl_ca_certs=/tmp/scap-runtime-secrets/internal_ca.crt
+      DATABASE_PASSWORD_SECRET_NAME: app_db_password
+      REQUIRE_HIGH_APP_SECRETS: "true"
     secrets:
+      - app_secret
       - vault_token
       - oidc_proxy_secret
       - audit_worm_token
       - internal_ca_cert
+      - app_db_password
+      - redis_password
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_READ_SEARCH
 
 secrets:
+  app_secret:
+    file: ${APP_SECRET_KEY_FILE_HOST:?set APP_SECRET_KEY_FILE_HOST in .env}
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE_HOST:?set POSTGRES_PASSWORD_FILE_HOST in .env}
+  app_db_password:
+    file: ${APP_DB_PASSWORD_FILE_HOST:?set APP_DB_PASSWORD_FILE_HOST in .env}
+  auditor_db_password:
+    file: ${AUDITOR_DB_PASSWORD_FILE_HOST:?set AUDITOR_DB_PASSWORD_FILE_HOST in .env}
+  redis_password:
+    file: ${REDIS_PASSWORD_FILE_HOST:?set REDIS_PASSWORD_FILE_HOST in .env}
   vault_token:
     file: ${VAULT_TOKEN_FILE_HOST:?set VAULT_TOKEN_FILE_HOST in .env}
   oidc_proxy_secret:

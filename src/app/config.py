@@ -5,9 +5,11 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
+from sqlalchemy.engine import make_url
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -27,6 +29,78 @@ def _bool_env(name: str, default: bool) -> bool:
 def _csv_env(name: str, default: str = "") -> tuple[str, ...]:
     raw = os.getenv(name, default)
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _read_secret_file(file_env: str) -> str | None:
+    """Read one bounded single-line secret without retaining it in the environment."""
+    path_value = os.getenv(file_env, "").strip()
+    if not path_value:
+        return None
+    path = Path(path_value)
+    try:
+        if path.stat().st_size > 16_384:
+            raise RuntimeError(f"{file_env} vượt quá giới hạn 16 KiB.")
+        value = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Không thể đọc secret file được chỉ định bởi {file_env}.") from exc
+    value = value.removesuffix("\n").removesuffix("\r")
+    if not value or "\x00" in value or "\n" in value or "\r" in value:
+        raise RuntimeError(f"{file_env} phải chứa đúng một secret khác rỗng trên một dòng.")
+    return value
+
+
+def _secret_setting(value_env: str, file_env: str) -> str:
+    value = os.getenv(value_env, "").strip()
+    file_value = _read_secret_file(file_env)
+    if value and file_value is not None:
+        raise RuntimeError(f"Chỉ cấu hình một trong {value_env} hoặc {file_env}.")
+    return file_value if file_value is not None else value
+
+
+def database_url_with_file_password(raw_url: str) -> str:
+    """Inject the file-backed database password without exposing it in process env."""
+    password = _read_secret_file("DATABASE_PASSWORD_FILE")
+    if password is None:
+        return raw_url
+    try:
+        parsed = make_url(raw_url)
+    except Exception as exc:
+        raise RuntimeError("DATABASE_URL không hợp lệ.") from exc
+    if parsed.username is None:
+        raise RuntimeError("DATABASE_URL cần username khi dùng DATABASE_PASSWORD_FILE.")
+    if parsed.password not in (None, ""):
+        raise RuntimeError(
+            "Không nhúng password vào DATABASE_URL khi DATABASE_PASSWORD_FILE được đặt."
+        )
+    split = urlsplit(raw_url)
+    if not split.hostname:
+        raise RuntimeError("DATABASE_URL không hợp lệ.")
+    host = split.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if split.port is not None:
+        host = f"{host}:{split.port}"
+    netloc = f"{quote(parsed.username, safe='')}:{quote(password, safe='')}@{host}"
+    return urlunsplit((split.scheme, netloc, split.path, split.query, split.fragment))
+
+
+def _redis_url_with_file_password(raw_url: str) -> str:
+    password = _read_secret_file("REDIS_PASSWORD_FILE")
+    if password is None:
+        return raw_url
+    parsed = urlsplit(raw_url)
+    if not parsed.hostname:
+        raise RuntimeError("REDIS_URL không hợp lệ.")
+    if parsed.password not in (None, ""):
+        raise RuntimeError("Không nhúng password vào REDIS_URL khi REDIS_PASSWORD_FILE được đặt.")
+    username = parsed.username or "default"
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    netloc = f"{quote(username, safe='')}:{quote(password, safe='')}@{host}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def _keyring_env(name: str = "MASTER_ENCRYPTION_KEYS") -> dict[int, str]:
@@ -160,9 +234,15 @@ class Settings:
         key_provider = os.getenv("KEY_PROVIDER", "local").strip().lower()
         if key_provider not in {"local", "vault", "aws-kms", "gcp-kms"}:
             raise RuntimeError("KEY_PROVIDER chỉ chấp nhận local, vault, aws-kms hoặc gcp-kms.")
-        database_url = os.getenv("DATABASE_URL", "sqlite:///./secure_chat.db")
+        raw_database_url = os.getenv("DATABASE_URL", "sqlite:///./secure_chat.db")
+        database_url = database_url_with_file_password(raw_database_url)
+        raw_redis_url = os.getenv("REDIS_URL", "").strip()
+        redis_url = _redis_url_with_file_password(raw_redis_url)
         # Development-only marker; the production guard below rejects it.
-        secret_key = os.getenv("APP_SECRET_KEY", "").strip() or "development-only-change-me"  # nosec B105
+        secret_key = (
+            _secret_setting("APP_SECRET_KEY", "APP_SECRET_KEY_FILE")
+            or "development-only-change-me"  # nosec B105
+        )
         master_key = os.getenv("MASTER_ENCRYPTION_KEY", "").strip()
         keyring = _keyring_env()
         if (
@@ -185,7 +265,7 @@ class Settings:
                 raise RuntimeError(
                     "MASTER_ENCRYPTION_KEY hoặc MASTER_ENCRYPTION_KEYS bắt buộc ở production."
                 )
-            if not os.getenv("REDIS_URL", "").strip():
+            if not redis_url:
                 raise RuntimeError(
                     "REDIS_URL bắt buộc ở production để rate limit hoạt động đa instance."
                 )
@@ -255,22 +335,53 @@ class Settings:
                     if vault_url.scheme.lower() != "https":
                         raise RuntimeError("SECURITY_PROFILE=high bắt buộc Vault dùng HTTPS.")
 
-                database_tls = parse_qs(urlparse(database_url).query).get("sslmode", [])
-                if not database_tls or database_tls[-1].lower() != "verify-full":
+                database_query = parse_qsl(urlparse(raw_database_url).query, keep_blank_values=True)
+                database_tls = [
+                    value for name, value in database_query if name.lower() == "sslmode"
+                ]
+                if len(database_tls) != 1 or database_tls[0].lower() != "verify-full":
                     raise RuntimeError(
-                        "SECURITY_PROFILE=high bắt buộc PostgreSQL TLS với sslmode=verify-full."
+                        "SECURITY_PROFILE=high bắt buộc đúng một sslmode=verify-full cho PostgreSQL."
                     )
-                redis_url = os.getenv("REDIS_URL", "").strip()
-                parsed_redis = urlparse(redis_url)
-                redis_tls = parse_qs(parsed_redis.query).get("ssl_cert_reqs", [])
+                parsed_redis = urlparse(raw_redis_url)
+                redis_query = parse_qsl(parsed_redis.query, keep_blank_values=True)
+                redis_tls = [
+                    value for name, value in redis_query if name.lower() == "ssl_cert_reqs"
+                ]
+                redis_hostname = [
+                    value for name, value in redis_query if name.lower() == "ssl_check_hostname"
+                ]
                 if (
                     parsed_redis.scheme.lower() != "rediss"
-                    or not redis_tls
-                    or redis_tls[-1].lower() != "required"
+                    or len(redis_tls) != 1
+                    or redis_tls[0].lower() != "required"
+                    or len(redis_hostname) != 1
+                    or redis_hostname[0].lower() not in {"1", "true", "yes", "on"}
                 ):
                     raise RuntimeError(
                         "SECURITY_PROFILE=high bắt buộc Redis TLS (rediss:// và "
-                        "ssl_cert_reqs=required)."
+                        "một ssl_cert_reqs=required, ssl_check_hostname=true)."
+                    )
+                required_secret_files = (
+                    "APP_SECRET_KEY_FILE",
+                    "DATABASE_PASSWORD_FILE",
+                    "REDIS_PASSWORD_FILE",
+                )
+                missing_secret_files = [
+                    name for name in required_secret_files if not os.getenv(name, "").strip()
+                ]
+                if missing_secret_files:
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high bắt buộc secret file cho: "
+                        + ", ".join(missing_secret_files)
+                    )
+                if (
+                    os.getenv("APP_SECRET_KEY", "").strip()
+                    or urlparse(raw_database_url).password not in (None, "")
+                    or urlparse(raw_redis_url).password not in (None, "")
+                ):
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high không cho phép secret nhúng trong environment URL."
                     )
                 if _bool_env("ALLOW_SELF_REGISTRATION", True):
                     raise RuntimeError(
@@ -375,7 +486,7 @@ class Settings:
             mfa_recovery_codes=int(os.getenv("MFA_RECOVERY_CODES", "10")),
             mfa_window_seconds=int(os.getenv("MFA_WINDOW_SECONDS", "300")),
             mfa_max_attempts=int(os.getenv("MFA_MAX_ATTEMPTS", "5")),
-            redis_url=os.getenv("REDIS_URL", "").strip(),
+            redis_url=redis_url,
             allowed_origins=_csv_env("ALLOWED_ORIGINS"),
             allowed_hosts=_csv_env("ALLOWED_HOSTS"),
             max_sessions_per_user=int(os.getenv("MAX_SESSIONS_PER_USER", "100")),

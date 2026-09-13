@@ -108,11 +108,10 @@ GRANT USAGE   ON SCHEMA public        TO scap_auditor;
 -- không xem được nội dung hội thoại (dù có đọc cũng chỉ thấy bản mã AES-GCM).
 
 -- ── 7. Ép mã hóa đường truyền ──────────────────────────────────────────────
--- Bổ sung vào pg_hba.conf (không đặt được bằng SQL):
---   hostssl  secure_chat  scap_app      0.0.0.0/0  scram-sha-256
---   hostnossl all          all           0.0.0.0/0  reject
--- và nối ?sslmode=require vào DATABASE_URL. Trong Docker Compose, mạng
--- "backend" đã là internal nên đây là lớp bảo vệ bổ sung chống nghe lén nội bộ.
+-- High-security overlay đặt các dòng `hostnossl ... reject` ở ĐẦU pg_hba.conf
+-- bằng scripts/enforce_postgres_tls.sh. Kết nối ứng dụng đồng thời bắt buộc
+-- sslmode=verify-full và CA nội bộ, nên cả mã hóa, CA và hostname đều được xác
+-- minh. Mạng backend internal vẫn là lớp phân đoạn bổ sung, không thay thế TLS.
 
 -- ── 8. Xác minh ────────────────────────────────────────────────────────────
 -- SELECT grantee, table_name, privilege_type

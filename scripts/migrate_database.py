@@ -6,11 +6,14 @@ from __future__ import annotations
 import os
 
 from src.app import models as _models  # noqa: F401 - registers SQLAlchemy metadata
+from src.app.config import database_url_with_file_password
 from src.app.db import Database
 
 
 def main() -> None:
-    database_url = os.environ.get("DATABASE_URL", "").strip()
+    database_url = database_url_with_file_password(
+        os.environ.get("DATABASE_URL", "").strip()
+    )
     if not database_url.startswith(("postgresql://", "postgresql+")):
         raise RuntimeError("Migration container requires an owner PostgreSQL DATABASE_URL.")
     database = Database(database_url)

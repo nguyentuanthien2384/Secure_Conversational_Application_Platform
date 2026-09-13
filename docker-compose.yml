@@ -21,9 +21,9 @@ services:
     environment:
       POSTGRES_DB: secure_chat
       POSTGRES_USER: secure_chat
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
-      AUDITOR_DB_PASSWORD: ${AUDITOR_DB_PASSWORD:?set AUDITOR_DB_PASSWORD in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-}
+      AUDITOR_DB_PASSWORD: ${AUDITOR_DB_PASSWORD:-}
       # scram-sha-256 thay cho md5: md5 đã bị coi là yếu cho xác thực Postgres.
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
       POSTGRES_HOST_AUTH_METHOD: scram-sha-256
@@ -97,7 +97,7 @@ services:
     build: *app-build
     restart: "no"
     environment:
-      DATABASE_URL: postgresql+psycopg://secure_chat:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/secure_chat
+      DATABASE_URL: postgresql+psycopg://secure_chat:${POSTGRES_PASSWORD:-}@db:5432/secure_chat
       # Direct script execution puts /app/scripts, not /app, on sys.path.
       PYTHONPATH: /app
     command: ["/app/.venv/bin/python", "scripts/migrate_database.py"]
@@ -128,7 +128,7 @@ services:
     env_file: .env
     environment:
       APP_ENV: production
-      DATABASE_URL: postgresql+psycopg://scap_app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}@db:5432/secure_chat
+      DATABASE_URL: postgresql+psycopg://scap_app:${APP_DB_PASSWORD:-}@db:5432/secure_chat
       REDIS_URL: redis://redis:6379/0
       ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?set PUBLIC_DOMAIN in .env}
       ALLOWED_HOSTS: ${PUBLIC_DOMAIN:?set PUBLIC_DOMAIN in .env}
