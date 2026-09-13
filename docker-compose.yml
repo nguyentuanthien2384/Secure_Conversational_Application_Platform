@@ -67,7 +67,7 @@ services:
     networks: [backend]
 
   redis:
-    image: redis:7.4-alpine
+    image: redis:8.10-alpine
     # Run the image entrypoint directly as its unprivileged account. This avoids
     # needing CHOWN/SETUID/SETGID and keeps cap_drop: ALL effective in production.
     user: redis
