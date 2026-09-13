@@ -31,6 +31,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 _SAFE_VAULT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Never forward Vault credentials to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ARG002
+        return None
+
+
 class KeyProviderError(RuntimeError):
     """A KEK operation failed without exposing provider or secret details."""
 
@@ -237,12 +244,19 @@ class VaultTransitKeyProvider:
         if not _SAFE_VAULT_NAME.fullmatch(mount) or not _SAFE_VAULT_NAME.fullmatch(key_name):
             raise ValueError("Vault mount and key name contain unsupported characters.")
         if not token_file:
-            raise ValueError("Vault token file is required; do not embed the token in configuration.")
+            raise ValueError(
+                "Vault token file is required; do not embed the token in configuration."
+            )
+        normalized_namespace = namespace.strip()
+        if len(normalized_namespace) > 256 or any(
+            ord(character) < 32 or ord(character) == 127 for character in normalized_namespace
+        ):
+            raise ValueError("Vault namespace contains unsupported characters.")
         self._address = address.rstrip("/")
         self._token_file = Path(token_file)
         self._mount = mount
         self._key_name = key_name
-        self._namespace = namespace.strip()
+        self._namespace = normalized_namespace
         self._timeout = timeout_seconds
         self._allow_insecure_http = allow_insecure_http
         self._kek_uri = f"vault://{mount}/{key_name}"
@@ -286,11 +300,16 @@ class VaultTransitKeyProvider:
             method="POST",
         )
         ssl_context = ssl.create_default_context()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl_context),
+            _RejectRedirects(),
+        )
         try:
-            with urllib.request.urlopen(  # nosec B310 - fixed Vault origin is HTTPS
+            # The origin is validated above and redirects are rejected so the
+            # workload token cannot be forwarded to another host.
+            with opener.open(
                 request,
                 timeout=self._timeout,
-                context=ssl_context,
             ) as response:
                 document = json.loads(response.read(1_048_577))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:

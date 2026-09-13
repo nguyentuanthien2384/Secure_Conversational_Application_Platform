@@ -12,8 +12,9 @@ cho thấy nguyên nhân đã được chặn.
 Thu hồi auth session hoặc `logout-all`, tăng `token_version` qua quy trình quản
 trị, xoay `APP_SECRET_KEY` nếu khóa ký có thể lộ và buộc đăng nhập lại toàn bộ.
 Kiểm tra audit/SIEM cho IP, user-agent, export ticket, thay role, tắt MFA, đăng ký
-device và truy cập prekey bất thường. Export ticket hết hạn tối đa 60 giây và
-single-use nhưng vẫn coi dữ liệu đã tải là có khả năng lộ.
+device và truy cập prekey bất thường. Export ticket hết hạn tối đa 60 giây,
+single-use và mất hiệu lực ngay khi phiên đăng nhập cha/tài khoản bị thu hồi;
+nhưng vẫn coi dữ liệu đã tải thành công là có khả năng lộ.
 
 ## Nghi lộ thiết bị E2EE
 
@@ -52,4 +53,3 @@ Ghi root cause, phạm vi dữ liệu, timeline, chỉ dấu xâm nhập, quyế
 khóa/token đã xoay, test hồi quy và chủ sở hữu action item. Chạy lại CI/security
 scan, restore drill, audit verification và pentest có mục tiêu trước khi mở lại
 high-security traffic.
-

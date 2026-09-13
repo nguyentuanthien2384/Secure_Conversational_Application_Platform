@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from sqlalchemy import select
@@ -26,8 +26,8 @@ from src.app.security import CryptoService
 logger = logging.getLogger("secure_chat.ai")
 
 # Thông điệp DUY NHẤT được trả về cho người dùng khi nhà cung cấp AI lỗi.
-# Cố ý chung chung: chi tiết lỗi (tên model, mã lỗi HTTP của Google, một phần
-# API key trong URL, traceback) chỉ đi vào log phía máy chủ.
+# Cố ý chung chung: chi tiết lỗi (mã HTTP, endpoint, API key hoặc nội dung phản
+# chiếu) không đi vào response và cũng không được sao chép sang log máy chủ.
 AI_UNAVAILABLE_MESSAGE = "Dịch vụ AI tạm thời không khả dụng. Vui lòng thử lại sau."
 EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE = (
     "Cần đồng ý trước khi gửi nội dung đến nhà cung cấp AI bên ngoài."
@@ -148,11 +148,14 @@ class AIService:
                     api_key=settings.google_genai_api_key,
                     model=settings.gemini_model,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 # Key sai định dạng hoặc SDK lỗi: KHÔNG để cả ứng dụng chết vì
                 # một tính năng phụ. Ghi log rồi để `generate()` xử lý — tùy
                 # ALLOW_DEMO_AI mà rơi về chế độ demo hay trả 503.
-                logger.exception("Không khởi tạo được GeminiClient; tính năng AI sẽ suy giảm.")
+                logger.error(
+                    "Không khởi tạo được GeminiClient; tính năng AI suy giảm (error_type=%s).",
+                    type(exc).__name__,
+                )
                 self._client = None
 
     @staticmethod
@@ -176,16 +179,28 @@ class AIService:
         """
         return AIService.redact_with_report(content)[0]
 
+    def redact_with_configured_policy(self, content: str) -> tuple[str, list[str]]:
+        """Redact with the deployment's complete detector set.
+
+        Unlike the compatibility helper above, this includes configured custom
+        dictionaries. Only category labels leave the scanner.
+        """
+        sanitized, findings = self.dlp.redact(content)
+        hits = [_DLP_LABELS[item.finding_type] for item in findings]
+        return sanitized, list(dict.fromkeys(hits))
+
     def generate(
         self,
         current_message: str,
-        history: Sequence[dict[str, str]],
+        history: Sequence[dict[str, str]] | Callable[[], Sequence[dict[str, str]]],
         *,
         allow_external_ai: bool,
         data_class: str = DataClass.INTERNAL.value,
         confirmed: bool = False,
     ) -> tuple[str, list[str]]:
-        sanitized_current_message, redacted_labels = self.redact_with_report(current_message)
+        sanitized_current_message, redacted_labels = self.redact_with_configured_policy(
+            current_message
+        )
         if self._client is None:
             if not self.settings.allow_demo_ai:
                 logger.error(
@@ -217,8 +232,12 @@ class AIService:
         sanitized_current_message = decision.output_text or ""
         redacted_labels = list(dict.fromkeys(redacted_labels + decision_labels))
 
+        # Decrypt/load history only after consent, confirmation, and the current
+        # message's DLP decision have all passed. A rejected request therefore
+        # never expands the plaintext exposure window for earlier messages.
+        history_items = history() if callable(history) else history
         sanitized_history = []
-        for item in list(history)[-8:]:
+        for item in list(history_items)[-8:]:
             history_decision = self.dlp.evaluate(
                 item["content"],
                 data_class=data_class,
@@ -275,8 +294,11 @@ class AIService:
             # thông điệp của chúng thường chứa chi tiết hạ tầng. Ghi đầy đủ vào
             # log máy chủ, trả cho người dùng một câu chung chung để tránh
             # information disclosure (OWASP A09 / CWE-209).
-            logger.exception(
-                "Gọi nhà cung cấp AI thất bại (model=%s, loại lỗi=%s)",
+            # Provider exceptions can embed API keys, endpoints, or echoed
+            # prompt fragments. Log only bounded metadata, never the exception
+            # message or traceback.
+            logger.error(
+                "Gọi nhà cung cấp AI thất bại (model=%s, error_type=%s)",
                 self.settings.gemini_model,
                 type(exc).__name__,
             )
@@ -469,18 +491,15 @@ class ChatService:
             raise PermissionError(
                 "Private E2EE không cho phép máy chủ nhận plaintext hoặc gọi AI tự động."
             )
-        # Only decrypt what the provider can actually receive. Previously the
-        # entire conversation was decrypted and only then sliced to eight rows.
-        history = self.recent_messages(
-            db,
-            chat_session,
-            limit=8,
-            since=consent_since,
-        )
         if isinstance(self.ai, AIService):
             response, redacted_labels = self.ai.generate(
                 content,
-                history,
+                lambda: self.recent_messages(
+                    db,
+                    chat_session,
+                    limit=8,
+                    since=consent_since,
+                ),
                 allow_external_ai=allow_external_ai,
                 data_class=chat_session.data_classification,
                 confirmed=confirm_external_ai,
@@ -489,6 +508,12 @@ class ChatService:
             # Preserve the small dependency-injection surface used by local
             # adapters and tests written before the classified-DLP arguments
             # were introduced. Production always receives ``AIService``.
+            history = self.recent_messages(
+                db,
+                chat_session,
+                limit=8,
+                since=consent_since,
+            )
             response, redacted_labels = self.ai.generate(
                 content,
                 history,
@@ -520,15 +545,13 @@ class ChatService:
                 message_uuid=user_uuid,
                 message_index=first_index,
             )
-            assistant_ciphertext, assistant_nonce, assistant_epoch = (
-                self.envelope.encrypt_message(
-                    db,
-                    chat_session,
-                    plaintext=response,
-                    role="assistant",
-                    message_uuid=assistant_uuid,
-                    message_index=first_index + 1,
-                )
+            assistant_ciphertext, assistant_nonce, assistant_epoch = self.envelope.encrypt_message(
+                db,
+                chat_session,
+                plaintext=response,
+                role="assistant",
+                message_uuid=assistant_uuid,
+                message_index=first_index + 1,
             )
             user_key_version = user_epoch
             assistant_key_version = assistant_epoch

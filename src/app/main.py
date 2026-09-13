@@ -17,11 +17,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.app.audit import client_ip, record_audit
+from src.app.audit import client_ip, record_audit, safe_user_agent
 from src.app.audit_chain import derive_audit_key, verify_chain
 from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
 from src.app.config import Settings
@@ -46,6 +46,7 @@ from src.app.ids import (
     Detection,
     IntrusionState,
     detect_anomalies,
+    evidence_fingerprint,
     mitre_technique_for_rule,
     run_safe_detection_verification,
     scan_text,
@@ -111,6 +112,7 @@ from src.app.schemas import (
 )
 from src.app.security import (
     CryptoService,
+    PasswordBreachCheckUnavailable,
     PasswordService,
     PwnedPasswordChecker,
     RedisSlidingWindowRateLimiter,
@@ -126,6 +128,13 @@ logger = logging.getLogger("secure_chat")
 
 bearer = HTTPBearer(auto_error=False)
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _audit_safe_path(path: str) -> str:
+    """Remove capability-bearing path segments before telemetry or IDS storage."""
+    if path.startswith("/api/exports/"):
+        return "/api/exports/[capability-redacted]"
+    return path[:200]
 
 
 def _build_crypto_services(
@@ -192,7 +201,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         raise ValueError("Security duration and rate-limit settings must be positive integers.")
     database = Database(settings.database_url)
     password_service = PasswordService()
-    breach_checker = PwnedPasswordChecker(enabled=settings.password_breach_check)
+    breach_checker = PwnedPasswordChecker(
+        enabled=settings.password_breach_check,
+        fail_closed=settings.security_profile == "high",
+    )
     token_service = TokenService(settings.secret_key, settings.access_token_minutes)
     crypto_service, key_provider, envelope_crypto_service = _build_crypto_services(settings)
     limiter_type = RedisSlidingWindowRateLimiter if settings.redis_url else SlidingWindowRateLimiter
@@ -339,6 +351,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # already handled structurally by Pydantic + the ORM.
         if settings.ids_enabled:
             source_ip = client_ip(request)
+            safe_request_path = _audit_safe_path(request.url.path)
             blocked, retry_after = intrusion_state.is_blocked(source_ip)
             if blocked:
                 emit_security_event(
@@ -346,7 +359,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     outcome="blocked",
                     source_ip=source_ip,
                     request_id=request_id,
-                    details={"path": request.url.path[:200]},
+                    details={"path": safe_request_path},
                 )
                 return JSONResponse(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -355,7 +368,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
 
             detections: list[Detection] = []
-            surface = f"{request.url.path}?{request.url.query}"
+            surface = f"{safe_request_path}?{request.url.query}"
             for rule_id, severity, description, evidence in scan_text(surface):
                 detections.append(
                     Detection(
@@ -364,9 +377,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         engine="signature",
                         description=description,
                         source_ip=source_ip,
-                        path=request.url.path[:200],
+                        path=safe_request_path,
                         method=request.method,
-                        evidence=evidence,
+                        evidence_sha256=evidence_fingerprint(evidence),
                         mitre_technique=mitre_technique_for_rule(rule_id),
                     )
                 )
@@ -379,9 +392,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         engine="signature",
                         description="User-Agent của công cụ quét lỗ hổng tự động",
                         source_ip=source_ip,
-                        path=request.url.path[:200],
+                        path=safe_request_path,
                         method=request.method,
-                        evidence=user_agent[:120],
+                        evidence_sha256=evidence_fingerprint(user_agent[:120]),
                     )
                 )
             if DECOY_PATHS.search(request.url.path):
@@ -392,9 +405,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         engine="signature",
                         description="Dò đường dẫn nhạy cảm không tồn tại trên hệ thống này",
                         source_ip=source_ip,
-                        path=request.url.path[:200],
+                        path=safe_request_path,
                         method=request.method,
-                        evidence=request.url.path[:120],
+                        evidence_sha256=evidence_fingerprint(request.url.path[:120]),
                     )
                 )
 
@@ -420,9 +433,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 # Evidence can be attacker-controlled and may
                                 # contain credentials. Keep only a correlation
                                 # hash in the long-lived audit/SIEM stream.
-                                "evidence_sha256": hashlib.sha256(
-                                    detection.evidence.encode("utf-8", errors="replace")
-                                ).hexdigest()[:16],
+                                "evidence_sha256": detection.evidence_sha256,
                             },
                         )
                     if newly_blocked:
@@ -493,9 +504,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.csp_report_only and not path.startswith("/api"):
             # Observe whether the bundled Gradio release can run without inline
             # script before promoting this stricter policy to enforcement.
-            report_policy = csp.replace(" 'unsafe-inline'", "").replace(
-                " 'unsafe-eval'", ""
-            )
+            report_policy = csp.replace(" 'unsafe-inline'", "").replace(" 'unsafe-eval'", "")
             response.headers["Content-Security-Policy-Report-Only"] = report_policy
         if settings.environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
@@ -503,11 +512,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
-        # Log server-side with request correlation, but never expose exception details to clients.
+        # Exception messages can contain SQL parameters, tokens, or provider
+        # payloads. Retain only correlation + type in logs and return a generic
+        # client response.
         logger.error(
-            "Unhandled exception request_id=%s",
+            "Unhandled exception request_id=%s error_type=%s",
             getattr(request.state, "request_id", None),
-            exc_info=(type(exc), exc, exc.__traceback__),
+            type(exc).__name__,
         )
         return JSONResponse(
             status_code=500,
@@ -523,6 +534,70 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield db
         finally:
             db.close()
+
+    def password_is_compromised(
+        password: str,
+        request: Request,
+        db: Session,
+        *,
+        event_type: str,
+        actor_id: str | None = None,
+    ) -> bool:
+        try:
+            return breach_checker.is_compromised(password)
+        except PasswordBreachCheckUnavailable as exc:
+            record_audit(
+                db,
+                request,
+                event_type,
+                actor_id=actor_id,
+                outcome="failure",
+                details={"reason": "password_breach_check_unavailable"},
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Tạm thời chưa thể kiểm tra an toàn mật khẩu. Vui lòng thử lại sau.",
+                headers={"Retry-After": "30"},
+            ) from exc
+
+    def as_utc(value: datetime) -> datetime:
+        """Normalize timestamps returned by SQLite and timezone-aware databases."""
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def retained_session_clause(now: datetime | None = None):
+        cutoff = now or utcnow()
+        return or_(
+            ChatSession.retention_expires_at.is_(None),
+            ChatSession.retention_expires_at > cutoff,
+        )
+
+    def reject_expired_session(
+        chat_session: ChatSession,
+        user: User,
+        db: Session,
+        request: Request,
+    ) -> None:
+        expires_at = chat_session.retention_expires_at
+        if expires_at is None or as_utc(expires_at) > utcnow():
+            return
+        session_id = chat_session.id
+        security_mode = chat_session.security_mode
+        db.delete(chat_session)
+        db.commit()
+        # The cache may still contain a plaintext DEK for the deleted row.
+        envelope_crypto_service.clear_cache()
+        record_audit(
+            db,
+            request,
+            "chat.session.retention_expired",
+            actor_id=user.id,
+            target_type="chat_session",
+            target_id=session_id,
+            details={"security_mode": security_mode, "deleted_on_access": True},
+        )
+        raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
 
     def current_user(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer)],
@@ -583,6 +658,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             # Return 404 to reduce resource enumeration.
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
+        reject_expired_session(chat_session, user, db, request)
         return chat_session
 
     def require_private_member_session(
@@ -611,6 +687,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 outcome="denied",
             )
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên E2EE.")
+        reject_expired_session(chat_session, user, db, request)
         return chat_session, member
 
     # Gradio UI is mounted after all API routes are registered (see below).
@@ -655,7 +732,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 issued_at=issued_at,
                 expires_at=datetime.fromtimestamp(int(token_payload["exp"]), tz=timezone.utc),
                 ip_address=ip,
-                user_agent=request.headers.get("user-agent", "")[:256] or None,
+                user_agent=safe_user_agent(request.headers.get("user-agent", "")),
                 root_issued_at=root_issued_at or issued_at,
                 last_step_up_at=issued_at if mark_step_up else last_step_up_at,
             )
@@ -711,9 +788,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         ):
             if password_service.verify(record.code_hash, normalized):
-                record.used_at = utcnow()
-                return True
+                consumed = db.execute(
+                    update(MfaRecoveryCode)
+                    .where(
+                        MfaRecoveryCode.id == record.id,
+                        MfaRecoveryCode.used_at.is_(None),
+                    )
+                    .values(used_at=utcnow())
+                    .execution_options(synchronize_session=False)
+                )
+                if consumed.rowcount == 1:
+                    return True
         return False
+
+    def claim_totp_counter(db: Session, user: User, counter: int) -> bool:
+        """Atomically consume one TOTP time step across concurrent requests."""
+        consumed = db.execute(
+            update(User)
+            .where(
+                User.id == user.id,
+                User.mfa_last_counter < counter,
+            )
+            .values(mfa_last_counter=counter)
+            .execution_options(synchronize_session=False)
+        )
+        return consumed.rowcount == 1
 
     @app.get("/api/health")
     def health(db: Annotated[Session, Depends(get_db)]):
@@ -748,7 +847,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Too many account creation attempts. Please try again later.",
                 headers={"Retry-After": str(retry_after)},
             )
-        if breach_checker.is_compromised(payload.password):
+        if not settings.allow_self_registration:
+            record_audit(
+                db,
+                request,
+                "auth.register",
+                outcome="denied",
+                details={"reason": "self_registration_disabled"},
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Hệ thống chỉ cho phép tài khoản được cấp bởi quản trị viên.",
+            )
+        if password_is_compromised(
+            payload.password,
+            request,
+            db,
+            event_type="auth.register",
+        ):
             record_audit(
                 db,
                 request,
@@ -967,8 +1083,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 raise HTTPException(status_code=401, detail="Không xác thực được mã.")
         else:
-            # Persist the accepted time counter so the same code cannot be replayed.
-            user.mfa_last_counter = matched_counter
+            if not claim_totp_counter(db, user, matched_counter):
+                db.rollback()
+                record_audit(
+                    db,
+                    request,
+                    "auth.mfa.verify",
+                    actor_id=user.id,
+                    outcome="failure",
+                    details={"reason": "code_replay"},
+                )
+                raise HTTPException(status_code=401, detail="Không xác thực được mã.")
 
         mfa_limiter.reset(f"mfa:{user_id}")
         db.add(
@@ -1030,6 +1155,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        allowed, retry_after = mfa_limiter.allow(
+            f"mfa-activate:{user.id}",
+            settings.mfa_max_attempts,
+            settings.mfa_window_seconds,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Thử kích hoạt MFA quá nhiều lần.",
+                headers={"Retry-After": str(retry_after)},
+            )
         if user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA đã được bật.")
         secret = load_mfa_secret(user)
@@ -1047,16 +1183,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=400, detail="Mã TOTP không đúng.")
 
+        activated = db.execute(
+            update(User)
+            .where(
+                User.id == user.id,
+                User.mfa_enabled.is_(False),
+                User.mfa_last_counter < matched_counter,
+            )
+            .values(mfa_enabled=True, mfa_last_counter=matched_counter)
+            .execution_options(synchronize_session=False)
+        )
+        if activated.rowcount != 1:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="Mã TOTP đã được sử dụng.")
         plain_codes = [generate_recovery_code() for _ in range(settings.mfa_recovery_codes)]
         db.add_all(
             MfaRecoveryCode(user_id=user.id, code_hash=password_service.hash(code))
             for code in plain_codes
         )
-        user.mfa_enabled = True
-        user.mfa_last_counter = matched_counter
         # Force other devices to re-authenticate now that a second factor exists.
         revoke_all_auth_sessions(db, user)
         db.commit()
+        mfa_limiter.reset(f"mfa-activate:{user.id}")
         record_audit(
             db, request, "auth.mfa.enabled", actor_id=user.id, target_type="user", target_id=user.id
         )
@@ -1069,6 +1217,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        allowed, retry_after = mfa_limiter.allow(
+            f"mfa-disable:{user.id}",
+            settings.mfa_max_attempts,
+            settings.mfa_window_seconds,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Thử tắt MFA quá nhiều lần.",
+                headers={"Retry-After": str(retry_after)},
+            )
         if not user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA chưa được bật.")
         secret = load_mfa_secret(user)
@@ -1111,6 +1270,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.delete(record)
         revoke_all_auth_sessions(db, user)
         db.commit()
+        mfa_limiter.reset(f"mfa-disable:{user.id}")
         record_audit(
             db,
             request,
@@ -1162,6 +1322,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     db, user, payload.code
                 )
                 valid = matched_counter is not None or used_recovery
+                if matched_counter is not None and not claim_totp_counter(
+                    db, user, matched_counter
+                ):
+                    valid = False
+                    matched_counter = None
         if not valid:
             db.commit()
             record_audit(
@@ -1178,8 +1343,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         auth_session = db.get(AuthSession, str(token_payload["jti"]))
         if auth_session is None or auth_session.user_id != user.id:
             raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
-        if matched_counter is not None:
-            user.mfa_last_counter = matched_counter
         verified_at = utcnow()
         auth_session.last_step_up_at = verified_at
         db.commit()
@@ -1206,8 +1369,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         consent_version_changed = (
-            payload.ai_data_consent
-            and user.ai_consent_version != settings.ai_consent_version
+            payload.ai_data_consent and user.ai_consent_version != settings.ai_consent_version
         )
         if user.ai_data_consent != payload.ai_data_consent or consent_version_changed:
             user.ai_data_consent = payload.ai_data_consent
@@ -1402,7 +1564,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=422, detail="New password must differ from the current password."
             )
-        if breach_checker.is_compromised(payload.new_password):
+        if password_is_compromised(
+            payload.new_password,
+            request,
+            db,
+            event_type="auth.password_change",
+            actor_id=user.id,
+        ):
             record_audit(
                 db,
                 request,
@@ -1515,7 +1683,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        _, title_findings = chat_service.ai.redact_with_report(payload.title)
+        _, title_findings = chat_service.ai.redact_with_configured_policy(payload.title)
         if title_findings:
             raise HTTPException(
                 status_code=422,
@@ -1538,7 +1706,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # database/storage resources by creating unlimited sessions.
         session_count = (
             db.scalar(
-                select(func.count()).select_from(ChatSession).where(ChatSession.owner_id == user.id)
+                select(func.count())
+                .select_from(ChatSession)
+                .where(ChatSession.owner_id == user.id)
+                .where(retained_session_clause())
             )
             or 0
         )
@@ -1616,7 +1787,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         stmt = (
             select(ChatSession)
-            .where(ChatSession.owner_id == user.id)
+            .where(ChatSession.owner_id == user.id, retained_session_clause())
             .order_by(ChatSession.updated_at.desc())
             .limit(100)
         )
@@ -1639,7 +1810,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        _, title_findings = chat_service.ai.redact_with_report(payload.title)
+        _, title_findings = chat_service.ai.redact_with_configured_policy(payload.title)
         if title_findings:
             raise HTTPException(
                 status_code=422,
@@ -1678,10 +1849,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         require_recent_step_up(credentials, user, db)
         row = require_owned_session(session_id, user, db, request)
+        if (
+            settings.security_profile == "high"
+            and payload.security_mode in {"confidential", "private_e2ee"}
+            and not user.mfa_enabled
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Chế độ hội thoại nhạy cảm bắt buộc tài khoản đã bật MFA.",
+            )
         has_messages = db.scalar(
-            select(SecureMessage.id)
-            .where(SecureMessage.session_id == row.id)
-            .limit(1)
+            select(SecureMessage.id).where(SecureMessage.session_id == row.id).limit(1)
         )
         has_e2ee = db.scalar(
             select(E2eeEnvelope.id).where(E2eeEnvelope.session_id == row.id).limit(1)
@@ -1794,10 +1972,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if last_created is not None:
                     stmt = stmt.where(
                         (E2eeEnvelope.created_at > last_created)
-                        | (
-                            (E2eeEnvelope.created_at == last_created)
-                            & (E2eeEnvelope.id > last_id)
-                        )
+                        | ((E2eeEnvelope.created_at == last_created) & (E2eeEnvelope.id > last_id))
                     )
                 page = list(db.scalars(stmt))
                 if not page:
@@ -1897,9 +2072,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         """Issue a 60-second one-use browser download capability after step-up."""
-        require_recent_step_up(credentials, user, db)
+        auth_session = require_recent_step_up(credentials, user, db)
         row = require_owned_session(session_id, user, db, request)
-        ticket = token_service.issue_export_ticket(user.id, row.id, seconds=60)
+        ticket = token_service.issue_export_ticket(
+            user.id,
+            row.id,
+            user.token_version,
+            auth_session.jti,
+            seconds=60,
+        )
         claims = token_service.decode_export_ticket(ticket)
         expires_at = datetime.fromtimestamp(int(claims["exp"]), tz=timezone.utc)
         record_audit(
@@ -1931,6 +2112,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # insert/primary key makes simultaneous redemption fail closed.
         if db.get(RevokedToken, ticket_jti) is not None:
             raise HTTPException(status_code=410, detail="Vé tải xuống đã được sử dụng.")
+        user = db.get(User, str(claims["sub"]))
+        parent_jti = str(claims["parent_jti"])
+        parent_session = db.get(AuthSession, parent_jti)
+        parent_expiry = parent_session.expires_at if parent_session is not None else None
+        if (
+            user is None
+            or not user.is_active
+            or int(claims["ver"]) != user.token_version
+            or parent_session is None
+            or parent_session.user_id != user.id
+            or parent_session.revoked_at is not None
+            or parent_expiry is None
+            or as_utc(parent_expiry) <= utcnow()
+            or db.get(RevokedToken, parent_jti) is not None
+        ):
+            raise HTTPException(status_code=404, detail="Vé tải xuống không hợp lệ.")
         row = db.scalar(
             select(ChatSession).where(
                 ChatSession.id == str(claims["sid"]),
@@ -1939,6 +2136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if row is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy dữ liệu xuất.")
+        reject_expired_session(row, user, db, request)
         db.add(
             RevokedToken(
                 jti=ticket_jti,
@@ -2077,8 +2275,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 row,
                 payload.content,
                 allow_external_ai=(
-                    user.ai_data_consent
-                    and user.ai_consent_version == settings.ai_consent_version
+                    user.ai_data_consent and user.ai_consent_version == settings.ai_consent_version
                 ),
                 confirm_external_ai=payload.confirm_external_ai,
                 consent_since=user.ai_consent_at,
@@ -2120,7 +2317,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except AIProviderError as exc:
             # Lỗi phía nhà cung cấp AI, không phải lỗi của người dùng: 503 kèm
             # Retry-After. `str(exc)` đã là thông điệp chung chung an toàn;
-            # nguyên nhân thật nằm trong log máy chủ (services.AIService).
+            # log máy chủ chỉ giữ loại lỗi và model, không giữ thông điệp SDK.
             record_audit(
                 db,
                 request,
@@ -2186,7 +2383,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sessions = list(
             db.scalars(
                 select(ChatSession)
-                .where(ChatSession.owner_id == user.id)
+                .where(ChatSession.owner_id == user.id, retained_session_clause())
                 .order_by(ChatSession.updated_at.desc())
                 .limit(100)
             )
@@ -2274,14 +2471,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, user, db)
+        _, display_findings = chat_service.ai.redact_with_configured_policy(payload.display_name)
+        if display_findings:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "sensitive_metadata",
+                    "message": "Tên thiết bị không được chứa bí mật hoặc dữ liệu định danh.",
+                    "categories": display_findings,
+                },
+            )
         now = utcnow()
         challenge = db.scalar(
-            select(E2eeDeviceChallenge)
-            .where(
+            select(E2eeDeviceChallenge).where(
                 E2eeDeviceChallenge.id == payload.challenge_id,
                 E2eeDeviceChallenge.user_id == user.id,
             )
-            .with_for_update()
         )
         expires_at = challenge.expires_at if challenge is not None else None
         if expires_at is not None and expires_at.tzinfo is None:
@@ -2307,9 +2512,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ):
             raise HTTPException(status_code=409, detail="Challenge không hợp lệ hoặc đã hết hạn.")
 
-        # Burn the challenge even when a following signature is invalid. This
-        # prevents online probing and makes the proof strictly single-use.
-        challenge.consumed_at = now
+        # Burn atomically even on SQLite, where SELECT ... FOR UPDATE is a no-op.
+        # This prevents two concurrent registrations from redeeming one proof.
+        burned = db.execute(
+            update(E2eeDeviceChallenge)
+            .where(
+                E2eeDeviceChallenge.id == challenge.id,
+                E2eeDeviceChallenge.user_id == user.id,
+                E2eeDeviceChallenge.challenge_hash == challenge.challenge_hash,
+                E2eeDeviceChallenge.consumed_at.is_(None),
+                E2eeDeviceChallenge.expires_at > now,
+            )
+            .values(consumed_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        if burned.rowcount != 1:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="Challenge đã được sử dụng.")
         if db.get(E2eeDevice, payload.device_id) is not None:
             record_audit(
                 db,
@@ -2402,11 +2621,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     detail="Thiết bị mới phải được một thiết bị đã tin cậy phê duyệt.",
                 )
             approver = next(
-                (
-                    item
-                    for item in trusted_devices
-                    if item.id == payload.approver_device_id
-                ),
+                (item for item in trusted_devices if item.id == payload.approver_device_id),
                 None,
             )
             if approver is None or not verify_device_approval(
@@ -2588,19 +2803,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         device = db.scalar(device_stmt.order_by(E2eeDevice.created_at.asc()).limit(1))
         if device is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy prekey bundle.")
-        prekey = db.scalar(
-            select(E2eePreKey)
-            .where(
-                E2eePreKey.device_id == device.id,
-                E2eePreKey.consumed_at.is_(None),
+        prekey: E2eePreKey | None = None
+        # Conditional UPDATE makes the public one-time prekey single-use even
+        # on SQLite, where row-level SELECT FOR UPDATE is not implemented.
+        for _ in range(3):
+            candidate = db.scalar(
+                select(E2eePreKey)
+                .where(
+                    E2eePreKey.device_id == device.id,
+                    E2eePreKey.consumed_at.is_(None),
+                )
+                .order_by(E2eePreKey.created_at.asc())
+                .limit(1)
             )
-            .order_by(E2eePreKey.created_at.asc())
-            .with_for_update(skip_locked=True)
-            .limit(1)
-        )
-        if prekey is not None:
-            prekey.consumed_at = utcnow()
-            prekey.consumed_by_user_id = requester.id
+            if candidate is None:
+                break
+            claimed = db.execute(
+                update(E2eePreKey)
+                .where(
+                    E2eePreKey.id == candidate.id,
+                    E2eePreKey.consumed_at.is_(None),
+                )
+                .values(
+                    consumed_at=utcnow(),
+                    consumed_by_user_id=requester.id,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount == 1:
+                prekey = candidate
+                break
+            db.rollback()
         db.commit()
         record_audit(
             db,
@@ -2878,7 +3111,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.refresh(stored)
         except IntegrityError as exc:
             db.rollback()
-            raise HTTPException(status_code=409, detail="Bản mã trùng hoặc đã được phát lại.") from exc
+            raise HTTPException(
+                status_code=409, detail="Bản mã trùng hoặc đã được phát lại."
+            ) from exc
         record_audit(
             db,
             request,
@@ -2962,7 +3197,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        if breach_checker.is_compromised(payload.password):
+        if password_is_compromised(
+            payload.password,
+            request,
+            db,
+            event_type="admin.user_create",
+            actor_id=admin.id,
+        ):
             record_audit(
                 db,
                 request,
@@ -2996,7 +3237,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             actor_id=admin.id,
             target_type="user",
             target_id=user.id,
-            details={"username": user.username, "role": user.role},
+            # The immutable target id is sufficient for correlation; avoid
+            # copying an account identifier into long-lived WORM audit data.
+            details={"role": user.role},
         )
         return user
 
@@ -3014,7 +3257,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Admin không thể tự xóa chính mình.")
         if target.role == "admin":
             raise HTTPException(status_code=400, detail="Không thể xóa tài khoản admin khác.")
-        username = target.username
         db.delete(target)
         db.commit()
         record_audit(
@@ -3024,7 +3266,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             actor_id=admin.id,
             target_type="user",
             target_id=user_id,
-            details={"deleted_username": username},
         )
         return Response(status_code=204)
 
@@ -3215,11 +3456,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload["high_assurance_intact"] = bool(
                 result.intact
                 and checkpoint_verification.intact
-                and (
-                    checkpoint_verification.externally_delivered
-                    if checkpoint_required
-                    else True
-                )
+                and (checkpoint_verification.externally_delivered if checkpoint_required else True)
             )
         payload["checked_at"] = utcnow().isoformat()
         payload["checked_by"] = admin.username
@@ -3347,9 +3584,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     gradio_auth_dependency = None
     if settings.gradio_auth_mode == "oidc":
         try:
-            proxy_secret = Path(settings.oidc_proxy_secret_file).read_text(
-                encoding="utf-8"
-            ).strip()
+            proxy_secret = Path(settings.oidc_proxy_secret_file).read_text(encoding="utf-8").strip()
         except OSError as exc:
             raise RuntimeError("Không đọc được bí mật xác thực reverse proxy OIDC.") from exc
         if len(proxy_secret) < 32 or len(proxy_secret) > 4096:
@@ -3363,8 +3598,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 proxy_secret,
             ):
                 return None
-            if not identity or len(identity) > 128 or any(
-                character in identity for character in ("\r", "\n", "\x00")
+            if (
+                not identity
+                or len(identity) > 128
+                or any(character in identity for character in ("\r", "\n", "\x00"))
             ):
                 return None
             return identity

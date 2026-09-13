@@ -78,6 +78,7 @@ class Settings:
     login_lockout_seconds: int = 900
     registration_window_seconds: int = 3600
     registration_max_attempts: int = 5
+    allow_self_registration: bool = True
     message_window_seconds: int = 60
     message_max_attempts: int = 20
     # Issuer xuất hiện HAI lần trong otpauth URI (trong label và trong query),
@@ -158,15 +159,18 @@ class Settings:
             raise RuntimeError("SECURITY_PROFILE chỉ chấp nhận standard hoặc high.")
         key_provider = os.getenv("KEY_PROVIDER", "local").strip().lower()
         if key_provider not in {"local", "vault", "aws-kms", "gcp-kms"}:
-            raise RuntimeError(
-                "KEY_PROVIDER chỉ chấp nhận local, vault, aws-kms hoặc gcp-kms."
-            )
+            raise RuntimeError("KEY_PROVIDER chỉ chấp nhận local, vault, aws-kms hoặc gcp-kms.")
         database_url = os.getenv("DATABASE_URL", "sqlite:///./secure_chat.db")
         # Development-only marker; the production guard below rejects it.
         secret_key = os.getenv("APP_SECRET_KEY", "").strip() or "development-only-change-me"  # nosec B105
         master_key = os.getenv("MASTER_ENCRYPTION_KEY", "").strip()
         keyring = _keyring_env()
-        if not master_key and not keyring and environment != "production" and key_provider == "local":
+        if (
+            not master_key
+            and not keyring
+            and environment != "production"
+            and key_provider == "local"
+        ):
             master_key = derive_demo_key(secret_key)
         active_version_raw = os.getenv("ACTIVE_KEY_VERSION", "").strip()
         active_version = int(active_version_raw) if active_version_raw else None
@@ -192,7 +196,9 @@ class Settings:
                     "ALLOWED_HOSTS bắt buộc ở production (chống tấn công Host header)."
                 )
             if "*" in _csv_env("ALLOWED_ORIGINS") or "*" in _csv_env("ALLOWED_HOSTS"):
-                raise RuntimeError("Production không cho phép wildcard trong origin/host allowlist.")
+                raise RuntimeError(
+                    "Production không cho phép wildcard trong origin/host allowlist."
+                )
             if _bool_env("DOCS_ENABLED", False):
                 raise RuntimeError("DOCS_ENABLED phải tắt ở production.")
             if os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "").strip():
@@ -240,6 +246,11 @@ class Settings:
                         "SECURITY_PROFILE=high bắt buộc image pin theo name@sha256 cho: "
                         + ", ".join(mutable_images)
                     )
+                if _bool_env("ALLOW_SELF_REGISTRATION", True):
+                    raise RuntimeError(
+                        "SECURITY_PROFILE=high không cho phép tự đăng ký tài khoản; "
+                        "hãy provision qua quản trị/IdP."
+                    )
                 required_controls = {
                     "IDS_ENABLED": _bool_env("IDS_ENABLED", True),
                     "AUDIT_CHAIN_ENABLED": _bool_env("AUDIT_CHAIN_ENABLED", True),
@@ -279,13 +290,9 @@ class Settings:
             "DEK_CACHE_SECONDS": int(os.getenv("DEK_CACHE_SECONDS", "60")),
             "STEP_UP_MINUTES": int(os.getenv("STEP_UP_MINUTES", "5")),
             "MAX_MESSAGES_PER_SESSION": int(os.getenv("MAX_MESSAGES_PER_SESSION", "10000")),
-            "CONFIDENTIAL_RETENTION_DAYS": int(
-                os.getenv("CONFIDENTIAL_RETENTION_DAYS", "7")
-            ),
+            "CONFIDENTIAL_RETENTION_DAYS": int(os.getenv("CONFIDENTIAL_RETENTION_DAYS", "7")),
             "SECURE_RETENTION_DAYS": int(os.getenv("SECURE_RETENTION_DAYS", "90")),
-            "AUDIT_CHECKPOINT_INTERVAL": int(
-                os.getenv("AUDIT_CHECKPOINT_INTERVAL", "100")
-            ),
+            "AUDIT_CHECKPOINT_INTERVAL": int(os.getenv("AUDIT_CHECKPOINT_INTERVAL", "100")),
         }
         if numeric_limits["DEK_CACHE_SECONDS"] < 0:
             raise RuntimeError("DEK_CACHE_SECONDS không được âm.")
@@ -313,9 +320,9 @@ class Settings:
             )
         header_re = re.compile(r"^[a-z0-9-]{3,64}$")
         oidc_user_header = os.getenv("OIDC_USER_HEADER", "x-auth-request-user").strip().lower()
-        oidc_proxy_secret_header = os.getenv(
-            "OIDC_PROXY_SECRET_HEADER", "x-scap-proxy-secret"
-        ).strip().lower()
+        oidc_proxy_secret_header = (
+            os.getenv("OIDC_PROXY_SECRET_HEADER", "x-scap-proxy-secret").strip().lower()
+        )
         if not header_re.fullmatch(oidc_user_header) or not header_re.fullmatch(
             oidc_proxy_secret_header
         ):
@@ -334,6 +341,7 @@ class Settings:
             login_lockout_seconds=int(os.getenv("LOGIN_LOCKOUT_SECONDS", "900")),
             registration_window_seconds=int(os.getenv("REGISTRATION_WINDOW_SECONDS", "3600")),
             registration_max_attempts=int(os.getenv("REGISTRATION_MAX_ATTEMPTS", "5")),
+            allow_self_registration=_bool_env("ALLOW_SELF_REGISTRATION", True),
             message_window_seconds=int(os.getenv("MESSAGE_WINDOW_SECONDS", "60")),
             message_max_attempts=int(os.getenv("MESSAGE_MAX_ATTEMPTS", "20")),
             mfa_issuer=os.getenv("MFA_ISSUER", "SCAP").strip() or "SCAP",
@@ -370,11 +378,8 @@ class Settings:
             dek_cache_seconds=numeric_limits["DEK_CACHE_SECONDS"],
             vault_addr=os.getenv("VAULT_ADDR", "").strip(),
             vault_token_file=os.getenv("VAULT_TOKEN_FILE", "").strip(),
-            vault_transit_mount=os.getenv("VAULT_TRANSIT_MOUNT", "transit").strip()
-            or "transit",
-            vault_transit_key=os.getenv(
-                "VAULT_TRANSIT_KEY", "scap-conversations"
-            ).strip()
+            vault_transit_mount=os.getenv("VAULT_TRANSIT_MOUNT", "transit").strip() or "transit",
+            vault_transit_key=os.getenv("VAULT_TRANSIT_KEY", "scap-conversations").strip()
             or "scap-conversations",
             vault_namespace=os.getenv("VAULT_NAMESPACE", "").strip(),
             vault_allow_insecure_http=_bool_env("VAULT_ALLOW_INSECURE_HTTP", False),
@@ -385,12 +390,10 @@ class Settings:
             max_messages_per_session=numeric_limits["MAX_MESSAGES_PER_SESSION"],
             confidential_retention_days=numeric_limits["CONFIDENTIAL_RETENTION_DAYS"],
             secure_retention_days=numeric_limits["SECURE_RETENTION_DAYS"],
-            ai_consent_version=os.getenv("AI_CONSENT_VERSION", "2026-09").strip()
-            or "2026-09",
+            ai_consent_version=os.getenv("AI_CONSENT_VERSION", "2026-09").strip() or "2026-09",
             dlp_custom_terms=_csv_env("DLP_CUSTOM_TERMS"),
             csp_report_only=_bool_env("CSP_REPORT_ONLY", True),
-            gradio_max_file_size=os.getenv("GRADIO_MAX_FILE_SIZE", "5mb").strip()
-            or "5mb",
+            gradio_max_file_size=os.getenv("GRADIO_MAX_FILE_SIZE", "5mb").strip() or "5mb",
             gradio_auth_mode=gradio_auth_mode,
             oidc_user_header=oidc_user_header,
             oidc_proxy_secret_header=oidc_proxy_secret_header,

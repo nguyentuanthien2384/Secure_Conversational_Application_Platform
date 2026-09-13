@@ -27,9 +27,10 @@ Không thể đổi trust boundary sau khi phiên đã có dữ liệu. Không �
    `MASTER_ENCRYPTION_KEY(S)`. Dùng workload identity hoặc token file ngắn hạn.
 3. Identity-aware proxy đã xác thực OIDC, xóa header do client gửi và chèn
    `OIDC_USER_HEADER` cùng `OIDC_PROXY_SECRET_HEADER`. Bí mật proxy dài ít nhất
-   32 ký tự, mount read-only tại `OIDC_PROXY_SECRET_FILE`.
+   32 ký tự, mount read-only tại `OIDC_PROXY_SECRET_FILE`; tự đăng ký bị tắt.
 4. Redis riêng cho rate limit đa instance; IDS, SIEM JSON, audit chain và kiểm
-   tra mật khẩu rò rỉ đều bật.
+   tra mật khẩu rò rỉ đều bật. Nếu dịch vụ kiểm tra mật khẩu không sẵn sàng,
+   thao tác tạo/đổi mật khẩu bị từ chối tạm thời thay vì bỏ qua kiểm tra.
 5. `AUDIT_WORM_ENDPOINT` là HTTPS tới kho append-only/retention-lock; credential
    nằm ở `AUDIT_WORM_TOKEN_FILE`. SOC phải cảnh báo nếu checkpoint ngừng đến,
    `last_event_id` giảm hoặc cùng ID có root hash khác.
@@ -80,9 +81,15 @@ environment đã render. Overlay không tự cài một nhà cung cấp danh tí
 hành phải đặt OIDC proxy/gateway đã được phê duyệt trước Caddy và mount cùng bí
 mật proxy vào workload đó.
 
+High profile tắt tự đăng ký (`ALLOW_SELF_REGISTRATION=false`). Tài khoản phải
+được cấp qua quản trị viên/quy trình IdP đã phê duyệt; không mở lại endpoint tự
+đăng ký trên hệ thống chứa hội thoại rất nhạy cảm.
+
 Không dùng Caddy cũ hơn 2.8 cho overlay này vì cấu hình chủ động bỏ access log
-ở đường dẫn vé export bằng `log_skip`. Caddyfile còn xóa Authorization, Cookie,
-Set-Cookie và secret header của OIDC proxy trước khi ghi log.
+ở đường dẫn vé export bằng `log_skip`. Access log thô của Uvicorn cũng bị tắt;
+sự kiện bảo mật có cấu trúc vẫn được ghi trong audit. Caddyfile còn xóa
+Authorization, Cookie, Set-Cookie và secret header của OIDC proxy trước khi ghi
+log.
 
 ## IAM tối thiểu cho khóa
 

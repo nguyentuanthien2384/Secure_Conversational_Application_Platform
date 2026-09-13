@@ -165,7 +165,7 @@ class Detection:
     source_ip: str
     path: str
     method: str
-    evidence: str
+    evidence_sha256: str
     mitre_technique: str | None = None
     detected_at: float = field(default_factory=time.time)
 
@@ -178,15 +178,17 @@ class Detection:
             "source_ip": self.source_ip,
             "path": self.path,
             "method": self.method,
-            # Matched URL/header fragments are attacker-controlled and may
-            # contain credentials. Analysts receive a stable correlation hash,
-            # while raw content stays out of API responses and screenshots.
-            "evidence_sha256": hashlib.sha256(
-                self.evidence.encode("utf-8", errors="replace")
-            ).hexdigest()[:16],
+            # Only the digest is retained; raw request/header fragments may
+            # contain credentials and never enter the in-memory IDS history.
+            "evidence_sha256": self.evidence_sha256,
             "mitre_technique": self.mitre_technique,
             "detected_at": self.detected_at,
         }
+
+
+def evidence_fingerprint(value: str) -> str:
+    """Return a stable correlation value without retaining attacker input."""
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def scan_text(text: str) -> list[tuple[str, str, str, str]]:

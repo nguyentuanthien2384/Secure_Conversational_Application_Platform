@@ -7,11 +7,20 @@ from fastapi import Request
 from sqlalchemy.orm import Session
 
 from src.app.audit_chain import append_lock, seal_event
+from src.app.dlp import DLPScanner
 from src.app.models import AuditEvent
 from src.app.security import safe_json
 from src.app.siem import emit_security_event
 
 logger = logging.getLogger("secure_chat.audit")
+_METADATA_DLP = DLPScanner()
+
+
+def safe_user_agent(value: str) -> str | None:
+    """Keep useful client metadata while removing common secrets and PII."""
+    sanitized, _ = _METADATA_DLP.redact(value[:512])
+    sanitized = sanitized.replace("\r", " ").replace("\n", " ").strip()[:256]
+    return sanitized or None
 
 
 def client_ip(request: Request) -> str:
@@ -49,7 +58,7 @@ def record_audit(
     loudly but never turned into a 500 for the end user.
     """
     ip = client_ip(request)
-    user_agent = request.headers.get("user-agent", "")[:256] or None
+    user_agent = safe_user_agent(request.headers.get("user-agent", ""))
     request_id = getattr(request.state, "request_id", None)
     event = AuditEvent(
         actor_id=actor_id,

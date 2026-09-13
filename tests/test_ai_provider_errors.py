@@ -9,7 +9,7 @@ thông điệp của SDK thường chứa tên model, endpoint và mã lỗi h�
 
 Các test dưới đây khoá lại hành vi mới:
   1. Lỗi nhà cung cấp → ``AIProviderError`` với thông điệp chung chung.
-  2. Chi tiết lỗi gốc không bao giờ rò ra response HTTP.
+  2. Chi tiết lỗi gốc không bao giờ rò ra response HTTP hoặc log.
   3. API trả 503 kèm ``Retry-After`` thay vì 500.
   4. Không có tin nhắn nào bị ghi vào DB khi lời gọi AI thất bại.
   5. Key sai định dạng không làm sập ứng dụng lúc khởi động.
@@ -17,6 +17,7 @@ Các test dưới đây khoá lại hành vi mới:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 
 import pytest
@@ -25,11 +26,18 @@ from sqlalchemy import func, select
 
 from src.app.config import Settings
 from src.app.models import SecureMessage
-from src.app.services import AI_UNAVAILABLE_MESSAGE, AIProviderError, AIService
+from src.app.services import (
+    AI_UNAVAILABLE_MESSAGE,
+    AIProviderError,
+    AIService,
+    DLPPolicyViolation,
+)
 from tests.conftest import register_and_login
 
 # Chuỗi mô phỏng thông tin nhạy cảm mà SDK hay nhét vào thông điệp lỗi.
-LEAKY_DETAIL = "401 UNAUTHENTICATED: API key AIzaSyLEAKED123 invalid at generativelanguage.googleapis.com"
+LEAKY_DETAIL = (
+    "401 UNAUTHENTICATED: API key AIzaSyLEAKED123 invalid at generativelanguage.googleapis.com"
+)
 
 
 class _ExplodingGeminiClient:
@@ -40,6 +48,11 @@ class _ExplodingGeminiClient:
 
     def generate(self, *args, **kwargs):
         raise self._exc
+
+
+class _EchoGeminiClient:
+    def generate(self, *args, **kwargs):
+        return "safe response"
 
 
 def _ai_service_with_failing_client(settings: Settings) -> AIService:
@@ -69,12 +82,54 @@ def test_provider_failure_message_hides_infrastructure_detail(settings: Settings
     assert LEAKY_DETAIL in str(excinfo.value.__cause__)
 
 
+def test_provider_failure_does_not_put_secret_details_in_logs(settings: Settings, caplog):
+    service = _ai_service_with_failing_client(settings)
+    with caplog.at_level(logging.ERROR, logger="secure_chat.ai"):
+        with pytest.raises(AIProviderError):
+            service.generate("xin chào", [], allow_external_ai=True)
+
+    assert "RuntimeError" in caplog.text
+    assert LEAKY_DETAIL not in caplog.text
+    assert "AIzaSy" not in caplog.text
+
+
 def test_missing_key_with_demo_disabled_raises_aiprovidererror(settings: Settings):
     """Không key + ALLOW_DEMO_AI=false: vẫn là lỗi dịch vụ, không phải crash."""
     offline = replace(settings, allow_demo_ai=False)
     service = AIService(offline)
     with pytest.raises(AIProviderError):
         service.generate("xin chào", [], allow_external_ai=True)
+
+
+def test_history_loader_is_not_called_before_ai_consent(settings: Settings):
+    service = AIService(settings)
+    service._client = _EchoGeminiClient()
+
+    def forbidden_history_load():
+        raise AssertionError("encrypted history must remain unopened")
+
+    with pytest.raises(PermissionError):
+        service.generate(
+            "xin chào",
+            forbidden_history_load,
+            allow_external_ai=False,
+        )
+
+
+def test_history_loader_is_not_called_when_current_message_is_blocked(settings: Settings):
+    service = AIService(settings)
+    service._client = _EchoGeminiClient()
+
+    def forbidden_history_load():
+        raise AssertionError("encrypted history must remain unopened")
+
+    with pytest.raises(DLPPolicyViolation):
+        service.generate(
+            "nội dung nhạy cảm",
+            forbidden_history_load,
+            allow_external_ai=True,
+            data_class="highly_confidential",
+        )
 
 
 def test_chat_endpoint_returns_503_not_500(client: TestClient, app):

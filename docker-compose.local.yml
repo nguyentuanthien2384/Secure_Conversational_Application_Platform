@@ -21,7 +21,7 @@ services:
         # closed unless BASE_IMAGE contains a verified sha256 digest.
         BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim}
         REQUIRE_BASE_IMAGE_DIGEST: "false"
-    command: ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
     environment:
       # ── APP_ENV: production -> development ────────────────────────────────
       # BẮT BUỘC phải hạ xuống development, không phải để cho tiện. Guard trong

@@ -49,6 +49,7 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+.pytest-tmp*/
 cover/
 
 # Translations
@@ -211,6 +212,8 @@ logs/
 reports/*.json
 reports/*.html
 reports/*.xml
+# Local document-rendering scratch space; source PDFs live outside the repo.
+tmp/pdfs/
 
 # Large binary / model / data archive files
 *.tar
@@ -224,4 +227,3 @@ reports/*.xml
 *.safetensors
 *.onnx
 *.bin
-

@@ -16,7 +16,7 @@ miệng. Thời lượng đầy đủ ~12 phút; bản rút gọn ~6 phút (ch�
 | # | Lệnh | Đạt khi thấy |
 |---|---|---|
 | 1 | `uv run python src/core/ai_core/gemini_ai.py` | In ra câu trả lời thật, vd. *"Hello! How can I help you today?"* |
-| 2 | `uv run pytest -q` | `106 passed` |
+| 2 | `uv run pytest -q` | Toàn bộ test `passed` |
 | 3 | `uv run python run_app.py` | `Uvicorn running on http://127.0.0.1:8000` |
 
 Chạy tuần tự để khoanh vùng lỗi cho dễ: chốt 1 hỏng là vấn đề key/model/mạng,
@@ -24,7 +24,7 @@ chưa liên quan tới mã ứng dụng.
 
 **Chốt 2 quan trọng nhất với đồ án:** ảnh chụp màn hình kết quả `pytest` là
 **bằng chứng trực tiếp** cho phần kiểm thử trong báo cáo. Chụp cả dòng tổng kết
-`106 passed`. Muốn kèm độ phủ thì dùng lệnh đầy đủ ở mục 10.
+không có test lỗi. Muốn kèm độ phủ thì dùng lệnh đầy đủ ở mục 10.
 
 > **Nếu máy chưa cài `uv`** (`uv: command not found`): chạy `bash setup.sh --no-run`
 > để cài, hoặc dùng thẳng môi trường ảo — thay `uv run` bằng
@@ -37,7 +37,7 @@ chưa liên quan tới mã ứng dụng.
 | Cài đặt & sinh secrets | `bash setup.sh --no-run` | Có file `.env` |
 | Dán Gemini key | Sửa `.env`: `GOOGLE_GENAI_API_KEY=<key>`, `GEMINI_MODEL=gemini-flash-lite-latest` | — |
 | Thử key (chốt 1) | `uv run python src/core/ai_core/gemini_ai.py` | In ra câu trả lời |
-| Chạy test (chốt 2) | `uv run pytest -q` | `106 passed` |
+| Chạy test (chốt 2) | `uv run pytest -q` | Toàn bộ test `passed` |
 | Khởi động (chốt 3) | `uv run python run_app.py` | `Uvicorn running on …:8000` |
 | Bật đồng ý AI | Đăng nhập `demo.user` → `[Tab Tài khoản]` → tick ô đồng ý | Ô được tick |
 | Gửi thử 1 tin | `[Tab Trò chuyện]` | Trả lời **không** có tiền tố `[DEMO AI]` |

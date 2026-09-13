@@ -26,9 +26,9 @@ def auth(token: str) -> dict[str, str]:
 
 def test_message_bound_aad_rejects_same_role_ciphertext_swap(client: TestClient, app):
     token = register_and_login(client, "aad-swap")
-    session_id = client.post(
-        "/api/sessions", headers=auth(token), json={"title": "AAD"}
-    ).json()["id"]
+    session_id = client.post("/api/sessions", headers=auth(token), json={"title": "AAD"}).json()[
+        "id"
+    ]
     with app.state.database.session_factory() as db:
         first = app.state.chat_service.store_message(db, session_id, "user", "first secret")
         second = app.state.chat_service.store_message(db, session_id, "user", "second secret")
@@ -45,12 +45,10 @@ def test_conversations_have_distinct_wrapped_deks_and_rewrap_without_reencrypt(
     client: TestClient, app
 ):
     token = register_and_login(client, "dek-isolation")
-    first_id = client.post(
-        "/api/sessions", headers=auth(token), json={"title": "One"}
-    ).json()["id"]
-    second_id = client.post(
-        "/api/sessions", headers=auth(token), json={"title": "Two"}
-    ).json()["id"]
+    first_id = client.post("/api/sessions", headers=auth(token), json={"title": "One"}).json()["id"]
+    second_id = client.post("/api/sessions", headers=auth(token), json={"title": "Two"}).json()[
+        "id"
+    ]
     with app.state.database.session_factory() as db:
         first = db.get(ChatSession, first_id)
         second = db.get(ChatSession, second_id)
@@ -119,6 +117,26 @@ def test_retention_deletes_ciphertext_and_wrapped_dek(client: TestClient, app):
         )
 
 
+def test_expired_session_is_hidden_and_purged_on_direct_access(client: TestClient, app):
+    token = register_and_login(client, "retention-on-access")
+    session_id = client.post(
+        "/api/sessions", headers=auth(token), json={"title": "Short lived"}
+    ).json()["id"]
+    with app.state.database.session_factory() as db:
+        chat_session = db.get(ChatSession, session_id)
+        assert chat_session is not None
+        chat_session.retention_expires_at = chat_session.created_at - timedelta(seconds=1)
+        db.commit()
+
+    listed = client.get("/api/sessions", headers=auth(token))
+    assert listed.status_code == 200
+    assert session_id not in {item["id"] for item in listed.json()}
+    assert client.get(f"/api/sessions/{session_id}", headers=auth(token)).status_code == 404
+
+    with app.state.database.session_factory() as db:
+        assert db.get(ChatSession, session_id) is None
+
+
 def test_new_messages_use_envelope_scheme(client: TestClient, app):
     token = register_and_login(client, "envelope-row")
     session_id = client.post(
@@ -130,15 +148,11 @@ def test_new_messages_use_envelope_scheme(client: TestClient, app):
         json={"content": "encrypted"},
     )
     with app.state.database.session_factory() as db:
-        rows = list(
-            db.scalars(select(SecureMessage).where(SecureMessage.session_id == session_id))
-        )
+        rows = list(db.scalars(select(SecureMessage).where(SecureMessage.session_id == session_id)))
         assert rows and all(row.encryption_scheme == ENVELOPE_SCHEME for row in rows)
 
 
-def test_sensitive_values_are_rejected_from_plaintext_session_metadata(
-    client: TestClient, app
-):
+def test_sensitive_values_are_rejected_from_plaintext_session_metadata(client: TestClient, app):
     token = register_and_login(client, "metadata-dlp")
     rejected = client.post(
         "/api/sessions",
@@ -148,9 +162,7 @@ def test_sensitive_values_are_rejected_from_plaintext_session_metadata(
     assert rejected.status_code == 422
     assert rejected.json()["detail"]["code"] == "sensitive_metadata"
 
-    created = client.post(
-        "/api/sessions", headers=auth(token), json={"title": "Safe title"}
-    )
+    created = client.post("/api/sessions", headers=auth(token), json={"title": "Safe title"})
     session_id = created.json()["id"]
     renamed = client.patch(
         f"/api/sessions/{session_id}",

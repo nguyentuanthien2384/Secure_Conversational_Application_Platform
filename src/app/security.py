@@ -5,10 +5,13 @@ import hashlib
 import hmac
 import json
 import secrets
+import ssl
 import struct
 import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -20,6 +23,17 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Do not send a password hash prefix to an unexpected redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ARG002
+        return None
+
+
+class PasswordBreachCheckUnavailable(RuntimeError):
+    """The external breach corpus could not be checked safely."""
 
 
 class PasswordService:
@@ -109,7 +123,14 @@ class TokenService:
             raise jwt.InvalidTokenError("Không phải token thử thách MFA.")
         return payload
 
-    def issue_export_ticket(self, user_id: str, session_id: str, seconds: int = 60) -> str:
+    def issue_export_ticket(
+        self,
+        user_id: str,
+        session_id: str,
+        token_version: int,
+        parent_jti: str,
+        seconds: int = 60,
+    ) -> str:
         """Mint a short-lived, single-purpose capability for browser downloads."""
         if seconds < 1 or seconds > 300:
             raise ValueError("Export ticket lifetime must be between 1 and 300 seconds.")
@@ -117,6 +138,8 @@ class TokenService:
         payload = {
             "sub": user_id,
             "sid": session_id,
+            "ver": token_version,
+            "parent_jti": parent_jti,
             "typ": "export_ticket",
             "iat": now,
             "nbf": now,
@@ -134,9 +157,24 @@ class TokenService:
             algorithms=[self.algorithm],
             audience="secure-chat-export",
             issuer="secure-chat-course-project",
-            options={"require": ["exp", "iat", "nbf", "sub", "sid", "jti"]},
+            options={
+                "require": [
+                    "exp",
+                    "iat",
+                    "nbf",
+                    "sub",
+                    "sid",
+                    "jti",
+                    "ver",
+                    "parent_jti",
+                ]
+            },
         )
-        if payload.get("typ") != "export_ticket":
+        if (
+            payload.get("typ") != "export_ticket"
+            or not isinstance(payload.get("ver"), int)
+            or not isinstance(payload.get("parent_jti"), str)
+        ):
             raise jwt.InvalidTokenError("Không phải vé xuất dữ liệu.")
         return payload
 
@@ -389,34 +427,49 @@ class PwnedPasswordChecker:
     """Screen passwords against Have I Been Pwned using k-anonymity (SHA-1 range API).
 
     Only the first five hex chars of the SHA-1 are ever sent, so the plaintext and
-    full hash never leave the process. Network failures fail *open* (treated as
-    not-breached) so an outage cannot block all sign-ups; callers should log that.
+    full hash never leave the process. Standard/demo deployments fail open for
+    availability; the high-security profile opts into fail-closed behavior.
     """
 
     _API = "https://api.pwnedpasswords.com/range/"
 
-    def __init__(self, *, enabled: bool = False, timeout: float = 2.0) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        timeout: float = 2.0,
+        fail_closed: bool = False,
+    ) -> None:
         self.enabled = enabled
         self.timeout = timeout
+        self.fail_closed = fail_closed
 
     def is_compromised(self, password: str) -> bool:
         if not self.enabled:
             return False
-        import urllib.error
-        import urllib.request
-
         # The HIBP range protocol mandates SHA-1; it is not used for password storage.
         sha1 = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()  # nosec B324
         prefix, suffix = sha1[:5], sha1[5:]
         # The base URL is a fixed HTTPS constant; only a five-character hash prefix is appended.
-        request = urllib.request.Request(  # nosec B310
+        request = urllib.request.Request(
             self._API + prefix,
             headers={"User-Agent": "secure-chat-course-project", "Add-Padding": "true"},
         )
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            _RejectRedirects(),
+        )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # nosec B310
-                body = response.read().decode("utf-8", "replace")
-        except (urllib.error.URLError, TimeoutError, OSError):
+            with opener.open(request, timeout=self.timeout) as response:
+                raw_body = response.read(2_000_001)
+                if len(raw_body) > 2_000_000:
+                    raise OSError("Password range response exceeded the safety limit.")
+                body = raw_body.decode("utf-8", "replace")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if self.fail_closed:
+                raise PasswordBreachCheckUnavailable(
+                    "Password breach screening is temporarily unavailable."
+                ) from exc
             return False  # fail open on any network problem
         for line in body.splitlines():
             candidate, _, count = line.partition(":")

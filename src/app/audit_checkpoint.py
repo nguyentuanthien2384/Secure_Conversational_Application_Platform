@@ -33,6 +33,13 @@ class AuditCheckpointError(RuntimeError):
     """Checkpoint creation or delivery failed without leaking sink details."""
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Never forward the WORM bearer token to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ARG002
+        return None
+
+
 def derive_checkpoint_key(secret_key: str) -> bytes:
     return hashlib.sha256(
         ("secure-chat:audit-checkpoint:v1:" + secret_key).encode("utf-8")
@@ -138,11 +145,16 @@ class AuditCheckpointService:
             headers=headers,
             method="POST",
         )
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            _RejectRedirects(),
+        )
         try:
-            with urllib.request.urlopen(  # nosec B310 - fixed URL validated as HTTPS
+            # The endpoint is fixed HTTPS and redirects are rejected so the
+            # bearer credential cannot cross origins.
+            with opener.open(
                 request,
                 timeout=self.timeout_seconds,
-                context=ssl.create_default_context(),
             ) as response:
                 response_body = response.read(16_385)
                 if len(response_body) > 16_384 or not 200 <= response.status < 300:
@@ -158,9 +170,7 @@ class AuditCheckpointService:
         if latest_event is None or not latest_event.entry_hash:
             return None
         existing = db.scalar(
-            select(AuditCheckpoint).where(
-                AuditCheckpoint.last_event_id == latest_event.id
-            )
+            select(AuditCheckpoint).where(AuditCheckpoint.last_event_id == latest_event.id)
         )
         if existing is not None:
             return existing

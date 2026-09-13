@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import base64
+import urllib.error
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from src.app.audit import safe_user_agent
 from src.app.config import Settings
+from src.app.main import _audit_safe_path, create_app
+from src.app.security import PasswordBreachCheckUnavailable, PwnedPasswordChecker
 
 
 def test_api_surface_ships_locked_down_csp(client: TestClient):
@@ -30,6 +35,55 @@ def test_common_security_headers_present(client: TestClient):
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["X-Frame-Options"] == "DENY"
     assert headers["Referrer-Policy"] == "no-referrer"
+
+
+def test_export_capability_is_removed_from_telemetry_paths():
+    raw_token = "signed.secret.capability"
+    safe = _audit_safe_path(f"/api/exports/{raw_token}")
+    assert safe == "/api/exports/[capability-redacted]"
+    assert raw_token not in safe
+
+
+def test_user_agent_metadata_redacts_pii_and_credentials():
+    raw = "client alice@example.com Authorization: Bearer abcdefghijklmnopqrstuvwxyz"
+    safe = safe_user_agent(raw)
+    assert safe is not None
+    assert "alice@example.com" not in safe
+    assert "abcdefghijklmnopqrstuvwxyz" not in safe
+
+
+def test_high_security_password_screening_fails_closed(monkeypatch):
+    class UnavailableOpener:
+        def open(self, *args, **kwargs):
+            raise urllib.error.URLError("simulated outage")
+
+    monkeypatch.setattr(
+        "src.app.security.urllib.request.build_opener",
+        lambda *handlers: UnavailableOpener(),
+    )
+    assert (
+        PwnedPasswordChecker(enabled=True, fail_closed=False).is_compromised(
+            "a sufficiently long candidate passphrase"
+        )
+        is False
+    )
+    with pytest.raises(PasswordBreachCheckUnavailable):
+        PwnedPasswordChecker(enabled=True, fail_closed=True).is_compromised(
+            "a sufficiently long candidate passphrase"
+        )
+
+
+def test_self_registration_can_be_disabled(settings: Settings):
+    locked_settings = replace(settings, allow_self_registration=False)
+    with TestClient(create_app(locked_settings)) as locked_client:
+        response = locked_client.post(
+            "/api/auth/register",
+            json={
+                "username": "not-self-provisioned",
+                "password": "Correct Horse Battery1",
+            },
+        )
+    assert response.status_code == 403
 
 
 def test_lean_api_excludes_the_removed_agent_surface(client: TestClient):
@@ -138,5 +192,8 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     assert '"--proxy-headers"' in compose
     assert '"--proxy-headers"' not in local_compose
     assert '"--proxy-headers"' not in dockerfile
+    assert '"--no-access-log"' in compose
+    assert '"--no-access-log"' in local_compose
+    assert '"--no-access-log"' in dockerfile
     assert "--refresh-telemetry" in local_compose
     assert "image: scap-app" in local_compose

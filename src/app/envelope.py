@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import secrets
 import threading
@@ -125,11 +126,13 @@ class EnvelopeCryptoService:
     @staticmethod
     def _session_cache_key(session_id: str, epoch: int, wrapped_dek: str) -> str:
         # The wrapped value is not secret and differentiates a rewrapped epoch.
-        return f"session:{session_id}:{epoch}:{wrapped_dek[-32:]}"
+        wrapped_digest = hashlib.sha256(wrapped_dek.encode("utf-8")).hexdigest()
+        return f"session:{session_id}:{epoch}:{wrapped_digest}"
 
     @staticmethod
     def _user_cache_key(user_id: str, epoch: int, wrapped_dek: str) -> str:
-        return f"user:{user_id}:{epoch}:{wrapped_dek[-32:]}"
+        wrapped_digest = hashlib.sha256(wrapped_dek.encode("utf-8")).hexdigest()
+        return f"user:{user_id}:{epoch}:{wrapped_digest}"
 
     def _cache_get(self, key: str) -> bytes | None:
         now = time.monotonic()
@@ -407,9 +410,7 @@ class EnvelopeCryptoService:
             or user.secret_crypto_epoch <= 0
         ):
             raise EnvelopeEncryptionError("Protected account key metadata is unavailable.")
-        cache_key = self._user_cache_key(
-            user.id, user.secret_crypto_epoch, user.secret_wrapped_dek
-        )
+        cache_key = self._user_cache_key(user.id, user.secret_crypto_epoch, user.secret_wrapped_dek)
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
@@ -430,9 +431,7 @@ class EnvelopeCryptoService:
             return
         epoch = 1
         try:
-            generated = self.provider.generate_wrapped_dek(
-                context=user_key_context(user, epoch)
-            )
+            generated = self.provider.generate_wrapped_dek(context=user_key_context(user, epoch))
         except (KeyProviderError, ValueError) as exc:
             raise EnvelopeEncryptionError("Unable to create a protected account key.") from exc
         user.secret_crypto_epoch = epoch
@@ -517,4 +516,6 @@ class EnvelopeCryptoService:
             )
             return plaintext.decode("utf-8")
         except (InvalidTag, ValueError, UnicodeDecodeError) as exc:
-            raise EnvelopeEncryptionError("Encrypted account secret authentication failed.") from exc
+            raise EnvelopeEncryptionError(
+                "Encrypted account secret authentication failed."
+            ) from exc

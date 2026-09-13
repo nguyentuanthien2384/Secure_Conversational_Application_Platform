@@ -156,7 +156,7 @@ xong hẵng đi tiếp — chạy cả ba cùng lúc chỉ làm khó việc khoa
 | # | Lệnh | Đạt khi thấy |
 |---|---|---|
 | 1 | `uv run python src/core/ai_core/gemini_ai.py` | In ra một câu trả lời thật (vd. *"Hello! How can I help you today?"*) |
-| 2 | `uv run pytest -q` | `106 passed`, không có `F` hay `E` |
+| 2 | `uv run pytest -q` | Toàn bộ test `passed`, không có `F` hay `E` |
 | 3 | `uv run python run_app.py` | `Uvicorn running on http://127.0.0.1:8000` |
 
 **Chốt 1 — key sống.** Gọi thẳng Gemini, không qua app. Hỏng ở đây nghĩa là vấn
@@ -164,7 +164,7 @@ xong hẵng đi tiếp — chạy cả ba cùng lúc chỉ làm khó việc khoa
 
 **Chốt 2 — bộ kiểm thử.** Quan trọng nhất với đồ án: **ảnh chụp màn hình kết quả
 `pytest` là bằng chứng trực tiếp cho phần kiểm thử trong báo cáo**. Nên chụp cả
-dòng tổng kết `106 passed`. Muốn kèm độ phủ thì dùng lệnh đầy đủ ở mục 5.
+dòng tổng kết không có test lỗi. Muốn kèm độ phủ thì dùng lệnh đầy đủ ở mục 5.
 
 **Chốt 3 — server.** Lên được là xong; mở <http://127.0.0.1:8000> để chắc chắn
 giao diện render chứ không chỉ tiến trình sống.

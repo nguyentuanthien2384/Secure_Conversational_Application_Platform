@@ -1,7 +1,7 @@
 # High-assurance Vault reference overlay.
-# An identity-aware OIDC proxy must sit between Caddy and app and inject both
-# configured headers. The app validates a shared secret mounted only into those
-# two workloads; direct/spoofed Gradio requests receive HTTP 401.
+# An identity-aware OIDC gateway must sit before Caddy, strip spoofed identity
+# headers, and inject the two configured headers. The app validates a shared
+# secret mounted only into the gateway and app; spoofed UI requests receive 401.
 services:
   db:
     image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE to an immutable name@sha256 digest}
@@ -17,6 +17,7 @@ services:
       SECURITY_PROFILE: high
       KEY_PROVIDER: vault
       ALLOW_DEMO_AI: "false"
+      ALLOW_SELF_REGISTRATION: "false"
       GRADIO_AUTH_MODE: oidc
       OIDC_USER_HEADER: x-auth-request-user
       OIDC_PROXY_SECRET_HEADER: x-scap-proxy-secret

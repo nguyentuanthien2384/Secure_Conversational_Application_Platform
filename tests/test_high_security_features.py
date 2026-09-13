@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from dataclasses import replace
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -12,6 +13,7 @@ from src.app.e2ee import (
     build_device_possession_message,
     encode_base64url,
 )
+from src.app.main import create_app
 from tests.conftest import register_and_login
 
 
@@ -56,12 +58,8 @@ def register_device(
             "identity_key": public_key,
             "possession_signature": encode_base64url(private_key.sign(possession)),
             "signed_prekey": signed_prekey,
-            "signed_prekey_signature": encode_base64url(
-                private_key.sign(signed_prekey_raw)
-            ),
-            "one_time_prekeys": [
-                encode_base64url(os.urandom(32)) for _ in range(prekey_count)
-            ],
+            "signed_prekey_signature": encode_base64url(private_key.sign(signed_prekey_raw)),
+            "one_time_prekeys": [encode_base64url(os.urandom(32)) for _ in range(prekey_count)],
         },
     )
     assert response.status_code == 201, response.text
@@ -175,3 +173,62 @@ def test_export_ticket_streams_and_is_single_use(client: TestClient):
     assert "attachment" in first.headers["content-disposition"]
     assert second.status_code == 410
 
+
+def test_export_ticket_is_revoked_with_parent_login_session(client: TestClient):
+    token = register_and_login(client, "revoked-export")
+    session_id = client.post(
+        "/api/sessions", headers=auth(token), json={"title": "Revocable export"}
+    ).json()["id"]
+    ticket = client.post(
+        f"/api/sessions/{session_id}/export-ticket",
+        headers=auth(token),
+    )
+    assert ticket.status_code == 200, ticket.text
+
+    logged_out = client.post("/api/auth/logout", headers=auth(token))
+    assert logged_out.status_code == 204
+    assert client.get(ticket.json()["download_url"]).status_code == 404
+
+
+def test_high_profile_cannot_upgrade_to_sensitive_mode_without_mfa(settings):
+    high_settings = replace(settings, security_profile="high")
+    with TestClient(create_app(high_settings)) as high_client:
+        token = register_and_login(high_client, "mode-upgrade-no-mfa")
+        session_id = high_client.post(
+            "/api/sessions",
+            headers=auth(token),
+            json={"title": "Initially secure"},
+        ).json()["id"]
+        upgraded = high_client.patch(
+            f"/api/sessions/{session_id}/security",
+            headers=auth(token),
+            json={
+                "security_mode": "private_e2ee",
+                "data_classification": "e2ee_private",
+            },
+        )
+    assert upgraded.status_code == 403
+
+
+def test_sensitive_classification_cannot_use_the_long_retention_secure_mode(
+    client: TestClient,
+):
+    token = register_and_login(client, "classification-boundary")
+    rejected = client.post(
+        "/api/sessions",
+        headers=auth(token),
+        json={
+            "title": "Mismatched policy",
+            "security_mode": "secure",
+            "data_classification": "highly_confidential",
+        },
+    )
+    assert rejected.status_code == 422
+
+    upgraded = client.post(
+        "/api/sessions",
+        headers=auth(token),
+        json={"title": "Confidential defaults", "security_mode": "confidential"},
+    )
+    assert upgraded.status_code == 201
+    assert upgraded.json()["data_classification"] == "confidential"

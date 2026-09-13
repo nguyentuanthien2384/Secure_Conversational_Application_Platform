@@ -292,7 +292,7 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | `GET` | `/api/sessions/{id}/ciphertexts` | Bản mã thô + nonce + key version |
 | `PATCH` | `/api/sessions/{id}/security` | Chọn secure/confidential/private_e2ee trước khi có dữ liệu |
 | `GET` | `/api/sessions/{id}/export` | Stream JSON trực tiếp, không tạo plaintext temp; cần recent step-up |
-| `POST` | `/api/sessions/{id}/export-ticket` | Vé tải 60 giây single-use cho trình duyệt |
+| `POST` | `/api/sessions/{id}/export-ticket` | Vé tải 60 giây single-use, ràng buộc phiên đăng nhập cha |
 | `POST` | `/api/sessions/{id}/messages` | Gửi tin nhắn; 403 nếu chưa đồng ý AI, 503 + `Retry-After` nếu provider lỗi |
 | `GET` | `/api/search/messages` | Tìm kiếm toàn cục trong phạm vi sở hữu |
 
@@ -425,7 +425,7 @@ audit log. **Chỉ dùng để demo cục bộ.**
 ### 10.1 Chạy tại máy
 
 ```bash
-uv run python -m pytest --cov=src.app --cov-report=term-missing   # 106 test
+uv run python -m pytest --cov=src.app --cov-report=term-missing   # toàn bộ test phải pass
 uv run ruff check src tests scripts
 uv run bandit -r src/app -ll -ii
 uv run pip-audit
@@ -504,7 +504,7 @@ Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Nh
 | Hạ tầng | `DATABASE_URL`, `REDIS_URL`, `ALLOWED_ORIGINS`, `ALLOWED_HOSTS`, `PUBLIC_DOMAIN` |
 | Phiên & token | `ACCESS_TOKEN_MINUTES`, `SESSION_ABSOLUTE_HOURS`, `REFRESH_WINDOW_SECONDS`, `REFRESH_MAX_ATTEMPTS` |
 | Hạn mức/retention | `MAX_SESSIONS_PER_USER`, `MAX_MESSAGES_PER_SESSION`, `SECURE_RETENTION_DAYS`, `CONFIDENTIAL_RETENTION_DAYS` |
-| Chống lạm dụng | `LOGIN_*`, `REGISTRATION_*`, `MESSAGE_*`, `PASSWORD_CHANGE_*` |
+| Chống lạm dụng | `LOGIN_*`, `ALLOW_SELF_REGISTRATION`, `REGISTRATION_*`, `MESSAGE_*`, `PASSWORD_CHANGE_*` |
 | 2FA | `MFA_ISSUER`, `MFA_CHALLENGE_MINUTES`, `MFA_RECOVERY_CODES`, `MFA_*_ATTEMPTS` |
 | IDS/Audit/SIEM | `IDS_*`, `AUDIT_CHAIN_ENABLED`, `AUDIT_WORM_*`, `AUDIT_CHECKPOINT_INTERVAL`, `SIEM_JSON_LOGS` |
 | UI/SSO | `GRADIO_AUTH_MODE`, `OIDC_*`, `GRADIO_MAX_FILE_SIZE`, `CSP_*` |
@@ -514,8 +514,9 @@ Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Nh
 ứng dụng **từ chối khởi động** nếu thiếu `APP_SECRET_KEY` đủ mạnh, thiếu khóa mã hóa, thiếu
 `REDIS_URL` / `ALLOWED_ORIGINS` / `ALLOWED_HOSTS`, còn bật `DOCS_ENABLED` hay `SEED_DEMO_DATA`,
 có đặt `BOOTSTRAP_ADMIN_PASSWORD`, hoặc `DATABASE_URL` dùng tài khoản chủ của Postgres.
-High profile còn bắt buộc KMS/Vault, PostgreSQL, OIDC gate, WORM audit, MFA cho tài khoản
-đặc quyền/hội thoại nhạy cảm và từ chối master key legacy trong web runtime.
+High profile còn bắt buộc KMS/Vault, PostgreSQL, OIDC gate, WORM audit, kiểm tra mật khẩu
+rò rỉ fail-closed, MFA cho tài khoản đặc quyền/hội thoại nhạy cảm, tắt tự đăng ký và từ
+chối master key legacy trong web runtime.
 
 ---
 

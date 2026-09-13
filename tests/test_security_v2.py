@@ -18,6 +18,7 @@ from src.app.ids import (
     Detection,
     IntrusionState,
     detect_anomalies,
+    evidence_fingerprint,
     run_safe_detection_verification,
     scan_text,
 )
@@ -211,7 +212,7 @@ def test_ips_blocks_a_source_after_repeated_high_severity_hits():
                 source_ip="203.0.113.7",
                 path="/api/health",
                 method="GET",
-                evidence="union select",
+                evidence_sha256=evidence_fingerprint("union select"),
             )
         )
 
@@ -225,6 +226,23 @@ def test_ips_blocks_a_source_after_repeated_high_severity_hits():
     assert state.is_blocked("198.51.100.9") == (False, 0)
     assert state.unblock("203.0.113.7")
     assert state.is_blocked("203.0.113.7") == (False, 0)
+
+
+def test_detection_retains_only_an_evidence_digest():
+    raw = "Authorization: Bearer must-not-remain-in-memory"
+    detection = Detection(
+        rule_id="TEST-001",
+        severity="medium",
+        engine="signature",
+        description="test",
+        source_ip="192.0.2.1",
+        path="/api/test",
+        method="GET",
+        evidence_sha256=evidence_fingerprint(raw),
+    )
+    serialized = str(detection.as_dict())
+    assert raw not in serialized
+    assert detection.evidence_sha256 == evidence_fingerprint(raw)
 
 
 def test_attack_request_is_blocked_and_audited(client: TestClient, app):
@@ -289,7 +307,9 @@ def test_admin_can_verify_chain_and_read_ids_state(client: TestClient, app):
     assert verify.json()["total_events"] == verify.json()["verified_events"]
     assert (
         db.execute(
-            select(func.count()).select_from(AuditEvent).where(AuditEvent.event_type == "audit.chain.verify")
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.event_type == "audit.chain.verify")
         ).scalar_one()
         == 1
     )

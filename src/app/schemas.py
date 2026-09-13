@@ -273,8 +273,18 @@ class SessionCreate(BaseModel):
     def align_private_mode(self) -> SessionCreate:
         if self.security_mode == "private_e2ee":
             self.data_classification = "e2ee_private"
+        elif self.security_mode == "confidential" and self.data_classification in {
+            "public",
+            "internal",
+        }:
+            self.data_classification = "confidential"
         elif self.data_classification == "e2ee_private":
             raise ValueError("e2ee_private chỉ dùng với chế độ private_e2ee.")
+        elif self.security_mode == "secure" and self.data_classification in {
+            "confidential",
+            "highly_confidential",
+        }:
+            raise ValueError("Dữ liệu nhạy cảm phải dùng chế độ confidential.")
         return self
 
 
@@ -308,8 +318,18 @@ class SessionSecurityUpdate(BaseModel):
     def align_private_mode(self) -> SessionSecurityUpdate:
         if self.security_mode == "private_e2ee":
             self.data_classification = "e2ee_private"
+        elif self.security_mode == "confidential" and self.data_classification in {
+            "public",
+            "internal",
+        }:
+            self.data_classification = "confidential"
         elif self.data_classification == "e2ee_private":
             raise ValueError("e2ee_private chỉ dùng với chế độ private_e2ee.")
+        elif self.security_mode == "secure" and self.data_classification in {
+            "confidential",
+            "highly_confidential",
+        }:
+            raise ValueError("Dữ liệu nhạy cảm phải dùng chế độ confidential.")
         return self
 
 
