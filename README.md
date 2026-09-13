@@ -43,7 +43,8 @@ Bản nâng cấp bổ sung ba trust boundary (`secure`, `confidential`,
 từng message, export streaming không tạo tệp plaintext tạm, consent AI phiên bản
 hóa, DLP chính thức, device/prekey/replay control cho E2EE, retention và audit
 checkpoint ngoài hệ thống, cùng TLS xác minh CA cho kết nối nội bộ ở high profile. Xem [hướng dẫn triển khai bảo mật cao](docs/HIGH_SECURITY_DEPLOYMENT.md),
-[hợp đồng E2EE client](docs/E2EE_CLIENT_CONTRACT.md) và
+[hợp đồng E2EE client](docs/E2EE_CLIENT_CONTRACT.md),
+[data inventory/DPIA baseline](docs/PRIVACY_DATA_INVENTORY.md) và
 [bảng truy vết yêu cầu](docs/SECURITY_REQUIREMENTS_TRACEABILITY.md).
 
 > `SECURITY_PROFILE=high` là guard fail-closed, không phải nhãn chứng nhận. E2EE

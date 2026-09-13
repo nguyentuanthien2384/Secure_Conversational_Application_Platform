@@ -128,7 +128,9 @@ Không dùng Caddy cũ hơn 2.8 cho overlay này vì cấu hình chủ động b
 ở đường dẫn vé export bằng `log_skip`. Access log thô của Uvicorn cũng bị tắt;
 sự kiện bảo mật có cấu trúc vẫn được ghi trong audit. Caddyfile còn xóa
 Authorization, Cookie, Set-Cookie và secret header của OIDC proxy trước khi ghi
-log.
+log. Chính sách CSP report-only gửi vi phạm tới endpoint giới hạn dung lượng/tần
+suất; endpoint chỉ giữ tên directive, status và origin, chủ động bỏ URL path,
+query, đoạn script/DOM và nội dung người dùng trước khi chuyển SIEM.
 
 ## IAM tối thiểu cho khóa
 

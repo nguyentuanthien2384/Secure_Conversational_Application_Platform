@@ -567,13 +567,19 @@ return {1, 0}
 def safe_json(data: dict[str, Any] | None) -> str:
     if not data:
         return "{}"
+    # Imported lazily so the low-level security module remains lightweight at
+    # startup while audit metadata still passes through the formal DLP engine.
+    from src.app.dlp import redact_text
+
     cleaned: dict[str, Any] = {}
     for key, value in data.items():
         safe_key = str(key).replace("\r", " ").replace("\n", " ")[:80]
         if isinstance(value, str):
-            cleaned[safe_key] = value.replace("\r", " ").replace("\n", " ")[:500]
+            redacted, _ = redact_text(value[:2048])
+            cleaned[safe_key] = redacted.replace("\r", " ").replace("\n", " ")[:500]
         elif isinstance(value, (int, float, bool)) or value is None:
             cleaned[safe_key] = value
         else:
-            cleaned[safe_key] = str(value)[:500]
+            redacted, _ = redact_text(str(value)[:2048])
+            cleaned[safe_key] = redacted.replace("\r", " ").replace("\n", " ")[:500]
     return json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))

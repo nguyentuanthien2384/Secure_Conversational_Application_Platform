@@ -21,6 +21,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+from src.app.dlp import redact_text
+
 SIEM_LOGGER_NAME = "security.siem"
 
 _SEVERITY_BY_OUTCOME = {
@@ -77,10 +79,12 @@ def configure_siem_logging(enabled: bool = True, level: int = logging.INFO) -> l
 
 def _scrub(value: Any) -> Any:
     if isinstance(value, str):
-        return value.replace("\r", " ").replace("\n", " ")[:512]
+        redacted, _ = redact_text(value[:2048])
+        return redacted.replace("\r", " ").replace("\n", " ")[:512]
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return str(value)[:512]
+    redacted, _ = redact_text(str(value)[:2048])
+    return redacted.replace("\r", " ").replace("\n", " ")[:512]
 
 
 def emit_security_event(

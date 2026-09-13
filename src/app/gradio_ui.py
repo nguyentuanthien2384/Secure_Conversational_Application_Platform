@@ -699,7 +699,13 @@ def _pw_meter_html(password: str) -> str:
 def build_ui() -> gr.Blocks:
     # Gradio 6 applies theme and CSS when the UI is mounted/launched.  Supplying
     # them to Blocks itself is deprecated and emits a warning on every startup.
-    with gr.Blocks(title="SCAP") as demo:
+    with gr.Blocks(
+        title="SCAP",
+        analytics_enabled=False,
+        # Defensive cleanup for any future file component. Current exports are
+        # direct one-use URLs and never enter Gradio's cache.
+        delete_cache=(60, 60),
+    ) as demo:
         st_token = gr.State("")
         st_exp = gr.State(0.0)
         st_mfa = gr.State("")

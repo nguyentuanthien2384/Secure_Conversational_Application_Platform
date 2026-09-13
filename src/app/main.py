@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 import gradio as gr
 import jwt
@@ -128,6 +129,7 @@ logger = logging.getLogger("secure_chat")
 
 bearer = HTTPBearer(auto_error=False)
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+CSP_DIRECTIVE_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 
 
 def _audit_safe_path(path: str) -> str:
@@ -135,6 +137,62 @@ def _audit_safe_path(path: str) -> str:
     if path.startswith("/api/exports/"):
         return "/api/exports/[capability-redacted]"
     return path[:200]
+
+
+def _safe_csp_location(value: object) -> str:
+    """Keep only a CSP keyword or URL origin; paths and queries may carry secrets."""
+    raw = str(value or "").strip()[:2048]
+    if raw in {"inline", "eval", "self", "data", "blob", "about"}:
+        return raw
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return "other"
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{parsed.scheme.lower()}://{host}{port}"
+    except (TypeError, ValueError):
+        return "other"
+
+
+def _safe_csp_report(payload: object) -> dict[str, object] | None:
+    """Normalize legacy and Reporting API CSP payloads into metadata-only fields."""
+    candidate: object = payload
+    if isinstance(payload, list):
+        candidate = payload[0] if payload else None
+    if not isinstance(candidate, dict):
+        return None
+    report = candidate.get("csp-report")
+    if not isinstance(report, dict):
+        report = candidate.get("body", candidate)
+    if not isinstance(report, dict):
+        return None
+
+    def directive(*names: str) -> str:
+        value = str(next((report[name] for name in names if name in report), "")).strip().lower()
+        return value if CSP_DIRECTIVE_RE.fullmatch(value) else "unknown"
+
+    status_code = report.get("status-code", report.get("statusCode"))
+    safe_status = (
+        status_code
+        if isinstance(status_code, int)
+        and not isinstance(status_code, bool)
+        and 100 <= status_code <= 599
+        else None
+    )
+    return {
+        "effective_directive": directive("effective-directive", "effectiveDirective"),
+        "violated_directive": directive("violated-directive", "violatedDirective"),
+        "blocked_origin": _safe_csp_location(
+            report.get("blocked-uri", report.get("blockedURL", ""))
+        ),
+        "document_origin": _safe_csp_location(
+            report.get("document-uri", report.get("documentURL", ""))
+        ),
+        "status_code": safe_status,
+    }
 
 
 def _build_crypto_services(
@@ -505,10 +563,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Observe whether the bundled Gradio release can run without inline
             # script before promoting this stricter policy to enforcement.
             report_policy = csp.replace(" 'unsafe-inline'", "").replace(" 'unsafe-eval'", "")
-            response.headers["Content-Security-Policy-Report-Only"] = report_policy
+            response.headers["Content-Security-Policy-Report-Only"] = (
+                report_policy + "; report-uri /api/security/csp-report"
+            )
         if settings.environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
+
+    @app.post("/api/security/csp-report", status_code=status.HTTP_204_NO_CONTENT)
+    async def receive_csp_report(request: Request) -> Response:
+        # CSP reports are generated before application login and therefore
+        # cannot require bearer auth. Bound both request size and per-source
+        # volume, then retain only origins/directive names—not URL paths,
+        # queries, script samples, DOM snippets, or user content.
+        allowed, _ = registration_limiter.allow(
+            f"csp-report:{client_ip(request)}",
+            max_attempts=30,
+            window_seconds=60,
+        )
+        if not allowed:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 16_384:
+                return Response(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
+        try:
+            payload = json.loads(body or b"{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        details = _safe_csp_report(payload)
+        if details is not None:
+            emit_security_event(
+                "browser.csp.violation",
+                outcome="denied",
+                source_ip=client_ip(request),
+                request_id=getattr(request.state, "request_id", None),
+                details=details,
+            )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -3840,7 +3933,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         theme=THEME,
         css=CUSTOM_CSS,
         auth_dependency=gradio_auth_dependency,
+        blocked_paths=["/app/.env", "/run/secrets", "/proc", "/sys", "/etc"],
+        show_error=False,
         max_file_size=settings.gradio_max_file_size,
+        enable_monitoring=False,
     )
 
     return app

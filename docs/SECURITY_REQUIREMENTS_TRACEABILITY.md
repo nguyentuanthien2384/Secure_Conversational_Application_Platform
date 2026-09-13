@@ -12,11 +12,12 @@ cổng vận hành. “Có trong repository” không đồng nghĩa “đã đ�
 | DLP chính thức | Unicode normalization, detectors Việt Nam/secret/health/card, allow/redact/confirm/block/local-only, output scan | `test_dlp_policy.py` | từ điển thật, rule tuning, vendor DPA/data residency |
 | Consent AI | timestamp + policy version, chỉ giải mã context sau consent/DLP pass, tối đa 8 message | API/provider tests | nội dung thông báo pháp lý được phê duyệt |
 | Private E2EE server | device challenge, possession/approval proof, trusted-device list, prekey một lần, membership epoch, opaque envelopes, replay UNIQUE | `test_e2ee_core.py`, `test_high_security_features.py` | client Double Ratchet/MLS đã audit và interop/pentest |
-| Gradio/HTTP | API JWT/RBAC, high profile OIDC proxy gate + tắt tự đăng ký, upload cap, CSP enforce + stricter report-only, headers | hardening/UI tests | OIDC IdP/proxy thật, nonce/hash CSP nếu Gradio hỗ trợ |
+| Gradio/HTTP | API JWT/RBAC, high profile OIDC proxy gate + tắt tự đăng ký, upload cap, chặn đường dẫn hệ thống/secret, tắt error/monitoring/analytics, CSP enforce + stricter report-only có endpoint metadata-only | hardening/UI tests | OIDC IdP/proxy thật, nonce/hash CSP nếu Gradio hỗ trợ |
 | Audit/WORM | HMAC chain, externally deliverable signed checkpoints, local+anchor verification, append-only DB grants | audit tests | WORM/retention-lock receiver, SOC alert/rule ownership |
 | Retention | mode-specific expiry, policy edit không được gia hạn, startup/on-access sweep, xóa wrapped DEK và metadata phiên đăng nhập hết hạn | retention tests | backup/snapshot lifecycle và legal hold |
 | Supply chain | frozen `uv.lock`, SHA-pinned actions, SAST/secret/dependency/image scan, CycloneDX SBOM, attestation | GitHub workflow | pin digest mọi image, protected branch, registry signature enforcement |
-| Runtime hardening | fail-closed high profile, TLS xác minh CA cho PostgreSQL/Redis/Vault, trusted hosts/CORS, Caddy TLS, read-only/cap-drop/resource limits, DB least privilege | config/security tests | mTLS nội bộ nếu threat model yêu cầu, orchestrator policies, load/chaos tests |
+| Runtime hardening | fail-closed high profile, TLS xác minh CA cho PostgreSQL/Redis/Vault, trusted hosts/CORS, Caddy TLS, read-only/cap-drop/resource limits, DB least privilege, DLP scrub cho metadata audit/SIEM không biết trước | config/security tests + container integration | mTLS nội bộ nếu threat model yêu cầu, orchestrator policies, load/chaos tests |
+| Privacy/DPIA | data inventory, purpose/minimization, mode-specific retention, rights workflow, processor/transfer và DPIA release gate trong `PRIVACY_DATA_INVENTORY.md` | consent/retention/export tests | controller/legal-basis, DPA/BAA, supplier facts, owner approval và data-subject SLA |
 | IR/DR/governance | runbook high-security, key/DLP/device/audit procedures | tài liệu review | tabletop, restore drill, pentest/Red Team, owner/SLA |
 
 ## Trạng thái tuyên bố

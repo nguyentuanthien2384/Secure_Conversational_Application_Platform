@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import urllib.error
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,8 @@ from scripts import migrate_database
 from src.app.audit import safe_user_agent
 from src.app.config import Settings
 from src.app.main import _audit_safe_path, create_app
-from src.app.security import PasswordBreachCheckUnavailable, PwnedPasswordChecker
+from src.app.security import PasswordBreachCheckUnavailable, PwnedPasswordChecker, safe_json
+from src.app.siem import _scrub
 
 
 def test_api_surface_ships_locked_down_csp(client: TestClient):
@@ -29,6 +31,48 @@ def test_ui_csp_drops_unsafe_eval_by_default(client: TestClient):
     assert csp, "UI responses must carry a CSP header"
     assert "'unsafe-eval'" not in csp
     assert "object-src 'none'" in csp
+    assert "report-uri /api/security/csp-report" in response.headers.get(
+        "Content-Security-Policy-Report-Only", ""
+    )
+
+
+def test_csp_report_retains_metadata_without_secret_urls(
+    client: TestClient, monkeypatch
+):
+    captured: dict[str, object] = {}
+
+    def capture_event(event_type: str, **kwargs) -> None:
+        captured["event_type"] = event_type
+        captured.update(kwargs)
+
+    monkeypatch.setattr("src.app.main.emit_security_event", capture_event)
+    secret = "capability-secret-must-not-reach-logs"
+    response = client.post(
+        "/api/security/csp-report",
+        content=json.dumps(
+            {
+                "csp-report": {
+                    "document-uri": f"https://chat.example.test/private?token={secret}",
+                    "blocked-uri": f"https://evil.example/payload.js?secret={secret}",
+                    "effective-directive": "script-src-elem",
+                    "violated-directive": "script-src-elem",
+                    "script-sample": secret,
+                    "status-code": 200,
+                }
+            }
+        ),
+        headers={"content-type": "application/csp-report"},
+    )
+    assert response.status_code == 204
+    assert captured["event_type"] == "browser.csp.violation"
+    assert captured["details"] == {
+        "effective_directive": "script-src-elem",
+        "violated_directive": "script-src-elem",
+        "blocked_origin": "https://evil.example",
+        "document_origin": "https://chat.example.test",
+        "status_code": 200,
+    }
+    assert secret not in json.dumps(captured)
 
 
 def test_common_security_headers_present(client: TestClient):
@@ -51,6 +95,16 @@ def test_user_agent_metadata_redacts_pii_and_credentials():
     assert safe is not None
     assert "alice@example.com" not in safe
     assert "abcdefghijklmnopqrstuvwxyz" not in safe
+
+
+def test_unknown_audit_and_siem_fields_pass_through_dlp_redaction():
+    raw = "alice@example.com Authorization: Bearer abcdefghijklmnop.qrstuvwx"
+    persisted = safe_json({"future_unknown_field": raw})
+    mirrored = str(_scrub(raw))
+    for output in (persisted, mirrored):
+        assert "alice@example.com" not in output
+        assert "abcdefghijklmnop.qrstuvwx" not in output
+        assert "[REDACTED:" in output
 
 
 def test_high_security_password_screening_fails_closed(monkeypatch):
@@ -247,6 +301,15 @@ def test_high_profile_requires_verified_tls_for_postgres_and_redis(
     with pytest.raises(RuntimeError, match="Redis TLS"):
         Settings.from_env()
 
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://scap_app@db:5432/secure_chat"
+        "?sslmode=verify-full&sslmode=disable",
+    )
+    with pytest.raises(RuntimeError, match="sslmode=verify-full"):
+        Settings.from_env()
+
 
 def test_high_profile_rejects_redis_tls_query_bypasses(monkeypatch, tmp_path: Path):
     _set_valid_high_env(monkeypatch, tmp_path)
@@ -264,6 +327,34 @@ def test_high_profile_rejects_redis_tls_query_bypasses(monkeypatch, tmp_path: Pa
         "rediss://scap@redis:6379/0?ssl_cert_reqs=required&ssl_check_hostname=false",
     )
     with pytest.raises(RuntimeError, match="Redis TLS"):
+        Settings.from_env()
+
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "REDIS_URL",
+        "rediss://scap@redis:6379/0?ssl_cert_reqs=required"
+        "&ssl_check_hostname=false&ssl_check_hostname=true",
+    )
+    with pytest.raises(RuntimeError, match="Redis TLS"):
+        Settings.from_env()
+
+
+def test_high_profile_secret_files_are_single_source_bounded_and_single_line(
+    monkeypatch, tmp_path: Path
+):
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("APP_SECRET_KEY", "environment-secret-that-must-not-be-accepted")
+    with pytest.raises(RuntimeError, match="Chỉ cấu hình một"):
+        Settings.from_env()
+
+    _set_valid_high_env(monkeypatch, tmp_path)
+    app_secret = tmp_path / "app-secret"
+    app_secret.write_text("first line\nsecond line", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="một dòng"):
+        Settings.from_env()
+
+    app_secret.write_text("x" * 16_385, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="16 KiB"):
         Settings.from_env()
 
 
@@ -363,3 +454,15 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
         assert f"{image_variable}: ${{{image_variable}:?" in high_compose
     assert "--refresh-telemetry" in local_compose
     assert "image: scap-app" in local_compose
+
+
+def test_gradio_mount_blocks_sensitive_files_and_debug_surfaces():
+    main_source = Path("src/app/main.py").read_text(encoding="utf-8")
+    ui_source = Path("src/app/gradio_ui.py").read_text(encoding="utf-8")
+    assert 'blocked_paths=["/app/.env", "/run/secrets", "/proc", "/sys", "/etc"]' in (
+        main_source
+    )
+    assert "show_error=False" in main_source
+    assert "enable_monitoring=False" in main_source
+    assert "analytics_enabled=False" in ui_source
+    assert "delete_cache=(60, 60)" in ui_source
