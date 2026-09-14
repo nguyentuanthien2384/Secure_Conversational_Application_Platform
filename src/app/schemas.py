@@ -18,6 +18,32 @@ VALID_DATA_CLASSES = {
     "e2ee_private",
 }
 
+# Explicit bidirectional embedding/override/isolate characters can make a URL
+# or filename appear in a different order from the stored value ("Trojan
+# Source" / visual phishing).  Do not reject ordinary Arabic/Hebrew text or the
+# common LRM/RLM marks; only reject the high-risk directional controls which
+# can open/close hidden direction scopes.
+UNSAFE_BIDI_CONTROLS = frozenset(
+    {
+        "\u202a",  # LEFT-TO-RIGHT EMBEDDING
+        "\u202b",  # RIGHT-TO-LEFT EMBEDDING
+        "\u202c",  # POP DIRECTIONAL FORMATTING
+        "\u202d",  # LEFT-TO-RIGHT OVERRIDE
+        "\u202e",  # RIGHT-TO-LEFT OVERRIDE
+        "\u2066",  # LEFT-TO-RIGHT ISOLATE
+        "\u2067",  # RIGHT-TO-LEFT ISOLATE
+        "\u2068",  # FIRST STRONG ISOLATE
+        "\u2069",  # POP DIRECTIONAL ISOLATE
+    }
+)
+
+
+def _reject_unsafe_bidi_controls(value: str, *, field_label: str) -> str:
+    if any(character in UNSAFE_BIDI_CONTROLS for character in value):
+        raise ValueError(f"{field_label} chứa ký tự điều hướng Unicode không an toàn.")
+    return value
+
+
 # NIST SP 800-63B-4 favours length and blocklists over composition rules. We require a
 # long secret, accept passphrases up to 128 chars, and screen obvious weak/known tokens
 # instead of forcing an uppercase/lowercase/digit mix.
@@ -248,6 +274,7 @@ class SessionCreate(BaseModel):
     @field_validator("title")
     @classmethod
     def clean_title(cls, value: str) -> str:
+        _reject_unsafe_bidi_controls(value, field_label="Tiêu đề")
         cleaned = " ".join(value.split())
         if not cleaned:
             raise ValueError("Tiêu đề không được để trống.")
@@ -294,6 +321,7 @@ class SessionUpdate(BaseModel):
     @field_validator("title")
     @classmethod
     def clean_title(cls, value: str) -> str:
+        _reject_unsafe_bidi_controls(value, field_label="Tiêu đề")
         cleaned = " ".join(value.split())
         if not cleaned:
             raise ValueError("Tiêu đề không được để trống.")
@@ -355,6 +383,7 @@ class MessageSend(BaseModel):
     @field_validator("content")
     @classmethod
     def validate_content(cls, value: str) -> str:
+        _reject_unsafe_bidi_controls(value, field_label="Nội dung")
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("Nội dung không được để trống.")

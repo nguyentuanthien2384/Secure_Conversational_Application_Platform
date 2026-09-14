@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from src.app.audit_chain import canonical_datetime
@@ -76,6 +76,10 @@ class CheckpointVerification:
     intact: bool
     externally_delivered: bool
     last_event_id: int | None = None
+    latest_event_id: int | None = None
+    unanchored_events: int = 0
+    fresh: bool = False
+    fully_anchored: bool = False
     reason: str | None = None
 
     def as_dict(self) -> dict[str, object]:
@@ -84,6 +88,10 @@ class CheckpointVerification:
             "checkpoint_intact": self.intact,
             "checkpoint_externally_delivered": self.externally_delivered,
             "checkpoint_last_event_id": self.last_event_id,
+            "checkpoint_latest_event_id": self.latest_event_id,
+            "checkpoint_unanchored_events": self.unanchored_events,
+            "checkpoint_fresh": self.fresh,
+            "checkpoint_fully_anchored": self.fully_anchored,
             "checkpoint_reason": self.reason,
         }
 
@@ -97,11 +105,15 @@ class AuditCheckpointService:
         endpoint: str = "",
         token_file: str = "",
         timeout_seconds: float = 5.0,
+        max_unanchored_events: int = 100,
     ) -> None:
         if interval < 1:
             raise ValueError("Audit checkpoint interval must be positive.")
+        if max_unanchored_events < 0:
+            raise ValueError("Maximum unanchored audit events cannot be negative.")
         self.key = derive_checkpoint_key(secret_key)
         self.interval = interval
+        self.max_unanchored_events = max_unanchored_events
         self.endpoint = endpoint.strip()
         self.token_file = Path(token_file) if token_file else None
         self.timeout_seconds = timeout_seconds
@@ -221,20 +233,39 @@ class AuditCheckpointService:
         return self.anchor(db)
 
     def verify_latest(self, db: Session) -> CheckpointVerification:
+        latest_event_id = db.scalar(select(func.max(AuditEvent.id)))
         checkpoint = db.scalar(
             select(AuditCheckpoint).order_by(AuditCheckpoint.last_event_id.desc()).limit(1)
         )
         if checkpoint is None:
-            return CheckpointVerification(False, False, False, reason="missing_checkpoint")
+            unanchored_events = db.scalar(select(func.count()).select_from(AuditEvent)) or 0
+            return CheckpointVerification(
+                present=False,
+                intact=False,
+                externally_delivered=False,
+                latest_event_id=latest_event_id,
+                unanchored_events=unanchored_events,
+                reason="missing_checkpoint",
+            )
+        unanchored_events = (
+            db.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(AuditEvent.id > checkpoint.last_event_id)
+            )
+            or 0
+        )
         event = db.get(AuditEvent, checkpoint.last_event_id)
         delivered = checkpoint.delivered_at is not None and bool(checkpoint.external_receipt)
         if event is None:
             return CheckpointVerification(
-                True,
-                False,
-                delivered,
-                checkpoint.last_event_id,
-                "anchored_event_missing",
+                present=True,
+                intact=False,
+                externally_delivered=delivered,
+                last_event_id=checkpoint.last_event_id,
+                latest_event_id=latest_event_id,
+                unanchored_events=unanchored_events,
+                reason="anchored_event_missing",
             )
         payload = canonical_checkpoint(
             checkpoint_id=checkpoint.id,
@@ -245,21 +276,36 @@ class AuditCheckpointService:
         expected = sign_checkpoint(self.key, payload)
         if not secrets.compare_digest(expected, checkpoint.signature):
             return CheckpointVerification(
-                True,
-                False,
-                delivered,
-                checkpoint.last_event_id,
-                "checkpoint_signature_mismatch",
+                present=True,
+                intact=False,
+                externally_delivered=delivered,
+                last_event_id=checkpoint.last_event_id,
+                latest_event_id=latest_event_id,
+                unanchored_events=unanchored_events,
+                reason="checkpoint_signature_mismatch",
             )
         if not event.entry_hash or not secrets.compare_digest(
             event.entry_hash,
             checkpoint.root_hash,
         ):
             return CheckpointVerification(
-                True,
-                False,
-                delivered,
-                checkpoint.last_event_id,
-                "checkpoint_root_mismatch",
+                present=True,
+                intact=False,
+                externally_delivered=delivered,
+                last_event_id=checkpoint.last_event_id,
+                latest_event_id=latest_event_id,
+                unanchored_events=unanchored_events,
+                reason="checkpoint_root_mismatch",
             )
-        return CheckpointVerification(True, True, delivered, checkpoint.last_event_id)
+        fresh = unanchored_events <= self.max_unanchored_events
+        fully_anchored = delivered and unanchored_events == 0
+        return CheckpointVerification(
+            present=True,
+            intact=True,
+            externally_delivered=delivered,
+            last_event_id=checkpoint.last_event_id,
+            latest_event_id=latest_event_id,
+            unanchored_events=unanchored_events,
+            fresh=fresh,
+            fully_anchored=fully_anchored,
+        )

@@ -7,6 +7,7 @@ trò chuyện, bản mã, tìm kiếm toàn cục, tài khoản, thiết bị, q
 
 from __future__ import annotations
 
+import html
 import os
 import time
 from datetime import datetime
@@ -40,8 +41,10 @@ THEME = gr.themes.Soft(
     # ngay khi mở, không cần zoom. Mật độ giảm một chút là cái giá xứng đáng.
     text_size=gr.themes.sizes.text_lg,
     spacing_size=gr.themes.sizes.spacing_md,
-    font=[gr.themes.GoogleFont("Be Vietnam Pro"), "system-ui", "sans-serif"],
-    font_mono=[gr.themes.GoogleFont("IBM Plex Mono"), "ui-monospace", "monospace"],
+    # Keep typography local. Remote font CSS is an unnecessary browser-side
+    # connection and would also be rejected by the application's strict CSP.
+    font=["system-ui", "sans-serif"],
+    font_mono=["ui-monospace", "SFMono-Regular", "Consolas", "monospace"],
 )
 
 CUSTOM_CSS = """
@@ -570,6 +573,24 @@ def _session_choices(token):
     ]
 
 
+def _safe_chat_text(content: str) -> str:
+    """Render untrusted chat content as text, never as browser markup.
+
+    ``gr.Chatbot(render_markdown=False)`` disables Markdown expansion, but its
+    frontend still places sanitized HTML into the DOM.  DOM sanitizers commonly
+    allow passive elements such as ``img``; an attacker-controlled remote image
+    would therefore still be able to beacon the reader's browser.  Escaping at
+    this final display boundary keeps the encrypted source message unchanged
+    while ensuring HTML, Markdown links/images, and Mermaid blocks remain inert.
+    """
+
+    # Provider output and legacy rows did not necessarily pass through the API
+    # schema. Make directional controls visible at the display boundary too.
+    for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)):
+        content = content.replace(chr(codepoint), f"\\u{codepoint:04X}")
+    return html.escape(content, quote=True)
+
+
 def _chat_history(token, session_id):
     if not session_id:
         return []
@@ -585,7 +606,7 @@ def _chat_history(token, session_id):
             }
         ]
     rows = _api(token, "GET", f"/api/sessions/{session_id}/messages")
-    return [{"role": row["role"], "content": row["content"]} for row in rows]
+    return [{"role": row["role"], "content": _safe_chat_text(row["content"])} for row in rows]
 
 
 def _devices_snapshot(token):
@@ -892,6 +913,12 @@ def build_ui() -> gr.Blocks:
                                 height=600,
                                 avatar_images=AVATARS,
                                 buttons=["copy", "copy_all"],
+                                # Chat/provider output is untrusted.  Keep it as
+                                # inert text instead of creating links, remote
+                                # images, HTML elements, or Mermaid diagrams.
+                                render_markdown=False,
+                                sanitize_html=True,
+                                allow_tags=False,
                                 allow_file_downloads=False,
                             )
                             with gr.Row():
@@ -1657,7 +1684,9 @@ def build_ui() -> gr.Blocks:
                 token, "GET", f"/api/sessions/{session_id}/messages", params={"query": query}
             )
             gr.Info(f"Tìm thấy {len(rows)} tin nhắn.")
-            return [{"role": row["role"], "content": row["content"]} for row in rows]
+            return [
+                {"role": row["role"], "content": _safe_chat_text(row["content"])} for row in rows
+            ]
 
         btn_search.click(_guard(search_in_session, 1), [st_token, dd_session, tb_search], [chatbot])
         btn_search_clear.click(

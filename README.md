@@ -219,7 +219,8 @@ không bao giờ gọi AI phía server.
   hoặc nút *Xác minh chuỗi* trên tab Bảo mật.
 - Song song, mỗi sự kiện được in ra stdout dạng JSON một dòng cho Loki/ELK/Splunk/Wazuh.
 - Checkpoint ký `last_event_id + root_hash` được đẩy qua HTTPS tới WORM. Đây là mốc ngoài máy
-  chủ để phát hiện cả việc xóa phần đuôi; API verify trả thêm `high_assurance_intact`.
+  chủ để phát hiện cả việc xóa phần đuôi; API verify đo cả số sự kiện chưa neo/freshness và chỉ
+  trả `high_assurance_intact=true` khi checkpoint đáp ứng đầy đủ ngưỡng của hồ sơ triển khai.
 
 ### 4.6 Kiểm chứng Purple Team an toàn (MITRE ATT&CK)
 - Mỗi phát hiện chữ ký ứng dụng đều gắn `mitre_technique: T1190` khi phù hợp, nên bản ghi
@@ -512,7 +513,7 @@ Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Nh
 | Hạn mức/retention | `MAX_SESSIONS_PER_USER`, `MAX_MESSAGES_PER_SESSION`, `SECURE_RETENTION_DAYS`, `CONFIDENTIAL_RETENTION_DAYS` |
 | Chống lạm dụng | `LOGIN_*`, `ALLOW_SELF_REGISTRATION`, `REGISTRATION_*`, `MESSAGE_*`, `PASSWORD_CHANGE_*` |
 | 2FA | `MFA_ISSUER`, `MFA_CHALLENGE_MINUTES`, `MFA_RECOVERY_CODES`, `MFA_*_ATTEMPTS` |
-| IDS/Audit/SIEM | `IDS_*`, `AUDIT_CHAIN_ENABLED`, `AUDIT_WORM_*`, `AUDIT_CHECKPOINT_INTERVAL`, `SIEM_JSON_LOGS` |
+| IDS/Audit/SIEM | `IDS_*`, `AUDIT_CHAIN_ENABLED`, `AUDIT_WORM_*`, `AUDIT_CHECKPOINT_INTERVAL`, `AUDIT_MAX_UNANCHORED_EVENTS`, `SIEM_JSON_LOGS` |
 | UI/SSO | `GRADIO_AUTH_MODE`, `OIDC_*`, `GRADIO_MAX_FILE_SIZE`, `CSP_*` |
 | AI/DLP | `GOOGLE_GENAI_API_KEY`, `GEMINI_MODEL`, `ALLOW_DEMO_AI`, `AI_CONSENT_VERSION`, `DLP_CUSTOM_TERMS` |
 

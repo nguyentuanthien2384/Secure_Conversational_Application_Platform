@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import gradio as gr
 import jwt
@@ -130,6 +130,9 @@ logger = logging.getLogger("secure_chat")
 bearer = HTTPBearer(auto_error=False)
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 CSP_DIRECTIVE_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+DISABLED_GRADIO_UPLOAD_PATHS = frozenset(
+    {"/gradio_api/upload", "/gradio_api/upload_progress"}
+)
 
 
 def _audit_safe_path(path: str) -> str:
@@ -137,6 +140,40 @@ def _audit_safe_path(path: str) -> str:
     if path.startswith("/api/exports/"):
         return "/api/exports/[capability-redacted]"
     return path[:200]
+
+
+def _is_disabled_gradio_file_request(path: str) -> bool:
+    """Close Gradio file routes that this text-only application never uses.
+
+    Gradio registers a generic upload API even when no File component exists.
+    It can also proxy public HTTP(S) files through ``/gradio_api/file=...``.
+    Neither capability belongs to SCAP's trust boundary: exports use the
+    separate one-use streaming API and avatars/QR codes remain local files.
+    Decode twice so a percent-encoded remote URL cannot bypass the decision.
+    """
+    normalized = path
+    for _ in range(2):
+        decoded = unquote(normalized)
+        if decoded == normalized:
+            break
+        normalized = decoded
+    normalized = normalized.rstrip("/")
+    lowered = normalized.lower()
+    if lowered in DISABLED_GRADIO_UPLOAD_PATHS:
+        return True
+    file_prefix = next(
+        (
+            prefix
+            for prefix in ("/gradio_api/file=", "/gradio_api/file/")
+            if lowered.startswith(prefix)
+        ),
+        None,
+    )
+    if file_prefix is None:
+        return False
+    target = normalized[len(file_prefix) :].strip()
+    parsed = urlsplit(target)
+    return parsed.scheme.lower() in {"http", "https"} or target.startswith("//")
 
 
 def _safe_csp_location(value: object) -> str:
@@ -291,6 +328,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             interval=settings.audit_checkpoint_interval,
             endpoint=settings.audit_worm_endpoint,
             token_file=settings.audit_worm_token_file,
+            max_unanchored_events=settings.audit_max_unanchored_events,
         )
         if settings.audit_chain_enabled
         else None
@@ -400,6 +438,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else str(uuid.uuid4())
         )
         request.state.request_id = request_id
+
+        if _is_disabled_gradio_file_request(request.url.path):
+            # Return 404 rather than advertising an unused file-processing
+            # surface. Do this before IDS/audit so attacker-controlled remote
+            # URLs never enter telemetry and no network fetch can begin.
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": "File transfer is not available."},
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "no-store",
+                },
+            )
 
         content_length = request.headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > 1_048_576:
@@ -557,11 +609,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             script_eval = " 'unsafe-eval'" if settings.csp_allow_unsafe_eval else ""
             csp = (
                 "default-src 'self'; "
-                f"script-src 'self' 'unsafe-inline'{script_eval} https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
-                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com https://cdnjs.cloudflare.com; "
-                "font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net data:; "
-                "img-src 'self' data: blob: https:; "
-                "connect-src 'self' ws: wss:; "
+                f"script-src 'self' 'unsafe-inline'{script_eval}; "
+                "style-src 'self' 'unsafe-inline'; "
+                "font-src 'self' data:; "
+                "img-src 'self' data: blob:; "
+                "connect-src 'self'; "
                 "worker-src 'self' blob:; "
                 "object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
             )
@@ -742,6 +794,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return None
         db.refresh(user)
         return user
+
+    def lock_auth_session_row(
+        db: Session,
+        jti: str,
+        user_id: str,
+    ) -> AuthSession | None:
+        """Atomically claim one still-active bearer session for rotation/revocation.
+
+        Both refresh and logout take the user lock first and this session lock
+        second. The conditional same-value UPDATE works as a row lock on
+        PostgreSQL and as a serialized writer claim on SQLite, while rechecking
+        ``revoked_at`` after a concurrent request has committed.
+        """
+        claimed = db.execute(
+            update(AuthSession)
+            .where(
+                AuthSession.jti == jti,
+                AuthSession.user_id == user_id,
+                AuthSession.revoked_at.is_(None),
+            )
+            .values(revoked_at=AuthSession.revoked_at)
+            .execution_options(synchronize_session=False)
+        )
+        if claimed.rowcount != 1:
+            return None
+        auth_session = db.get(AuthSession, jti)
+        if auth_session is None:
+            return None
+        db.refresh(auth_session)
+        return auth_session
 
     def lock_chat_session_row(db: Session, chat_session: ChatSession) -> ChatSession | None:
         """Serialize policy, membership, epoch, and content mutations.
@@ -1903,21 +1985,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         payload = token_service.decode(credentials.credentials)
+        old_jti = str(payload["jti"])
         expires_at = datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc)
-        db.add(
-            RevokedToken(
-                jti=str(payload["jti"]),
-                user_id=user.id,
-                expires_at=expires_at,
-                reason="logout",
-            )
-        )
-        auth_session = db.get(AuthSession, str(payload["jti"]))
-        if auth_session is not None:
+        if lock_user_row(db, user) is None or payload.get("ver") != user.token_version:
+            raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
+        auth_session = lock_auth_session_row(db, old_jti, user.id)
+        revoked_family = auth_session is None
+        if revoked_family:
+            # A refresh may have won after current_user validated the old token.
+            # Revoke every descendant conservatively so a stolen bearer cannot
+            # keep the session alive by racing the legitimate logout request.
+            revoke_all_auth_sessions(db, user)
+        else:
             auth_session.revoked_at = utcnow()
+        if db.get(RevokedToken, old_jti) is None:
+            db.add(
+                RevokedToken(
+                    jti=old_jti,
+                    user_id=user.id,
+                    expires_at=expires_at,
+                    reason="logout_after_rotation" if revoked_family else "logout",
+                )
+            )
         db.commit()
         record_audit(
-            db, request, "auth.logout", actor_id=user.id, target_type="user", target_id=user.id
+            db,
+            request,
+            "auth.logout",
+            actor_id=user.id,
+            target_type="user",
+            target_id=user.id,
+            details={"scope": "all_sessions" if revoked_family else "current_session"},
         )
         return Response(status_code=204)
 
@@ -1957,11 +2055,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         payload = token_service.decode(credentials.credentials)
         old_jti = str(payload["jti"])
-        old_session = db.get(AuthSession, old_jti)
+        if lock_user_row(db, user) is None or payload.get("ver") != user.token_version:
+            raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
+        old_session = lock_auth_session_row(db, old_jti, user.id)
+        if old_session is None or db.get(RevokedToken, old_jti) is not None:
+            raise HTTPException(
+                status_code=401,
+                detail="Token đã được xoay hoặc thu hồi; vui lòng đăng nhập lại.",
+            )
 
-        root_issued_at = None
-        if old_session is not None:
-            root_issued_at = old_session.root_issued_at or old_session.issued_at
+        root_issued_at = old_session.root_issued_at or old_session.issued_at
         if root_issued_at is not None and root_issued_at.tzinfo is None:
             root_issued_at = root_issued_at.replace(tzinfo=timezone.utc)
 
@@ -1993,7 +2096,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             user,
             ip,
             root_issued_at=root_issued_at,
-            last_step_up_at=old_session.last_step_up_at if old_session is not None else None,
+            last_step_up_at=old_session.last_step_up_at,
         )
         # Thu hồi token cũ SAU khi đã cấp token mới, trong cùng transaction.
         db.add(
@@ -2004,8 +2107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 reason="refresh",
             )
         )
-        if old_session is not None:
-            old_session.revoked_at = now
+        old_session.revoked_at = now
         db.commit()
         record_audit(
             db,
@@ -2443,9 +2545,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def delete_session_endpoint(
         session_id: str,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, user, db)
         row = require_owned_session(session_id, user, db, request, for_update=True)
         # Zeroize cached plaintext key material on both sides of the cascade.
         envelope_crypto_service.clear_cache()
@@ -3755,9 +3859,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def admin_create_user(
         payload: AdminCreateUser,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, admin, db)
         if password_is_compromised(
             payload.password,
             request,
@@ -3808,9 +3914,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def admin_delete_user(
         user_id: str,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, admin, db)
         target = db.get(User, user_id)
         if target is None:
             raise HTTPException(status_code=404, detail="User not found.")
@@ -3864,9 +3972,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user_id: str,
         payload: UserRoleUpdate,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, admin, db)
         target = db.get(User, user_id)
         if target is None:
             raise HTTPException(status_code=404, detail="User not found.")
@@ -3895,9 +4005,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user_id: str,
         payload: UserStatusUpdate,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, admin, db)
         target = db.get(User, user_id)
         if target is None:
             raise HTTPException(status_code=404, detail="User account was not found.")
@@ -4058,10 +4170,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.update(checkpoint_verification.as_dict())
             checkpoint_required = bool(settings.audit_worm_endpoint)
             payload["external_checkpoint_required"] = checkpoint_required
+            checkpoint_coverage_intact = (
+                checkpoint_verification.fully_anchored
+                if checkpoint_required
+                else checkpoint_verification.intact and checkpoint_verification.fresh
+            )
             payload["high_assurance_intact"] = bool(
-                result.intact
-                and checkpoint_verification.intact
-                and (checkpoint_verification.externally_delivered if checkpoint_required else True)
+                result.intact and checkpoint_coverage_intact
             )
         payload["checked_at"] = utcnow().isoformat()
         payload["checked_by"] = admin.username

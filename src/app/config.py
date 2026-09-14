@@ -218,6 +218,7 @@ class Settings:
     audit_worm_endpoint: str = ""
     audit_worm_token_file: str = ""
     audit_checkpoint_interval: int = 100
+    audit_max_unanchored_events: int = 100
     retention_sweep_on_startup: bool = True
 
     @classmethod
@@ -434,6 +435,9 @@ class Settings:
             "CONFIDENTIAL_RETENTION_DAYS": int(os.getenv("CONFIDENTIAL_RETENTION_DAYS", "7")),
             "SECURE_RETENTION_DAYS": int(os.getenv("SECURE_RETENTION_DAYS", "90")),
             "AUDIT_CHECKPOINT_INTERVAL": int(os.getenv("AUDIT_CHECKPOINT_INTERVAL", "100")),
+            "AUDIT_MAX_UNANCHORED_EVENTS": int(
+                os.getenv("AUDIT_MAX_UNANCHORED_EVENTS", "100")
+            ),
         }
         if numeric_limits["DEK_CACHE_SECONDS"] < 0:
             raise RuntimeError("DEK_CACHE_SECONDS không được âm.")
@@ -446,6 +450,19 @@ class Settings:
         ):
             if numeric_limits[name] <= 0:
                 raise RuntimeError(f"{name} phải là số nguyên dương.")
+        if numeric_limits["AUDIT_MAX_UNANCHORED_EVENTS"] < 0:
+            raise RuntimeError("AUDIT_MAX_UNANCHORED_EVENTS không được âm.")
+        if security_profile == "high":
+            if numeric_limits["AUDIT_CHECKPOINT_INTERVAL"] != 1:
+                raise RuntimeError(
+                    "SECURITY_PROFILE=high bắt buộc AUDIT_CHECKPOINT_INTERVAL=1 "
+                    "để mọi sự kiện audit được neo ngay."
+                )
+            if numeric_limits["AUDIT_MAX_UNANCHORED_EVENTS"] != 0:
+                raise RuntimeError(
+                    "SECURITY_PROFILE=high bắt buộc AUDIT_MAX_UNANCHORED_EVENTS=0 "
+                    "để không chấp nhận phần đuôi audit chưa được neo."
+                )
 
         gradio_auth_mode = os.getenv("GRADIO_AUTH_MODE", "application").strip().lower()
         if gradio_auth_mode not in {"application", "oidc"}:
@@ -542,5 +559,6 @@ class Settings:
             audit_worm_endpoint=os.getenv("AUDIT_WORM_ENDPOINT", "").strip(),
             audit_worm_token_file=os.getenv("AUDIT_WORM_TOKEN_FILE", "").strip(),
             audit_checkpoint_interval=numeric_limits["AUDIT_CHECKPOINT_INTERVAL"],
+            audit_max_unanchored_events=numeric_limits["AUDIT_MAX_UNANCHORED_EVENTS"],
             retention_sweep_on_startup=_bool_env("RETENTION_SWEEP_ON_STARTUP", True),
         )

@@ -68,7 +68,8 @@ OIDC_PROXY_SECRET_FILE_HOST=/secure-host-path/oidc-proxy-secret
 
 AUDIT_WORM_ENDPOINT=https://worm.internal.example/v1/scap/checkpoints
 AUDIT_WORM_TOKEN_FILE_HOST=/secure-host-path/worm-token
-AUDIT_CHECKPOINT_INTERVAL=100
+AUDIT_CHECKPOINT_INTERVAL=1
+AUDIT_MAX_UNANCHORED_EVENTS=0
 
 # CA nội bộ và chứng chỉ máy chủ; SAN phải chứa đúng tên DNS `db` / `redis`.
 INTERNAL_CA_CERT_FILE_HOST=/secure-host-path/internal-ca.crt
@@ -221,9 +222,19 @@ Mỗi checkpoint gửi JSON canonical gồm `format`, `checkpoint_id`,
 - sao lưu/giám sát bằng tài khoản khác với đội vận hành SCAP.
 
 `GET /api/admin/audit/verify` trả cả trạng thái chuỗi cục bộ và checkpoint.
-`high_assurance_intact=true` chỉ khi chuỗi và checkpoint đều nguyên vẹn, đồng
-thời checkpoint ngoài đã được giao nếu cấu hình WORM. Admin có thể ép tạo mốc
+`high_assurance_intact=true` chỉ khi chuỗi nguyên vẹn, checkpoint còn đúng chữ
+ký, phần đuôi nằm trong ngưỡng freshness và, khi cấu hình WORM, checkpoint mới
+nhất đã được giao ra ngoài và bao phủ toàn bộ phần đuôi. Admin có thể ép tạo mốc
 bằng `POST /api/admin/audit/checkpoint` sau step-up authentication.
+
+Hồ sơ high-security bắt buộc neo mỗi sự kiện
+(`AUDIT_CHECKPOINT_INTERVAL=1`) và không chấp nhận phần đuôi chưa neo
+(`AUDIT_MAX_UNANCHORED_EVENTS=0`). Kết quả xác minh nêu rõ ID sự kiện mới nhất,
+số sự kiện sau checkpoint, trạng thái `checkpoint_fresh` và
+`checkpoint_fully_anchored`; một checkpoint cũ không còn đủ để chứng minh toàn
+bộ phần đuôi hiện tại đã được giao ra WORM. Hồ sơ standard/demo vẫn có thể gom
+nhiều sự kiện để giảm chi phí, nhưng không được dùng cấu hình đó để tuyên bố
+high-assurance.
 
 ## DLP và AI
 

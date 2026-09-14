@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from scripts import migrate_database
 from src.app.audit import safe_user_agent
 from src.app.config import Settings
-from src.app.main import _audit_safe_path, create_app
+from src.app.main import _audit_safe_path, _is_disabled_gradio_file_request, create_app
 from src.app.security import PasswordBreachCheckUnavailable, PwnedPasswordChecker, safe_json
 from src.app.siem import _scrub
 
@@ -31,8 +31,61 @@ def test_ui_csp_drops_unsafe_eval_by_default(client: TestClient):
     assert csp, "UI responses must carry a CSP header"
     assert "'unsafe-eval'" not in csp
     assert "object-src 'none'" in csp
+    assert "img-src 'self' data: blob:;" in csp
+    assert "connect-src 'self';" in csp
+    assert "https:" not in csp
+    assert " ws:" not in csp and " wss:" not in csp
     assert "report-uri /api/security/csp-report" in response.headers.get(
         "Content-Security-Policy-Report-Only", ""
+    )
+
+
+def test_unused_gradio_upload_and_remote_file_proxy_are_closed(
+    client: TestClient, monkeypatch
+):
+    proxy_called = False
+
+    async def fail_if_remote_proxy_runs(*_args, **_kwargs):
+        nonlocal proxy_called
+        proxy_called = True
+        raise AssertionError("Gradio remote proxy must not run")
+
+    monkeypatch.setattr("gradio.routes.secure_url_stream_response", fail_if_remote_proxy_runs)
+    upload = client.post(
+        "/gradio_api/upload",
+        files={"files": ("payload.txt", b"untrusted content", "text/plain")},
+    )
+    progress = client.get("/gradio_api/upload_progress?upload_id=attacker-controlled")
+    remote_file = client.get(
+        "/gradio_api/file=https%3A%2F%2F127.0.0.1%3A9%2Fmetadata"
+    )
+    deprecated_remote_file = client.get("/gradio_api/file/https://evil.example/beacon")
+    encoded_deprecated_remote_file = client.get(
+        "/gradio_api/file/http%3A%2F%2Fevil.example%2Fbeacon"
+    )
+
+    assert {
+        upload.status_code,
+        progress.status_code,
+        remote_file.status_code,
+        deprecated_remote_file.status_code,
+        encoded_deprecated_remote_file.status_code,
+    } == {404}
+    assert proxy_called is False
+    assert upload.json() == {"detail": "File transfer is not available."}
+    assert upload.headers["Cache-Control"] == "no-store"
+    assert upload.headers["X-Content-Type-Options"] == "nosniff"
+
+    # Local files are still governed by Gradio's allowed/blocked path rules so
+    # packaged avatars and generated QR codes keep working.
+    assert not _is_disabled_gradio_file_request(
+        "/gradio_api/file=D:/btl/scap/src/app/ui_assets/assistant.png"
+    )
+    assert _is_disabled_gradio_file_request(
+        "/gradio_api/file=https%253A%252F%252Fevil.example%252Fbeacon.png"
+    )
+    assert _is_disabled_gradio_file_request(
+        "/gradio_api/file/https%253A%252F%252Fevil.example%252Fbeacon.png"
     )
 
 
@@ -239,6 +292,8 @@ def _set_valid_high_env(monkeypatch, tmp_path: Path) -> None:
         "PASSWORD_BREACH_CHECK": "true",
         "AUDIT_WORM_ENDPOINT": "https://worm.example.test/checkpoints",
         "AUDIT_WORM_TOKEN_FILE": "/run/secrets/audit_worm_token",
+        "AUDIT_CHECKPOINT_INTERVAL": "1",
+        "AUDIT_MAX_UNANCHORED_EVENTS": "0",
         "GRADIO_AUTH_MODE": "oidc",
         "OIDC_PROXY_SECRET_FILE": "/run/secrets/oidc_proxy_secret",
     }
@@ -384,6 +439,34 @@ def test_high_profile_accepts_strict_internal_transport_settings(
     assert settings.redis_url.startswith("rediss://")
     assert "database%20password%3Awith%2Fspecials" in settings.database_url
     assert "redis%20password%3Awith%2Fspecials%20and%20spaces" in settings.redis_url
+    assert settings.audit_checkpoint_interval == 1
+    assert settings.audit_max_unanchored_events == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("AUDIT_CHECKPOINT_INTERVAL", "2", "AUDIT_CHECKPOINT_INTERVAL=1"),
+        ("AUDIT_MAX_UNANCHORED_EVENTS", "1", "AUDIT_MAX_UNANCHORED_EVENTS=0"),
+    ],
+)
+def test_high_profile_rejects_an_unanchored_audit_tail_budget(
+    monkeypatch, tmp_path: Path, name: str, value: str, message: str
+):
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match=message):
+        Settings.from_env()
+
+
+def test_standard_profile_rejects_negative_unanchored_audit_budget(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("SECURITY_PROFILE", "standard")
+    monkeypatch.setenv("AUDIT_MAX_UNANCHORED_EVENTS", "-1")
+
+    with pytest.raises(RuntimeError, match="không được âm"):
+        Settings.from_env()
 
 
 def test_migration_uses_file_backed_database_password(monkeypatch, tmp_path: Path):
