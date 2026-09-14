@@ -43,9 +43,10 @@ class DLPAction(str, Enum):
 class FindingType(str, Enum):
     """Stable, non-secret identifiers for detector results."""
 
-    SECRET = "secret"
+    # These are detector-category labels, never credential material.
+    SECRET = "secret"  # nosec B105
     JWT = "jwt"
-    BEARER_TOKEN = "bearer_token"
+    BEARER_TOKEN = "bearer_token"  # nosec B105
     PRIVATE_KEY = "private_key"
     API_KEY = "api_key"
     EMAIL = "email"

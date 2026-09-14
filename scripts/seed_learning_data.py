@@ -344,10 +344,12 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
             )
             for ua, ip, revoked, hours_ago in devices:
                 issued = now - timedelta(hours=hours_ago)
+                session_jti = str(uuid.uuid4())
                 db.add(
                     AuthSession(
-                        jti=str(uuid.uuid4()),
+                        jti=session_jti,
                         user_id=users["learn.user"].id,
+                        session_family_id=session_jti,
                         issued_at=issued,
                         expires_at=issued
                         + timedelta(minutes=max(settings.access_token_minutes, 30)),

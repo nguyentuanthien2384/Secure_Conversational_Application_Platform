@@ -13,6 +13,8 @@ import hmac
 import json
 import secrets
 import ssl
+import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -22,11 +24,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.app.audit_chain import canonical_datetime
 from src.app.db import utcnow
 from src.app.models import AuditCheckpoint, AuditEvent
+
+CHECKPOINT_NAMESPACE = uuid.UUID("995c6f15-89fb-47bb-b5b6-067562f076f1")
+EXTERNAL_FAILURE_RETRY_SECONDS = 30
 
 
 class AuditCheckpointError(RuntimeError):
@@ -106,17 +112,24 @@ class AuditCheckpointService:
         token_file: str = "",
         timeout_seconds: float = 5.0,
         max_unanchored_events: int = 100,
+        probe_interval_seconds: int = 300,
     ) -> None:
         if interval < 1:
             raise ValueError("Audit checkpoint interval must be positive.")
         if max_unanchored_events < 0:
             raise ValueError("Maximum unanchored audit events cannot be negative.")
+        if probe_interval_seconds < 1:
+            raise ValueError("Audit WORM probe interval must be positive.")
         self.key = derive_checkpoint_key(secret_key)
         self.interval = interval
         self.max_unanchored_events = max_unanchored_events
+        self.probe_interval_seconds = probe_interval_seconds
         self.endpoint = endpoint.strip()
         self.token_file = Path(token_file) if token_file else None
         self.timeout_seconds = timeout_seconds
+        self._delivery_lock = threading.RLock()
+        self._last_external_success_monotonic: float | None = None
+        self._last_external_failure_monotonic: float | None = None
         if self.endpoint:
             parsed = urlparse(self.endpoint)
             if (
@@ -177,21 +190,71 @@ class AuditCheckpointService:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise AuditCheckpointError("Audit WORM delivery failed.") from exc
 
-    def anchor(self, db: Session) -> AuditCheckpoint | None:
+    @staticmethod
+    def _document(checkpoint: AuditCheckpoint) -> dict[str, object]:
+        signed_payload = canonical_checkpoint(
+            checkpoint_id=checkpoint.id,
+            last_event_id=checkpoint.last_event_id,
+            root_hash=checkpoint.root_hash,
+            created_at=checkpoint.created_at,
+        )
+        document: dict[str, object] = json.loads(signed_payload)
+        document["signature"] = checkpoint.signature
+        document["signer"] = checkpoint.signer_uri
+        return document
+
+    def _delivery_succeeded(self) -> None:
+        self._last_external_success_monotonic = time.monotonic()
+        self._last_external_failure_monotonic = None
+
+    def _delivery_failed(self) -> None:
+        self._last_external_failure_monotonic = time.monotonic()
+
+    def _failure_backoff_active(self) -> bool:
+        last_failure = self._last_external_failure_monotonic
+        return (
+            last_failure is not None
+            and time.monotonic() - last_failure < EXTERNAL_FAILURE_RETRY_SECONDS
+        )
+
+    def _probe_is_due(self) -> bool:
+        last_success = self._last_external_success_monotonic
+        return (
+            last_success is None
+            or time.monotonic() - last_success >= self.probe_interval_seconds
+        )
+
+    def _anchor(self, db: Session) -> AuditCheckpoint | None:
         latest_event = db.scalar(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1))
         if latest_event is None or not latest_event.entry_hash:
             return None
+        # Cache scalar values before a commit/rollback can expire ORM state.
+        # This keeps the concurrent-insert recovery path deterministic on every
+        # SQLAlchemy backend, including PostgreSQL deployments.
+        latest_event_id = latest_event.id
+        latest_event_hash = latest_event.entry_hash
+        latest_event_created_at = latest_event.created_at or utcnow()
         existing = db.scalar(
-            select(AuditCheckpoint).where(AuditCheckpoint.last_event_id == latest_event.id)
+            select(AuditCheckpoint).where(AuditCheckpoint.last_event_id == latest_event_id)
         )
         if existing is not None:
             return existing
-        checkpoint_id = str(uuid.uuid4())
-        created_at = utcnow()
+        # A deterministic id makes a retry safe when the receiver persisted the
+        # checkpoint but its response was lost. The WORM endpoint sees the same
+        # Idempotency-Key instead of a second logical anchor.
+        checkpoint_id = str(
+            uuid.uuid5(
+                CHECKPOINT_NAMESPACE,
+                f"{latest_event_id}:{latest_event_hash}",
+            )
+        )
+        # Bind the complete payload to the sealed event so independent workers
+        # derive the same signature as well as the same idempotency key.
+        created_at = latest_event_created_at
         signed_payload = canonical_checkpoint(
             checkpoint_id=checkpoint_id,
-            last_event_id=latest_event.id,
-            root_hash=latest_event.entry_hash,
+            last_event_id=latest_event_id,
+            root_hash=latest_event_hash,
             created_at=created_at,
         )
         signature = sign_checkpoint(self.key, signed_payload)
@@ -201,12 +264,17 @@ class AuditCheckpointService:
         receipt = None
         delivered_at = None
         if self.endpoint:
-            receipt = self._deliver(document, checkpoint_id)
+            try:
+                receipt = self._deliver(document, checkpoint_id)
+            except AuditCheckpointError:
+                self._delivery_failed()
+                raise
             delivered_at = utcnow()
+            self._delivery_succeeded()
         checkpoint = AuditCheckpoint(
             id=checkpoint_id,
-            last_event_id=latest_event.id,
-            root_hash=latest_event.entry_hash,
+            last_event_id=latest_event_id,
+            root_hash=latest_event_hash,
             signature=signature,
             signer_uri="hmac-sha256://scap/audit-checkpoint-v1",
             signer_version="v1",
@@ -218,10 +286,37 @@ class AuditCheckpointService:
         try:
             db.commit()
             db.refresh(checkpoint)
+        except IntegrityError as exc:
+            db.rollback()
+            # Another worker may have delivered and inserted the same
+            # deterministic checkpoint concurrently. Accept only an exact,
+            # externally delivered match; any conflict is suspicious.
+            concurrent = db.scalar(
+                select(AuditCheckpoint).where(
+                    AuditCheckpoint.last_event_id == latest_event_id
+                )
+            )
+            if (
+                concurrent is not None
+                and concurrent.id == checkpoint_id
+                and concurrent.root_hash == latest_event_hash
+                and concurrent.signature == signature
+                and (not self.endpoint or concurrent.delivered_at is not None)
+            ):
+                if self.endpoint:
+                    self._delivery_succeeded()
+                return concurrent
+            raise AuditCheckpointError("Could not persist the audit checkpoint.") from exc
         except Exception as exc:
             db.rollback()
             raise AuditCheckpointError("Could not persist the audit checkpoint.") from exc
         return checkpoint
+
+    def anchor(self, db: Session) -> AuditCheckpoint | None:
+        # Serialize delivery and insertion within one process. The deterministic
+        # idempotency key provides the corresponding protection across workers.
+        with self._delivery_lock:
+            return self._anchor(db)
 
     def maybe_anchor(self, db: Session, event: AuditEvent) -> AuditCheckpoint | None:
         latest = db.scalar(
@@ -232,13 +327,67 @@ class AuditCheckpointService:
             return None
         return self.anchor(db)
 
+    def ensure_latest_anchored(
+        self,
+        db: Session,
+        *,
+        probe_external: bool = False,
+    ) -> CheckpointVerification:
+        """Catch up an audit tail and optionally prove the WORM sink is reachable.
+
+        Replaying an already delivered checkpoint uses its deterministic
+        idempotency key and does not modify the append-only local table. A
+        readiness probe can therefore detect an idle sink outage without
+        manufacturing new checkpoints or weakening database grants.
+        """
+
+        with self._delivery_lock:
+            # This method backs the public readiness endpoint. Cache a recent
+            # failure so callers cannot turn an outage into unbounded outbound
+            # TLS attempts; direct/admin anchoring remains explicitly retryable.
+            if probe_external and self.endpoint and self._failure_backoff_active():
+                raise AuditCheckpointError("Audit WORM delivery is temporarily unavailable.")
+            verification = self.verify_latest(db)
+            if verification.latest_event_id is None:
+                return verification
+
+            if not verification.fully_anchored:
+                self._anchor(db)
+                verification = self.verify_latest(db)
+
+            if (
+                probe_external
+                and self.endpoint
+                and verification.fully_anchored
+                and self._probe_is_due()
+            ):
+                checkpoint = db.scalar(
+                    select(AuditCheckpoint)
+                    .order_by(AuditCheckpoint.last_event_id.desc())
+                    .limit(1)
+                )
+                if checkpoint is None:
+                    return verification
+                try:
+                    self._deliver(self._document(checkpoint), checkpoint.id)
+                except AuditCheckpointError:
+                    self._delivery_failed()
+                    raise
+                self._delivery_succeeded()
+
+            return verification
+
     def verify_latest(self, db: Session) -> CheckpointVerification:
-        latest_event_id = db.scalar(select(func.max(AuditEvent.id)))
+        # Avoid returning cached ORM values after an out-of-band edit and keep
+        # latest-id/tail-count telemetry within one database statement.
+        db.expire_all()
         checkpoint = db.scalar(
             select(AuditCheckpoint).order_by(AuditCheckpoint.last_event_id.desc()).limit(1)
         )
         if checkpoint is None:
-            unanchored_events = db.scalar(select(func.count()).select_from(AuditEvent)) or 0
+            latest_event_id, unanchored_events = db.execute(
+                select(func.max(AuditEvent.id), func.count(AuditEvent.id))
+            ).one()
             return CheckpointVerification(
                 present=False,
                 intact=False,
@@ -247,14 +396,12 @@ class AuditCheckpointService:
                 unanchored_events=unanchored_events,
                 reason="missing_checkpoint",
             )
-        unanchored_events = (
-            db.scalar(
-                select(func.count())
-                .select_from(AuditEvent)
-                .where(AuditEvent.id > checkpoint.last_event_id)
+        latest_event_id, unanchored_events = db.execute(
+            select(
+                func.max(AuditEvent.id),
+                func.count(AuditEvent.id).filter(AuditEvent.id > checkpoint.last_event_id),
             )
-            or 0
-        )
+        ).one()
         event = db.get(AuditEvent, checkpoint.last_event_id)
         delivered = checkpoint.delivered_at is not None and bool(checkpoint.external_receipt)
         if event is None:

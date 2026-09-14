@@ -43,11 +43,11 @@ USER app
 
 EXPOSE 8000
 
-# Liveness probe: Docker/Compose tự khởi động lại container khi ứng dụng treo,
-# phục vụ tính Sẵn sàng (Availability) trong C.I.A — Bài 1.
+# Readiness probe: ngoài việc kiểm tra tiến trình/DB, high profile còn xác minh
+# mốc WORM mới nhất. `/api/health` vẫn là liveness tối giản riêng biệt.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", \
-         "import os,urllib.request,sys; host=os.environ.get('ALLOWED_HOSTS','').split(',')[0].strip() or '127.0.0.1'; request=urllib.request.Request('http://127.0.0.1:8000/api/health',headers={'Host':host}); sys.exit(0 if urllib.request.urlopen(request,timeout=3).status==200 else 1)"]
+         "import os,urllib.request,sys; host=os.environ.get('ALLOWED_HOSTS','').split(',')[0].strip() or '127.0.0.1'; request=urllib.request.Request('http://127.0.0.1:8000/api/ready',headers={'Host':host}); sys.exit(0 if urllib.request.urlopen(request,timeout=3).status==200 else 1)"]
 
 # Không tin các proxy header theo mặc định. Bản Compose production bật chúng
 # riêng sau Caddy, còn bản local được publish thẳng nên không thể bị giả IP qua

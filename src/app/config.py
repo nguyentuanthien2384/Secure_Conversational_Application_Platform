@@ -219,6 +219,7 @@ class Settings:
     audit_worm_token_file: str = ""
     audit_checkpoint_interval: int = 100
     audit_max_unanchored_events: int = 100
+    audit_worm_probe_interval_seconds: int = 300
     retention_sweep_on_startup: bool = True
 
     @classmethod
@@ -438,6 +439,9 @@ class Settings:
             "AUDIT_MAX_UNANCHORED_EVENTS": int(
                 os.getenv("AUDIT_MAX_UNANCHORED_EVENTS", "100")
             ),
+            "AUDIT_WORM_PROBE_INTERVAL_SECONDS": int(
+                os.getenv("AUDIT_WORM_PROBE_INTERVAL_SECONDS", "300")
+            ),
         }
         if numeric_limits["DEK_CACHE_SECONDS"] < 0:
             raise RuntimeError("DEK_CACHE_SECONDS không được âm.")
@@ -447,6 +451,7 @@ class Settings:
             "CONFIDENTIAL_RETENTION_DAYS",
             "SECURE_RETENTION_DAYS",
             "AUDIT_CHECKPOINT_INTERVAL",
+            "AUDIT_WORM_PROBE_INTERVAL_SECONDS",
         ):
             if numeric_limits[name] <= 0:
                 raise RuntimeError(f"{name} phải là số nguyên dương.")
@@ -462,6 +467,11 @@ class Settings:
                 raise RuntimeError(
                     "SECURITY_PROFILE=high bắt buộc AUDIT_MAX_UNANCHORED_EVENTS=0 "
                     "để không chấp nhận phần đuôi audit chưa được neo."
+                )
+            if numeric_limits["AUDIT_WORM_PROBE_INTERVAL_SECONDS"] > 300:
+                raise RuntimeError(
+                    "SECURITY_PROFILE=high yêu cầu AUDIT_WORM_PROBE_INTERVAL_SECONDS "
+                    "không quá 300 giây."
                 )
 
         gradio_auth_mode = os.getenv("GRADIO_AUTH_MODE", "application").strip().lower()
@@ -560,5 +570,8 @@ class Settings:
             audit_worm_token_file=os.getenv("AUDIT_WORM_TOKEN_FILE", "").strip(),
             audit_checkpoint_interval=numeric_limits["AUDIT_CHECKPOINT_INTERVAL"],
             audit_max_unanchored_events=numeric_limits["AUDIT_MAX_UNANCHORED_EVENTS"],
+            audit_worm_probe_interval_seconds=numeric_limits[
+                "AUDIT_WORM_PROBE_INTERVAL_SECONDS"
+            ],
             retention_sweep_on_startup=_bool_env("RETENTION_SWEEP_ON_STARTUP", True),
         )

@@ -63,6 +63,9 @@ def test_unused_gradio_upload_and_remote_file_proxy_are_closed(
     encoded_deprecated_remote_file = client.get(
         "/gradio_api/file/http%3A%2F%2Fevil.example%2Fbeacon"
     )
+    unused_generic_proxy = client.get(
+        "/gradio_api/proxy=https%3A%2F%2Fevil.example%2Fbeacon"
+    )
 
     assert {
         upload.status_code,
@@ -70,6 +73,7 @@ def test_unused_gradio_upload_and_remote_file_proxy_are_closed(
         remote_file.status_code,
         deprecated_remote_file.status_code,
         encoded_deprecated_remote_file.status_code,
+        unused_generic_proxy.status_code,
     } == {404}
     assert proxy_called is False
     assert upload.json() == {"detail": "File transfer is not available."}
@@ -294,6 +298,7 @@ def _set_valid_high_env(monkeypatch, tmp_path: Path) -> None:
         "AUDIT_WORM_TOKEN_FILE": "/run/secrets/audit_worm_token",
         "AUDIT_CHECKPOINT_INTERVAL": "1",
         "AUDIT_MAX_UNANCHORED_EVENTS": "0",
+        "AUDIT_WORM_PROBE_INTERVAL_SECONDS": "300",
         "GRADIO_AUTH_MODE": "oidc",
         "OIDC_PROXY_SECRET_FILE": "/run/secrets/oidc_proxy_secret",
     }
@@ -441,6 +446,7 @@ def test_high_profile_accepts_strict_internal_transport_settings(
     assert "redis%20password%3Awith%2Fspecials%20and%20spaces" in settings.redis_url
     assert settings.audit_checkpoint_interval == 1
     assert settings.audit_max_unanchored_events == 0
+    assert settings.audit_worm_probe_interval_seconds == 300
 
 
 @pytest.mark.parametrize(
@@ -448,6 +454,11 @@ def test_high_profile_accepts_strict_internal_transport_settings(
     [
         ("AUDIT_CHECKPOINT_INTERVAL", "2", "AUDIT_CHECKPOINT_INTERVAL=1"),
         ("AUDIT_MAX_UNANCHORED_EVENTS", "1", "AUDIT_MAX_UNANCHORED_EVENTS=0"),
+        (
+            "AUDIT_WORM_PROBE_INTERVAL_SECONDS",
+            "301",
+            "AUDIT_WORM_PROBE_INTERVAL_SECONDS",
+        ),
     ],
 )
 def test_high_profile_rejects_an_unanchored_audit_tail_budget(
@@ -533,6 +544,9 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     assert '"--no-access-log"' in local_compose
     assert '"--no-access-log"' in dockerfile
     assert "headers={'Host':host}" in dockerfile
+    healthcheck = dockerfile.split("HEALTHCHECK", maxsplit=1)[1]
+    assert "/api/ready" in healthcheck
+    assert "/api/health" not in healthcheck
     db_service = compose.split("\n  redis:", maxsplit=1)[0]
     assert "read_only: true" in db_service
     assert "/var/run/postgresql" in db_service
@@ -558,6 +572,7 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     ).read_text(encoding="utf-8")
     assert "PGSSLMODE=verify-full" in high_compose
     assert "env_file: !reset []" in high_compose
+    assert 'AUDIT_WORM_PROBE_INTERVAL_SECONDS: "300"' in high_compose
     assert "uv==0.11.15" in dockerfile
     assert "ENV HOME=/app" in dockerfile
     for image_variable in ("BASE_IMAGE", "POSTGRES_IMAGE", "REDIS_IMAGE", "CADDY_IMAGE"):

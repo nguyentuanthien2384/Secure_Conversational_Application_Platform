@@ -23,7 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.app.audit import client_ip, record_audit, safe_user_agent
-from src.app.audit_chain import derive_audit_key, verify_chain
+from src.app.audit_chain import append_lock, derive_audit_key, seal_event, verify_chain
 from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
 from src.app.config import Settings
 from src.app.db import Database, utcnow
@@ -146,9 +146,10 @@ def _is_disabled_gradio_file_request(path: str) -> bool:
     """Close Gradio file routes that this text-only application never uses.
 
     Gradio registers a generic upload API even when no File component exists.
-    It can also proxy public HTTP(S) files through ``/gradio_api/file=...``.
-    Neither capability belongs to SCAP's trust boundary: exports use the
-    separate one-use streaming API and avatars/QR codes remain local files.
+    It can also proxy public HTTP(S) files through ``/gradio_api/file=...`` or
+    its generic ``proxy=`` route. Neither capability belongs to SCAP's trust
+    boundary: exports use the separate one-use streaming API and avatars/QR
+    codes remain local files.
     Decode twice so a percent-encoded remote URL cannot bypass the decision.
     """
     normalized = path
@@ -160,6 +161,8 @@ def _is_disabled_gradio_file_request(path: str) -> bool:
     normalized = normalized.rstrip("/")
     lowered = normalized.lower()
     if lowered in DISABLED_GRADIO_UPLOAD_PATHS:
+        return True
+    if lowered.startswith("/gradio_api/proxy="):
         return True
     file_prefix = next(
         (
@@ -329,6 +332,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             endpoint=settings.audit_worm_endpoint,
             token_file=settings.audit_worm_token_file,
             max_unanchored_events=settings.audit_max_unanchored_events,
+            probe_interval_seconds=settings.audit_worm_probe_interval_seconds,
         )
         if settings.audit_chain_enabled
         else None
@@ -342,6 +346,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database.assert_schema_ready()
         else:
             database.create_all()
+        # A high-security instance must prove both the existing local chain and
+        # the external append-only sink before it begins serving requests. The
+        # startup event gives a brand-new database a real signed document to
+        # anchor, so an empty installation cannot accidentally skip the WORM
+        # availability gate.
+        if (
+            settings.security_profile == "high"
+            and settings.audit_worm_endpoint
+            and audit_key is not None
+            and audit_checkpoint_service is not None
+        ):
+            with database.session_factory() as startup_db:
+                existing_chain = verify_chain(startup_db, audit_key)
+                if not existing_chain.intact:
+                    raise RuntimeError(
+                        "Audit chain verification failed; refusing high-security startup."
+                    )
+                startup_event = AuditEvent(
+                    event_type="application.startup",
+                    outcome="success",
+                    details_json="{}",
+                )
+                with append_lock(startup_db):
+                    seal_event(startup_db, startup_event, audit_key)
+                    startup_db.add(startup_event)
+                    startup_db.commit()
+                    startup_db.refresh(startup_event)
+                try:
+                    verification = audit_checkpoint_service.ensure_latest_anchored(startup_db)
+                except AuditCheckpointError as exc:
+                    emit_security_event(
+                        "audit.checkpoint.delivery_failed",
+                        outcome="failure",
+                        audit_id=startup_event.id,
+                        entry_hash=startup_event.entry_hash,
+                    )
+                    raise RuntimeError(
+                        "Audit WORM is unavailable; refusing high-security startup."
+                    ) from exc
+                if not verification.fully_anchored:
+                    raise RuntimeError(
+                        "Audit checkpoint is incomplete; refusing high-security startup."
+                    )
+                emit_security_event(
+                    startup_event.event_type,
+                    outcome=startup_event.outcome,
+                    audit_id=startup_event.id,
+                    entry_hash=startup_event.entry_hash,
+                )
         if settings.retention_sweep_on_startup:
             with database.session_factory() as retention_db:
                 retention_result = enforce_retention(
@@ -1123,6 +1176,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             auth_session.revoked_at = now
         user.token_version += 1
 
+    def revoke_auth_session_family(
+        db: Session,
+        *,
+        user_id: str,
+        family_id: str,
+        reason: str,
+    ) -> int:
+        """Revoke every live token descended from one device login."""
+
+        now = utcnow()
+        rows = list(
+            db.scalars(
+                select(AuthSession).where(
+                    AuthSession.user_id == user_id,
+                    AuthSession.session_family_id == family_id,
+                    AuthSession.revoked_at.is_(None),
+                )
+            )
+        )
+        for auth_session in rows:
+            auth_session.revoked_at = now
+            if db.get(RevokedToken, auth_session.jti) is None:
+                db.add(
+                    RevokedToken(
+                        jti=auth_session.jti,
+                        user_id=user_id,
+                        expires_at=auth_session.expires_at,
+                        reason=reason,
+                    )
+                )
+        return len(rows)
+
     def issue_access_session(
         db: Session,
         request: Request,
@@ -1131,6 +1216,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         *,
         root_issued_at: datetime | None = None,
         last_step_up_at: datetime | None = None,
+        session_family_id: str | None = None,
         mark_step_up: bool = False,
     ) -> str:
         """Mint an access token and persist its server-side AuthSession record.
@@ -1143,11 +1229,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """
         token = token_service.issue(user.id, user.username, user.role, user.token_version)
         token_payload = token_service.decode(token)
+        token_jti = str(token_payload["jti"])
         issued_at = datetime.fromtimestamp(int(token_payload["iat"]), tz=timezone.utc)
         db.add(
             AuthSession(
-                jti=str(token_payload["jti"]),
+                jti=token_jti,
                 user_id=user.id,
+                session_family_id=session_family_id or token_jti,
                 issued_at=issued_at,
                 expires_at=datetime.fromtimestamp(int(token_payload["exp"]), tz=timezone.utc),
                 ip_address=ip,
@@ -1279,6 +1367,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.environment != "production":
             payload["environment"] = settings.environment
         return payload
+
+    @app.get("/api/ready")
+    def readiness(db: Annotated[Session, Depends(get_db)]):
+        """Report whether this instance is safe to receive routed traffic.
+
+        Liveness intentionally remains separate at ``/api/health``. In the high
+        profile, readiness also catches up any audit tail and periodically
+        replays the latest checkpoint with the same idempotency key, proving
+        that the external WORM receiver remains reachable even while idle.
+        """
+
+        db.scalar(select(func.count()).select_from(User))
+        if settings.security_profile == "high" and settings.audit_worm_endpoint:
+            if audit_checkpoint_service is None:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"status": "unavailable"},
+                    headers={"Retry-After": "30"},
+                )
+            try:
+                verification = audit_checkpoint_service.ensure_latest_anchored(
+                    db,
+                    probe_external=True,
+                )
+            except AuditCheckpointError:
+                emit_security_event(
+                    "audit.checkpoint.readiness_failed",
+                    outcome="failure",
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"status": "unavailable"},
+                    headers={"Retry-After": "30"},
+                )
+            if not verification.fully_anchored:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"status": "unavailable"},
+                    headers={"Retry-After": "30"},
+                )
+        return {"status": "ready"}
 
     @app.post("/api/auth/register", response_model=UserResponse, status_code=201)
     def register(
@@ -1990,21 +2119,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if lock_user_row(db, user) is None or payload.get("ver") != user.token_version:
             raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
         auth_session = lock_auth_session_row(db, old_jti, user.id)
-        revoked_family = auth_session is None
-        if revoked_family:
-            # A refresh may have won after current_user validated the old token.
-            # Revoke every descendant conservatively so a stolen bearer cannot
-            # keep the session alive by racing the legitimate logout request.
+        source_session = auth_session or db.get(AuthSession, old_jti)
+        if source_session is None or source_session.user_id != user.id:
+            # This can only happen if lifecycle cleanup removed a row between
+            # dependency validation and the account lock. Fail conservatively.
             revoke_all_auth_sessions(db, user)
+            revoked_scope = "all_sessions"
         else:
-            auth_session.revoked_at = utcnow()
-        if db.get(RevokedToken, old_jti) is None:
+            family_id = source_session.session_family_id or source_session.jti
+            revoke_auth_session_family(
+                db,
+                user_id=user.id,
+                family_id=family_id,
+                reason="logout",
+            )
+            revoked_scope = "session_family"
+        if auth_session is None and db.get(RevokedToken, old_jti) is None:
             db.add(
                 RevokedToken(
                     jti=old_jti,
                     user_id=user.id,
                     expires_at=expires_at,
-                    reason="logout_after_rotation" if revoked_family else "logout",
+                    reason="logout",
                 )
             )
         db.commit()
@@ -2015,7 +2151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             actor_id=user.id,
             target_type="user",
             target_id=user.id,
-            details={"scope": "all_sessions" if revoked_family else "current_session"},
+            details={"scope": revoked_scope},
         )
         return Response(status_code=204)
 
@@ -2097,6 +2233,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ip,
             root_issued_at=root_issued_at,
             last_step_up_at=old_session.last_step_up_at,
+            session_family_id=old_session.session_family_id or old_session.jti,
         )
         # Thu hồi token cũ SAU khi đã cấp token mới, trong cùng transaction.
         db.add(
@@ -2237,25 +2374,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def revoke_auth_session(
         session_jti: str,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, user, db)
+        if lock_user_row(db, user) is None:
+            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
         auth_session = db.get(AuthSession, session_jti)
-        if (
-            auth_session is None
-            or auth_session.user_id != user.id
-            or auth_session.revoked_at is not None
-        ):
+        if auth_session is None or auth_session.user_id != user.id:
             raise HTTPException(status_code=404, detail="Login session was not found.")
-        auth_session.revoked_at = utcnow()
-        db.add(
-            RevokedToken(
-                jti=session_jti,
-                user_id=user.id,
-                expires_at=auth_session.expires_at,
-                reason="session_revoke",
-            )
+        family_id = auth_session.session_family_id or auth_session.jti
+        revoked = revoke_auth_session_family(
+            db,
+            user_id=user.id,
+            family_id=family_id,
+            reason="session_revoke",
         )
+        if revoked == 0:
+            raise HTTPException(status_code=404, detail="Login session was not found.")
         db.commit()
         record_audit(
             db,
@@ -2263,16 +2400,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "auth.session_revoke",
             actor_id=user.id,
             target_type="auth_session",
-            target_id=session_jti,
+            target_id=family_id,
+            details={"revoked_tokens": revoked},
         )
         return Response(status_code=204)
 
     @app.post("/api/auth/logout-all", status_code=204)
     def logout_all(
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, user, db)
+        if lock_user_row(db, user) is None:
+            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
         revoke_all_auth_sessions(db, user)
         db.commit()
         record_audit(
@@ -4170,13 +4312,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.update(checkpoint_verification.as_dict())
             checkpoint_required = bool(settings.audit_worm_endpoint)
             payload["external_checkpoint_required"] = checkpoint_required
-            checkpoint_coverage_intact = (
-                checkpoint_verification.fully_anchored
-                if checkpoint_required
-                else checkpoint_verification.intact and checkpoint_verification.fresh
-            )
             payload["high_assurance_intact"] = bool(
-                result.intact and checkpoint_coverage_intact
+                result.intact
+                and checkpoint_required
+                and checkpoint_verification.fully_anchored
             )
         payload["checked_at"] = utcnow().isoformat()
         payload["checked_by"] = admin.username
@@ -4278,9 +4417,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def ids_unblock(
         source_ip: str,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        require_recent_step_up(credentials, admin, db)
         removed = intrusion_state.unblock(source_ip)
         record_audit(
             db,

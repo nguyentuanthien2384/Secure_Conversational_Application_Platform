@@ -157,6 +157,32 @@ class Database:
                 connection.execute(
                     text("ALTER TABLE auth_sessions ADD COLUMN last_step_up_at TIMESTAMP")
                 )
+            if "session_family_id" not in auth_session_columns:
+                connection.execute(
+                    text("ALTER TABLE auth_sessions ADD COLUMN session_family_id VARCHAR(36)")
+                )
+                # Pre-upgrade rows cannot be linked retrospectively because the
+                # former schema stored no parent relation. Treat each as its own
+                # conservative family; all new rotations preserve this value.
+                connection.execute(
+                    text(
+                        "UPDATE auth_sessions SET session_family_id = jti "
+                        "WHERE session_family_id IS NULL"
+                    )
+                )
+                if self.engine.dialect.name == "postgresql":
+                    connection.execute(
+                        text(
+                            "ALTER TABLE auth_sessions "
+                            "ALTER COLUMN session_family_id SET NOT NULL"
+                        )
+                    )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_auth_sessions_family_active "
+                    "ON auth_sessions (user_id, session_family_id, revoked_at)"
+                )
+            )
 
             # Conversation security policy and active envelope metadata.
             if "security_mode" not in chat_session_columns:
@@ -293,7 +319,7 @@ class Database:
                 "secret_kek_version",
                 "secret_crypto_epoch",
             },
-            "auth_sessions": {"last_step_up_at"},
+            "auth_sessions": {"root_issued_at", "last_step_up_at", "session_family_id"},
             "chat_sessions": {
                 "security_mode",
                 "data_classification",

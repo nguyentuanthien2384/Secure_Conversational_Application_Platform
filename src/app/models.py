@@ -69,12 +69,23 @@ class AuthSession(Base):
     """Server-side record for each issued JWT, enabling per-device revocation."""
 
     __tablename__ = "auth_sessions"
-    __table_args__ = (Index("ix_auth_sessions_user_active", "user_id", "revoked_at"),)
+    __table_args__ = (
+        Index("ix_auth_sessions_user_active", "user_id", "revoked_at"),
+        Index(
+            "ix_auth_sessions_family_active",
+            "user_id",
+            "session_family_id",
+            "revoked_at",
+        ),
+    )
 
     jti: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
+    # Stable across access-token rotation. Revoking a device session therefore
+    # also revokes a successor minted concurrently from the selected token.
+    session_family_id: Mapped[str] = mapped_column(String(36), nullable=False)
     issued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

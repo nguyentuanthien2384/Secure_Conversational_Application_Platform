@@ -176,12 +176,13 @@ sequenceDiagram
 - **TOTP (RFC 6238)** cài đặt trực tiếp bằng thư viện chuẩn để báo cáo giải thích được HOTP/TOTP;
   lưu `mfa_last_counter` để một mã đã dùng không thể replay trong cùng bước thời gian.
 - **Recovery code** chỉ lưu hash Argon2id, dùng một lần.
-- **JWT HS256** có `iss`/`aud`/`jti`/`ver`; mỗi token gắn một bản ghi `AuthSession` phía server
-  nên thu hồi được từng thiết bị (`DELETE /api/auth/sessions/{jti}`) hoặc tất cả (`logout-all`).
+- **JWT HS256** có `iss`/`aud`/`jti`/`ver`; mỗi token gắn một bản ghi `AuthSession` phía server.
+  Token được xoay vẫn giữ `session_family_id`, nên thao tác thu hồi thiết bị bắt được cả token kế
+  nhiệm vừa sinh đồng thời mà không đăng xuất các thiết bị khác; `logout-all` thu hồi toàn tài khoản.
 - **Trần phiên tuyệt đối**: `root_issued_at` được mang qua mỗi lần `/api/auth/refresh`, vượt
   `SESSION_ABSOLUTE_HOURS` (mặc định 8h) thì buộc đăng nhập lại — sliding session không thành vĩnh viễn.
 - **Mật khẩu** tối thiểu 15 ký tự (NIST 800-63B ưu tiên độ dài); tùy chọn đối chiếu HIBP bằng
-  k-anonymity, fail-open khi mất mạng.
+  k-anonymity. Standard profile có thể fail-open khi HIBP mất mạng; high profile bắt buộc fail-closed.
 
 ### 4.2 Mã hóa dữ liệu khi lưu trữ
 - Mọi tin nhắn lưu dưới dạng **AES-256-GCM**, nonce 96-bit ngẫu nhiên cho từng bản ghi.
@@ -282,8 +283,8 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | `PATCH` | `/api/auth/ai-consent` | Bật/tắt đồng ý gửi nội dung cho AI bên ngoài |
 | `PATCH` | `/api/auth/password` | Đổi mật khẩu (có rate limit riêng) |
 | `POST` | `/api/auth/refresh` | Xoay token, giữ `root_issued_at` để áp trần phiên |
-| `POST` | `/api/auth/logout` · `/logout-all` | Thu hồi phiên hiện tại / mọi phiên |
-| `GET`/`DELETE` | `/api/auth/sessions[/{jti}]` | Liệt kê và thu hồi từng thiết bị |
+| `POST` | `/api/auth/logout` · `/logout-all` | Thu hồi họ token hiện tại / mọi phiên; `logout-all` cần recent step-up |
+| `GET`/`DELETE` | `/api/auth/sessions[/{jti}]` | Liệt kê / thu hồi cả họ token của thiết bị; `DELETE` cần recent step-up |
 
 ### Hội thoại
 | Method | Đường dẫn | Ghi chú |
@@ -319,6 +320,7 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | `POST` | `/api/admin/audit/checkpoint` | admin + step-up — ký/giao mốc chuỗi tới WORM |
 | `GET`/`DELETE` | `/api/admin/ids/blocklist[/{ip}]` | admin |
 | `GET` | `/api/health` | công khai, cố ý tối giản |
+| `GET` | `/api/ready` | công khai, readiness DB + WORM trong high profile |
 
 > Admin **không** đọc được nội dung hội thoại của người khác qua API: `ChatService.get_owned_session`
 > luôn lọc theo `owner_id`, kể cả với vai trò admin. Đây là lựa chọn thiết kế, không phải thiếu sót.

@@ -70,6 +70,7 @@ AUDIT_WORM_ENDPOINT=https://worm.internal.example/v1/scap/checkpoints
 AUDIT_WORM_TOKEN_FILE_HOST=/secure-host-path/worm-token
 AUDIT_CHECKPOINT_INTERVAL=1
 AUDIT_MAX_UNANCHORED_EVENTS=0
+AUDIT_WORM_PROBE_INTERVAL_SECONDS=300
 
 # CA nội bộ và chứng chỉ máy chủ; SAN phải chứa đúng tên DNS `db` / `redis`.
 INTERNAL_CA_CERT_FILE_HOST=/secure-host-path/internal-ca.crt
@@ -222,19 +223,35 @@ Mỗi checkpoint gửi JSON canonical gồm `format`, `checkpoint_id`,
 - sao lưu/giám sát bằng tài khoản khác với đội vận hành SCAP.
 
 `GET /api/admin/audit/verify` trả cả trạng thái chuỗi cục bộ và checkpoint.
-`high_assurance_intact=true` chỉ khi chuỗi nguyên vẹn, checkpoint còn đúng chữ
-ký, phần đuôi nằm trong ngưỡng freshness và, khi cấu hình WORM, checkpoint mới
-nhất đã được giao ra ngoài và bao phủ toàn bộ phần đuôi. Admin có thể ép tạo mốc
+`high_assurance_intact=true` chỉ khi chuỗi nguyên vẹn, WORM ngoài thực sự được
+cấu hình, checkpoint còn đúng chữ ký, và checkpoint mới nhất đã được giao ra
+ngoài đồng thời bao phủ toàn bộ phần đuôi. Admin có thể ép tạo mốc
 bằng `POST /api/admin/audit/checkpoint` sau step-up authentication.
 
-Hồ sơ high-security bắt buộc neo mỗi sự kiện
-(`AUDIT_CHECKPOINT_INTERVAL=1`) và không chấp nhận phần đuôi chưa neo
-(`AUDIT_MAX_UNANCHORED_EVENTS=0`). Kết quả xác minh nêu rõ ID sự kiện mới nhất,
-số sự kiện sau checkpoint, trạng thái `checkpoint_fresh` và
-`checkpoint_fully_anchored`; một checkpoint cũ không còn đủ để chứng minh toàn
-bộ phần đuôi hiện tại đã được giao ra WORM. Hồ sơ standard/demo vẫn có thể gom
-nhiều sự kiện để giảm chi phí, nhưng không được dùng cấu hình đó để tuyên bố
-high-assurance.
+Hồ sơ high-security yêu cầu thử neo mỗi sự kiện
+(`AUDIT_CHECKPOINT_INTERVAL=1`) và không coi trạng thái là high-assurance nếu
+còn bất kỳ phần đuôi chưa neo nào (`AUDIT_MAX_UNANCHORED_EVENTS=0`). Kết quả xác
+minh nêu rõ ID sự kiện mới nhất, số sự kiện sau checkpoint, trạng thái
+`checkpoint_fresh` (freshness theo số sự kiện) và `checkpoint_fully_anchored`;
+một checkpoint cũ không còn đủ để chứng minh toàn bộ phần đuôi hiện tại đã được
+giao ra WORM. Hồ sơ standard/demo vẫn có thể gom nhiều sự kiện để giảm chi phí,
+nhưng không được dùng cấu hình đó để tuyên bố high-assurance.
+
+`GET /api/health` chỉ chứng minh tiến trình và DB còn sống. Docker dùng
+`GET /api/ready`: ở high profile, endpoint này thử bù phần đuôi chưa neo và phát
+lại checkpoint mới nhất với cùng `Idempotency-Key` tối đa mỗi
+`AUDIT_WORM_PROBE_INTERVAL_SECONDS` (high không cho quá 300 giây). Mã 503 không
+tiết lộ endpoint hay lỗi nội bộ và trạng thái lỗi được giữ 30 giây trước lần thử
+kết nối kế tiếp, tránh để endpoint công khai khuếch đại tải khi WORM đang sự cố.
+Khi khởi động, high profile xác minh toàn chuỗi, ghi một sự kiện startup rồi bắt
+buộc giao mốc đó thành công; chuỗi gãy hoặc WORM không sẵn sàng làm tiến trình
+từ chối phục vụ.
+
+Việc giao WORM xảy ra sau transaction nghiệp vụ hiện tại, nên không phải một
+distributed transaction nguyên tử với thay đổi dữ liệu. Nếu sink hỏng đúng giữa
+một request, request đó có thể đã hoàn tất; lần readiness kế tiếp sẽ chuyển 503
+và tự thử bù. Hạ tầng phải loại instance 503 khỏi luồng truy cập, còn SOC vẫn
+phải cảnh báo nếu checkpoint im lặng quá SLA.
 
 ## DLP và AI
 

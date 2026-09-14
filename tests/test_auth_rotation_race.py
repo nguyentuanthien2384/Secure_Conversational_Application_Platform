@@ -61,6 +61,15 @@ def test_two_concurrent_refreshes_mint_only_one_successor(client: TestClient, ap
 
 def test_logout_wins_even_when_refresh_claimed_the_old_token_first(client: TestClient, app):
     token = register_and_login(client, "refresh-logout-race-user")
+    other_login = client.post(
+        "/api/auth/login",
+        json={
+            "username": "refresh-logout-race-user",
+            "password": "Correct Horse Battery1",
+        },
+    )
+    assert other_login.status_code == 200, other_login.text
+    other_token = other_login.json()["access_token"]
     results: dict[str, object] = {}
 
     with pause_after_sql(app.state.database.engine, AUTH_SESSION_CLAIM_SQL) as (
@@ -102,3 +111,65 @@ def test_logout_wins_even_when_refresh_claimed_the_old_token_first(client: TestC
     successor = results["refresh"].json()["access_token"]
     assert client.get("/api/auth/me", headers=auth(token)).status_code == 401
     assert client.get("/api/auth/me", headers=auth(successor)).status_code == 401
+    assert client.get("/api/auth/me", headers=auth(other_token)).status_code == 200
+
+
+def test_device_session_revoke_catches_a_concurrent_refresh_successor(
+    client: TestClient, app
+):
+    control_token = register_and_login(client, "revoke-refresh-race-user")
+    target_login = client.post(
+        "/api/auth/login",
+        json={
+            "username": "revoke-refresh-race-user",
+            "password": "Correct Horse Battery1",
+        },
+    )
+    assert target_login.status_code == 200, target_login.text
+    target_token = target_login.json()["access_token"]
+    target_jti = str(app.state.token_service.decode(target_token)["jti"])
+    results: dict[str, object] = {}
+
+    with pause_after_sql(app.state.database.engine, AUTH_SESSION_CLAIM_SQL) as (
+        claimed,
+        release,
+        hook_error,
+    ):
+        refresh = threading.Thread(
+            target=run_request,
+            args=(
+                results,
+                "refresh",
+                lambda: client.post("/api/auth/refresh", headers=auth(target_token)),
+            ),
+        )
+        refresh.start()
+        assert claimed.wait(timeout=5), "refresh did not claim the target session"
+        revoke = threading.Thread(
+            target=run_request,
+            args=(
+                results,
+                "revoke",
+                lambda: client.delete(
+                    f"/api/auth/sessions/{target_jti}",
+                    headers=auth(control_token),
+                ),
+            ),
+        )
+        revoke.start()
+        time.sleep(0.15)
+        assert revoke.is_alive(), "session revocation bypassed the account lock"
+        release.set()
+        refresh.join(timeout=10)
+        revoke.join(timeout=10)
+
+    assert not refresh.is_alive() and not revoke.is_alive()
+    assert not hook_error
+    assert not isinstance(results.get("refresh"), BaseException)
+    assert not isinstance(results.get("revoke"), BaseException)
+    assert results["refresh"].status_code == 200
+    assert results["revoke"].status_code == 204
+    successor = results["refresh"].json()["access_token"]
+    assert client.get("/api/auth/me", headers=auth(target_token)).status_code == 401
+    assert client.get("/api/auth/me", headers=auth(successor)).status_code == 401
+    assert client.get("/api/auth/me", headers=auth(control_token)).status_code == 200
