@@ -14,7 +14,7 @@ x-default-logging: &default-logging
 
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     restart: unless-stopped
     # Hardening ngang bằng các service khác (trước đây container này không có
     # cap_drop / no-new-privileges — điểm yếu nhất trong chuỗi hạ tầng).
