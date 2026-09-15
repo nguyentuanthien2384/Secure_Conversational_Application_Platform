@@ -110,16 +110,19 @@ def test_workspace_keeps_one_full_width_responsive_shell():
     assert "wrap=False" in source
 
 
-def test_chat_history_height_keeps_composer_above_the_fold():
-    """Lịch sử chat phải co theo viewport thay vì đẩy nút Gửi khỏi màn hình."""
+def test_chat_history_uses_viewport_bounded_height():
+    """Lịch sử chat dùng chiều cao giới hạn theo viewport và tự cuộn."""
     from src.app.gradio_ui import CHAT_HISTORY_HEIGHT, build_ui
 
     demo = build_ui()
-    chatbots = [component for component in demo.blocks.values() if isinstance(component, gr.Chatbot)]
+    chatbots = [
+        component for component in demo.blocks.values() if isinstance(component, gr.Chatbot)
+    ]
 
     assert len(chatbots) == 1
     assert CHAT_HISTORY_HEIGHT == "clamp(320px, calc(100dvh - 360px), 480px)"
     assert chatbots[0].height == CHAT_HISTORY_HEIGHT
+    assert chatbots[0].autoscroll is True
 
 
 def test_dashboard_uses_metric_cards_for_report_ready_security_overview():
