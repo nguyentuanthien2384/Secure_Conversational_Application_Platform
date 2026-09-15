@@ -21,6 +21,11 @@ BASE_URL = os.getenv("SELF_BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '800
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", BASE_URL).rstrip("/")
 PASSWORD_MIN = 15
 
+# Vùng lịch sử co theo chiều cao màn hình để ô soạn và nút Gửi luôn ở gần nội
+# dung. Giới hạn dưới vẫn đủ đọc hội thoại; giới hạn trên tránh khoảng trắng lớn
+# đẩy trình soạn thảo xuống dưới nếp gấp trên laptop.
+CHAT_HISTORY_HEIGHT = "clamp(320px, calc(100dvh - 360px), 480px)"
+
 # Ảnh tĩnh của giao diện (avatar trợ lý). Đặt cạnh module để không phụ thuộc
 # thư mục làm việc khi chạy bằng uvicorn hay Docker.
 ASSET_DIR = Path(__file__).resolve().parent / "ui_assets"
@@ -50,14 +55,12 @@ THEME = gr.themes.Soft(
 CUSTOM_CSS = """
 /* ==========================================================================
    SCAP — bảng điều khiển bảo mật
-   Nguyên tắc: cột nội dung có giới hạn chiều rộng, mật độ cao, dữ liệu mật mã
-   luôn dùng monospace. Màu nhấn CHỈ dùng để báo trạng thái, không trang trí.
+   Nguyên tắc: workspace dùng toàn bộ chiều rộng khả dụng, mật độ cao, dữ liệu
+   mật mã luôn dùng monospace. Màu nhấn CHỈ dùng để báo trạng thái, không trang trí.
    ========================================================================== */
 
 :root {
-  /* Cột nội dung: 1400px lấp vừa một cửa sổ trình duyệt cỡ thường mà vẫn không
-     trải dài vô tận trên màn hình rộng — dòng chữ quá dài thì mắt khó bắt dòng. */
-  --scap-shell: 1400px;
+  --scap-page-gutter: clamp(14px, 2vw, 28px);
   --scap-rail-h: 52px;
   --scap-ok-bg: #ecfdf5;   --scap-ok-bd: #6ee7b7;   --scap-ok-fg: #065f46;
   --scap-warn-bg: #fffbeb; --scap-warn-bd: #fcd34d; --scap-warn-fg: #78350f;
@@ -87,14 +90,46 @@ CUSTOM_CSS = """
 
 footer { display: none !important; }
 
-/* ── Khung ngoài: đây chính là phần sửa "full màn hình" ─────────────────── */
+/* ── Khung ngoài: một workspace full-width duy nhất cho mọi tab ─────────
+   Gradio tự thêm padding cho cả .gradio-container và div.main. Nếu giữ cả hai,
+   lề bị cộng đôi và trang trông như lúc full, lúc bị co theo breakpoint. Chỉ
+   div.main giữ gutter; 100% (không phải 100vw) tránh dư đúng bề rộng scrollbar. */
 .gradio-container {
-  max-width: var(--scap-shell) !important;
-  margin: 0 auto !important;
-  padding: 22px 28px 56px !important;
+  width: 100% !important;
+  max-width: none !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  box-sizing: border-box !important;
   background:
     radial-gradient(circle at 6% 0%, rgba(16,185,129,.07), transparent 28rem),
     radial-gradient(circle at 95% 8%, rgba(37,99,235,.06), transparent 24rem);
+}
+
+.gradio-container > .main {
+  width: 100% !important;
+  max-width: none !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+  padding: 16px var(--scap-page-gutter) 48px !important;
+  box-sizing: border-box !important;
+}
+
+#app-sec,
+#workspace-tabs {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  box-sizing: border-box !important;
+}
+
+/* Đảm bảo toàn bộ tab panel và nội dung bên trong luôn chiếm 100% chiều rộng */
+.tabitem,
+[role="tabpanel"] {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  box-sizing: border-box !important;
 }
 
 /* ── Trang đăng nhập ─────────────────────────────────────────────────────
@@ -273,15 +308,28 @@ footer { display: none !important; }
    Đọc như màn hình chỉ báo của thiết bị: phiên khóa, thời hạn token, trạng
    thái chuỗi audit. tabular-nums để chữ số không nhảy khi đếm ngược. */
 #topbar {
+  display: grid !important;
+  grid-template-columns: max-content minmax(0, 1fr) max-content max-content max-content;
+  grid-template-areas: "brand user timer extend logout";
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
   min-height: var(--scap-rail-h);
   border: 1px solid #1e3a5f;
   border-radius: 10px;
-  padding: 0 18px;
+  padding: 8px 18px;
   background: linear-gradient(105deg, var(--scap-navy), #10284a 70%, #0f766e);
   align-items: center;
   gap: 16px;
   overflow: hidden;
   box-shadow: 0 14px 30px -22px rgba(15,23,42,.8);
+  box-sizing: border-box !important;
+}
+#topbar > * {
+  width: auto !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  margin: 0 !important;
 }
 #topbar .md p {
   margin: 0;
@@ -290,13 +338,24 @@ footer { display: none !important; }
   font-variant-numeric: tabular-nums;
   letter-spacing: .01em;
   color: #cbd5e1;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #topbar .md strong, #topbar .md code {
   color: #f8fafc; font-weight: 600; background: none; padding: 0;
 }
-#topbar button { font-size: 14px !important; }
-.app-wordmark { min-width: 170px; }
+#topbar button {
+  font-size: 13.5px !important;
+  width: clamp(120px, 12vw, 200px) !important;
+  white-space: nowrap !important;
+}
+#topbar > .topbar-brand {
+  grid-area: brand;
+  width: max-content !important;
+  overflow: visible !important;
+}
+.app-wordmark {
+  white-space: nowrap !important;
+}
 .app-wordmark .app-kicker {
   display: block; color: #5eead4; font-family: var(--font-mono); font-size: 10px;
   font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
@@ -305,6 +364,31 @@ footer { display: none !important; }
   display: block; margin-top: 2px; color: #fff; font-size: 15px; font-weight: 680;
   letter-spacing: .01em;
 }
+
+#topbar > .topbar-user {
+  grid-area: user;
+  min-width: 0 !important;
+  overflow: hidden !important;
+  padding: 0 !important;
+}
+#topbar .topbar-user p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#topbar > .topbar-timer {
+  grid-area: timer;
+  width: max-content !important;
+  overflow: visible !important;
+  padding: 0 !important;
+  white-space: nowrap !important;
+}
+#topbar .topbar-timer p {
+  color: #fcd34d;
+}
+#topbar > .topbar-extend { grid-area: extend; }
+#topbar > .topbar-logout { grid-area: logout; }
 
 /* ── Thẻ nội dung ──────────────────────────────────────────────────────── */
 .section-card {
@@ -430,13 +514,27 @@ footer { display: none !important; }
 #sec-verdict p, #sec-ids-verdict p { margin: 0; font-size: 15px; }
 
 /* ── Bố cục ngang ──────────────────────────────────────────────────────── */
-@media (min-width: 1000px) {
+@media (min-width: 1024px) {
   #chat-row { flex-wrap: nowrap !important; }
-  #topbar { flex-wrap: nowrap !important; }
 }
 @media (max-width: 999px) {
-  .gradio-container { padding: 14px 16px 36px !important; }
-  #topbar { padding: 12px 14px; }
+  .gradio-container > .main {
+    padding: 12px var(--scap-page-gutter) 32px !important;
+  }
+}
+@media (max-width: 820px) {
+  #topbar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "brand timer"
+      "user user"
+      "extend logout";
+    gap: 10px 12px;
+    padding: 10px 14px;
+  }
+  #topbar > .topbar-timer { justify-self: end; }
+  #topbar > .topbar-extend,
+  #topbar > .topbar-logout { width: 100% !important; }
 }
 /* Dưới 900px: thẻ bám sát mép trên để ô nhập đầu tiên luôn nằm trên nếp gấp
    màn hình điện thoại. */
@@ -726,6 +824,7 @@ def build_ui() -> gr.Blocks:
         # Defensive cleanup for any future file component. Current exports are
         # direct one-use URLs and never enter Gradio's cache.
         delete_cache=(60, 60),
+        fill_width=True,
     ) as demo:
         st_token = gr.State("")
         st_exp = gr.State(0.0)
@@ -827,16 +926,20 @@ def build_ui() -> gr.Blocks:
                         btn_mfa_cancel = gr.Button("Quay lại")
 
         # ============ ỨNG DỤNG ============
-        with gr.Column(visible=False) as app_sec:
+        with gr.Column(visible=False, elem_id="app-sec") as app_sec:
             with gr.Row(elem_id="topbar"):
-                _static_html(APP_WORDMARK_HTML)
-                md_banner = gr.Markdown("", elem_classes="md")
-                md_countdown = gr.Markdown("", elem_classes="md")
-                btn_extend = gr.Button("Gia hạn phiên", scale=0, size="sm")
-                btn_logout = gr.Button("Đăng xuất", scale=0, size="sm")
+                _static_html(APP_WORDMARK_HTML, elem_classes="topbar-brand")
+                md_banner = gr.Markdown("", elem_classes=["md", "topbar-user"])
+                md_countdown = gr.Markdown("", elem_classes=["md", "topbar-timer"])
+                btn_extend = gr.Button(
+                    "Gia hạn phiên", size="sm", elem_classes=["topbar-action", "topbar-extend"]
+                )
+                btn_logout = gr.Button(
+                    "Đăng xuất", size="sm", elem_classes=["topbar-action", "topbar-logout"]
+                )
             timer = gr.Timer(1, active=False)
 
-            with gr.Tabs():
+            with gr.Tabs(elem_id="workspace-tabs"):
                 # ---------- TRÒ CHUYỆN ----------
                 with gr.Tab("Trò chuyện"):
                     with gr.Row(elem_id="chat-row"):
@@ -910,7 +1013,7 @@ def build_ui() -> gr.Blocks:
                             )
                             chatbot = gr.Chatbot(
                                 label="Nội dung",
-                                height=600,
+                                height=CHAT_HISTORY_HEIGHT,
                                 avatar_images=AVATARS,
                                 buttons=["copy", "copy_all"],
                                 # Chat/provider output is untrusted.  Keep it as
@@ -1120,7 +1223,9 @@ def build_ui() -> gr.Blocks:
                             "Thời điểm",
                         ],
                         interactive=False,
-                        wrap=True,
+                        # Giữ nguyên audit ID/IP; bảng tự cuộn ngang khi màn hình
+                        # hẹp thay vì bẻ đôi định danh khiến dữ liệu khó đọc.
+                        wrap=False,
                         elem_classes="mono-df",
                     )
 

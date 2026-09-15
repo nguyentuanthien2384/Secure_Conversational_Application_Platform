@@ -90,6 +90,38 @@ def test_session_labels_carry_the_lock_marker():
     assert "🔒" in source, "Nhãn phiên hội thoại cần ổ khoá nhắc trạng thái mã hoá"
 
 
+def test_workspace_keeps_one_full_width_responsive_shell():
+    """Mọi tab phải dùng chung shell rộng và header không được tràn viewport."""
+    from src.app.gradio_ui import build_ui
+
+    source = UI_SOURCE.read_text(encoding="utf-8")
+    demo = build_ui()
+
+    assert demo.fill_width is True
+    assert "fill_width=True" in source
+    assert "--scap-shell" not in source
+    assert 'elem_id="app-sec"' in source
+    assert 'elem_id="workspace-tabs"' in source
+    assert 'grid-template-areas: "brand user timer extend logout"' in source
+    assert '"brand timer"' in source
+    assert '"extend logout"' in source
+    assert 'elem_classes=["topbar-action", "topbar-extend"]' in source
+    assert 'elem_classes=["topbar-action", "topbar-logout"]' in source
+    assert "wrap=False" in source
+
+
+def test_chat_history_height_keeps_composer_above_the_fold():
+    """Lịch sử chat phải co theo viewport thay vì đẩy nút Gửi khỏi màn hình."""
+    from src.app.gradio_ui import CHAT_HISTORY_HEIGHT, build_ui
+
+    demo = build_ui()
+    chatbots = [component for component in demo.blocks.values() if isinstance(component, gr.Chatbot)]
+
+    assert len(chatbots) == 1
+    assert CHAT_HISTORY_HEIGHT == "clamp(320px, calc(100dvh - 360px), 480px)"
+    assert chatbots[0].height == CHAT_HISTORY_HEIGHT
+
+
 def test_dashboard_uses_metric_cards_for_report_ready_security_overview():
     """Khoá lại bố cục KPI của tab Quản trị/Bảo mật để refactor không làm mất dashboard."""
     source = UI_SOURCE.read_text(encoding="utf-8")
