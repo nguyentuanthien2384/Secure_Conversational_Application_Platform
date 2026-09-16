@@ -238,7 +238,13 @@ def seed_demo_data(
     (brute-force và IDOR bị chặn) để cửa sổ IDS 60 phút luôn có kịch bản để
     trình diễn; không đụng đến dữ liệu hội thoại hay các sự kiện lịch sử.
     """
-    database.create_all()
+    # PostgreSQL schema changes belong to the owner-only migration service.
+    # The demo seed runs inside the least-privilege web process, so on an
+    # already-migrated PostgreSQL database it must only validate the schema.
+    if database.engine.dialect.name == "postgresql":
+        database.assert_schema_ready()
+    else:
+        database.create_all()
     with database.session_factory() as db:
         if reset:
             removed = 0

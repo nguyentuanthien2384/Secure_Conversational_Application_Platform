@@ -125,6 +125,33 @@ def test_chat_history_uses_viewport_bounded_height():
     assert chatbots[0].autoscroll is True
 
 
+def test_audit_table_refreshes_when_the_row_limit_changes():
+    """Đổi thanh hoặc ô số Số dòng phải tải lại dữ liệu audit."""
+    from src.app.gradio_ui import build_ui
+
+    demo = build_ui()
+    sliders = [
+        component
+        for component in demo.blocks.values()
+        if isinstance(component, gr.Slider) and component.label == "Số dòng"
+    ]
+    audit_tables = [
+        component
+        for component in demo.blocks.values()
+        if isinstance(component, gr.Dataframe)
+        and component.headers == ["#", "Sự kiện", "Kết quả", "Actor", "Đối tượng", "IP", "Thời điểm"]
+    ]
+
+    assert len(sliders) == 1
+    assert len(audit_tables) == 1
+    assert any(
+        (sliders[0]._id, "change") in dependency["targets"]
+        and sliders[0]._id in dependency["inputs"]
+        and audit_tables[0]._id in dependency["outputs"]
+        for dependency in demo.config["dependencies"]
+    )
+
+
 def test_dashboard_uses_metric_cards_for_report_ready_security_overview():
     """Khoá lại bố cục KPI của tab Quản trị/Bảo mật để refactor không làm mất dashboard."""
     source = UI_SOURCE.read_text(encoding="utf-8")

@@ -340,9 +340,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        if settings.environment == "production" and settings.database_url.startswith(
-            ("postgresql://", "postgresql+")
-        ):
+        # PostgreSQL always uses the one-shot owner migration service, including
+        # the local Docker overlay. The runtime role intentionally has no DDL
+        # permission, so asking it to run compatibility migrations on each
+        # development restart would make an already-migrated database fail.
+        if settings.database_url.startswith(("postgresql://", "postgresql+")):
             database.assert_schema_ready()
         else:
             database.create_all()

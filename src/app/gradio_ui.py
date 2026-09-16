@@ -2100,6 +2100,16 @@ def build_ui() -> gr.Blocks:
 
         btn_audit.click(_guard(load_audit, 1), [st_token, sl_audit], [df_audit])
         mod_tab.select(_guard(load_audit, 1), [st_token, sl_audit], [df_audit])
+        # Cả phần kéo và ô số đều là cùng một Slider. Phải tải lại bảng khi
+        # giá trị đổi, nếu không giao diện chỉ đổi con số cục bộ còn dữ liệu
+        # vẫn là lần tải trước đó.
+        sl_audit.change(
+            _guard(load_audit, 1),
+            [st_token, sl_audit],
+            [df_audit],
+            show_progress="hidden",
+            trigger_mode="always_last",
+        )
 
         # ---- TRUNG TÂM BẢO MẬT ----
         _SEV_ICON = {"high": "🔴 cao", "medium": "🟠 vừa", "low": "🟡 thấp"}

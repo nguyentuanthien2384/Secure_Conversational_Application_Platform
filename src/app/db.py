@@ -66,6 +66,9 @@ class Database:
         auth_session_columns = {
             column["name"] for column in inspector.get_columns("auth_sessions")
         }
+        auth_session_indexes = {
+            index["name"] for index in inspector.get_indexes("auth_sessions")
+        }
         chat_session_columns = {
             column["name"] for column in inspector.get_columns("chat_sessions")
         }
@@ -177,12 +180,16 @@ class Database:
                             "ALTER COLUMN session_family_id SET NOT NULL"
                         )
                     )
-            connection.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_auth_sessions_family_active "
-                    "ON auth_sessions (user_id, session_family_id, revoked_at)"
+            # Ứng dụng chạy dưới role ít quyền nên không được phép thực thi
+            # CREATE INDEX trên bảng do role migration sở hữu. Migrate service
+            # tạo index một lần; startup app chỉ kiểm tra và bỏ qua khi nó đã có.
+            if "ix_auth_sessions_family_active" not in auth_session_indexes:
+                connection.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_auth_sessions_family_active "
+                        "ON auth_sessions (user_id, session_family_id, revoked_at)"
+                    )
                 )
-            )
 
             # Conversation security policy and active envelope metadata.
             if "security_mode" not in chat_session_columns:
