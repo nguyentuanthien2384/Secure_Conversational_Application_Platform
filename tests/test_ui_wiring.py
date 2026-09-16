@@ -56,10 +56,11 @@ def test_stage_lists_and_reset_tuple_have_matching_arity():
     stage1 = len(_find_list_assign(body, "STAGE1").elts)
     stage2 = len(_find_list_assign(body, "STAGE2").elts)
     reset_len = _final_return_len(_find_func(body, "_reset_tuple"))
-    # RESET_OUTS = STAGE1 + STAGE2 + [md_countdown, st_warned]
-    assert reset_len == stage1 + stage2 + 2, (
+    # RESET_OUTS = STAGE1 + STAGE2 + [qr_html, tb_secret, md_countdown, st_warned]
+    assert reset_len == stage1 + stage2 + 4, (
         f"_reset_tuple trả {reset_len} giá trị nhưng RESET_OUTS cần "
-        f"{stage1 + stage2 + 2} (STAGE1={stage1}, STAGE2={stage2}, +countdown/warned)"
+        f"{stage1 + stage2 + 4} (STAGE1={stage1}, STAGE2={stage2}, "
+        "+QR/khóa tạm, +countdown/warned)"
     )
 
 
@@ -191,3 +192,33 @@ def test_export_download_button_never_caches_the_plaintext_response(monkeypatch)
     rendered = button.postprocess(capability)
     assert rendered is not None
     assert rendered.path == capability
+
+
+def test_totp_qr_is_inline_and_has_no_file_toolbar():
+    """2FA QR must stay in page memory, without a downloadable cache file."""
+    import base64
+
+    from src.app.gradio_ui import QR_DISPLAY_PX, _totp_qr_markup, build_ui
+    from src.app.security import TotpService
+
+    uri = TotpService().provisioning_uri("A" * 32, "demo.boss", "SCAP")
+    markup = _totp_qr_markup(uri, QR_DISPLAY_PX)
+    encoded = markup.split("data:image/png;base64,", 1)[1].split('"', 1)[0]
+    assert base64.b64decode(encoded).startswith(b"\x89PNG\r\n\x1a\n")
+    assert "gradio_cache" not in markup
+    assert "download" not in markup.lower()
+
+    demo = build_ui()
+    qr_panels = [
+        component
+        for component in demo.blocks.values()
+        if isinstance(component, gr.HTML)
+        and component.label == "Quét bằng ứng dụng xác thực"
+    ]
+    assert len(qr_panels) == 1
+    assert qr_panels[0].buttons == []
+    assert not any(
+        isinstance(component, gr.Image)
+        and component.label == "Quét bằng ứng dụng xác thực"
+        for component in demo.blocks.values()
+    ), "QR không được quay lại gr.Image (sẽ tạo tệp cache)"

@@ -513,6 +513,22 @@ footer { display: none !important; }
 }
 #sec-verdict p, #sec-ids-verdict p { margin: 0; font-size: 15px; }
 
+/* ── QR 2FA: ảnh nội tuyến, không có toolbar lưu/chia sẻ ──────────────── */
+.scap-totp-qr-panel { min-width: 0 !important; }
+.scap-totp-qr {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 352px; width: 100%; overflow: hidden;
+  border: 1px solid var(--scap-line); border-radius: 8px;
+  background: #fff;
+}
+.scap-totp-qr img {
+  display: block; width: min(352px, 100%); height: auto;
+  aspect-ratio: 1; image-rendering: pixelated; user-select: none;
+}
+@media (max-width: 820px) {
+  .scap-totp-qr { min-height: min(352px, 80vw); }
+}
+
 /* ── Bố cục ngang ──────────────────────────────────────────────────────── */
 @media (min-width: 1024px) {
   #chat-row { flex-wrap: nowrap !important; }
@@ -558,9 +574,8 @@ footer { display: none !important; }
 
 
 # ────────────────────────── API helper ──────────────────────────
-# Cạnh ô hiển thị mã QR. Ảnh được dựng đúng bằng số pixel này rồi mới đưa vào
-# gr.Image, để trình duyệt không phải co giãn — co giãn không nguyên lần làm nhoè
-# biên các module và là lý do chính khiến camera điện thoại không đọc được mã.
+# Cạnh ô hiển thị mã QR. Ảnh được dựng đúng bằng số pixel này rồi mới nhúng vào
+# trang — co giãn không nguyên lần làm nhoè biên module và khiến camera khó đọc.
 QR_DISPLAY_PX = 352
 
 
@@ -596,6 +611,32 @@ def _totp_qr_image(uri: str, target_px: int = QR_DISPLAY_PX):
         canvas.paste(image, (offset, offset))
         image = canvas
     return image
+
+
+def _totp_qr_markup(uri: str, target_px: int = QR_DISPLAY_PX) -> str:
+    """Return the QR as inline HTML instead of a Gradio-managed image file.
+
+    ``gr.Image`` post-processes PIL values into the Gradio cache directory.  That
+    is unnecessary for an enrollment QR and leaves a copy on the host running
+    the UI (as well as exposing download/share controls).  Encoding the already
+    generated PNG in a ``data:`` URL keeps it in the current page memory only;
+    the browser never receives a file path or a download action.
+    """
+    import base64
+    import io
+
+    image = _totp_qr_image(uri, target_px)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=False)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return (
+        '<div class="scap-totp-qr" role="img" '
+        'aria-label="Mã QR thiết lập xác thực hai lớp">'
+        f'<img src="data:image/png;base64,{encoded}" '
+        f'width="{target_px}" height="{target_px}" '
+        'alt="Mã QR thiết lập xác thực hai lớp" draggable="false">'
+        "</div>"
+    )
 
 
 def _api(token, method, path, body=None, *, params=None):
@@ -1113,18 +1154,22 @@ def build_ui() -> gr.Blocks:
                             btn_enroll = gr.Button("Bắt đầu thiết lập 2FA", size="sm")
                             with gr.Group(visible=False) as grp_mfa_setup:
                                 with gr.Row():
-                                    # height/width khớp đúng ảnh sinh ra (xem
-                                    # _totp_qr_image) nên tỉ lệ hiển thị là 1:1.
-                                    img_qr = gr.Image(
+                                    # QR được nhúng trực tiếp vào HTML để Gradio
+                                    # không ghi PNG tạm ra máy chạy giao diện.
+                                    qr_html = gr.HTML(
                                         label="Quét bằng ứng dụng xác thực",
-                                        height=QR_DISPLAY_PX,
-                                        width=QR_DISPLAY_PX,
+                                        show_label=True,
+                                        min_height=QR_DISPLAY_PX,
+                                        container=True,
+                                        padding=False,
                                         scale=1,
-                                        interactive=False,
+                                        elem_classes=["scap-totp-qr-panel"],
                                     )
                                     with gr.Column(scale=2):
                                         tb_secret = gr.Textbox(
-                                            label="Khóa thủ công", interactive=False
+                                            label="Khóa thủ công",
+                                            info="Chỉ dùng khi không quét được QR; sẽ xóa sau khi kích hoạt.",
+                                            interactive=False,
                                         )
                                         tb_activate = gr.Textbox(label="Mã 6 số", max_length=8)
                                         btn_activate = gr.Button(
@@ -1336,9 +1381,10 @@ def build_ui() -> gr.Blocks:
             dd_revoke,
             timer,
         ]
-        # st_warned nằm ở CUỐI danh sách một cách có chủ đích: các handler chỉ
-        # trả về STAGE1 (đăng nhập, xác minh MFA) không phải sửa gì thêm.
-        RESET_OUTS = STAGE1 + STAGE2 + [md_countdown, st_warned]
+        # Dữ liệu QR/khóa chỉ dùng trong lúc đăng ký; đưa chúng vào mọi luồng
+        # reset để đăng xuất, hết hạn phiên hoặc đổi mật khẩu đều xóa khỏi UI.
+        # st_warned vẫn nằm CUỐI danh sách vì _alive() giữ nguyên hai output này.
+        RESET_OUTS = STAGE1 + STAGE2 + [qr_html, tb_secret, md_countdown, st_warned]
 
         def _reset_tuple():
             return (
@@ -1366,6 +1412,8 @@ def build_ui() -> gr.Blocks:
                 [],
                 gr.update(choices=[], value=None),
                 gr.Timer(active=False),
+                gr.update(value="", visible=False),  # qr_html
+                "",  # tb_secret
                 "",
                 False,
             )
@@ -1879,24 +1927,24 @@ def build_ui() -> gr.Blocks:
         # ---- 2FA ----
         def mfa_enroll(token):
             data = _api(token, "POST", "/api/auth/mfa/enroll")
-            image = None
+            markup = ""
             try:
-                image = _totp_qr_image(data["provisioning_uri"], QR_DISPLAY_PX)
+                markup = _totp_qr_markup(data["provisioning_uri"], QR_DISPLAY_PX)
             except ImportError:
                 gr.Warning("Thiếu thư viện qrcode (chạy `uv sync`) — dùng khóa thủ công bên dưới.")
             except Exception:
                 gr.Warning("Không dựng được mã QR — hãy dùng khóa thủ công bên dưới.")
-            if image is not None:
-                gr.Info("Quét mã QR rồi nhập mã 6 số để kích hoạt.")
+            if markup:
+                gr.Info("Quét mã QR rồi nhập mã 6 số để kích hoạt. QR chỉ hiển thị tạm thời, không tạo tệp tải xuống.")
             else:
                 gr.Info("Nhập khóa thủ công vào ứng dụng xác thực, rồi nhập mã 6 số.")
             return (
                 gr.update(visible=True),
-                gr.update(value=image, visible=image is not None),
+                gr.update(value=markup, visible=bool(markup)),
                 data["secret"],
             )
 
-        btn_enroll.click(_guard(mfa_enroll, 3), [st_token], [grp_mfa_setup, img_qr, tb_secret])
+        btn_enroll.click(_guard(mfa_enroll, 3), [st_token], [grp_mfa_setup, qr_html, tb_secret])
 
         def mfa_activate(token, code):
             data = _api(token, "POST", "/api/auth/mfa/activate", {"code": (code or "").strip()})
@@ -1909,15 +1957,26 @@ def build_ui() -> gr.Blocks:
                 gr.update(visible=False),
                 gr.update(visible=True),
                 gr.update(visible=False),
+                gr.update(value="", visible=False),
+                "",
                 gr.update(value=recovery, visible=True),
                 "**2FA đang bật.**",
                 "",
             )
 
         btn_activate.click(
-            _guard(mfa_activate, 6),
+            _guard(mfa_activate, 8),
             [st_token, tb_activate],
-            [grp_mfa_enroll, grp_mfa_manage, grp_mfa_setup, md_recovery, md_mfa_state, tb_activate],
+            [
+                grp_mfa_enroll,
+                grp_mfa_manage,
+                grp_mfa_setup,
+                qr_html,
+                tb_secret,
+                md_recovery,
+                md_mfa_state,
+                tb_activate,
+            ],
         )
 
         def mfa_disable(token, password, code):
