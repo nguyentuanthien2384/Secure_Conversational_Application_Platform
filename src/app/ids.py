@@ -557,6 +557,7 @@ def _authentication_correlations(
             AuditEvent.actor_id,
             AuditEvent.outcome,
             AuditEvent.ip_address,
+            AuditEvent.created_at,
             func.coalesce(
                 func.sum(successful).over(
                     partition_by=AuditEvent.actor_id,
@@ -578,6 +579,7 @@ def _authentication_correlations(
     )
     failure_count = func.sum(case((ordered.c.outcome != "success", 1), else_=0))
     success_id = func.max(case((ordered.c.outcome == "success", ordered.c.id)))
+    success_at = func.max(case((ordered.c.outcome == "success", ordered.c.created_at)))
     episodes = (
         select(
             ordered.c.actor_id,
@@ -590,6 +592,7 @@ def _authentication_correlations(
                 ),
             ))).label("sources"),
             success_id.label("success_id"),
+            success_at.label("success_at"),
         )
         .group_by(ordered.c.actor_id, ordered.c.episode)
         .having(failure_count >= failure_threshold, success_id.is_not(None))
@@ -599,13 +602,13 @@ def _authentication_correlations(
         episodes,
         func.row_number().over(
             partition_by=episodes.c.actor_id,
-            order_by=episodes.c.success_id.desc(),
+            order_by=(episodes.c.success_at.desc(), episodes.c.success_id.desc()),
         ).label("rank"),
     ).subquery()
     sequences = db.execute(
         select(ranked.c.actor_id, ranked.c.failures, ranked.c.sources, ranked.c.success_id)
         .where(ranked.c.rank == 1)
-        .order_by(ranked.c.success_id.desc(), ranked.c.actor_id)
+        .order_by(ranked.c.success_at.desc(), ranked.c.success_id.desc(), ranked.c.actor_id)
         .limit(MAX_CORRELATION_FINDINGS)
     ).all()
     findings.extend(

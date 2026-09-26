@@ -416,7 +416,7 @@ _REGEX_RULES: tuple[_RegexRule, ...] = (
         re.compile(
             r"\b(?:password|passwd|passphrase|pwd|mật\s*khẩu|client[_ -]?secret|"
             r"private[_ -]?secret|secret)\s*(?:is|là)?\s*[:=]\s*"
-            r"(?P<value>\"(?:\\.|[^\"\r\n]){4,}\"|'(?:\\.|[^'\r\n]){4,}'|[^\s,;]{4,})",
+            r"(?P<value>\"(?:\\.|[^\"\\\r\n]){4,}\"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;]{4,})",
             _FLAGS,
         ),
         DataClass.HIGHLY_CONFIDENTIAL,
@@ -452,7 +452,7 @@ _REGEX_RULES: tuple[_RegexRule, ...] = (
         re.compile(
             r"\b(?:api[_ -]?key|x-api-key|access[_ -]?token|refresh[_ -]?token|"
             r"auth[_ -]?token|google[_ -]?api[_ -]?key)\s*[:=]\s*"
-            r"(?P<value>\"(?:\\.|[^\"\r\n]){6,}\"|'(?:\\.|[^'\r\n]){6,}'|[^\s,;]{6,})",
+            r"(?P<value>\"(?:\\.|[^\"\\\r\n]){6,}\"|'(?:\\.|[^'\\\r\n]){6,}'|[^\s,;]{6,})",
             _FLAGS,
         ),
         DataClass.HIGHLY_CONFIDENTIAL,
@@ -577,7 +577,7 @@ MAX_DECODED_VIEWS = 512
 _PERCENT_RUN_RE = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
 _HTML_ENTITY_RE = re.compile(r"&(?:#[xX][0-9A-Fa-f]{1,8}|#[0-9]{1,10}|[A-Za-z][A-Za-z0-9]{1,31});")
 _BASE64_RE = re.compile(
-    r"(?<![A-Za-z0-9+/_-])(?P<value>[A-Za-z0-9+/_-]{16,}={0,2})"
+    r"(?<![A-Za-z0-9+/_-])(?P<value>[A-Za-z0-9+/_-]{6,}={0,2})"
     r"(?![A-Za-z0-9+/_=-])"
 )
 
@@ -623,7 +623,16 @@ def _decode_escapes(view: _InspectionView, *, entities: bool) -> _InspectionView
         return None
     chunks.append(view.text[cursor:])
     origins.extend(view.origins[cursor:])
-    return _InspectionView("".join(chunks), tuple(origins), view.depth + 1)
+    decoded_text = "".join(chunks)
+    canonical = normalize_text(decoded_text)
+    if canonical != decoded_text:
+        # A combining mark decoded from an entity may compose with an adjacent
+        # plain character. Inspect the fully normalized view. When composition
+        # changes offsets, conservatively redact the whole source view rather
+        # than guessing a narrower span and risking a partial disclosure.
+        source = (origins[0][0], origins[-1][1])
+        origins = [source] * len(canonical)
+    return _InspectionView(canonical, tuple(origins), view.depth + 1)
 
 
 def _decoded_views(view: _InspectionView) -> Iterable[_InspectionView]:
@@ -736,7 +745,16 @@ class DLPScanner:
 
     def _dictionary_spans(self, text: str) -> list[_DetectedSpan]:
         spans: list[_DetectedSpan] = []
+        if not self._custom_dictionaries:
+            return spans
         folded_text = text.casefold()
+        # Casefold can expand one source character (ß -> ss, İ -> i + dot).
+        # Search on folded text, then map back before redaction or decoded-view
+        # mapping. Using folded offsets on the original text leaks suffixes and
+        # can index beyond the source when an expansion precedes a match.
+        folded_origins = [
+            index for index, char in enumerate(text) for _ in char.casefold()
+        ]
         for dictionary in self._custom_dictionaries:
             # A short opaque detector id distinguishes dictionaries without
             # putting a potentially sensitive dictionary name in reports.
@@ -762,8 +780,8 @@ class DLPScanner:
                             continue
                     spans.append(
                         _DetectedSpan(
-                            start,
-                            end,
+                            folded_origins[start],
+                            folded_origins[end - 1] + 1,
                             FindingType.CUSTOM_DICTIONARY,
                             detector_id,
                             dictionary.data_class,

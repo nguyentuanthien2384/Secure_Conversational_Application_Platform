@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from src.app.audit import client_ip, record_audit, safe_user_agent
 from src.app.audit_chain import append_lock, derive_audit_key, seal_event, verify_chain
 from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
+from src.app.browser_security import browser_request_denial
 from src.app.config import Settings
 from src.app.db import Database, utcnow
 from src.app.e2ee import (
@@ -508,6 +509,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         request.state.request_id = request_id
 
+        origin_denial = browser_request_denial(request, settings.allowed_origins)
+        if origin_denial is not None:
+            # Bound telemetry for unauthenticated browser denials without
+            # persisting headers, URL paths, credentials, or request bodies.
+            source_allowed, _ = auth_audit_limiter.allow(
+                f"browser-origin:source:{client_ip(request)}", 10, 60
+            )
+            if source_allowed:
+                global_allowed, _ = auth_audit_limiter.allow("browser-origin:global", 100, 60)
+                if global_allowed:
+                    emit_security_event(
+                        "browser.origin.denied",
+                        outcome="denied",
+                        source_ip=client_ip(request),
+                        request_id=request_id,
+                        details={"reason": origin_denial},
+                    )
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Nguồn yêu cầu trình duyệt không được cho phép."},
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Frame-Options": "DENY",
+                    "Cache-Control": "no-store",
+                    "Referrer-Policy": "no-referrer",
+                    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+                    "Vary": "Origin, Sec-Fetch-Site",
+                },
+            )
+
         if _is_disabled_gradio_file_request(request.scope["path"]):
             # Return 404 rather than advertising an unused file-processing
             # surface. Do this before IDS/audit so attacker-controlled remote
@@ -639,6 +671,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
 
         response = await call_next(request)
+        response.headers.add_vary_header("Origin")
+        response.headers.add_vary_header("Sec-Fetch-Site")
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -1003,6 +1037,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details={"reason": reason},
             )
 
+    def auth_session_expiry_reason(auth_session: AuthSession, now: datetime) -> str | None:
+        """Use one policy for bearer requests, rotation and export capabilities."""
+        if now >= as_utc(auth_session.expires_at):
+            return "token_lifetime_exceeded"
+        root = as_utc(auth_session.root_issued_at or auth_session.issued_at)
+        if now >= root + timedelta(hours=settings.session_absolute_hours):
+            return "absolute_lifetime_exceeded"
+        activity = as_utc(auth_session.last_activity_at or auth_session.issued_at)
+        if now >= activity + timedelta(minutes=settings.session_idle_minutes):
+            return "idle_timeout"
+        return None
+
+    def expire_auth_session(
+        db: Session, request: Request, auth_session: AuthSession, reason: str, now: datetime
+    ) -> None:
+        """Persist expiry while the account and active-session locks are held."""
+        auth_session.revoked_at = now
+        if db.get(RevokedToken, auth_session.jti) is None:
+            db.add(RevokedToken(
+                jti=auth_session.jti,
+                user_id=auth_session.user_id,
+                expires_at=auth_session.expires_at,
+                reason=reason,
+            ))
+        db.commit()
+        record_audit(
+            db, request, "auth.session.expired", actor_id=auth_session.user_id,
+            target_type="auth_session", target_id=auth_session.jti,
+            outcome="denied", details={"reason": reason},
+        )
+
     def current_user(
         request: Request,
         credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer)],
@@ -1032,53 +1097,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             audit_access_denial(db, request, "inactive_session")
             raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
 
-        # Enforce both server-side session bounds on every authenticated request.
-        # JWT expiry alone is insufficient because a client can keep rotating a
-        # valid token in the background.  Keycloak calls these Session Idle and
-        # Session Max; keeping the timestamps in AuthSession also lets operators
-        # revoke one device without invalidating every device.
-        now = utcnow()
-        root_issued_at = as_utc(auth_session.root_issued_at or auth_session.issued_at)
-        last_activity_at = as_utc(auth_session.last_activity_at or auth_session.issued_at)
-        idle_deadline = last_activity_at + timedelta(minutes=settings.session_idle_minutes)
-        absolute_deadline = root_issued_at + timedelta(hours=settings.session_absolute_hours)
-        deadline_reason = (
-            "absolute_lifetime_exceeded" if now >= absolute_deadline
-            else "idle_timeout" if now >= idle_deadline
-            else None
-        )
-        if deadline_reason is not None:
-            auth_session.revoked_at = now
-            if db.get(RevokedToken, auth_session.jti) is None:
-                db.add(RevokedToken(
-                    jti=auth_session.jti,
-                    user_id=user.id,
-                    expires_at=auth_session.expires_at,
-                    reason=deadline_reason,
-                ))
-            db.commit()
-            record_audit(
-                db,
-                request,
-                "auth.session.expired",
-                actor_id=user.id,
-                target_type="auth_session",
-                target_id=auth_session.jti,
-                outcome="denied",
-                details={"reason": deadline_reason},
-            )
-            raise HTTPException(status_code=401, detail="Phiên đăng nhập đã hết hạn; vui lòng đăng nhập lại.")
-
-        # Authentication metadata endpoints should not be able to keep an idle
-        # session alive merely through polling.  The actual protected operation
-        # advances the timestamp after its deadline check.
+        # Polling and token rotation cannot keep an abandoned login alive.
+        # Logout also leaves activity untouched; its endpoint must still revoke
+        # a successor when a concurrent refresh wins the account lock first.
         metadata_path = request.url.path in {
             "/api/auth/me",
             "/api/auth/sessions",
             "/api/auth/refresh",
+            "/api/auth/logout",
         }
-        if not metadata_path:
-            auth_session.last_activity_at = now
+        if not metadata_path or auth_session_expiry_reason(auth_session, utcnow()) is not None:
+            # Re-read under the same account -> session lock order used by
+            # refresh/revocation. Never overwrite a concurrent revocation or
+            # revive a session which expired while waiting for the lock.
+            if lock_user_row(db, user) is None or payload.get("ver") != user.token_version:
+                raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+            auth_session = lock_auth_session_row(db, str(payload["jti"]), user.id)
+            if auth_session is None or db.get(RevokedToken, str(payload["jti"])) is not None:
+                raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
+            now = utcnow()
+            reason = auth_session_expiry_reason(auth_session, now)
+            if reason is not None:
+                expire_auth_session(db, request, auth_session, reason, now)
+                raise HTTPException(
+                    status_code=401,
+                    detail="Phiên đăng nhập đã hết hạn; vui lòng đăng nhập lại.",
+                )
+            if not metadata_path:
+                # max also preserves monotonicity if a worker's clock moves back.
+                auth_session.last_activity_at = max(
+                    now, as_utc(auth_session.last_activity_at or auth_session.issued_at)
+                )
             db.commit()
         return user
 
@@ -2298,31 +2347,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Token đã được xoay hoặc thu hồi; vui lòng đăng nhập lại.",
             )
 
-        root_issued_at = old_session.root_issued_at or old_session.issued_at
-        if root_issued_at is not None and root_issued_at.tzinfo is None:
-            root_issued_at = root_issued_at.replace(tzinfo=timezone.utc)
-
         now = utcnow()
-        if root_issued_at is not None:
-            age = now - root_issued_at
-            if age > timedelta(hours=settings.session_absolute_hours):
-                record_audit(
-                    db,
-                    request,
-                    "auth.session.refresh",
-                    actor_id=user.id,
-                    outcome="denied",
-                    target_type="user",
-                    target_id=user.id,
-                    details={"reason": "absolute_lifetime_exceeded"},
-                )
-                raise HTTPException(
-                    status_code=401,
-                    detail=(
-                        f"Phiên đã vượt quá thời hạn tối đa "
-                        f"{settings.session_absolute_hours} giờ. Vui lòng đăng nhập lại."
-                    ),
-                )
+        # The dependency ran before taking either lock. Recheck all deadlines
+        # after waiting so a concurrent operation cannot stretch the idle bound.
+        reason = auth_session_expiry_reason(old_session, now)
+        if reason is not None:
+            expire_auth_session(db, request, old_session, reason, now)
+            raise HTTPException(
+                status_code=401,
+                detail="Phiên đăng nhập đã hết hạn; vui lòng đăng nhập lại.",
+            )
+        root_issued_at = as_utc(old_session.root_issued_at or old_session.issued_at)
 
         token = issue_access_session(
             db,
@@ -2992,40 +3027,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=410, detail="Vé tải xuống đã được sử dụng.")
         user = db.get(User, str(claims["sub"]))
         parent_jti = str(claims["parent_jti"])
-        parent_session = db.get(AuthSession, parent_jti)
-        parent_expiry = parent_session.expires_at if parent_session is not None else None
-        now = utcnow()
-        parent_idle_expiry = None
-        parent_absolute_expiry = None
-        if parent_session is not None:
-            parent_last_activity = as_utc(
-                parent_session.last_activity_at or parent_session.issued_at
-            )
-            parent_root_issued = as_utc(
-                parent_session.root_issued_at or parent_session.issued_at
-            )
-            parent_idle_expiry = parent_last_activity + timedelta(
-                minutes=settings.session_idle_minutes
-            )
-            parent_absolute_expiry = parent_root_issued + timedelta(
-                hours=settings.session_absolute_hours
-            )
         if (
             user is None
-            or not user.is_active
+            or lock_user_row(db, user) is None
             or int(claims["ver"]) != user.token_version
-            or parent_session is None
-            or parent_session.user_id != user.id
-            or parent_session.revoked_at is not None
-            or parent_expiry is None
-            or as_utc(parent_expiry) <= now
-            or parent_idle_expiry is None
-            or parent_idle_expiry <= now
-            or parent_absolute_expiry is None
-            or parent_absolute_expiry <= now
+        ):
+            raise HTTPException(status_code=404, detail="Vé tải xuống không hợp lệ.")
+        # Serialize capability consumption with rotation/logout; inspecting a
+        # cached parent before this lock can otherwise miss a revoked successor.
+        parent_session = lock_auth_session_row(db, parent_jti, user.id)
+        now = utcnow()
+        if (
+            parent_session is None
+            or datetime.fromtimestamp(int(claims["exp"]), tz=timezone.utc) <= now
             or db.get(RevokedToken, parent_jti) is not None
         ):
             raise HTTPException(status_code=404, detail="Vé tải xuống không hợp lệ.")
+        reason = auth_session_expiry_reason(parent_session, now)
+        if reason is not None:
+            expire_auth_session(db, request, parent_session, reason, now)
+            raise HTTPException(status_code=404, detail="Vé tải xuống không hợp lệ.")
+        if db.get(RevokedToken, ticket_jti) is not None:
+            raise HTTPException(status_code=410, detail="Vé tải xuống đã được sử dụng.")
         row = db.scalar(
             select(ChatSession).where(
                 ChatSession.id == str(claims["sid"]),

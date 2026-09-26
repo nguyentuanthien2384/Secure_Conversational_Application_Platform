@@ -181,8 +181,15 @@ class SecurityMaintenance:
             subject_hash = hashlib.sha256((anomaly.subject or "").encode()).hexdigest()
             # Rising counts alone do not produce alert storms. A severity
             # escalation gets a fresh alert even within the suppression window.
+            # A different completed-login episode is also a new actionable
+            # occurrence; re-scanning the same success remains deduplicated.
+            occurrence = (
+                anomaly.evidence_event_id
+                if anomaly.code == "IDS-AUTH-SUCCESS-AFTER-FAILURES"
+                else ""
+            )
             fingerprint = hashlib.sha256(
-                f"{anomaly.code}:{anomaly.severity}:{subject_hash}".encode()
+                f"{anomaly.code}:{anomaly.severity}:{subject_hash}:{occurrence}".encode()
             ).hexdigest()
             if not self._claim_alert(fingerprint):
                 continue

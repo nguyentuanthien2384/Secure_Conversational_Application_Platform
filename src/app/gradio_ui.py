@@ -756,7 +756,9 @@ def _devices_snapshot(token):
             (row.get("user_agent") or "Không rõ")[:60],
             row.get("ip_address") or "—",
             _fmt(row["issued_at"]),
-            _fmt(row["expires_at"]),
+            _fmt(row["last_activity_at"]),
+            _fmt(row["idle_expires_at"]),
+            _fmt(row["absolute_expires_at"]),
         ]
         for row in rows
     ]
@@ -1190,10 +1192,16 @@ def build_ui() -> gr.Blocks:
                                 "Thiết bị / trình duyệt",
                                 "IP",
                                 "Đăng nhập lúc",
-                                "Hết hạn",
+                                "Hoạt động gần nhất",
+                                "Hết hạn nếu không hoạt động",
+                                "Giới hạn phiên tối đa",
                             ],
                             interactive=False,
                             wrap=True,
+                        )
+                        gr.Markdown(
+                            "Làm mới danh sách hoặc gia hạn token không kéo dài thời hạn không hoạt động. "
+                            "Các mốc trong bảng được kiểm tra ở máy chủ."
                         )
                         with gr.Row():
                             dd_revoke = gr.Dropdown(label="Phiên cần thu hồi", choices=[], scale=3)

@@ -8,20 +8,6 @@ Phần nhận xét của giảng viên ở trang PDF 3 đánh giá tính thực 
 triển khai, không liệt kê lỗi của SCAP. Các đề xuất kỹ thuật dưới đây được rút ra
 từ nội dung báo cáo, rồi kiểm chứng trên mã nguồn SCAP.
 
-## Đối chiếu với dự án và hướng dẫn thực tế
-
-- Vòng đời phiên dùng hai mốc idle/max theo mô hình [Keycloak Session
-  Timeout](https://www.keycloak.org/docs/latest/server_admin/#_timeouts), nhưng
-  được thực thi ở `AuthSession` phía server để refresh token không gia hạn ngầm.
-- DLP kiểm tra nội dung bị biến đổi theo cách tiếp cận converter/encoded-content
-  của [Microsoft PyRIT](https://microsoft.github.io/PyRIT/0.13.0/api/pyrit-prompt-converter/)
-  và nguyên tắc xác thực đầu ra của [OWASP LLM05: Improper Output
-  Handling](https://genai.owasp.org/llmrisk/llm052025-improper-output-handling/).
-  Đây là detector có giới hạn, không phải cam kết phát hiện mọi mã hóa tùy ý.
-- Tương quan IDS theo chuỗi thời gian và nhiều nguồn lấy cảm hứng từ cách
-  [Wazuh biểu diễn frequency/timeframe và same/different field](https://documentation.wazuh.com/current/user-manual/ruleset/ruleset-xml-syntax/rules.html);
-  các cảnh báo giữ số lượng, ID bằng chứng và nhãn ATT&CK thay vì sao chép payload.
-
 - Mục **3.4.4**, trang in **75** / trang PDF **97**: giới hạn của dò mẫu trước
   mã hoá nhiều lớp và chi phí xử lý khi tải cao. SCAP bổ sung chuẩn hoá có giới
   hạn, kiểm tra toàn bộ đường dẫn và kiểm soát kích thước yêu cầu thực nhận.
@@ -33,6 +19,13 @@ từ nội dung báo cáo, rồi kiểm chứng trên mã nguồn SCAP.
   tình huống → đối chiếu bằng chứng → xuất kết quả → dọn môi trường**, phù hợp
   ứng dụng FastAPI hiện tại. Các thao tác tấn công hệ điều hành trong PDF không
   được chạy trên máy hoặc dữ liệu đang sử dụng.
+
+## Nâng cấp theo các dự án thực tế
+
+Đợt phát triển tiếp theo bổ sung quản lý phiên idle/max, DLP kiểm tra mã hóa nhiều
+lớp, tương quan đăng nhập phân tán và kiểm tra nguồn trình duyệt. Nguồn tham khảo,
+cấu hình, migration, giới hạn và tình huống kiểm chứng nằm tại
+[ADVANCED_SECURITY.md](ADVANCED_SECURITY.md).
 
 ## Các thay đổi thực tế
 

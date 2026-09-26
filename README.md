@@ -6,6 +6,10 @@ bảo mật API/audit/IDS và tác vụ bảo mật định kỳ. Xem
 [hướng dẫn bảo mật và tự động hoá](docs/SECURITY_AUTOMATION.md) để chạy kiểm chứng,
 bật lịch kiểm tra và đối chiếu từng thay đổi với nội dung PDF.
 
+Đợt nâng cấp tiếp theo bổ sung thời hạn không hoạt động của phiên, DLP kiểm tra
+mã hóa nhiều lớp, tương quan đăng nhập phân tán và chặn yêu cầu trình duyệt từ
+nguồn không tin cậy. Xem [nguồn tham khảo và cách vận hành](docs/ADVANCED_SECURITY.md).
+
 > **Đồ án môn học:** Bảo mật Ứng dụng và Hệ thống
 > **Kiến trúc:** FastAPI + Gradio 6 + envelope encryption (Vault/KMS) + DLP phân loại + E2EE ciphertext relay + audit anchor/WORM + IDS/IPS
 
@@ -224,8 +228,10 @@ không bao giờ gọi AI phía server.
   số nguồn và nhãn ATT&CK; tác vụ định kỳ phát cảnh báo quan sát, không tự khóa người dùng.
 - Điểm rủi ro tích lũy (high=3 / medium=2 / low=1); vượt `IDS_BLOCK_THRESHOLD` thì **chặn nguồn**
   `IDS_BLOCK_SECONDS` và trả 403 kèm `Retry-After`.
-- Middleware cố ý **không đọc body**: buffer body ở middleware sẽ phá streaming và tạo primitive
-  khuếch đại bộ nhớ cho kẻ tấn công.
+- IDS quét URL/header; lớp giới hạn yêu cầu riêng chỉ giữ tối đa 1 MiB body trong
+  RAM trước khi phân tích. Phản hồi streaming không bị buffer.
+- Yêu cầu trình duyệt thay đổi trạng thái phải vượt qua kiểm tra `Origin` và
+  `Sec-Fetch-Site`, kể cả các route Gradio; nguồn chéo phải có trong `ALLOWED_ORIGINS`.
 
 ### 4.5 Audit chống giả mạo & SIEM
 - `entry_hash = HMAC-SHA256(audit_key, prev_hash ‖ canonical(entry))`, `audit_key` dẫn xuất từ
