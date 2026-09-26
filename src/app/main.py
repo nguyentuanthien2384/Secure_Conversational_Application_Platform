@@ -59,6 +59,7 @@ from src.app.key_management import (
     LocalAesKeyProvider,
     VaultTransitKeyProvider,
 )
+from src.app.maintenance import SecurityMaintenance
 from src.app.models import (
     AuditEvent,
     AuthSession,
@@ -73,6 +74,7 @@ from src.app.models import (
     SecureMessage,
     User,
 )
+from src.app.request_limits import RequestLimitsMiddleware
 from src.app.retention import enforce_retention
 from src.app.schemas import (
     AdminCreateUser,
@@ -313,6 +315,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     mfa_limiter = limiter_type(*limiter_args)
     password_change_limiter = limiter_type(*limiter_args)
     refresh_limiter = limiter_type(*limiter_args)
+    auth_audit_limiter = limiter_type(*limiter_args)
     totp_service = TotpService()
     chat_service = ChatService(envelope_crypto_service, AIService(settings))
     # Structured JSON security log on stdout for SIEM ingestion (Bài 7 §SIEM).
@@ -336,6 +339,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if settings.audit_chain_enabled
         else None
+    )
+    maintenance = SecurityMaintenance(
+        settings,
+        session_factory=database.session_factory,
+        checkpoint_service=audit_checkpoint_service,
+        clear_crypto_cache=envelope_crypto_service.clear_cache,
     )
 
     @asynccontextmanager
@@ -441,9 +450,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 refresh_telemetry=True,
                 log=logger.info,
             )
-        yield
-        envelope_crypto_service.clear_cache()
-        database.engine.dispose()
+        maintenance.start()
+        try:
+            yield
+        finally:
+            await maintenance.stop()
+            envelope_crypto_service.clear_cache()
+            database.engine.dispose()
 
     app = FastAPI(
         title=settings.app_name,
@@ -465,6 +478,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.intrusion_state = intrusion_state
     app.state.audit_key = audit_key
     app.state.audit_checkpoint_service = audit_checkpoint_service
+    app.state.security_maintenance = maintenance
 
     # Reject requests whose Host header is not explicitly allowed. This blocks
     # Host-header injection and DNS-rebinding attacks. Enabled whenever
@@ -494,7 +508,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         request.state.request_id = request_id
 
-        if _is_disabled_gradio_file_request(request.url.path):
+        if _is_disabled_gradio_file_request(request.scope["path"]):
             # Return 404 rather than advertising an unused file-processing
             # surface. Do this before IDS/audit so attacker-controlled remote
             # URLs never enter telemetry and no network fetch can begin.
@@ -508,22 +522,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 },
             )
 
-        content_length = request.headers.get("content-length")
-        if content_length and content_length.isdigit() and int(content_length) > 1_048_576:
-            return JSONResponse(
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                content={"detail": "Request body vượt quá 1 MiB."},
-                headers={"X-Request-ID": request_id},
-            )
-
         # ── IDS/IPS: inspect before the request reaches any handler ──
-        # Only the URL and headers are inspected here. The body is intentionally
-        # NOT buffered: reading it in middleware would break streaming and give
-        # an attacker a memory-amplification primitive. Body-level validation is
-        # already handled structurally by Pydantic + the ORM.
+        # Only URL and headers are signature-scanned. The outer request guard
+        # bounds actual body bytes before Pydantic parses them.
         if settings.ids_enabled:
             source_ip = client_ip(request)
-            safe_request_path = _audit_safe_path(request.url.path)
+            safe_request_path = _audit_safe_path(request.scope["path"])
             blocked, retry_after = intrusion_state.is_blocked(source_ip)
             if blocked:
                 emit_security_event(
@@ -540,7 +544,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
 
             detections: list[Detection] = []
-            surface = f"{safe_request_path}?{request.url.query}"
+            # Scan the complete path; sanitize only the metadata we retain.
+            # ASGI path is already decoded. Re-parsing it as a URL would treat
+            # an encoded '#' in the path as a fragment and omit its suffix.
+            raw_query = request.scope.get("query_string", b"").decode("latin-1")
+            surface = f"{request.scope['path']}?{raw_query}"
             for rule_id, severity, description, evidence in scan_text(surface):
                 detections.append(
                     Detection(
@@ -569,7 +577,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         evidence_sha256=evidence_fingerprint(user_agent[:120]),
                     )
                 )
-            if DECOY_PATHS.search(request.url.path):
+            if DECOY_PATHS.search(request.scope["path"]):
                 detections.append(
                     Detection(
                         rule_id="RECON-001",
@@ -579,7 +587,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         source_ip=source_ip,
                         path=safe_request_path,
                         method=request.method,
-                        evidence_sha256=evidence_fingerprint(request.url.path[:120]),
+                        evidence_sha256=evidence_fingerprint(request.scope["path"][:120]),
                     )
                 )
 
@@ -683,6 +691,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
+
+    app.add_middleware(RequestLimitsMiddleware)
 
     @app.post("/api/security/csp-report", status_code=status.HTTP_204_NO_CONTENT)
     async def receive_csp_report(request: Request) -> Response:
@@ -972,15 +982,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
 
+    def audit_access_denial(
+        db: Session, request: Request, reason: str, *,
+        event_type: str = "auth.access.denied", actor_id: str | None = None,
+    ) -> None:
+        # Persist a bounded sample per source and across the deployment. This
+        # gives correlation evidence without allowing unauthenticated traffic
+        # to create an unbounded stream of database writes.
+        per_source, _ = auth_audit_limiter.allow(
+            f"auth-audit:source:{client_ip(request)}", max_attempts=10, window_seconds=60
+        )
+        if not per_source:
+            return
+        global_allowed, _ = auth_audit_limiter.allow(
+            "auth-audit:global", max_attempts=100, window_seconds=60
+        )
+        if global_allowed:
+            record_audit(
+                db, request, event_type, outcome="denied", actor_id=actor_id,
+                details={"reason": reason},
+            )
+
     def current_user(
+        request: Request,
         credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer)],
         db: Annotated[Session, Depends(get_db)],
     ) -> User:
         if credentials is None or credentials.scheme.lower() != "bearer":
+            audit_access_denial(db, request, "missing_credentials")
             raise HTTPException(status_code=401, detail="Yêu cầu xác thực.")
         try:
             payload = token_service.decode(credentials.credentials)
         except jwt.PyJWTError as exc:
+            audit_access_denial(db, request, "invalid_token")
             raise HTTPException(
                 status_code=401, detail="Token không hợp lệ hoặc đã hết hạn."
             ) from exc
@@ -995,20 +1029,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             or auth_session.revoked_at is not None
             or db.get(RevokedToken, payload.get("jti")) is not None
         ):
+            audit_access_denial(db, request, "inactive_session")
             raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
         return user
 
-    def admin_user(user: Annotated[User, Depends(current_user)]) -> User:
+    def admin_user(
+        user: Annotated[User, Depends(current_user)], request: Request,
+        db: Annotated[Session, Depends(get_db)],
+    ) -> User:
         if user.role != "admin":
+            audit_access_denial(db, request, "admin_role_required", event_type="authorization.denied", actor_id=user.id)
             raise HTTPException(status_code=403, detail="Không đủ quyền truy cập.")
         if settings.security_profile == "high" and not user.mfa_enabled:
+            audit_access_denial(db, request, "privileged_mfa_required", event_type="authorization.denied", actor_id=user.id)
             raise HTTPException(status_code=403, detail="Tài khoản quản trị bắt buộc bật MFA.")
         return user
 
-    def moderator_or_admin(user: Annotated[User, Depends(current_user)]) -> User:
+    def moderator_or_admin(
+        user: Annotated[User, Depends(current_user)], request: Request,
+        db: Annotated[Session, Depends(get_db)],
+    ) -> User:
         if user.role not in ("moderator", "admin"):
+            audit_access_denial(db, request, "privileged_role_required", event_type="authorization.denied", actor_id=user.id)
             raise HTTPException(status_code=403, detail="Không đủ quyền truy cập.")
         if settings.security_profile == "high" and not user.mfa_enabled:
+            audit_access_denial(db, request, "privileged_mfa_required", event_type="authorization.denied", actor_id=user.id)
             raise HTTPException(status_code=403, detail="Tài khoản đặc quyền bắt buộc bật MFA.")
         return user
 
@@ -4233,6 +4278,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "total_messages": total_messages,
             "recent_login_failures": recent_login_failures,
             "recent_auth_denials": recent_auth_denials,
+        }
+
+    @app.get("/api/admin/security/maintenance")
+    def security_maintenance_status(_: Annotated[User, Depends(admin_user)]):
+        return {
+            "enabled": settings.security_maintenance_enabled,
+            "retention_enabled": settings.security_maintenance_retention_enabled,
+            "interval_seconds": settings.security_maintenance_interval_seconds,
+            "last_result": maintenance.last_result,
         }
 
     @app.get("/api/admin/security-alerts", response_model=list[SecurityAlertResponse])

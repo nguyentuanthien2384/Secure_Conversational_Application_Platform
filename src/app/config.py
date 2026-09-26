@@ -221,6 +221,12 @@ class Settings:
     audit_max_unanchored_events: int = 100
     audit_worm_probe_interval_seconds: int = 300
     retention_sweep_on_startup: bool = True
+    # Periodic maintenance is opt-in; deletion requires a second explicit flag.
+    security_maintenance_enabled: bool = False
+    security_maintenance_interval_seconds: int = 300
+    security_maintenance_batch_size: int = 500
+    security_maintenance_retention_enabled: bool = False
+    security_maintenance_anomaly_window_minutes: int = 60
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -457,6 +463,19 @@ class Settings:
                 raise RuntimeError(f"{name} phải là số nguyên dương.")
         if numeric_limits["AUDIT_MAX_UNANCHORED_EVENTS"] < 0:
             raise RuntimeError("AUDIT_MAX_UNANCHORED_EVENTS không được âm.")
+        maintenance_limits = {
+            "SECURITY_MAINTENANCE_INTERVAL_SECONDS": (300, 10, 86_400),
+            "SECURITY_MAINTENANCE_BATCH_SIZE": (500, 1, 5_000),
+            "SECURITY_MAINTENANCE_ANOMALY_WINDOW_MINUTES": (60, 1, 1_440),
+        }
+        for name, (default, minimum, maximum) in maintenance_limits.items():
+            try:
+                value = int(os.getenv(name, str(default)))
+            except ValueError as exc:
+                raise RuntimeError(f"{name} phải là số nguyên.") from exc
+            if not minimum <= value <= maximum:
+                raise RuntimeError(f"{name} phải nằm trong khoảng {minimum} đến {maximum}.")
+            numeric_limits[name] = value
         if security_profile == "high":
             if numeric_limits["AUDIT_CHECKPOINT_INTERVAL"] != 1:
                 raise RuntimeError(
@@ -574,4 +593,15 @@ class Settings:
                 "AUDIT_WORM_PROBE_INTERVAL_SECONDS"
             ],
             retention_sweep_on_startup=_bool_env("RETENTION_SWEEP_ON_STARTUP", True),
+            security_maintenance_enabled=_bool_env("SECURITY_MAINTENANCE_ENABLED", False),
+            security_maintenance_interval_seconds=numeric_limits[
+                "SECURITY_MAINTENANCE_INTERVAL_SECONDS"
+            ],
+            security_maintenance_batch_size=numeric_limits["SECURITY_MAINTENANCE_BATCH_SIZE"],
+            security_maintenance_retention_enabled=_bool_env(
+                "SECURITY_MAINTENANCE_RETENTION_ENABLED", False
+            ),
+            security_maintenance_anomaly_window_minutes=numeric_limits[
+                "SECURITY_MAINTENANCE_ANOMALY_WINDOW_MINUTES"
+            ],
         )

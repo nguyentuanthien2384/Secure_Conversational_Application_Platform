@@ -1,5 +1,11 @@
 # 🛡️ Secure Conversational Application Platform (SCAP)
 
+Đợt phát triển theo báo cáo Vũ Văn Mạnh bổ sung kiểm soát body/URI thực nhận,
+IDS xử lý mã hoá nhiều lớp, bằng chứng từ chối xác thực/phân quyền, bộ kiểm chứng
+bảo mật API/audit/IDS và tác vụ bảo mật định kỳ. Xem
+[hướng dẫn bảo mật và tự động hoá](docs/SECURITY_AUTOMATION.md) để chạy kiểm chứng,
+bật lịch kiểm tra và đối chiếu từng thay đổi với nội dung PDF.
+
 > **Đồ án môn học:** Bảo mật Ứng dụng và Hệ thống
 > **Kiến trúc:** FastAPI + Gradio 6 + envelope encryption (Vault/KMS) + DLP phân loại + E2EE ciphertext relay + audit anchor/WORM + IDS/IPS
 

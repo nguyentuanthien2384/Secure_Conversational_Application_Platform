@@ -108,11 +108,21 @@ def emit_security_event(
     severity = _SEVERITY_BY_OUTCOME.get(outcome, "info")
     if event_type in _HIGH_VALUE_EVENTS and severity == "info":
         severity = "notice"
+    # ECS accepts only success/failure/unknown for event.outcome and a numeric
+    # event.severity. Preserve SCAP's more specific decisions separately so an
+    # Elasticsearch mapping never rejects blocked/denied events or text severity.
+    ecs_outcome = (
+        "success" if outcome == "success"
+        else "failure" if outcome in {"failure", "denied", "blocked"}
+        else "unknown"
+    )
     document = {
         "event.dataset": "scap.audit",
         "event.action": event_type,
-        "event.outcome": outcome,
-        "event.severity": severity,
+        "event.outcome": ecs_outcome,
+        "event.severity": {"info": 1, "notice": 3, "warning": 5, "high": 8}[severity],
+        "scap.outcome": outcome,
+        "scap.severity": severity,
         "user.id": actor_id,
         "target.type": target_type,
         "target.id": target_id,
@@ -124,6 +134,16 @@ def emit_security_event(
     }
     for key, value in (details or {}).items():
         document[f"scap.{str(key)[:40]}"] = _scrub(value)
+    # Reserved fields describe the actual emitted event, never caller metadata.
+    document["scap.outcome"] = outcome
+    document["scap.severity"] = severity
+    technique = (details or {}).get("mitre_technique")
+    if technique == "T1190":
+        document.update({
+            "threat.framework": "MITRE ATT&CK",
+            "threat.technique.id": ["T1190"],
+            "threat.technique.name": ["Exploit Public-Facing Application"],
+        })
     document = {k: v for k, v in document.items() if v is not None}
     level = logging.WARNING if severity in {"warning", "high"} else logging.INFO
     try:

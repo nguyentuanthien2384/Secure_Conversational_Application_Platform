@@ -23,7 +23,7 @@
 	# Enforce the same high-sensitivity upload ceiling at the Internet edge.
 	# Caddy returns 413 before FastAPI/Gradio reads more than this amount.
 	request_body {
-		max_size 5MB
+		max_size 1MB
 	}
 
 	# ── RFC 9116: kênh báo cáo lỗ hổng có trách nhiệm (Bài 8 §vận hành) ──

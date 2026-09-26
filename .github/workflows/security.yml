@@ -35,6 +35,9 @@ jobs:
       - run: uv lock --check
       - run: uv sync --frozen --group dev
       - run: uv run python -m pytest --cov=src.app --cov-report=xml
+      - name: Validate security controls and correlated detection evidence offline
+        if: ${{ !cancelled() }}
+        run: uv run python -m scripts.validate_security --output-dir reports/security-validation
       - run: uv run ruff check src tests scripts
       - run: uv run bandit -r src/app -ll -ii -f json -o reports-bandit.json
       - run: uv export --frozen --no-dev --no-emit-project --output-file requirements-audit.txt
@@ -49,6 +52,8 @@ jobs:
             coverage.xml
             reports-bandit.json
             reports-pip-audit.json
+            reports/security-validation/security-validation.json
+            reports/security-validation/security-validation.junit.xml
 
   secret-scan:
     runs-on: ubuntu-latest

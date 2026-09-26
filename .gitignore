@@ -212,6 +212,7 @@ logs/
 reports/*.json
 reports/*.html
 reports/*.xml
+reports/security-validation/
 # Local document-rendering scratch space; source PDFs live outside the repo.
 tmp/pdfs/
 

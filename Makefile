@@ -1,4 +1,4 @@
-.PHONY: install run test security docker
+.PHONY: install run test security security-validate docker
 
 install:
 	uv sync --group dev
@@ -12,6 +12,9 @@ test:
 security:
 	uv run bandit -r src/app
 	uv run pip-audit
+
+security-validate:
+	uv run python -m scripts.validate_security
 
 docker:
 	docker compose up --build

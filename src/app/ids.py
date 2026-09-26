@@ -25,9 +25,10 @@ is safe. Pattern matching on request text is trivially bypassable.
 from __future__ import annotations
 
 import hashlib
+import html
 import re
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import timedelta
 from threading import Lock
@@ -191,27 +192,94 @@ def evidence_fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
-def scan_text(text: str) -> list[tuple[str, str, str, str]]:
-    """Run every signature over one decoded string.
+# The HTTP middleware rejects larger request targets before scanning. Keep the
+# same bound here for non-HTTP callers so decoding and regular-expression work
+# never scales with an unbounded attacker-supplied string.
+MAX_SCAN_TEXT_CHARS = 16_384
+MAX_DECODE_PASSES = 3
+_TEXT_ESCAPE = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))")
+_XSS_IGNORED_CONTROLS = str.maketrans("", "", "\t\r\n")
 
-    Returns ``(rule_id, severity, description, matched_text)`` tuples. The URL is
-    decoded twice because attackers routinely double-encode to slip past naive
-    filters (``%252e%252e%252f``).
+
+def _decode_text_escape(match: re.Match[str]) -> str:
+    return chr(int(match.group(1) or match.group(2), 16))
+
+
+def _scan_candidates(text: str) -> list[str]:
+    """Produce a fixed number of detection-only canonical representations.
+
+    Never feed these values back into request handling: HTML/JSON/URL decoding
+    is context dependent, and an IDS hit is evidence of a probe, not proof that
+    the application would execute it. Repeated decoding stops at a fixed bound
+    even for deliberately nested encodings.
     """
+    candidates = [text]
+    for _ in range(MAX_DECODE_PASSES):
+        decoded = html.unescape(_TEXT_ESCAPE.sub(_decode_text_escape, unquote_plus(text)))
+        if decoded == text:
+            break
+        if decoded not in candidates:
+            candidates.append(decoded)
+        text = decoded
+    return candidates
+
+
+def _sql_comment_view(text: str) -> str:
+    """Replace SQL comments with spaces, preserving MySQL executable comments.
+
+    Walk non-overlapping spans instead of an unbounded lazy regex: many open
+    comment markers with no closing marker must not cause quadratic searching.
+    This is a signature view, not a SQL parser or an input sanitizer.
+    """
+    parts: list[str] = []
+    cursor = 0
+    while True:
+        start = text.find("/*", cursor)
+        if start == -1:
+            parts.append(text[cursor:])
+            break
+        end = text.find("*/", start + 2)
+        if end == -1:
+            parts.append(text[cursor:])
+            break
+        parts.append(text[cursor:start])
+        if text.startswith("/*!", start):
+            executable = text[start + 3 : end]
+            # MySQL's optional version gate precedes the executable content.
+            executable = re.sub(r"^\d{5,6}\s*", "", executable)
+            parts.append(f" {executable} ")
+        else:
+            parts.append(" ")
+        cursor = end + 2
+    return "".join(parts)
+
+
+def scan_text(text: str) -> list[tuple[str, str, str, str]]:
+    """Inspect raw and bounded canonical views, retaining one hit per rule.
+
+    Returns ``(rule_id, severity, description, matched_text)`` tuples. This only
+    covers known patterns; deeply nested or novel obfuscation may still evade
+    it. Oversized input is rejected rather than silently ignoring its tail.
+    """
+    if len(text) > MAX_SCAN_TEXT_CHARS:
+        raise ValueError("IDS scan input exceeds the request-target limit.")
     if not text:
         return []
-    candidates = {text, unquote_plus(text)}
-    candidates.add(unquote_plus(unquote_plus(text)))
+    candidates = _scan_candidates(text)
     hits: list[tuple[str, str, str, str]] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        for rule_id, severity, pattern, description in SIGNATURES:
-            if rule_id in seen:
-                continue
+    sql_candidates = [_sql_comment_view(candidate) for candidate in candidates]
+    xss_candidates = [candidate.translate(_XSS_IGNORED_CONTROLS) for candidate in candidates]
+    for rule_id, severity, pattern, description in SIGNATURES:
+        views = candidates
+        if rule_id.startswith("SQLI-"):
+            views = candidates + sql_candidates
+        elif rule_id.startswith("XSS-"):
+            views = candidates + xss_candidates
+        for candidate in dict.fromkeys(views):
             match = pattern.search(candidate)
             if match:
-                seen.add(rule_id)
                 hits.append((rule_id, severity, description, match.group(0)[:120]))
+                break
     return hits
 
 
@@ -278,16 +346,48 @@ class IntrusionState:
     """
 
     def __init__(
-        self, *, block_threshold: int = 5, block_seconds: int = 900, history: int = 500
+        self,
+        *,
+        block_threshold: int = 5,
+        block_seconds: int = 900,
+        history: int = 500,
+        max_sources: int = 10_000,
     ) -> None:
+        if min(block_threshold, block_seconds, history, max_sources) <= 0:
+            raise ValueError("IDS thresholds, retention and source capacity must be positive.")
         self.block_threshold = block_threshold
         self.block_seconds = block_seconds
+        self.max_sources = max_sources
         self._lock = Lock()
         self._detections: deque[Detection] = deque(maxlen=history)
-        self._scores: dict[str, deque[float]] = defaultdict(deque)
+        self._scores: OrderedDict[str, deque[float]] = OrderedDict()
         self._blocked: dict[str, float] = {}
+        self._next_cleanup = 0.0
 
     _SEVERITY_WEIGHT = {"high": 3, "medium": 2, "low": 1}
+
+    def _expire_source(self, source_ip: str, now: float) -> None:
+        expiry = self._blocked.get(source_ip)
+        if expiry is not None and expiry <= now:
+            self._blocked.pop(source_ip, None)
+            # A served ban starts a fresh observation window. Otherwise a hit
+            # immediately after expiry can reuse the old score and re-ban it.
+            self._scores.pop(source_ip, None)
+
+    def _cleanup(self, now: float, *, force: bool = False) -> None:
+        """Remove idle sources even when their addresses never return."""
+        if not force and now < self._next_cleanup:
+            return
+        cutoff = now - self.block_seconds
+        for source_ip in list(self._scores):
+            self._expire_source(source_ip, now)
+            bucket = self._scores.get(source_ip)
+            if bucket is not None and source_ip not in self._blocked:
+                while bucket and bucket[0] <= cutoff:
+                    bucket.popleft()
+                if not bucket:
+                    self._scores.pop(source_ip, None)
+        self._next_cleanup = now + min(60, self.block_seconds)
 
     def record(self, detection: Detection) -> bool:
         """Store a detection; return True if this pushed the source over the block threshold."""
@@ -296,8 +396,25 @@ class IntrusionState:
         cutoff = now - self.block_seconds
         with self._lock:
             self._detections.append(detection)
+            self._cleanup(now)
+            self._expire_source(detection.source_ip, now)
+            if detection.source_ip not in self._scores:
+                if len(self._scores) >= self.max_sources:
+                    self._cleanup(now, force=True)
+                if len(self._scores) >= self.max_sources:
+                    # Preserve active bans when capacity is reached. Reclaim
+                    # the oldest unblocked source; if every slot is blocked,
+                    # only the bounded detection history records this source.
+                    oldest = next(
+                        (ip for ip in self._scores if ip not in self._blocked), None
+                    )
+                    if oldest is None:
+                        return False
+                    self._scores.pop(oldest)
+                self._scores[detection.source_ip] = deque(maxlen=self.block_threshold)
             bucket = self._scores[detection.source_ip]
-            while bucket and bucket[0] < cutoff:
+            self._scores.move_to_end(detection.source_ip)
+            while bucket and bucket[0] <= cutoff:
                 bucket.popleft()
             for _ in range(weight):
                 bucket.append(now)
@@ -309,21 +426,22 @@ class IntrusionState:
     def is_blocked(self, source_ip: str) -> tuple[bool, int]:
         now = time.monotonic()
         with self._lock:
+            self._cleanup(now)
+            self._expire_source(source_ip, now)
             expiry = self._blocked.get(source_ip)
             if expiry is None:
-                return False, 0
-            if expiry <= now:
-                del self._blocked[source_ip]
                 return False, 0
             return True, max(1, int(expiry - now))
 
     def unblock(self, source_ip: str) -> bool:
         with self._lock:
+            self._scores.pop(source_ip, None)
             return self._blocked.pop(source_ip, None) is not None
 
     def blocked_sources(self) -> list[dict[str, Any]]:
         now = time.monotonic()
         with self._lock:
+            self._cleanup(now, force=True)
             return [
                 {"source_ip": ip, "seconds_remaining": max(0, int(expiry - now))}
                 for ip, expiry in sorted(self._blocked.items())
