@@ -196,6 +196,9 @@ class SecurityMaintenance:
                     "window_minutes": anomaly.window_minutes,
                     "subject_sha256": subject_hash,
                     "response": "observe",
+                    "mitre_technique": anomaly.mitre_technique,
+                    "source_count": anomaly.source_count,
+                    "evidence_event_id": anomaly.evidence_event_id,
                 },
             )
             result["anomalies_emitted"] += 1

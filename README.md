@@ -187,6 +187,9 @@ sequenceDiagram
   nhiệm vừa sinh đồng thời mà không đăng xuất các thiết bị khác; `logout-all` thu hồi toàn tài khoản.
 - **Trần phiên tuyệt đối**: `root_issued_at` được mang qua mỗi lần `/api/auth/refresh`, vượt
   `SESSION_ABSOLUTE_HOURS` (mặc định 8h) thì buộc đăng nhập lại — sliding session không thành vĩnh viễn.
+- **Hết hạn khi không hoạt động**: `last_activity_at` được kiểm tra ở server cho mọi bearer request;
+  `SESSION_IDLE_MINUTES` (mặc định 30 phút) không bị kéo dài bằng polling `/me` hoặc refresh nền.
+  API quản lý phiên trả cả thời điểm hoạt động cuối và hai deadline để người dùng thu hồi thiết bị đúng lúc.
 - **Mật khẩu** tối thiểu 15 ký tự (NIST 800-63B ưu tiên độ dài); tùy chọn đối chiếu HIBP bằng
   k-anonymity. Standard profile có thể fail-open khi HIBP mất mạng; high profile bắt buộc fail-closed.
 
@@ -203,6 +206,9 @@ sequenceDiagram
 ### 4.3 DLP trước khi ra khỏi biên tin cậy
 Áp dụng ở [src/app/dlp.py](src/app/dlp.py) và [src/app/services.py](src/app/services.py) cho **cả prompt lẫn phản hồi**, và trả về
 *tên danh mục* đã che (không bao giờ trả lại giá trị gốc) để UI và audit log hiển thị an toàn.
+Scanner cũng giải mã có giới hạn URL-percent, HTML entity và Base64 nhiều lớp chỉ trong vùng kiểm tra;
+mọi span được ánh xạ về chuỗi gốc để che cả dạng mã hóa. Vượt ngân sách kiểm tra chuyển sang
+`inspection_limit` (highly confidential) và fail-closed thay vì âm thầm cho dữ liệu đi qua.
 Ngoài ra dữ liệu người dùng được bọc trong JSON `UNTRUSTED_USER_DATA_JSON` kèm system instruction
 để giảm rủi ro prompt injection. Việc gọi AI ngoài **chỉ xảy ra khi người dùng bật đồng ý**
 (`PATCH /api/auth/ai-consent`); consent có timestamp/policy version và context chỉ lấy tối đa tám
@@ -213,7 +219,9 @@ không bao giờ gọi AI phía server.
 - Engine **signature**: 10 nhóm luật (SQLi, XSS, path traversal, command injection, SSTI,
   Log4Shell, NoSQL injection), nhận diện User-Agent công cụ quét và các đường dẫn "mồi".
 - Engine **anomaly**: soi chính bảng `audit_events` để phát hiện credential stuffing, brute force
-  một tài khoản, và chuỗi từ chối quyền liên tiếp (dấu hiệu dò IDOR).
+  một tài khoản, password guessing phân tán qua nhiều IP, chuỗi thất bại rồi đăng nhập thành công,
+  và chuỗi từ chối quyền liên tiếp (dấu hiệu dò IDOR). Tương quan chạy trong SQL, chỉ giữ ID bằng chứng,
+  số nguồn và nhãn ATT&CK; tác vụ định kỳ phát cảnh báo quan sát, không tự khóa người dùng.
 - Điểm rủi ro tích lũy (high=3 / medium=2 / low=1); vượt `IDS_BLOCK_THRESHOLD` thì **chặn nguồn**
   `IDS_BLOCK_SECONDS` và trả 403 kèm `Retry-After`.
 - Middleware cố ý **không đọc body**: buffer body ở middleware sẽ phá streaming và tạo primitive
@@ -517,7 +525,7 @@ Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Nh
 | Hồ sơ/KMS | `SECURITY_PROFILE`, `KEY_PROVIDER`, `VAULT_*`, `AWS_KMS_KEY_ID`, `GCP_KMS_KEY_NAME`, `DEK_CACHE_SECONDS` |
 | Bí mật local/legacy | `APP_SECRET_KEY`, `MASTER_ENCRYPTION_KEY`, `MASTER_ENCRYPTION_KEYS`, `ACTIVE_KEY_VERSION` |
 | Hạ tầng | `DATABASE_URL`, `REDIS_URL`, `ALLOWED_ORIGINS`, `ALLOWED_HOSTS`, `PUBLIC_DOMAIN` |
-| Phiên & token | `ACCESS_TOKEN_MINUTES`, `SESSION_ABSOLUTE_HOURS`, `REFRESH_WINDOW_SECONDS`, `REFRESH_MAX_ATTEMPTS` |
+| Phiên & token | `ACCESS_TOKEN_MINUTES`, `SESSION_IDLE_MINUTES`, `SESSION_ABSOLUTE_HOURS`, `REFRESH_WINDOW_SECONDS`, `REFRESH_MAX_ATTEMPTS` |
 | Hạn mức/retention | `MAX_SESSIONS_PER_USER`, `MAX_MESSAGES_PER_SESSION`, `SECURE_RETENTION_DAYS`, `CONFIDENTIAL_RETENTION_DAYS` |
 | Chống lạm dụng | `LOGIN_*`, `ALLOW_SELF_REGISTRATION`, `REGISTRATION_*`, `MESSAGE_*`, `PASSWORD_CHANGE_*` |
 | 2FA | `MFA_ISSUER`, `MFA_CHALLENGE_MINUTES`, `MFA_RECOVERY_CODES`, `MFA_*_ATTEMPTS` |

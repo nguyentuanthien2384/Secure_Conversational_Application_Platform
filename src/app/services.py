@@ -29,6 +29,7 @@ logger = logging.getLogger("secure_chat.ai")
 # Cố ý chung chung: chi tiết lỗi (mã HTTP, endpoint, API key hoặc nội dung phản
 # chiếu) không đi vào response và cũng không được sao chép sang log máy chủ.
 AI_UNAVAILABLE_MESSAGE = "Dịch vụ AI tạm thời không khả dụng. Vui lòng thử lại sau."
+MAX_PROVIDER_RESPONSE_CHARACTERS = 32_000
 EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE = (
     "Cần đồng ý trước khi gửi nội dung đến nhà cung cấp AI bên ngoài."
 )
@@ -71,6 +72,7 @@ _DLP_LABELS = {
     FindingType.TAX_ID: "mã số thuế",
     FindingType.HEALTH_DATA: "dữ liệu sức khỏe",
     FindingType.CUSTOM_DICTIONARY: "dữ liệu nội bộ",
+    FindingType.INSPECTION_LIMIT: "dữ liệu vượt giới hạn kiểm tra",
 }
 
 
@@ -305,10 +307,17 @@ class AIService:
             raise AIProviderError(AI_UNAVAILABLE_MESSAGE) from exc
         # Output DLP prevents a provider from reflecting a secret supplied via
         # an indirect prompt or poisoned context back into the trusted UI.
-        sanitized_response, output_findings = self.dlp.redact(response[:8000])
+        # A cap before inspection can cut off a key footer or an encoding and
+        # make a secret undetectable. Inspect the complete bounded response,
+        # then shorten the sanitized text for display. Oversized or malformed
+        # provider responses fail closed without logging their contents.
+        if not isinstance(response, str) or len(response) > MAX_PROVIDER_RESPONSE_CHARACTERS:
+            logger.error("Nhà cung cấp AI trả nội dung vượt giới hạn kiểm tra hoặc sai kiểu.")
+            raise AIProviderError(AI_UNAVAILABLE_MESSAGE)
+        sanitized_response, output_findings = self.dlp.redact(response)
         output_labels = [_DLP_LABELS[item.finding_type] for item in output_findings]
         labels = list(dict.fromkeys(redacted_labels + output_labels))
-        return sanitized_response, labels
+        return sanitized_response[:8000], labels
 
 
 class ChatService:

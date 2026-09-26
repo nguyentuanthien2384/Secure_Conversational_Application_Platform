@@ -1031,6 +1031,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ):
             audit_access_denial(db, request, "inactive_session")
             raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+
+        # Enforce both server-side session bounds on every authenticated request.
+        # JWT expiry alone is insufficient because a client can keep rotating a
+        # valid token in the background.  Keycloak calls these Session Idle and
+        # Session Max; keeping the timestamps in AuthSession also lets operators
+        # revoke one device without invalidating every device.
+        now = utcnow()
+        root_issued_at = as_utc(auth_session.root_issued_at or auth_session.issued_at)
+        last_activity_at = as_utc(auth_session.last_activity_at or auth_session.issued_at)
+        idle_deadline = last_activity_at + timedelta(minutes=settings.session_idle_minutes)
+        absolute_deadline = root_issued_at + timedelta(hours=settings.session_absolute_hours)
+        deadline_reason = (
+            "absolute_lifetime_exceeded" if now >= absolute_deadline
+            else "idle_timeout" if now >= idle_deadline
+            else None
+        )
+        if deadline_reason is not None:
+            auth_session.revoked_at = now
+            if db.get(RevokedToken, auth_session.jti) is None:
+                db.add(RevokedToken(
+                    jti=auth_session.jti,
+                    user_id=user.id,
+                    expires_at=auth_session.expires_at,
+                    reason=deadline_reason,
+                ))
+            db.commit()
+            record_audit(
+                db,
+                request,
+                "auth.session.expired",
+                actor_id=user.id,
+                target_type="auth_session",
+                target_id=auth_session.jti,
+                outcome="denied",
+                details={"reason": deadline_reason},
+            )
+            raise HTTPException(status_code=401, detail="Phiên đăng nhập đã hết hạn; vui lòng đăng nhập lại.")
+
+        # Authentication metadata endpoints should not be able to keep an idle
+        # session alive merely through polling.  The actual protected operation
+        # advances the timestamp after its deadline check.
+        metadata_path = request.url.path in {
+            "/api/auth/me",
+            "/api/auth/sessions",
+            "/api/auth/refresh",
+        }
+        if not metadata_path:
+            auth_session.last_activity_at = now
+            db.commit()
         return user
 
     def admin_user(
@@ -1262,6 +1311,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ip: str,
         *,
         root_issued_at: datetime | None = None,
+        last_activity_at: datetime | None = None,
         last_step_up_at: datetime | None = None,
         session_family_id: str | None = None,
         mark_step_up: bool = False,
@@ -1288,6 +1338,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ip_address=ip,
                 user_agent=safe_user_agent(request.headers.get("user-agent", "")),
                 root_issued_at=root_issued_at or issued_at,
+                last_activity_at=last_activity_at or issued_at,
                 last_step_up_at=issued_at if mark_step_up else last_step_up_at,
             )
         )
@@ -2279,6 +2330,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             user,
             ip,
             root_issued_at=root_issued_at,
+            last_activity_at=old_session.last_activity_at or old_session.issued_at,
             last_step_up_at=old_session.last_step_up_at,
             session_family_id=old_session.session_family_id or old_session.jti,
         )
@@ -2405,17 +2457,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 .order_by(AuthSession.issued_at.desc())
             )
         )
-        return [
-            AuthSessionResponse(
+        now = utcnow()
+        active: list[AuthSessionResponse] = []
+        for session in sessions:
+            last_activity = as_utc(session.last_activity_at or session.issued_at)
+            root_issued = as_utc(session.root_issued_at or session.issued_at)
+            idle_expires = last_activity + timedelta(minutes=settings.session_idle_minutes)
+            absolute_expires = root_issued + timedelta(hours=settings.session_absolute_hours)
+            if as_utc(session.expires_at) <= now or idle_expires <= now or absolute_expires <= now:
+                continue
+            active.append(AuthSessionResponse(
                 id=session.jti,
                 issued_at=session.issued_at,
                 expires_at=session.expires_at,
+                last_activity_at=last_activity,
+                idle_expires_at=idle_expires,
+                absolute_expires_at=absolute_expires,
                 ip_address=session.ip_address,
                 user_agent=session.user_agent,
                 is_current=session.jti == current_jti,
-            )
-            for session in sessions
-        ]
+            ))
+        return active
 
     @app.delete("/api/auth/sessions/{session_jti}", status_code=204)
     def revoke_auth_session(
@@ -2932,6 +2994,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         parent_jti = str(claims["parent_jti"])
         parent_session = db.get(AuthSession, parent_jti)
         parent_expiry = parent_session.expires_at if parent_session is not None else None
+        now = utcnow()
+        parent_idle_expiry = None
+        parent_absolute_expiry = None
+        if parent_session is not None:
+            parent_last_activity = as_utc(
+                parent_session.last_activity_at or parent_session.issued_at
+            )
+            parent_root_issued = as_utc(
+                parent_session.root_issued_at or parent_session.issued_at
+            )
+            parent_idle_expiry = parent_last_activity + timedelta(
+                minutes=settings.session_idle_minutes
+            )
+            parent_absolute_expiry = parent_root_issued + timedelta(
+                hours=settings.session_absolute_hours
+            )
         if (
             user is None
             or not user.is_active
@@ -2940,7 +3018,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             or parent_session.user_id != user.id
             or parent_session.revoked_at is not None
             or parent_expiry is None
-            or as_utc(parent_expiry) <= utcnow()
+            or as_utc(parent_expiry) <= now
+            or parent_idle_expiry is None
+            or parent_idle_expiry <= now
+            or parent_absolute_expiry is None
+            or parent_absolute_expiry <= now
             or db.get(RevokedToken, parent_jti) is not None
         ):
             raise HTTPException(status_code=404, detail="Vé tải xuống không hợp lệ.")

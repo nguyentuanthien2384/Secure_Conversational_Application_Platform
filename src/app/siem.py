@@ -138,12 +138,20 @@ def emit_security_event(
     document["scap.outcome"] = outcome
     document["scap.severity"] = severity
     technique = (details or {}).get("mitre_technique")
-    if technique == "T1190":
+    technique_names = {
+        "T1190": "Exploit Public-Facing Application",
+        "T1110": "Brute Force",
+    }
+    technique_id = "T1110" if technique == "T1110.001" else technique
+    if isinstance(technique_id, str) and technique_id in technique_names:
         document.update({
             "threat.framework": "MITRE ATT&CK",
-            "threat.technique.id": ["T1190"],
-            "threat.technique.name": ["Exploit Public-Facing Application"],
+            "threat.technique.id": [technique_id],
+            "threat.technique.name": [technique_names[technique_id]],
         })
+        if technique == "T1110.001":
+            document["threat.technique.subtechnique.id"] = ["T1110.001"]
+            document["threat.technique.subtechnique.name"] = ["Password Guessing"]
     document = {k: v for k, v in document.items() if v is not None}
     level = logging.WARNING if severity in {"warning", "high"} else logging.INFO
     try:

@@ -30,12 +30,12 @@ import re
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any
 from urllib.parse import unquote_plus
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from src.app.db import utcnow
@@ -465,6 +465,9 @@ class Anomaly:
     count: int
     window_minutes: int
     subject: str | None = None
+    mitre_technique: str | None = None
+    source_count: int | None = None
+    evidence_event_id: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -474,7 +477,153 @@ class Anomaly:
             "count": self.count,
             "window_minutes": self.window_minutes,
             "subject": self.subject,
+            "mitre_technique": self.mitre_technique,
+            "source_count": self.source_count,
+            "evidence_event_id": self.evidence_event_id,
         }
+
+
+# Correlation stays in SQL: no request bodies, credentials, or unbounded list of
+# raw events is loaded into application memory. The administrator can narrow
+# the window to investigate additional accounts in a very large incident.
+MAX_CORRELATION_FINDINGS = 100
+
+
+def _authentication_correlations(
+    db: Session,
+    *,
+    cutoff: datetime,
+    now: datetime,
+    window_minutes: int,
+    failure_threshold: int,
+    distributed_source_threshold: int,
+) -> list[Anomaly]:
+    """Observe attack-shaped authentication sequences without blocking users.
+
+    Account/source correlation follows Wazuh's same/different-field approach
+    and Microsoft Sentinel's distributed-password detection. Neither changing
+    IPs nor a recovered password proves compromise; findings need investigation.
+    Only completed login or MFA verification events count as success.
+    """
+    valid_source = AuditEvent.ip_address.not_in(("", "unknown"))
+    distributed = db.execute(
+        select(
+            AuditEvent.actor_id,
+            func.count(AuditEvent.id).label("failures"),
+            func.count(func.distinct(AuditEvent.ip_address)).label("sources"),
+            func.max(AuditEvent.id).label("evidence_id"),
+        )
+        .where(
+            AuditEvent.event_type == "auth.login",
+            AuditEvent.outcome.in_(("failure", "blocked", "denied")),
+            AuditEvent.actor_id.is_not(None),
+            AuditEvent.actor_id != "",
+            valid_source,
+            AuditEvent.created_at >= cutoff,
+            AuditEvent.created_at <= now,
+        )
+        .group_by(AuditEvent.actor_id)
+        .having(
+            func.count(AuditEvent.id) >= failure_threshold,
+            func.count(func.distinct(AuditEvent.ip_address)) >= distributed_source_threshold,
+        )
+        .order_by(func.count(AuditEvent.id).desc(), AuditEvent.actor_id)
+        .limit(MAX_CORRELATION_FINDINGS)
+    ).all()
+    findings = [
+        Anomaly(
+            "IDS-DISTRIBUTED-BRUTEFORCE",
+            "high",
+            f"Tài khoản {actor} có {failures} lần đăng nhập thất bại từ {sources} nguồn "
+            f"trong {window_minutes} phút; cần điều tra dấu hiệu dò mật khẩu phân tán.",
+            failures,
+            window_minutes,
+            subject=actor,
+            mitre_technique="T1110.001",
+            source_count=sources,
+            evidence_event_id=evidence_id,
+        )
+        for actor, failures, sources, evidence_id in distributed
+    ]
+
+    # A successful authentication ends its preceding failure sequence. Window
+    # rows exclude the current row so the success remains in that sequence;
+    # the next event starts a new one. Timestamp then id gives deterministic
+    # chronology, including equal database timestamps and backfilled events.
+    successful = case((AuditEvent.outcome == "success", 1), else_=0)
+    ordered = (
+        select(
+            AuditEvent.id,
+            AuditEvent.actor_id,
+            AuditEvent.outcome,
+            AuditEvent.ip_address,
+            func.coalesce(
+                func.sum(successful).over(
+                    partition_by=AuditEvent.actor_id,
+                    order_by=(AuditEvent.created_at, AuditEvent.id),
+                    rows=(None, -1),
+                ),
+                0,
+            ).label("episode"),
+        )
+        .where(
+            AuditEvent.event_type.in_(("auth.login", "auth.mfa.verify")),
+            AuditEvent.outcome.in_(("success", "failure", "blocked", "denied")),
+            AuditEvent.actor_id.is_not(None),
+            AuditEvent.actor_id != "",
+            AuditEvent.created_at >= cutoff,
+            AuditEvent.created_at <= now,
+        )
+        .subquery()
+    )
+    failure_count = func.sum(case((ordered.c.outcome != "success", 1), else_=0))
+    success_id = func.max(case((ordered.c.outcome == "success", ordered.c.id)))
+    episodes = (
+        select(
+            ordered.c.actor_id,
+            failure_count.label("failures"),
+            func.count(func.distinct(case(
+                (
+                    (ordered.c.outcome != "success")
+                    & ordered.c.ip_address.not_in(("", "unknown")),
+                    ordered.c.ip_address,
+                ),
+            ))).label("sources"),
+            success_id.label("success_id"),
+        )
+        .group_by(ordered.c.actor_id, ordered.c.episode)
+        .having(failure_count >= failure_threshold, success_id.is_not(None))
+        .subquery()
+    )
+    ranked = select(
+        episodes,
+        func.row_number().over(
+            partition_by=episodes.c.actor_id,
+            order_by=episodes.c.success_id.desc(),
+        ).label("rank"),
+    ).subquery()
+    sequences = db.execute(
+        select(ranked.c.actor_id, ranked.c.failures, ranked.c.sources, ranked.c.success_id)
+        .where(ranked.c.rank == 1)
+        .order_by(ranked.c.success_id.desc(), ranked.c.actor_id)
+        .limit(MAX_CORRELATION_FINDINGS)
+    ).all()
+    findings.extend(
+        Anomaly(
+            "IDS-AUTH-SUCCESS-AFTER-FAILURES",
+            "high",
+            f"Tài khoản {actor} đã hoàn tất đăng nhập sau {failures} lần xác thực thất bại "
+            f"liên tiếp trong {window_minutes} phút; cần xác minh với chủ tài khoản.",
+            failures,
+            window_minutes,
+            subject=actor,
+            mitre_technique="T1110",
+            source_count=sources,
+            evidence_event_id=event_id,
+        )
+        for actor, failures, sources, event_id in sequences
+    )
+    return findings
 
 
 def detect_anomalies(
@@ -484,6 +633,7 @@ def detect_anomalies(
     brute_force_threshold: int = 5,
     spray_account_threshold: int = 3,
     idor_threshold: int = 5,
+    distributed_source_threshold: int = 3,
 ) -> list[Anomaly]:
     """Correlate recent audit events into attack-shaped findings.
 
@@ -492,7 +642,14 @@ def detect_anomalies(
     against one account is classic brute force. The distinction changes the
     response, which is exactly what an IDS is for.
     """
-    cutoff = utcnow() - timedelta(minutes=window_minutes)
+    if not 1 <= window_minutes <= 1_440:
+        raise ValueError("IDS correlation window must be between 1 and 1440 minutes.")
+    if min(brute_force_threshold, spray_account_threshold, idor_threshold) < 1:
+        raise ValueError("IDS correlation thresholds must be positive.")
+    if distributed_source_threshold < 2:
+        raise ValueError("Distributed authentication correlation requires at least two sources.")
+    now = utcnow()
+    cutoff = now - timedelta(minutes=window_minutes)
     anomalies: list[Anomaly] = []
 
     # 1. Brute force: repeated failed logins from a single source address.
@@ -608,4 +765,12 @@ def detect_anomalies(
             )
         )
 
+    anomalies.extend(_authentication_correlations(
+        db,
+        cutoff=cutoff,
+        now=now,
+        window_minutes=window_minutes,
+        failure_threshold=brute_force_threshold,
+        distributed_source_threshold=distributed_source_threshold,
+    ))
     return anomalies

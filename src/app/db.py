@@ -160,6 +160,15 @@ class Database:
                 connection.execute(
                     text("ALTER TABLE auth_sessions ADD COLUMN last_step_up_at TIMESTAMP")
                 )
+            if "last_activity_at" not in auth_session_columns:
+                connection.execute(
+                    text("ALTER TABLE auth_sessions ADD COLUMN last_activity_at TIMESTAMP")
+                )
+                # Preserve a conservative existing timestamp rather than grant
+                # every old session a new inactivity window at deployment.
+                connection.execute(
+                    text("UPDATE auth_sessions SET last_activity_at = issued_at")
+                )
             if "session_family_id" not in auth_session_columns:
                 connection.execute(
                     text("ALTER TABLE auth_sessions ADD COLUMN session_family_id VARCHAR(36)")
@@ -326,7 +335,12 @@ class Database:
                 "secret_kek_version",
                 "secret_crypto_epoch",
             },
-            "auth_sessions": {"root_issued_at", "last_step_up_at", "session_family_id"},
+            "auth_sessions": {
+                "root_issued_at",
+                "last_step_up_at",
+                "last_activity_at",
+                "session_family_id",
+            },
             "chat_sessions": {
                 "security_mode",
                 "data_classification",

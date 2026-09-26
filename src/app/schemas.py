@@ -246,6 +246,9 @@ class AuthSessionResponse(BaseModel):
     id: str
     issued_at: datetime
     expires_at: datetime
+    last_activity_at: datetime
+    idle_expires_at: datetime
+    absolute_expires_at: datetime
     ip_address: str | None
     user_agent: str | None
     is_current: bool

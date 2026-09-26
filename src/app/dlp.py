@@ -11,10 +11,13 @@ short-lived objects used while producing a redacted payload.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import html
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -56,6 +59,7 @@ class FindingType(str, Enum):
     TAX_ID = "tax_id"
     HEALTH_DATA = "health_data"
     CUSTOM_DICTIONARY = "custom_dictionary"
+    INSPECTION_LIMIT = "inspection_limit"
 
     # Readable aliases for integrations which use broader terminology.
     CREDIT_CARD = "payment_card"
@@ -98,6 +102,7 @@ _DEFAULT_CLASS_BY_FINDING: dict[FindingType, DataClass] = {
     FindingType.TAX_ID: DataClass.HIGHLY_CONFIDENTIAL,
     FindingType.HEALTH_DATA: DataClass.HIGHLY_CONFIDENTIAL,
     FindingType.CUSTOM_DICTIONARY: DataClass.CONFIDENTIAL,
+    FindingType.INSPECTION_LIMIT: DataClass.HIGHLY_CONFIDENTIAL,
 }
 
 
@@ -123,6 +128,7 @@ _SAFE_LABELS: dict[FindingType, str] = {
     FindingType.TAX_ID: "Mã số thuế Việt Nam",
     FindingType.HEALTH_DATA: "Dữ liệu sức khỏe",
     FindingType.CUSTOM_DICTIONARY: "Từ điển dữ liệu tùy chỉnh",
+    FindingType.INSPECTION_LIMIT: "Dữ liệu vượt giới hạn kiểm tra",
 }
 
 
@@ -561,6 +567,93 @@ def _overlap(first: _DetectedSpan, second: _DetectedSpan) -> bool:
     return first.start < second.end and second.start < first.end
 
 
+# Decoding is inspection only: never execute content or send decoded values to
+# another service. Limits fail closed instead of quietly passing an uninspected
+# suffix. They bound text size, repeated transformations, and branching work.
+MAX_SCAN_CHARACTERS = 65_536
+MAX_DECODE_DEPTH = 3
+MAX_DECODED_CHARACTERS = 262_144
+MAX_DECODED_VIEWS = 512
+_PERCENT_RUN_RE = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+_HTML_ENTITY_RE = re.compile(r"&(?:#[xX][0-9A-Fa-f]{1,8}|#[0-9]{1,10}|[A-Za-z][A-Za-z0-9]{1,31});")
+_BASE64_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_-])(?P<value>[A-Za-z0-9+/_-]{16,}={0,2})"
+    r"(?![A-Za-z0-9+/_=-])"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _InspectionView:
+    text: str = field(repr=False)
+    # Each decoded character maps to its complete source span. Base64 has no
+    # useful per-character mapping, so every character maps to the whole token.
+    origins: tuple[tuple[int, int], ...] = field(repr=False)
+    depth: int = 0
+
+
+def _source_span(view: _InspectionView, start: int, end: int) -> tuple[int, int]:
+    return view.origins[start][0], view.origins[end - 1][1]
+
+
+def _decode_escapes(view: _InspectionView, *, entities: bool) -> _InspectionView | None:
+    pattern = _HTML_ENTITY_RE if entities else _PERCENT_RUN_RE
+    chunks: list[str] = []
+    origins: list[tuple[int, int]] = []
+    cursor = 0
+    changed = False
+    for match in pattern.finditer(view.text):
+        raw = match.group()
+        try:
+            decoded = (
+                html.unescape(raw)
+                if entities
+                else bytes.fromhex(raw.replace("%", "")).decode("utf-8", errors="strict")
+            )
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if decoded == raw:
+            continue
+        decoded = normalize_text(decoded)
+        chunks.extend((view.text[cursor : match.start()], decoded))
+        origins.extend(view.origins[cursor : match.start()])
+        origins.extend([_source_span(view, match.start(), match.end())] * len(decoded))
+        cursor = match.end()
+        changed = True
+    if not changed:
+        return None
+    chunks.append(view.text[cursor:])
+    origins.extend(view.origins[cursor:])
+    return _InspectionView("".join(chunks), tuple(origins), view.depth + 1)
+
+
+def _decoded_views(view: _InspectionView) -> Iterable[_InspectionView]:
+    for entities in (False, True):
+        escaped = _decode_escapes(view, entities=entities)
+        if escaped is not None and escaped.text:
+            yield escaped
+    for match in _BASE64_RE.finditer(view.text):
+        candidate = match.group("value")
+        try:
+            decoded_bytes = base64.b64decode(
+                candidate + "=" * (-len(candidate) % 4), altchars=b"-_", validate=True
+            )
+            decoded = decoded_bytes.decode("utf-8", errors="strict")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+        # Require canonical encoding and readable UTF-8, avoiding binary blobs
+        # and most ordinary words which happen to use the Base64 alphabet.
+        canonical = base64.b64encode(decoded_bytes).decode("ascii").rstrip("=")
+        if candidate.translate(str.maketrans("-_", "+/")).rstrip("=") != canonical:
+            continue
+        if any(unicodedata.category(char) == "Cc" and char not in "\t\r\n" for char in decoded):
+            continue
+        decoded = normalize_text(decoded)
+        if not decoded:
+            continue
+        origin = _source_span(view, match.start(), match.end())
+        yield _InspectionView(decoded, (origin,) * len(decoded), view.depth + 1)
+
+
 class DLPScanner:
     """Normalize, detect, redact, and apply the formal DLP policy."""
 
@@ -699,7 +792,7 @@ class DLPScanner:
         ]
         return sorted(result, key=lambda item: (item.start, item.end, item.finding_type.value))
 
-    def _detect_spans(self, normalized_text: str) -> list[_DetectedSpan]:
+    def _detect_plain_spans(self, normalized_text: str) -> list[_DetectedSpan]:
         return self._deduplicate_and_disambiguate(
             [
                 *self._regex_spans(normalized_text),
@@ -707,6 +800,50 @@ class DLPScanner:
                 *self._dictionary_spans(normalized_text),
             ]
         )
+
+    def _detect_spans(self, normalized_text: str) -> list[_DetectedSpan]:
+        def limit_span(start: int, end: int) -> _DetectedSpan:
+            return _DetectedSpan(
+                start, end, FindingType.INSPECTION_LIMIT,
+                "inspection.budget", DataClass.HIGHLY_CONFIDENTIAL,
+            )
+
+        if len(normalized_text) > MAX_SCAN_CHARACTERS:
+            return [limit_span(0, len(normalized_text))]
+        if not normalized_text:
+            return []
+        initial = _InspectionView(
+            normalized_text, tuple((index, index + 1) for index in range(len(normalized_text)))
+        )
+        pending = deque([initial])
+        seen = {(initial.text, initial.origins)}
+        total_characters = len(normalized_text)
+        spans: list[_DetectedSpan] = []
+        while pending:
+            view = pending.popleft()
+            for found in self._detect_plain_spans(view.text):
+                start, end = _source_span(view, found.start, found.end)
+                spans.append(_DetectedSpan(
+                    start, end, found.finding_type,
+                    ("encoded." if view.depth else "") + found.detector_id,
+                    found.data_class,
+                ))
+            for decoded in _decoded_views(view):
+                identity = (decoded.text, decoded.origins)
+                if identity in seen:
+                    continue
+                if (
+                    decoded.depth > MAX_DECODE_DEPTH
+                    or len(seen) >= MAX_DECODED_VIEWS
+                    or total_characters + len(decoded.text) > MAX_DECODED_CHARACTERS
+                ):
+                    start, end = _source_span(decoded, 0, len(decoded.text))
+                    spans.append(limit_span(start, end))
+                    continue
+                seen.add(identity)
+                total_characters += len(decoded.text)
+                pending.append(decoded)
+        return self._deduplicate_and_disambiguate(spans)
 
     @staticmethod
     def _safe_findings(spans: Iterable[_DetectedSpan]) -> tuple[DLPFinding, ...]:

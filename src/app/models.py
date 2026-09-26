@@ -91,6 +91,11 @@ class AuthSession(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Request activity is separate from token issuance: background token refresh
+    # must never keep an abandoned login alive.
+    last_activity_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # Thời điểm đăng nhập *gốc* của chuỗi phiên này. Mỗi lần /api/auth/refresh

@@ -184,6 +184,8 @@ class Settings:
     # Trần tuyệt đối cho một chuỗi phiên: dù gia hạn bao nhiêu lần, sau ngần
     # này giờ kể từ lần đăng nhập gốc vẫn phải xác thực lại từ đầu.
     session_absolute_hours: int = 8
+    # Server-side inactivity limit, independent of JWT rotation and UI polling.
+    session_idle_minutes: int = 30
     # Số lần được gọi /api/auth/refresh trong một cửa sổ, chống lạm dụng.
     refresh_window_seconds: int = 60
     refresh_max_attempts: int = 10
@@ -464,6 +466,8 @@ class Settings:
         if numeric_limits["AUDIT_MAX_UNANCHORED_EVENTS"] < 0:
             raise RuntimeError("AUDIT_MAX_UNANCHORED_EVENTS không được âm.")
         maintenance_limits = {
+            "SESSION_IDLE_MINUTES": (30, 1, 1_440),
+            "SESSION_ABSOLUTE_HOURS": (8, 1, 168),
             "SECURITY_MAINTENANCE_INTERVAL_SECONDS": (300, 10, 86_400),
             "SECURITY_MAINTENANCE_BATCH_SIZE": (500, 1, 5_000),
             "SECURITY_MAINTENANCE_ANOMALY_WINDOW_MINUTES": (60, 1, 1_440),
@@ -554,7 +558,8 @@ class Settings:
             ids_block_threshold=int(os.getenv("IDS_BLOCK_THRESHOLD", "5")),
             ids_block_seconds=int(os.getenv("IDS_BLOCK_SECONDS", "900")),
             audit_chain_enabled=_bool_env("AUDIT_CHAIN_ENABLED", True),
-            session_absolute_hours=int(os.getenv("SESSION_ABSOLUTE_HOURS", "8")),
+            session_absolute_hours=numeric_limits["SESSION_ABSOLUTE_HOURS"],
+            session_idle_minutes=numeric_limits["SESSION_IDLE_MINUTES"],
             refresh_window_seconds=int(os.getenv("REFRESH_WINDOW_SECONDS", "60")),
             refresh_max_attempts=int(os.getenv("REFRESH_MAX_ATTEMPTS", "10")),
             siem_json_logs=_bool_env("SIEM_JSON_LOGS", True),
