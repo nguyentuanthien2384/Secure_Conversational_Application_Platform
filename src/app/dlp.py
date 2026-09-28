@@ -475,7 +475,9 @@ _REGEX_RULES: tuple[_RegexRule, ...] = (
         re.compile(
             r"(?<![\w.+-])(?P<value>[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
             r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
-            r"[A-Za-z]{2,63})(?![\w.-])"
+            # A sentence-ending dot is punctuation, while dots followed by
+            # domain characters must not permit a partial-domain match.
+            r"[A-Za-z]{2,63})(?![\w-]|\.+[\w-])"
         ),
         DataClass.CONFIDENTIAL,
     ),

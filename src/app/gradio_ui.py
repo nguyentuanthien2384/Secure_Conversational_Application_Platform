@@ -1389,10 +1389,70 @@ def build_ui() -> gr.Blocks:
             dd_revoke,
             timer,
         ]
-        # Dữ liệu QR/khóa chỉ dùng trong lúc đăng ký; đưa chúng vào mọi luồng
-        # reset để đăng xuất, hết hạn phiên hoặc đổi mật khẩu đều xóa khỏi UI.
-        # st_warned vẫn nằm CUỐI danh sách vì _alive() giữ nguyên hai output này.
-        RESET_OUTS = STAGE1 + STAGE2 + [qr_html, tb_secret, md_countdown, st_warned]
+        # Chỉ ẩn app_sec không xóa dữ liệu khỏi trình duyệt. Mọi dữ liệu theo
+        # tài khoản, bản nháp, thông tin xác thực và URL tải xuống phải được
+        # xóa khi đăng xuất/hết hạn/đổi mật khẩu để lần đăng nhập tiếp theo
+        # không nhìn thấy kết quả còn sót lại của tài khoản trước.
+        # Ghép component với giá trị reset ngay tại đây để không lệch vị trí.
+        EXTRA_RESET = [
+            (li_user, ""),
+            (re_user, ""),
+            (re_pass, ""),
+            (chk_showpw, False),
+            (auth_tabs, gr.update(selected="tab_login")),
+            (html_pw_meter, _pw_meter_html("")),
+            (tb_new_title, ""),
+            (dd_new_security, "secure"),
+            (dd_new_class, "internal"),
+            (tb_rename, ""),
+            (tb_export_password, ""),
+            (tb_export_code, ""),
+            (file_export, gr.update(value=None, visible=False)),
+            (tb_msg, ""),
+            (md_chat_notice, gr.update(value="", visible=False)),
+            (btn_consent_send, gr.update(visible=False)),
+            (tb_search, ""),
+            (df_cipher, []),
+            (tb_gq, ""),
+            (df_gsearch, []),
+            (tb_pw_cur, ""),
+            (tb_pw_new, ""),
+            (grp_mfa_setup, gr.update(visible=False)),
+            (qr_html, gr.update(value="", visible=False)),
+            (tb_secret, ""),
+            (tb_activate, ""),
+            (md_recovery, gr.update(value="", visible=False)),
+            (tb_dis_pw, ""),
+            (tb_dis_code, ""),
+            (md_metric_users, md_metric_users.value),
+            (md_metric_sessions, md_metric_sessions.value),
+            (md_metric_login, md_metric_login.value),
+            (md_metric_denials, md_metric_denials.value),
+            (md_stats, md_stats.value),
+            (md_alerts, md_alerts.value),
+            (df_users, []),
+            (dd_user_pick, gr.update(choices=[], value=None)),
+            (dd_role_new, "user"),
+            (tb_cu_name, ""),
+            (tb_cu_pw, ""),
+            (dd_cu_role, "user"),
+            (sl_audit, 100),
+            (df_audit, []),
+            (md_sec_detections, md_sec_detections.value),
+            (md_sec_anomalies, md_sec_anomalies.value),
+            (md_sec_blocks, md_sec_blocks.value),
+            (md_sec_verdict, md_sec_verdict.value),
+            (df_sec_det, []),
+            (sl_sec_win, 60),
+            (df_sec_anom, []),
+            (md_sec_ids_verdict, md_sec_ids_verdict.value),
+            (df_sec_block, []),
+            (tb_sec_ip, ""),
+        ]
+        # _alive() cập nhật đúng hai output cuối, giữ nguyên mọi ô đang nhập.
+        RESET_OUTS = STAGE1 + STAGE2 + [item[0] for item in EXTRA_RESET] + [
+            md_countdown, st_warned,
+        ]
 
         def _reset_tuple():
             return (
@@ -1402,7 +1462,7 @@ def build_ui() -> gr.Blocks:
                 gr.update(visible=True),
                 gr.update(visible=False),
                 gr.update(visible=False),
-                "",
+                gr.update(value="", type="password"),  # li_pass
                 "",
                 gr.update(visible=True),  # grp_auth_forms
                 gr.update(visible=False),
@@ -1420,8 +1480,10 @@ def build_ui() -> gr.Blocks:
                 [],
                 gr.update(choices=[], value=None),
                 gr.Timer(active=False),
-                gr.update(value="", visible=False),  # qr_html
-                "",  # tb_secret
+            ) + tuple(
+                value.copy() if isinstance(value, (dict, list)) else value
+                for _, value in EXTRA_RESET
+            ) + (
                 "",
                 False,
             )
@@ -1612,7 +1674,7 @@ def build_ui() -> gr.Blocks:
             icon = "⚠️" if left <= WARN_BEFORE_EXPIRY else "⏳"
             return _alive(f"{icon} **{shown}**", warned)
 
-        timer.tick(tick, [st_exp, st_warned], RESET_OUTS)
+        timer.tick(tick, [st_exp, st_warned], RESET_OUTS, show_progress="hidden")
 
         def extend_session(token):
             """Xin token mới trước khi token hiện tại hết hạn (sliding session).
@@ -1802,8 +1864,8 @@ def build_ui() -> gr.Blocks:
             if labels:
                 banner = gr.update(
                     value=(
-                        "🛡️ **Lớp DLP đã can thiệp.** Trước khi gửi sang nhà cung cấp AI "
-                        "bên ngoài, hệ thống đã che: **" + ", ".join(labels) + "**. "
+                        "🛡️ **Lớp DLP đã can thiệp.** Trong nội dung dành cho AI hoặc phản hồi AI, "
+                        "hệ thống đã che: **" + ", ".join(labels) + "**. "
                         "Bản gốc vẫn được mã hoá AES-256-GCM và lưu nguyên trong hội thoại của bạn."
                     ),
                     visible=True,
@@ -1913,10 +1975,10 @@ def build_ui() -> gr.Blocks:
         def change_password(token, current, new):
             if not (current or "").strip() or not (new or "").strip():
                 gr.Warning("Nhập cả mật khẩu hiện tại và mật khẩu mới.")
-                return tuple(gr.skip() for _ in RESET_OUTS) + (gr.skip(), gr.skip())
+                return tuple(gr.skip() for _ in RESET_OUTS)
             if len(new) < PASSWORD_MIN:
                 gr.Warning(f"Mật khẩu mới phải có ít nhất {PASSWORD_MIN} ký tự.")
-                return tuple(gr.skip() for _ in RESET_OUTS) + (gr.skip(), gr.skip())
+                return tuple(gr.skip() for _ in RESET_OUTS)
             _api(
                 token,
                 "PATCH",
@@ -1924,12 +1986,12 @@ def build_ui() -> gr.Blocks:
                 {"current_password": current, "new_password": new},
             )
             gr.Info("Đã đổi mật khẩu — mọi phiên bị thu hồi, mời đăng nhập lại.")
-            return _reset_tuple() + ("", "")
+            return _reset_tuple()
 
         btn_pw.click(
-            _guard(change_password, len(RESET_OUTS) + 2),
+            _guard(change_password, len(RESET_OUTS)),
             [st_token, tb_pw_cur, tb_pw_new],
-            RESET_OUTS + [tb_pw_cur, tb_pw_new],
+            RESET_OUTS,
         )
 
         # ---- 2FA ----

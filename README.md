@@ -1,5 +1,11 @@
 # 🛡️ Secure Conversational Application Platform (SCAP)
 
+**Demo đồ án trên máy cá nhân:** sau khi đã cài thư viện, chạy
+`.\.venv\Scripts\python.exe -m scripts.demo_local` rồi mở <http://127.0.0.1:8000>.
+Lượt demo có SQLite và khóa tạm riêng, tự nạp tài khoản mẫu và dùng AI ngoại tuyến;
+không cần máy chủ, Docker, API key hoặc sửa `.env`. Xem
+[hướng dẫn chạy](HUONG_DAN_CHAY.md) và [kịch bản 6/12 phút](docs/DEMO_SCRIPT.md).
+
 Đợt phát triển theo báo cáo Vũ Văn Mạnh bổ sung kiểm soát body/URI thực nhận,
 IDS xử lý mã hoá nhiều lớp, bằng chứng từ chối xác thực/phân quyền, bộ kiểm chứng
 bảo mật API/audit/IDS và tác vụ bảo mật định kỳ. Xem
@@ -67,9 +73,9 @@ REST API qua HTTP** ([src/app/gradio_ui.py](src/app/gradio_ui.py)) — nghĩa l�
 trên giao diện đều đi qua đúng lớp JWT, RBAC, rate limit và audit như một client bên ngoài.
 Không có đường tắt nào từ UI xuống thẳng cơ sở dữ liệu.
 
-Mặc định hệ thống chạy **SQLite + rate limiter in-memory + AI demo ngoại tuyến**, nên clone
-về là chạy được ngay. Cấu hình production (`APP_ENV=production`) bật một loạt guard bắt buộc
-và chuyển sang PostgreSQL + Redis + Caddy.
+Launcher `scripts.demo_local` chạy **SQLite + rate limiter in-memory + AI demo ngoại tuyến**
+trong môi trường tạm sau khi đã cài thư viện. Cách chạy thông thường qua `run_app.py` đọc
+cấu hình riêng; guard production (`APP_ENV=production`) yêu cầu hạ tầng và bí mật tương ứng.
 
 ---
 
@@ -128,8 +134,8 @@ và chuyển sang PostgreSQL + Redis + Caddy.
 └─────────────────────────────┬────────────────────────────────────┘
 ┌─────────────────────────────▼────────────────────────────────────┐
 │  DLP — src/app/services.py                                       │
-│   Che mật khẩu, Bearer token, JWT, private key, Google API key,  │
-│   số thẻ, email, số điện thoại, số định danh trước khi ra ngoài  │
+│   Phân loại và áp dụng chính sách che/xác nhận/chặn gửi;         │
+│   secret, private key và số thẻ không được gửi sang AI ngoài    │
 └─────────────────────────────┬────────────────────────────────────┘
 ┌─────────────────────────────▼────────────────────────────────────┐
 │  LƯU TRỮ & KIỂM TOÁN                                             │
@@ -166,12 +172,21 @@ sequenceDiagram
     U->>API: POST /api/sessions/{id}/messages
     API->>IDS: Quét chữ ký + rate limit theo user
     API->>DB: Kiểm tra quyền sở hữu phiên (sai → 404, không phải 403)
-    API->>DLP: Che dữ liệu nhạy cảm trong prompt
-    DLP->>AI: Prompt đã làm sạch (chỉ khi user bật ai_data_consent)
-    AI-->>API: Câu trả lời (503 + Retry-After nếu provider lỗi)
-    API->>DB: Mã hóa AES-256-GCM cả câu hỏi lẫn câu trả lời
-    API->>AUD: chat.message.send (+ dlp.redacted nếu có che)
-    API-->>U: Nội dung trả lời + danh mục dữ liệu đã che
+    API->>DLP: Kiểm tra prompt và chính sách theo mode/classification
+    alt Nhánh AI ngoài thiếu consent hoặc policy chặn
+        API-->>U: Từ chối; không gọi provider, không lưu tin nhắn
+    else Được xử lý
+        alt AI ngoại tuyến
+            DLP->>AI: Bản xem trước đã che (không ra Internet)
+        else AI bên ngoài được consent và policy cho phép
+            DLP->>AI: Prompt và ngữ cảnh được phép, đã che dữ liệu
+        end
+        AI-->>API: Phản hồi (503 + Retry-After nếu provider lỗi)
+        API->>DLP: Kiểm tra phản hồi provider trước khi lưu/hiển thị
+        API->>DB: Mã hóa AES-256-GCM cả câu hỏi lẫn câu trả lời
+        API->>AUD: chat.message.send (+ dlp.redacted nếu có che)
+        API-->>U: Nội dung trả lời + danh mục dữ liệu đã che
+    end
 ```
 
 ---
@@ -349,26 +364,34 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 
 ## 7. Chạy nhanh trên máy cá nhân
 
-Yêu cầu: **Python 3.10+** và [`uv`](https://docs.astral.sh/uv/) (uv có thể tự tải Python nếu máy chưa có).
+Yêu cầu: **Python 3.10+** và các thư viện trong `uv.lock`. Từ thư mục dự án,
+nếu chưa có `.venv`, cài một lần bằng `uv sync --frozen --group dev` (cần mạng).
+Sau đó dùng PowerShell:
 
-```bash
-git clone https://github.com/nguyentuanthien2384/Secure_Conversational_Application_Platform.git
-cd Secure_Conversational_Application_Platform
-
-uv sync --group dev          # cài dependency đúng theo uv.lock
-cp .env.example .env         # Windows PowerShell: Copy-Item .env.example .env
-uv run python scripts/generate_secrets.py   # sinh APP_SECRET_KEY / MASTER_ENCRYPTION_KEY
-
-uv run python scripts/seed_demo_data.py     # dữ liệu mẫu (tùy chọn)
-uv run python run_app.py
+```powershell
+.\.venv\Scripts\python.exe -m scripts.demo_local --check
+.\.venv\Scripts\python.exe -m scripts.demo_local
 ```
 
 - **Giao diện:** <http://127.0.0.1:8000>
 - **OpenAPI / Swagger:** <http://127.0.0.1:8000/docs>
 
-Có sẵn script bọc sẵn cho lần đầu: [setup.sh](setup.sh) (Linux/macOS) và [setup.ps1](setup.ps1) (Windows).
-Không cấu hình `GOOGLE_GENAI_API_KEY` thì ứng dụng chạy **Demo AI ngoại tuyến** — vẫn đủ để trình
-diễn toàn bộ luồng bảo mật, kể cả DLP.
+`--check` kiểm tra sẵn sàng rồi thoát, không mở cổng. `--port 8080` đổi cổng nếu cần.
+Trên macOS/Linux dùng `./.venv/bin/python`. Launcher lắng nghe trên loopback, bỏ qua
+`.env`, dùng SQLite/khóa tạm mới mỗi lần, tự seed và ép AI ngoại tuyến. Dừng bằng `Ctrl+C`;
+khởi động lại là lượt demo mới, không xóa hoặc thay đổi cơ sở dữ liệu đang có của dự án.
+
+Bot `[DEMO AI]` cho xem nội dung đã qua DLP. Nó không gọi AI ngoài nên không chứng minh
+nhánh đồng thuận/chặn gửi/kiểm tra phản hồi provider. Runner bật consent rồi kiểm chứng
+chặn secret mã hóa, che email và lọc phản hồi với nhà cung cấp giả lập; nhánh thiếu consent
+được kiểm tra trong bộ pytest. Không cần khóa API:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.validate_security
+```
+
+JSON/JUnit được lưu trong `reports/security-validation/`. Đây là kiểm chứng ứng dụng
+trên môi trường tạm, không phải thử tấn công giao diện đang trình chiếu.
 
 Tài liệu đi kèm: [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md) (từng bước đến lúc demo được),
 [HUONG_DAN_DOCKER.md](HUONG_DAN_DOCKER.md), [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) (kịch bản bảo vệ đồ án).
@@ -377,31 +400,20 @@ Tài liệu đi kèm: [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md) (từng bước đ�
 
 ## 8. Tài khoản demo & dữ liệu mẫu
 
-```bash
-uv run python scripts/seed_demo_data.py           # tạo dữ liệu mẫu (idempotent)
-uv run python scripts/seed_demo_data.py --reset   # xóa và tạo lại
-uv run python scripts/seed_demo_data.py --refresh-telemetry
-                                                  # làm mới cảnh báo IDS trong 60 phút
-```
+Launcher nạp sẵn dữ liệu mẫu. Mật khẩu chung: **`Phenikaa-Vault#2026-Lab`**.
 
-Hoặc đặt `SEED_DEMO_DATA=true` trong `.env` để seed ngay lúc khởi động (guard production sẽ
-**từ chối khởi động** nếu cờ này bật ở `APP_ENV=production`).
+- `demo.user` (`user`): trò chuyện, xem bản mã, tìm kiếm, MFA và thiết bị.
+- `demo.mod` (`moderator`): thêm nhật ký kiểm toán, phát hiện IDS và bất thường.
+- `demo.boss` (`admin`): thêm thống kê, quản lý người dùng, danh sách chặn và xác minh audit.
 
-Mật khẩu chung: **`Phenikaa-Vault#2026-Lab`**
+Có thêm 8 tài khoản `lab.*` và tổng cộng 24 hội thoại. Các sự kiện seed đều là mô phỏng,
+bao gồm chuỗi thất bại từ nhiều IP rồi đăng nhập thành công để trình diễn tương quan.
+Không dùng sự kiện seed làm bằng chứng rằng một tấn công thật đã xảy ra hoặc đã bị chặn.
 
-| Tài khoản | Vai trò | Thấy được gì |
-| :--- | :--- | :--- |
-| `demo.user` | `user` | Trò chuyện, soi bản mã, tìm kiếm, 2FA & thiết bị |
-| `demo.mod` | `moderator` | Như trên + Nhật ký kiểm toán, phát hiện IDS & bất thường |
-| `demo.boss` | `admin` | Toàn quyền: thống kê, quản lý user, danh sách chặn IDS, xác minh chuỗi audit |
-
-Mỗi lần seed sạch có thêm 8 tài khoản `lab.*` (tổng 11 tài khoản) và 24 hội thoại
-AES-256-GCM để bảng quản trị, phân trang và tìm kiếm có dữ liệu đủ khi trình diễn.
-Lệnh `--refresh-telemetry` chỉ thêm các sự kiện brute-force/IDOR gần hiện tại, nên
-không nhân bản người dùng hoặc hội thoại.
-
-[scripts/seed_learning_data.py](scripts/seed_learning_data.py) sinh khối lượng dữ liệu lớn hơn
-để bảng thống kê và biểu đồ có gì để nhìn khi demo.
+Muốn làm lại bài demo, dừng và chạy lại launcher. Các công cụ
+[seed_demo_data.py](scripts/seed_demo_data.py) và
+[seed_learning_data.py](scripts/seed_learning_data.py) vẫn dành cho môi trường cấu hình
+riêng; không cần chạy chúng hoặc dùng `--reset` cho lượt demo tạm.
 
 ---
 
@@ -604,9 +616,9 @@ Secure_Conversational_Application_Platform/
    WORM phát hiện rollback sau khi giao; full host compromise trước khi giao vẫn còn rủi ro.
 2. **CSP còn `'unsafe-inline'`.** Gradio sinh style/script inline. `'unsafe-eval'` đã bỏ được
    (giai đoạn 1); chuyển sang nonce/hash cần tách frontend riêng (giai đoạn 2).
-3. **IDS chữ ký là phòng thủ chiều sâu, không phải kiểm soát chính.** SQL injection đã bất khả thi
-   về mặt cấu trúc nhờ tham số hóa của SQLAlchemy; engine signature tồn tại để *phát hiện và ghi lại*
-   ý đồ tấn công, và có thể bị né bằng mã hóa/obfuscation.
+3. **IDS chữ ký là phòng thủ chiều sâu, không phải kiểm soát chính.** Truy vấn tham số hóa
+   của SQLAlchemy là biện pháp chính chống SQL injection trong các luồng đã triển khai;
+   engine signature phát hiện dấu hiệu nghi vấn và có thể bị né bằng mã hóa/obfuscation.
 4. **Rate limiter in-memory chỉ đúng cho một tiến trình.** Nhiều worker bắt buộc dùng Redis —
    guard production đã ép điều này.
 5. **E2EE cần client riêng đã audit.** Server đã có public-key/prekey/membership/ciphertext relay

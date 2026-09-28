@@ -20,6 +20,8 @@ from src.app.db import Database, utcnow
 from src.app.models import AuditEvent, ChatSession, SecureMessage, User
 from src.app.security import CryptoService, PasswordService
 
+_AUDIT_KEY_FROM_ENV = object()
+
 
 def _seed_audit_key() -> bytes | None:
     """Khóa HMAC của hash chain, dẫn xuất từ cùng APP_SECRET_KEY mà server dùng.
@@ -71,7 +73,8 @@ DEMO_CONVERSATIONS: list[tuple[str, list[tuple[str, str]]]] = [
                 "Mỗi tin nhắn được mã hóa bằng AES-256-GCM trước khi ghi xuống database. "
                 "Hệ thống sinh một nonce 12 byte ngẫu nhiên cho từng tin nhắn, và AAD "
                 "(Additional Authenticated Data) ràng buộc bản mã với session_id, vai trò "
-                "và phiên bản khóa — vì vậy trong DB không tồn tại bất kỳ plaintext nào.",
+                "và phiên bản khóa. Nội dung tin nhắn không được lưu dạng rõ; metadata "
+                "như tiêu đề và thời điểm vẫn được lưu để phục vụ giao diện.",
             ),
             ("user", "AAD giúp ích gì? Không có nó thì sao?"),
             (
@@ -114,7 +117,11 @@ DEMO_CONVERSATIONS: list[tuple[str, list[tuple[str, str]]]] = [
                 "Mặc định 30 phút. Token JWT chứa các claim exp, nbf, iat, jti, issuer và "
                 "audience. Mỗi lần đăng nhập tạo một bản ghi phiên phía server gắn với jti — "
                 "nhờ đó bạn có thể vào tab Tài khoản để xem và thu hồi từng thiết bị, hoặc "
-                "đăng xuất tất cả.",
+                "đăng xuất tất cả. Gia hạn token xoay vòng phiên và vô hiệu token cũ; "
+                "phát lại token cũ sẽ thu hồi cả họ phiên. Máy chủ còn áp dụng mặc định "
+                "30 phút không hoạt động và giới hạn tuyệt đối 8 giờ từ lần đăng nhập "
+                "đầu tiên. Xem danh sách thiết bị hoặc gia hạn token không kéo dài mốc "
+                "không hoạt động.",
             ),
             ("user", "Đổi mật khẩu xong tôi bị văng ra, có phải lỗi không?"),
             (
@@ -219,7 +226,8 @@ SAMPLE_CONVERSATIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ),
 ]
 
-FAKE_IPS = ("203.113.131.10", "14.161.20.88", "118.70.126.45", "42.114.53.201")
+# Các dải TEST-NET dành cho tài liệu, không đại diện cho nguồn tấn công thật.
+FAKE_IPS = ("203.0.113.10", "198.51.100.88", "192.0.2.45", "203.0.113.201")
 
 
 def seed_demo_data(
@@ -229,15 +237,25 @@ def seed_demo_data(
     *,
     reset: bool = False,
     refresh_telemetry: bool = False,
+    audit_key: bytes | None | object = _AUDIT_KEY_FROM_ENV,
     log=print,
 ) -> None:
     """Nạp dữ liệu demo, có thể làm mới telemetry hiển thị trên dashboard.
 
     Mặc định thao tác này idempotent: tài khoản, hội thoại và audit đã có sẽ
-    không bị nhân bản. ``refresh_telemetry`` chỉ thêm 12 sự kiện gần hiện tại
-    (brute-force và IDOR bị chặn) để cửa sổ IDS 60 phút luôn có kịch bản để
+    không bị nhân bản. ``refresh_telemetry`` chỉ thêm 19 sự kiện gần hiện tại
+    (brute-force, IDOR, dò phân tán và thành công sau chuỗi thất bại) để IDS
+    trong cửa sổ 60 phút luôn có kịch bản để
     trình diễn; không đụng đến dữ liệu hội thoại hay các sự kiện lịch sử.
+
+    Truyền ``audit_key`` để dùng cùng khóa với cấu hình của ứng dụng mà không
+    đọc lại .env. ``None`` tắt niêm phong; bỏ qua tham số giữ hành vi cũ là đọc
+    khóa từ môi trường. Dữ liệu và telemetry đều là mẫu tổng hợp cho local lab.
     """
+    if audit_key is _AUDIT_KEY_FROM_ENV:
+        audit_key = _seed_audit_key()
+    if audit_key is not None and not isinstance(audit_key, bytes):
+        raise TypeError("audit_key phải là bytes hoặc None.")
     # PostgreSQL schema changes belong to the owner-only migration service.
     # The demo seed runs inside the least-privilege web process, so on an
     # already-migrated PostgreSQL database it must only validate the schema.
@@ -346,7 +364,10 @@ def seed_demo_data(
                     ip_address=ip,
                     user_agent="Mozilla/5.0 (seed-demo)",
                     request_id="seed-" + uuid.uuid4().hex[:12],
-                    details_json=json.dumps(details, ensure_ascii=False),
+                    details_json=json.dumps(
+                        {**details, "synthetic": True, "sample_source": "seed_demo_data"},
+                        ensure_ascii=False,
+                    ),
                     created_at=utcnow() - timedelta(minutes=minutes_ago),
                 )
 
@@ -389,9 +410,26 @@ def seed_demo_data(
                         target=("chat_session", uuid.uuid4().hex[:8]),
                     )
                 )
+            # Dữ liệu tổng hợp: một tài khoản bị dò từ 3 IP TEST-NET, rồi có
+            # đăng nhập thành công. Đây là tín hiệu cần điều tra, không chứng
+            # minh tài khoản thật bị xâm nhập và không tự động khóa tài khoản.
+            for i in range(6):
+                events.append(
+                    audit(
+                        9 - i, "auth.login", "failure", users["lab.alice"],
+                        FAKE_IPS[i % 3],
+                        {"reason": "invalid_credentials", "scenario": "distributed_guessing"},
+                    )
+                )
+            events.append(
+                audit(
+                    2, "auth.login", "success", users["lab.alice"], FAKE_IPS[2],
+                    {"scenario": "success_after_failures"},
+                )
+            )
             # Hoạt động bình thường rải trong nhiều ngày để dashboard có phân
             # bố dữ liệu thay vì chỉ một cụm sự kiện ở hiện tại. Phần lịch sử
-            # chỉ sinh khi tạo lại dữ liệu, còn refresh chỉ sinh 12 tín hiệu
+            # chỉ sinh khi tạo lại dữ liệu, còn refresh chỉ sinh 19 tín hiệu
             # cần cho việc xem IDS ngay lúc đó.
             if created_any or reset:
                 for day in range(7):
@@ -418,11 +456,9 @@ def seed_demo_data(
                                 {"content_length": _DEMO_RANDOM.randint(20, 300)},
                             )
                         )
-            # Trước đây các bản ghi này được INSERT trực tiếp, không đi qua
-            # seal_event, nên entry_hash = NULL và GET /api/admin/audit/verify
-            # báo "đã xác minh 97/120". Bây giờ mỗi bản ghi được niêm phong đúng
-            # thứ tự id, nên chuỗi phủ 100% và trang Bảo mật hiển thị 120/120.
-            audit_key = _seed_audit_key()
+            # Niêm phong theo thứ tự chèn để mẫu dùng chính cơ chế kiểm chứng
+            # của ứng dụng. Nhãn synthetic vẫn được bảo vệ bởi chuỗi HMAC.
+            events.sort(key=lambda event: event.created_at)
             if audit_key is None:
                 log("[audit] AUDIT_CHAIN_ENABLED=false — bỏ qua niêm phong hash chain.")
                 db.add_all(events)
@@ -436,6 +472,7 @@ def seed_demo_data(
                     db.flush()
                 db.commit()
             mode = "làm mới cảnh báo trong 60 phút" if refresh_telemetry and not (created_any or reset) else "tạo dữ liệu"
-            log(f"[audit] Đã ghi {len(events)} sự kiện kiểm toán mô phỏng ({mode}, đã niêm phong).")
+            sealing = "đã niêm phong" if audit_key is not None else "không niêm phong"
+            log(f"[audit] Đã ghi {len(events)} sự kiện kiểm toán mô phỏng ({mode}, {sealing}).")
 
     log("[seed] Dữ liệu mẫu sẵn sàng — mật khẩu chung: " + DEMO_PASSPHRASE)

@@ -14,9 +14,10 @@ Khác gì so với scripts/seed_demo_data.py?
      (audit_chain.seal_event), nên GET /api/admin/audit/verify báo
      verified_events == total_events. Bản seed cũ chèn thẳng vào DB mà không
      niêm phong, khiến verify đếm được rất ít bản ghi đã xác minh.
-  5. Kịch bản tấn công phân biệt brute force (1 tài khoản, nhiều mật khẩu) với
-     password spraying (nhiều tài khoản, 1 mật khẩu) — đúng như engine bất
-     thường trong src/app/ids.py phân loại.
+  5. Telemetry tổng hợp minh họa dấu hiệu brute force (nhiều lỗi trên một tài
+     khoản), spraying (lỗi trên nhiều tài khoản), dò phân tán và thành công
+     sau chuỗi thất bại. Không lưu mật khẩu thử nên không chứng minh cùng
+     một mật khẩu đã được dùng trong các lần thử.
 
 Cách chạy (dùng cùng file .env với server, vì tin nhắn mã hóa bằng đúng
 MASTER_ENCRYPTION_KEY mà server sẽ dùng để giải mã):
@@ -85,9 +86,12 @@ CONVERSATIONS_USER: list[tuple[str, list[tuple[str, str]]]] = [
             ("user", "Vậy vì sao thời hạn chỉ 30 phút?"),
             (
                 "assistant",
-                "Vì chưa có refresh-token rotation. Token càng sống lâu thì cửa sổ mà "
-                "một token bị đánh cắp còn dùng được càng rộng. 30 phút là đánh đổi giữa "
-                "trải nghiệm và rủi ro — README mục 9 ghi rõ đây là giới hạn có chủ đích.",
+                "30 phút là thời hạn mặc định của access token. Dự án có xoay vòng token: "
+                "gia hạn hợp lệ tạo token kế tiếp, vô hiệu token cũ; phát lại token cũ "
+                "sẽ thu hồi cả họ phiên. Máy chủ kiểm tra thêm hạn không hoạt động "
+                "30 phút và giới hạn tuyệt đối 8 giờ từ lần đăng nhập đầu tiên. Gia hạn "
+                "token, xem thông tin tài khoản và danh sách thiết bị không kéo dài "
+                "mốc không hoạt động. Các giá trị này có thể cấu hình.",
             ),
         ],
     ),
@@ -120,12 +124,13 @@ CONVERSATIONS_USER: list[tuple[str, list[tuple[str, str]]]] = [
             ("user", "Một bảng log mà admin DB sửa được thì có ý nghĩa gì không?"),
             (
                 "assistant",
-                "Đúng là gần như không, nên dự án dùng hash chain: mỗi bản ghi lưu "
+                "Dự án dùng hash chain để phát hiện thay đổi: mỗi bản ghi lưu "
                 "entry_hash = HMAC-SHA256(khóa, prev_hash || nội dung bản ghi). Sửa một "
-                "dòng ở giữa làm mọi hash phía sau sai, và verify chỉ ra đúng id đầu tiên "
+                "dòng ở giữa làm kiểm chứng chuỗi thất bại, và verify chỉ ra id đầu tiên "
                 "bị gãy. Khóa HMAC dẫn xuất từ APP_SECRET_KEY với nhãn riêng, không nằm "
-                "trong database — nên người chỉ có quyền SQL có thể XÓA nhưng không thể "
-                "GIẢ MẠO một chuỗi hợp lệ.",
+                "trong database. Chuỗi giúp phát hiện sửa hoặc xóa giữa chuỗi. Nếu một "
+                "người có quyền xóa phần cuối mà không có checkpoint bên ngoài, chỉ "
+                "kiểm tra hash chain không đủ để phát hiện mất phần cuối đó.",
             ),
             (
                 "user",
@@ -133,10 +138,12 @@ CONVERSATIONS_USER: list[tuple[str, list[tuple[str, str]]]] = [
             ),
             (
                 "assistant",
-                "Có lớp thứ hai ở tầng database: vai trò runtime scap_app bị REVOKE "
+                "Khi triển khai PostgreSQL theo cấu hình phân quyền của dự án, vai trò "
+                "runtime scap_app bị REVOKE "
                 "UPDATE, DELETE, TRUNCATE trên bảng audit_events, chỉ còn SELECT và "
                 "INSERT. Hash chain PHÁT HIỆN việc sửa đổi, còn phân quyền NGĂN CHẶN nó "
-                "ngay từ đầu. Hai lớp bổ sung cho nhau, đúng nguyên tắc defense in depth.",
+                "ngay từ đầu. Demo SQLite cục bộ chỉ minh họa hash chain; không có lớp "
+                "vai trò PostgreSQL này.",
             ),
         ],
     ),
@@ -146,21 +153,24 @@ CONVERSATIONS_USER: list[tuple[str, list[tuple[str, str]]]] = [
             ("user", "Nếu tôi vô tình dán số thẻ vào chat thì sao?"),
             (
                 "assistant",
-                "Lớp DLP quét bản rõ và che các mẫu nhạy cảm TRƯỚC khi nội dung được gửi "
-                "tới nhà cung cấp AI bên ngoài. Bản gốc vẫn được lưu mã hóa trong DB của "
-                "bạn, chỉ phần đi ra ngoài bị che. Khi có gì bị che, giao diện hiện banner "
-                "cảnh báo và một sự kiện dlp.redacted được ghi vào nhật ký.",
+                "Số thẻ hợp lệ được phân loại highly_confidential và bị CHẶN khi gửi "
+                "tới AI bên ngoài. Email và số điện thoại thuộc confidential có thể "
+                "được CHE theo chính sách và xác nhận cần thiết. Yêu cầu bị chặn sẽ "
+                "không được ghi thành tin nhắn. Với yêu cầu được chấp nhận, nội dung "
+                "gốc được lưu mã hóa, phần gửi ngoài được che. Chế độ AI ngoại tuyến "
+                "chỉ minh họa việc che; nó không gửi dữ liệu ra mạng.",
             ),
             (
                 "user",
-                "Nghe nói lớp này từng bị lỗi?",
+                "Dữ liệu mã hóa Base64 hoặc URL có bị bỏ sót không?",
             ),
             (
                 "assistant",
-                "Có, và đó là lỗi đáng nhớ nhất của dự án: regex bị escape hai lần trong "
-                "chuỗi raw nên không khớp gì cả — lớp DLP trông như đang hoạt động nhưng "
-                "thực tế không che gì. Nó chỉ lộ ra khi có test kiểm tra đầu ra thật. Bài "
-                "học: một kiểm soát bảo mật không có test là một kiểm soát chưa tồn tại.",
+                "Bộ quét kiểm tra thêm các lớp URL encoding, HTML entity và Base64, "
+                "tối đa 3 lớp và có giới hạn khối lượng xử lý. Nếu chạm giới hạn kiểm "
+                "tra, dữ liệu bị nâng lên highly_confidential để chặn đường gửi ra "
+                "ngoài. Toàn bộ phản hồi AI cũng được quét trước khi cắt ngắn để hiển "
+                "thị. Cơ chế theo mẫu không bảo đảm nhận diện mọi cách giấu dữ liệu.",
             ),
         ],
     ),
@@ -175,7 +185,7 @@ CONVERSATIONS_MOD: list[tuple[str, list[tuple[str, str]]]] = [
                 "assistant",
                 "Chính xác. Hãy đăng nhập bằng learn.user, lấy session_id của hội thoại "
                 "này rồi gọi GET /api/chat/sessions/{id}/messages. Máy chủ kiểm tra quyền "
-                "sở hữu trên từng phiên nên sẽ trả 403 hoặc 404 thay vì nội dung, và ghi "
+                "sở hữu trên từng phiên nên sẽ trả 404 thay vì nội dung, và ghi "
                 "một sự kiện authorization.denied kèm id bị nhắm tới. Đó là cách chống "
                 "IDOR/BOLA: không bao giờ tin id do client gửi lên.",
             ),
@@ -189,11 +199,16 @@ UA_MOBILE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5) Mobile/15E148 Safari/604.1
 UA_ATTACK = "python-requests/2.32.3"
 
 
-def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuống dễ hơn là tách hàm
-    reset = "--reset" in sys.argv
-    wipe_audit = "--wipe-audit" in sys.argv
+def seed_learning_data(
+    settings: Settings, *, reset: bool = False, wipe_audit: bool = False, log=print,
+) -> dict | None:
+    """Seed a local teaching lab using the caller's explicit configuration.
 
-    settings = Settings.from_env()
+    All audit records are labelled synthetic. Returned MFA secrets and recovery
+    codes belong only to these lab users; never call this on a production DB.
+    """
+    if settings.environment not in {"development", "test"}:
+        raise ValueError("Dữ liệu học tập chỉ được tạo trong development hoặc test.")
     database = Database(settings.database_url)
     passwords = PasswordService()
     crypto = CryptoService(
@@ -204,7 +219,10 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
     totp = TotpService()
     audit_key = derive_audit_key(settings.secret_key) if settings.audit_chain_enabled else None
 
-    database.create_all()
+    if database.engine.dialect.name == "postgresql":
+        database.assert_schema_ready()
+    else:
+        database.create_all()
     notes: list[str] = []
 
     with database.session_factory() as db:
@@ -212,7 +230,7 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
         if wipe_audit:
             removed = db.query(AuditEvent).delete(synchronize_session=False)
             db.commit()
-            print(f"[wipe] Đã xóa {removed} bản ghi audit — chuỗi băm bắt đầu lại từ genesis.")
+            log(f"[wipe] Đã xóa {removed} bản ghi audit — chuỗi băm bắt đầu lại từ genesis.")
 
         if reset:
             gone = 0
@@ -227,7 +245,7 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
                 .delete(synchronize_session=False)
             )
             db.commit()
-            print(f"[reset] Đã xóa {gone} tài khoản và {killed} bản ghi audit mẫu.")
+            log(f"[reset] Đã xóa {gone} tài khoản và {killed} bản ghi audit mẫu.")
             if killed and not wipe_audit:
                 notes.append(
                     "Vừa XÓA bản ghi audit ở giữa chuỗi. Nếu verify báo chain_intact=false, "
@@ -253,14 +271,14 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
             db.add(user)
             users[username] = user
             created_any = True
-            print(f"[user] Tạo {username} (role={role}).")
+            log(f"[user] Tạo {username} (role={role}).")
         db.commit()
         for user in users.values():
             db.refresh(user)
 
         if not created_any and not reset:
-            print("[skip] Tài khoản mẫu đã tồn tại. Dùng --reset để tạo lại từ đầu.")
-            _print_tour(None, notes)
+            log("[skip] Tài khoản mẫu đã tồn tại. Dùng --reset để tạo lại từ đầu.")
+            _print_tour(None, notes, log=log)
             return
 
         # ───────────────── 2. Trạng thái đặc biệt ─────────────────
@@ -281,7 +299,7 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
         for code in recovery_plain:
             db.add(MfaRecoveryCode(user_id=mfa_user.id, code_hash=passwords.hash(code)))
         db.commit()
-        print(f"[mfa] Đã bật 2FA cho {mfa_user.username} + {len(recovery_plain)} mã khôi phục.")
+        log(f"[mfa] Đã bật 2FA cho {mfa_user.username} + {len(recovery_plain)} mã khôi phục.")
 
         # ───────────────── 3. Hội thoại mã hóa ─────────────────
         idor_target: str | None = None
@@ -323,7 +341,7 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
                             created_at=stamp,
                         )
                     )
-                print(f"[chat] {owner.username}: “{title}” — {len(turns)} tin đã mã hóa.")
+                log(f"[chat] {owner.username}: “{title}” — {len(turns)} tin đã mã hóa.")
             db.commit()
 
         if idor_target is None:
@@ -338,12 +356,12 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
         ):
             now = utcnow()
             devices = (
-                (UA_DESKTOP, FAKE_IPS[0], None, 20),
-                (UA_MOBILE, FAKE_IPS[1], None, 6),
-                (UA_ATTACK, FAKE_IPS[2], now - timedelta(hours=30), 34),
+                (UA_DESKTOP, FAKE_IPS[0], None, 10),
+                (UA_MOBILE, FAKE_IPS[1], None, 5),
+                (UA_ATTACK, FAKE_IPS[2], now - timedelta(hours=30), 34 * 60),
             )
-            for ua, ip, revoked, hours_ago in devices:
-                issued = now - timedelta(hours=hours_ago)
+            for ua, ip, revoked, minutes_ago in devices:
+                issued = now - timedelta(minutes=minutes_ago)
                 session_jti = str(uuid.uuid4())
                 db.add(
                     AuthSession(
@@ -351,20 +369,21 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
                         user_id=users["learn.user"].id,
                         session_family_id=session_jti,
                         issued_at=issued,
-                        expires_at=issued
-                        + timedelta(minutes=max(settings.access_token_minutes, 30)),
+                        root_issued_at=issued,
+                        last_activity_at=issued if revoked else now,
+                        expires_at=(issued if revoked else now)
+                        + timedelta(minutes=settings.access_token_minutes),
                         revoked_at=revoked,
                         ip_address=ip,
-                        user_agent=ua,
+                        user_agent=ua + " (synthetic-learning-device)",
                     )
                 )
             db.commit()
-            print("[device] 3 phiên thiết bị (1 đã thu hồi) cho learn.user.")
+            log("[device] 3 phiên mẫu: 2 còn hiệu lực, 1 đã thu hồi; không phát hành token thật.")
 
         # ───────────────── 5. Nhật ký kiểm toán ─────────────────
-        # Xây danh sách rồi SẮP XẾP THEO THỜI GIAN trước khi chèn: chuỗi băm đi
-        # theo id tăng dần, nên id phải cùng thứ tự với created_at, nếu không
-        # verify sẽ báo gãy vì lý do không phải tấn công.
+        # Sắp xếp theo thời gian giúp đọc kịch bản dễ hơn. Chuỗi HMAC xác minh
+        # theo thứ tự id, không yêu cầu timestamp của mọi bản ghi tăng dần.
         drafts: list[tuple[int, dict]] = []
 
         def ev(minutes_ago: int, event_type: str, outcome: str, **kw) -> None:
@@ -385,7 +404,7 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
         # 5b. Đăng ký + bật 2FA (vòng đời MFA đầy đủ).
         ev(4300, "auth.register", "success", actor=u_mfa, ip=FAKE_IPS[1])
         ev(4200, "auth.mfa.enroll", "success", actor=u_mfa, ip=FAKE_IPS[1])
-        ev(4190, "auth.mfa.activate", "success", actor=u_mfa, ip=FAKE_IPS[1],
+        ev(4190, "auth.mfa.enabled", "success", actor=u_mfa, ip=FAKE_IPS[1],
            details={"recovery_codes": len(recovery_plain)})
         ev(2000, "auth.mfa.challenge", "success", actor=u_mfa, ip=FAKE_IPS[1])
         ev(1999, "auth.mfa.verify", "failure", actor=u_mfa, ip=FAKE_IPS[1],
@@ -423,7 +442,7 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
 
         # 5g. DLP che dữ liệu trước khi gửi ra nhà cung cấp AI.
         ev(70, "dlp.redacted", "success", actor=u_user, ip=FAKE_IPS[0],
-           details={"patterns": ["credit_card", "email"], "redactions": 2})
+           details={"categories": ["Địa chỉ email", "Số điện thoại"]})
 
         # 5h. Phản ứng sự cố: thu hồi phiên, đổi mật khẩu, đổi vai trò.
         ev(55, "auth.session_revoke", "success", actor=u_user, ip=FAKE_IPS[0],
@@ -440,6 +459,20 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
         ev(10, "chat.message.search", "success", actor=u_user, ip=FAKE_IPS[0],
            details={"query_length": 6, "matches": 3})
 
+        # 5i. Hai luật tương quan mới đều có bằng chứng trong cửa sổ 60 phút.
+        # Không nhập mật khẩu sai thật, không đổi trạng thái tài khoản mẫu.
+        for i in range(6):
+            ev(28 - i, "auth.login", "failure", actor=u_user, ip=FAKE_IPS[i % 3],
+               details={"reason": "invalid_credentials", "scenario": "distributed_guessing"})
+        ev(21, "auth.login", "success", actor=u_user, ip=FAKE_IPS[2],
+           details={"scenario": "success_after_failures"})
+        ev(8, "dlp.redacted", "success", actor=u_user, ip=FAKE_IPS[0],
+           details={"categories": ["Địa chỉ email"], "scenario": "encoded_email"})
+        ev(7, "browser.origin.denied", "denied", ip=FAKE_IPS[1],
+           details={"reason": "untrusted_cross_origin"})
+        ev(6, "auth.session.expired", "denied", actor=u_mod, ip=FAKE_IPS[1],
+           details={"reason": "idle_timeout"})
+
         # Chèn theo đúng thứ tự thời gian và niêm phong từng bản ghi.
         drafts.sort(key=lambda item: -item[0])
         sealed = 0
@@ -455,7 +488,10 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
                 ip_address=spec.get("ip"),
                 user_agent=spec.get("ua", UA_DESKTOP),
                 request_id=TAG + uuid.uuid4().hex[:12],
-                details_json=json.dumps(spec.get("details", {}), ensure_ascii=False),
+                details_json=json.dumps(
+                    {**spec.get("details", {}), "synthetic": True,
+                     "sample_source": "seed_learning_data"}, ensure_ascii=False,
+                ),
                 created_at=utcnow() - timedelta(minutes=minutes_ago),
             )
             if audit_key is not None:
@@ -466,35 +502,34 @@ def main() -> None:  # noqa: C901 - script tuần tự, đọc từ trên xuốn
             db.add(row)
             db.flush()
         db.commit()
-        print(f"[audit] Đã ghi {len(drafts)} sự kiện" + (f", niêm phong {sealed}." if sealed else "."))
+        log(f"[audit] Đã ghi {len(drafts)} sự kiện mô phỏng" + (f", niêm phong {sealed}." if sealed else "."))
 
-        _print_tour(
-            {
-                "idor_target": idor_target,
-                "mfa_user": mfa_user.username,
-                "mfa_secret": mfa_secret,
-                "recovery": recovery_plain,
-                "locked_user": u_locked.username,
-                "sealed": sealed,
-            },
-            notes,
-        )
+        info = {
+            "idor_target": idor_target,
+            "mfa_user": mfa_user.username,
+            "mfa_secret": mfa_secret,
+            "recovery": recovery_plain,
+            "locked_user": u_locked.username,
+            "sealed": sealed,
+        }
+        _print_tour(info, notes, log=log)
+        return info
 
 
-def _print_tour(info: dict | None, notes: list[str]) -> None:
+def _print_tour(info: dict | None, notes: list[str], *, log=print) -> None:
     line = "─" * 68
-    print(f"\n{line}\nTÀI KHOẢN MẪU — mật khẩu chung: {LEARN_PASSPHRASE}\n{line}")
+    log(f"\n{line}\nTÀI KHOẢN MẪU — mật khẩu chung: {LEARN_PASSPHRASE}\n{line}")
     for username, role, why in LEARN_USERS:
-        print(f"  {username:<14} {role:<10} {why}")
+        log(f"  {username:<14} {role:<10} {why}")
 
     if info:
-        print(f"\n{line}\n2FA — nạp vào Google Authenticator / Authy\n{line}")
-        print(f"  Tài khoản  : {info['mfa_user']}")
-        print(f"  Secret     : {info['mfa_secret']}   (base32, nhập tay vào app)")
-        print(f"  Mã khôi phục: {', '.join(info['recovery'])}")
-        print("  Chỉ in ra một lần — trong DB chỉ có bản băm Argon2id của mã khôi phục.")
+        log(f"\n{line}\n2FA — nạp vào Google Authenticator / Authy\n{line}")
+        log(f"  Tài khoản  : {info['mfa_user']}")
+        log(f"  Secret     : {info['mfa_secret']}   (base32, nhập tay vào app)")
+        log(f"  Mã khôi phục: {', '.join(info['recovery'])}")
+        log("  Chỉ in ra một lần — trong DB chỉ có bản băm Argon2id của mã khôi phục.")
 
-        print(f"\n{line}\nLỘ TRÌNH TÌM HIỂU — làm theo thứ tự này\n{line}")
+        log(f"\n{line}\nLỘ TRÌNH TÌM HIỂU — làm theo thứ tự này\n{line}")
         steps = [
             ("Mã hóa at-rest",
              "Đăng nhập learn.user → tab Dữ liệu mã hóa. Mỗi dòng có ciphertext, "
@@ -504,7 +539,7 @@ def _print_tour(info: dict | None, notes: list[str]) -> None:
              "vì sao copy ciphertext sang hội thoại khác sẽ thất bại."),
             ("IDOR bị chặn",
              f"Vẫn là learn.user, gọi GET /api/chat/sessions/{info['idor_target']}/messages "
-             "(hội thoại này thuộc learn.mod) → 403/404 + audit authorization.denied."),
+             "(hội thoại này thuộc learn.mod) → 404 + audit authorization.denied."),
             ("Account lockout",
              f"Đăng nhập {info['locked_user']} bằng mật khẩu đúng → vẫn bị từ chối vì đang "
              "trong thời gian khóa. Thông báo lỗi giữ nguyên dạng chung, không tiết lộ "
@@ -515,29 +550,43 @@ def _print_tour(info: dict | None, notes: list[str]) -> None:
             ("Brute force vs spraying",
              "Đăng nhập learn.boss → tab Quản trị. Nhật ký có hai cụm tấn công khác nhau: "
              "một IP dò nhiều mật khẩu trên 1 tài khoản, và một IP thử 1 mật khẩu trên 5 "
-             "tài khoản. Engine bất thường phân loại chúng khác nhau."),
+             "tài khoản. Đây là lịch sử mô phỏng, chỉ xem được khi cửa sổ thời gian "
+             "bao phủ nó; mẫu không lưu hay chứng minh mật khẩu nào được thử."),
+            ("Dò phân tán và đăng nhập đáng ngờ",
+             "Ở cửa sổ 60 phút, xem IDS-DISTRIBUTED-BRUTEFORCE và "
+             "IDS-AUTH-SUCCESS-AFTER-FAILURES. 6 thất bại từ 3 IP rồi 1 thành công "
+             "được gắn synthetic=true: dữ liệu minh họa luật, không phải sự cố thật."),
             ("IDS/IPS",
              "Cùng tab, tìm ids.signature rồi ids.block: điểm rủi ro tích lũy vượt ngưỡng "
              "nên nguồn bị chặn có thời hạn."),
             ("Audit chain",
              "Gọi GET /api/admin/audit/verify → verified_events nên bằng total_events. "
-             "Sau đó sửa tay một dòng audit bằng psql rồi gọi lại → chain_intact=false "
-             "kèm first_broken_id đúng dòng vừa sửa."),
+             "Bộ kiểm thử của dự án minh họa phát hiện sửa log trong database tạm; "
+             "không sửa nhật ký trên bản demo đang trình chiếu."),
             ("Phân quyền 3 cấp",
              "Đăng nhập learn.mod: thấy nhật ký kiểm toán nhưng KHÔNG thấy quản lý người "
              "dùng. learn.user không thấy cả hai. Cùng một API, ba kết quả."),
             ("Thiết bị đăng nhập",
-             "learn.user → tab Tài khoản: 3 phiên, 1 đã thu hồi. Thu hồi một phiên rồi "
-             "thử dùng lại token của phiên đó."),
+             "learn.user → tab Tài khoản: có 2 phiên mẫu còn hạn ngay sau khi seed, "
+             "cộng phiên đăng nhập thật của bạn. Phiên đã thu hồi không hiện ở danh "
+             "sách đang hoạt động. Mẫu không có token thật; dùng 2 trình duyệt để "
+             "demo thu hồi và thử truy cập lại."),
         ]
         for i, (title, body) in enumerate(steps, 1):
-            print(f"\n  {i:>2}. {title}\n      {body}")
+            log(f"\n  {i:>2}. {title}\n      {body}")
 
     if notes:
-        print(f"\n{line}\nLƯU Ý\n{line}")
+        log(f"\n{line}\nLƯU Ý\n{line}")
         for note in notes:
-            print(f"  ! {note}")
-    print()
+            log(f"  ! {note}")
+    log("")
+
+
+def main() -> None:
+    seed_learning_data(
+        Settings.from_env(), reset="--reset" in sys.argv,
+        wipe_audit="--wipe-audit" in sys.argv,
+    )
 
 
 if __name__ == "__main__":

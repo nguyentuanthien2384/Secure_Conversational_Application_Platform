@@ -1,329 +1,165 @@
-# Hướng dẫn chạy dự án từ đầu đến khi demo được
+# Chạy SCAP để demo đồ án trên máy cá nhân
 
-Tài liệu này bổ sung cho `README.md`, viết theo hướng "làm theo từng bước là chạy".
-Đã kèm sẵn file `.env` với secrets sinh riêng, nên bạn **không cần cấu hình gì thêm**.
+Bản demo này dùng SQLite, AI ngoại tuyến và dữ liệu mẫu. Không cần máy chủ,
+tên miền, Docker, Gemini API key hay sửa `.env`. Sau khi cài đủ thư viện, có thể
+chạy phần demo ứng dụng và kiểm chứng bảo mật mà không cần Internet.
 
----
+## 1. Chuẩn bị một lần
 
-## 0. Điều kiện
+Mở PowerShell tại thư mục gốc dự án, nơi có `pyproject.toml` và `uv.lock`.
+Nếu đã có `.venv\Scripts\python.exe`, chuyển sang bước 2.
 
-| Thứ cần có | Ghi chú |
-|---|---|
-| Internet | Bắt buộc cho lần cài dependency đầu tiên |
-| Python 3.10+ | Không có cũng được — `uv` sẽ tự tải Python 3.12 |
-| ~1 GB đĩa trống | Gradio và các thư viện AI/QR |
-| Docker | **Chỉ khi** muốn chạy bản PostgreSQL (mục 4) |
-
----
-
-## 1. Chạy nhanh nhất — 1 lệnh
-
-### macOS / Linux / WSL
-
-```bash
-cd <thư-mục-dự-án>
-bash setup.sh
-```
-
-### Windows PowerShell
+Nếu chưa có môi trường Python, cài Python 3.10 trở lên và `uv`, rồi cài đúng
+các phiên bản trong tệp khóa (bước này cần mạng):
 
 ```powershell
-cd <thư-mục-dự-án>
-powershell -ExecutionPolicy Bypass -File setup.ps1
+uv sync --frozen --group dev
 ```
 
-Script sẽ: kiểm tra Python → cài `uv` nếu thiếu → giữ/tạo `.env` → `uv sync --group dev`
-→ khởi động server.
+Các lệnh dưới đây dùng trực tiếp Python trong `.venv` để không tự cập nhật hoặc
+tải thư viện khi đang trình bày. Trên macOS/Linux, thay
+`.\.venv\Scripts\python.exe` bằng `./.venv/bin/python`.
 
-Tuỳ chọn thêm:
+## 2. Kiểm tra sẵn sàng rồi mở ứng dụng
 
-- `bash setup.sh --test` / `setup.ps1 -Test` — chạy pytest + ruff + bandit trước khi start.
-- `bash setup.sh --no-run` / `setup.ps1 -NoRun` — chỉ cài, không chạy.
+Chạy kiểm tra trước buổi demo:
 
-Khi thấy dòng `Uvicorn running on http://127.0.0.1:8000`, mở trình duyệt:
-
-| Địa chỉ | Nội dung |
-|---|---|
-| <http://127.0.0.1:8000> | Giao diện chính (Gradio, thuần Python) |
-| <http://127.0.0.1:8000/docs> | Swagger / OpenAPI |
-
----
-
-## 2. Làm thủ công (nếu không muốn dùng script)
-
-```bash
-# 1) Cài uv
-curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS/Linux
-# hoặc: powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
-
-# 2) Cài dependency theo uv.lock
-uv sync --group dev
-
-# 3) Chạy
-uv run python run_app.py
+```powershell
+.\.venv\Scripts\python.exe -m scripts.demo_local --check
 ```
 
-File `.env` đã có sẵn trong thư mục dự án. Nếu bạn muốn tự sinh lại secrets:
+Lệnh kiểm tra tạo ứng dụng cùng dữ liệu mẫu trong môi trường tạm, kiểm tra sức
+khỏe, đăng nhập, chat ngoại tuyến/DLP, audit và các trang rồi thoát; không mở
+cổng phục vụ trình duyệt. Nếu có lỗi, xử lý trước bước tiếp theo.
 
-```bash
-python scripts/generate_secrets.py
-# rồi dán 2 dòng kết quả vào .env, ghi đè APP_SECRET_KEY và MASTER_ENCRYPTION_KEY
+Mở ứng dụng:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.demo_local
 ```
 
-> Local/demo dùng khóa này để bọc DEK riêng của từng hội thoại; dữ liệu legacy
-> vẫn có thể phụ thuộc trực tiếp vào keyring. Muốn chuyển/đổi khóa mà giữ dữ liệu,
-> dùng `scripts/migrate_envelope_encryption.py` và `scripts/rewrap_deks.py` theo
-> `docs/HIGH_SECURITY_DEPLOYMENT.md`, không thay khóa đột ngột.
+Khi ứng dụng sẵn sàng, vào <http://127.0.0.1:8000>. Tài liệu API nằm tại
+<http://127.0.0.1:8000/docs>. Giữ terminal này mở trong suốt buổi trình bày.
+Đóng tab demo rồi dừng bằng `Ctrl+C`. Nếu còn tab mở, ứng dụng chờ tối đa
+5 giây để kết thúc kết nối trước khi dọn dữ liệu tạm.
 
----
+Nếu cổng 8000 đang được dùng, chọn một cổng khác:
 
-## 3. Tài khoản đăng nhập
-
-`.env` đang bật `SEED_DEMO_DATA=true`, nên khi server khởi động lần đầu sẽ tự tạo
-3 tài khoản demo chính, thêm 8 tài khoản lab (tổng 11), 24 hội thoại đã mã hóa
-và một chuỗi sự kiện audit mô phỏng (brute-force, IDOR bị chặn) để trang quản trị
-có dữ liệu.
-
-**Mật khẩu chung:** `Phenikaa-Vault#2026-Lab`
-
-| Tài khoản | Vai trò | Xem được gì |
-|---|---|---|
-| `demo.user` | user | 4 hội thoại mẫu, bản mã trong DB, tìm kiếm |
-| `demo.mod` | moderator | như user + nhật ký kiểm toán |
-| `demo.boss` | admin | toàn bộ bảng quản trị: thống kê, cảnh báo, quản lý user |
-
-Ngoài ra `.env` có `BOOTSTRAP_ADMIN_USERNAME=admin` cùng mật khẩu ngẫu nhiên —
-mở file `.env` để xem. Sau khi demo xong nên xoá 2 dòng `BOOTSTRAP_ADMIN_*`.
-
-Muốn tạo lại dữ liệu mẫu sạch:
-
-```bash
-uv run python scripts/seed_demo_data.py --reset
+```powershell
+.\.venv\Scripts\python.exe -m scripts.demo_local --port 8080
 ```
 
----
+Khi đó mở <http://127.0.0.1:8080>. Luôn dùng cùng địa chỉ `127.0.0.1` và đúng
+cổng mà lệnh thông báo, thay vì đổi qua lại giữa nhiều tên máy.
 
-## 3b. Bật Gemini API thật (thay cho DEMO AI)
+Launcher chỉ lắng nghe trên máy cục bộ. Mỗi lần chạy dùng SQLite tạm và khóa
+ngẫu nhiên riêng, bỏ qua `.env`, bật seed và ép AI ngoại tuyến. Dữ liệu đang có
+của dự án không được dùng làm dữ liệu demo. Thư mục tạm được dọn khi dừng bình
+thường hoặc khi kiểm tra xong. Khởi động lại tạo một lượt demo mới: hội thoại
+vừa tạo, thay đổi tài khoản và thiết lập MFA của lượt cũ không được giữ lại.
+Đây là cách làm lại bài trình bày; không cần xóa cơ sở dữ liệu hay tắt IDS.
 
-Mặc định app chạy chế độ **Offline Demo AI**. Để dùng Gemini thật:
+## 3. Đăng nhập và hiểu đúng dữ liệu mẫu
 
-1. Lấy API key tại Google AI Studio (`aistudio.google.com` → *Get API key*).
-2. Điền vào `.env`:
+Mật khẩu chung của các tài khoản mẫu: **`Phenikaa-Vault#2026-Lab`**.
 
-   ```bash
-   GOOGLE_GENAI_API_KEY=<key-cua-ban>
-   GEMINI_MODEL=gemini-flash-lite-latest
-   ALLOW_DEMO_AI=false   # tùy chọn: báo lỗi rõ ràng thay vì âm thầm về demo
-   ```
+- `demo.user`: người dùng, dùng để chat, xem bản mã, thiết bị và MFA.
+- `demo.mod`: điều hành, xem thêm nhật ký kiểm toán và phát hiện IDS.
+- `demo.boss`: quản trị viên, xem dashboard và xác minh chuỗi audit.
 
-   Nên dùng alias `-latest` thay vì tên model có số phiên bản. Google khai tử
-   model cũ theo thời gian: bản ghim `gemini-2.5-flash-lite` nay trả **404**
-   *"no longer available to new users"*, trong khi alias tự trỏ sang thế hệ
-   còn hiệu lực.
+Có thêm tài khoản `lab.*` và hội thoại mẫu cho việc tìm kiếm, phân trang. Các
+sự kiện tấn công được seed là **dữ liệu mô phỏng**, không phải dấu vết một cuộc
+tấn công thật. Bằng chứng kiểm soát có hoạt động nằm trong bộ kiểm chứng ở
+bước 4, nơi các yêu cầu và kết quả được đối chiếu tự động.
 
-3. **Khởi động lại server.** `AIService` chỉ khởi tạo một lần lúc app start,
-   sửa `.env` khi đang chạy không có tác dụng.
-4. **Bật đồng ý gửi dữ liệu.** Đăng nhập `demo.user` / `Phenikaa-Vault#2026-Lab`
-   → tab **Tài khoản** → tick ô *"Cho phép gửi nội dung … tới AI bên ngoài"*.
-   Chưa tick thì API trả **403** — đây là cơ chế đồng thuận (`ai_data_consent`),
-   cố ý chứ không phải lỗi.
-5. **Gửi thử một tin nhắn.** Nếu câu trả lời **không** có tiền tố `[DEMO AI]`
-   thì Gemini thật đã chạy.
+Gửi một tin nhắn trong hội thoại mới ở chế độ **Secure**. Câu trả lời bắt đầu
+bằng `[DEMO AI]` là kết quả đúng: bot ngoại tuyến nhắc lại bản xem trước sau
+DLP, không phải một mô hình AI sinh câu trả lời thông minh.
 
-Kiểm tra nhanh key trước khi chạy cả app:
+Ví dụ dùng dữ liệu giả:
 
-```bash
-uv run python src/core/ai_core/gemini_ai.py
+```text
+Hãy kiểm tra email demo@example.com và email mã hóa demo%40example.com.
 ```
 
-**Lưu ý về DLP:** engine trong `src/app/dlp.py` chuẩn hóa Unicode, phát hiện
-secret/token/private key, email, điện thoại, thẻ Luhn, CCCD, mã số thuế, dữ liệu
-sức khỏe và từ điển nội bộ. Policy có thể che, yêu cầu xác nhận, chặn hoặc ép
-local-only; audit chỉ ghi tên category, không ghi giá trị khớp.
+Kết quả mong đợi: bản xem trước của bot thay các email bằng nhãn che; phần
+thông báo chỉ nêu loại dữ liệu. Bản gốc của tin nhắn vẫn được mã hóa để lưu
+trong hội thoại của người gửi. Tiêu đề và một số metadata không phải nội dung
+tin nhắn mã hóa, vì vậy chỉ nhập dữ liệu giả khi trình diễn.
 
-**Khi nhà cung cấp AI lỗi** (key sai, hết quota, mất mạng): API trả **503** kèm
-`Retry-After: 30` và thông điệp chung chung; chi tiết lỗi chỉ ghi vào log máy
-chủ để tránh information disclosure (CWE-209). Xem
-`tests/test_ai_provider_errors.py`.
+AI ngoại tuyến không cần đồng ý gửi dữ liệu cho bên ngoài. Đổi ô đồng ý ở tab
+**Tài khoản** sẽ không tạo lỗi thiếu đồng thuận trong chế độ này. Runner bật
+đồng thuận rồi kiểm chứng chặn secret mã hóa, che email và lọc phản hồi bằng
+nhà cung cấp giả lập, không cần khóa API thật. Kiểm thử từ chối khi thiếu đồng
+thuận và các quy tắc DLP khác nằm trong bộ pytest.
 
----
+## 4. Chạy kiểm chứng và lưu bằng chứng
 
-## 3c. Ba chốt kiểm tra trước khi demo
+Mở terminal thứ hai tại thư mục dự án:
 
-Làm **lần lượt**, chốt trước pass rồi mới sang chốt sau. Nếu chốt nào hỏng, sửa
-xong hẵng đi tiếp — chạy cả ba cùng lúc chỉ làm khó việc khoanh vùng lỗi.
-
-| # | Lệnh | Đạt khi thấy |
-|---|---|---|
-| 1 | `uv run python src/core/ai_core/gemini_ai.py` | In ra một câu trả lời thật (vd. *"Hello! How can I help you today?"*) |
-| 2 | `uv run pytest -q` | Toàn bộ test `passed`, không có `F` hay `E` |
-| 3 | `uv run python run_app.py` | `Uvicorn running on http://127.0.0.1:8000` |
-
-**Chốt 1 — key sống.** Gọi thẳng Gemini, không qua app. Hỏng ở đây nghĩa là vấn
-đề nằm ở key/model/mạng chứ không phải ở mã nguồn ứng dụng, xem bảng sự cố mục 6.
-
-**Chốt 2 — bộ kiểm thử.** Quan trọng nhất với đồ án: **ảnh chụp màn hình kết quả
-`pytest` là bằng chứng trực tiếp cho phần kiểm thử trong báo cáo**. Nên chụp cả
-dòng tổng kết không có test lỗi. Muốn kèm độ phủ thì dùng lệnh đầy đủ ở mục 5.
-
-**Chốt 3 — server.** Lên được là xong; mở <http://127.0.0.1:8000> để chắc chắn
-giao diện render chứ không chỉ tiến trình sống.
-
-> **Nếu máy chưa cài `uv`** (`uv: command not found`): chạy `bash setup.sh --no-run`
-> để cài, hoặc dùng thẳng môi trường ảo có sẵn — thay `uv run` bằng
-> `.venv\Scripts\python.exe` (Windows) / `.venv/bin/python` (macOS, Linux).
-> Ví dụ: `.venv\Scripts\python.exe -m pytest -q`.
-
----
-
-## 4. Chạy bản PostgreSQL bằng Docker (tùy chọn, nâng cao)
-
-Có **hai** cấu hình, đừng nhầm:
-
-| Cấu hình | Lệnh | Dùng khi |
-|---|---|---|
-| **Local — demo được ngay** | `docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build` | Demo trên laptop |
-| **Production thật** | `docker compose up -d --build` | Deploy VPS có tên miền thật |
-
-### Cách local (khuyến nghị nếu muốn demo bằng Docker)
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+```powershell
+.\.venv\Scripts\python.exe -m scripts.validate_security
 ```
 
-Xong. Vào <http://localhost:8000>, đăng nhập `demo.user` / `Phenikaa-Vault#2026-Lab`
-— **11 tài khoản demo/lab, 24 hội thoại đã mã hoá và chuỗi audit đều được nạp tự động**,
-Swagger có ở `/docs`. Không phải tạo tài khoản thủ công.
+Đạt khi từng tình huống là `PASS`, dòng tổng kết không có tình huống lỗi và
+lệnh kết thúc với mã 0. Runner tự tạo cơ sở dữ liệu và khóa tạm riêng, không
+gửi yêu cầu tới ứng dụng đang trình chiếu và không nhận URL máy đích.
 
-Overlay local hạ `APP_ENV` xuống `development` vì guard trong `src/app/config.py`
-cấm `DOCS_ENABLED=true` và `SEED_DEMO_DATA=true` ở production — mà kịch bản demo
-cần cả hai. Đây là khác biệt **có chủ đích và nên nói ra** khi bảo vệ.
+Báo cáo được tạo ở:
 
-Reset sạch: `down -v` rồi `up -d` (đừng dùng `seed_demo_data.py --reset` trên DB
-đang chạy — nó xoá bản ghi audit giữa chuỗi và làm gãy chuỗi băm).
+- `reports/security-validation/security-validation.json`: từng kiểm tra và bằng chứng.
+- `reports/security-validation/security-validation.junit.xml`: kết quả định dạng JUnit.
 
-### Cách production
+Muốn kiểm chứng riêng bốn tính năng mới:
 
-Cấu hình gốc `docker-compose.yml` là **production thật**: `APP_ENV=production`,
-Caddy tự xin chứng chỉ Let's Encrypt, nên nó **cần một tên miền thật trỏ về máy**.
-Với `localhost` thì Caddy không gọi ACME mà tự sinh CA nội bộ — xem
-`HUONG_DAN_DOCKER.md` Phần 4.
-
-Kiến trúc: chỉ Caddy publish cổng 80/443; app, PostgreSQL, Redis nằm trong mạng
-`backend` nội bộ (`internal: true`), không publish cổng ra host. Container
-`migrate` chạy một lần với tài khoản chủ schema, còn app chạy bằng vai trò
-`scap_app` quyền tối thiểu.
-
-**Nếu chỉ cần demo nhanh nhất** → dùng cách SQLite ở mục 1, không cần Docker.
-Chi tiết Docker đầy đủ: `HUONG_DAN_DOCKER.md`.
-
----
-
-## 5. Chạy kiểm thử và quét bảo mật (phần cần cho báo cáo)
-
-```bash
-uv run pytest --cov=src.app --cov-report=term-missing      # unit + security regression
-uv run ruff check src tests scripts                      # lint
-uv run bandit -q -r src/app -ll -ii                        # SAST
-uv export --frozen --no-dev --no-emit-project --output-file /tmp/req.txt
-uv run pip-audit -r /tmp/req.txt                           # SCA (CVE dependency)
+```powershell
+.\.venv\Scripts\python.exe -m scripts.validate_security --scenario session-timeout --scenario encoded-dlp --scenario auth-correlation --scenario browser-origin
 ```
 
-DAST bằng OWASP ZAP khi server đang chạy (cần Docker):
+Mỗi lần chạy mặc định ghi lại báo cáo ở cùng vị trí. Để giữ kết quả riêng của
+lần diễn tập:
 
-```bash
-bash scripts/run_zap_baseline.sh http://host.docker.internal:8000
+```powershell
+.\.venv\Scripts\python.exe -m scripts.validate_security --output-dir reports/security-validation-rehearsal
 ```
 
-Hoặc dùng `make`: `make install`, `make run`, `make test`, `make security`.
+Chạy kiểm thử tổng thể trước buổi bảo vệ; không cần đợi toàn bộ bộ test trong
+thời gian trình bày:
 
----
-
-## 6. Xử lý sự cố thường gặp
-
-| Triệu chứng | Nguyên nhân & cách xử lý |
-|---|---|
-| `uv: command not found` sau khi cài | Mở terminal mới, hoặc `export PATH="$HOME/.local/bin:$PATH"` |
-| `uv sync` treo hoặc timeout | Mạng chậm/proxy. Thử lại, hoặc `uv sync --group dev --no-cache` |
-| `Address already in use` cổng 8000 | Đổi cổng: `PORT=8080 uv run python run_app.py` |
-| Đăng nhập báo sai dù mật khẩu đúng | Đã bị lockout do nhập sai 5 lần. Chờ 15 phút (`LOGIN_LOCKOUT_SECONDS`) hoặc xoá `secure_chat.db` để reset |
-| Hội thoại cũ hiện lỗi giải mã | `MASTER_ENCRYPTION_KEY` đã bị đổi. Khôi phục khóa cũ, hoặc xoá `secure_chat.db` rồi seed lại |
-| Bot chỉ trả lời chung chung | Chưa có `GOOGLE_GENAI_API_KEY` → đang ở chế độ DEMO AI. Điền key vào `.env` nếu muốn Gemini thật |
-| Gửi tin nhắn báo 403 "Cần đồng ý…" | Chưa tick ô đồng ý ở tab **Tài khoản** (`ai_data_consent`) |
-| Gửi tin nhắn báo 503 "Dịch vụ AI tạm thời không khả dụng" | Key sai / hết quota / mất mạng. Xem log máy chủ (`secure_chat.ai`) để biết nguyên nhân thật |
-| Bị chặn khi đang thử tấn công | IDS/IPS đã tự chặn IP 15 phút. Chờ, hoặc tạm đặt `IDS_ENABLED=false` |
-| Muốn reset toàn bộ | Dừng server, xoá `secure_chat.db`, chạy lại |
-
----
-
-## 7. Chuẩn bị cho buổi demo
-
-**Dữ liệu mẫu** đã tự tạo khi server khởi động lần đầu (`SEED_DEMO_DATA=true`):
-3 tài khoản RBAC, 8 tài khoản lab, 24 hội thoại đã mã hóa, và một chuỗi sự kiện
-audit mô phỏng brute-force + IDOR bị chặn — để trang quản trị có dữ liệu thật mà
-xem. Muốn làm lại sạch:
-
-```bash
-uv run python scripts/seed_demo_data.py --reset
+```powershell
+.\.venv\Scripts\python.exe -m pytest -o addopts='' -q
+.\.venv\Scripts\python.exe -m ruff check src tests scripts
+.\.venv\Scripts\python.exe -m bandit -q -r src/app -ll -ii
 ```
 
-Ba tài khoản dùng chung mật khẩu `Phenikaa-Vault#2026-Lab`: `demo.user` (user),
-`demo.mod` (moderator), `demo.boss` (admin).
+Lưu ảnh dòng tổng kết thực tế cùng ngày chạy. Không ghi cố định một số lượng
+test hoặc một tỷ lệ bao phủ vào báo cáo nếu chưa có kết quả tương ứng.
+Kiểm tra CVE trực tuyến, Docker/ZAP và hạ tầng PostgreSQL/Redis là phần mở rộng,
+không phải điều kiện để hoàn thành demo SQLite ngoại tuyến.
 
-**Cần chuẩn bị thêm:**
+## 5. Trình bày và làm lại
 
-| Thứ cần có | Dùng cho | Ghi chú |
-|---|---|---|
-| Điện thoại có Google Authenticator | Bước 4 — demo 2FA quét QR | Quét không ra thì dùng ô *Khóa thủ công* |
-| Tab 1: <http://127.0.0.1:8000> | Giao diện chính | |
-| Tab 2: <http://127.0.0.1:8000/docs> | Bước 5 — tấn công IDOR qua Swagger | Cho giảng viên thấy bạn gọi API trực tiếp |
-| Cửa sổ ẩn danh | Đăng nhập tài khoản thứ hai | Để lấy `session_id` của user khác mà không mất phiên đầu |
-| Terminal đang chạy server | Bước 9 — chỉ vào log | Chứng minh chi tiết lỗi nằm ở phía máy chủ |
+Làm theo [kịch bản 6 phút hoặc 12 phút](docs/DEMO_SCRIPT.md). Mở sẵn giao diện
+người dùng và một cửa sổ ẩn danh đăng nhập `demo.boss`. Chạy sẵn bộ kiểm chứng
+và để kết quả ở terminal thứ hai.
 
-> **Biết trước đường thoát IDS/IPS.** Bước 5 và 6 rất dễ khiến bạn **tự chặn IP
-> của chính mình**. Khi đó: chờ 15 phút, hoặc dừng server → đặt `IDS_ENABLED=false`
-> trong `.env` → chạy lại. Chuẩn bị sẵn `demo.mod` để đăng nhập tiếp mà không phải chờ.
+- Nếu bị khóa do nhập sai nhiều lần hoặc tự thử payload: dừng lượt demo, chạy
+  lại launcher, rồi đăng nhập lại. Không tắt IDS hoặc xóa `secure_chat.db`.
+- Nếu MFA báo mã đã dùng: chờ mã TOTP mới; mã dùng để kích hoạt không được dùng
+  lại ngay để đăng nhập. Kiểm tra đồng hồ điện thoại trước buổi trình bày.
+- Nếu bot chỉ nhắc lại nội dung đã che: đó là chức năng AI ngoại tuyến dự kiến.
+- Nếu trình duyệt báo mất phiên sau khi khởi động lại: tải lại trang và đăng
+  nhập lại, vì lượt mới có khóa và cơ sở dữ liệu mới.
+- Nếu cần giữ ảnh/video/báo cáo: lưu trước khi dừng lượt demo. Không đưa QR,
+  khóa MFA, mã khôi phục hay bearer token vào ảnh báo cáo.
 
----
+## 6. Tài liệu dùng trong báo cáo
 
-## 8. Kịch bản demo (~10 phút)
+- [DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md): thao tác, kết quả mong đợi và lời giải thích.
+- [ADVANCED_SECURITY.md](docs/ADVANCED_SECURITY.md): bốn tính năng mới, nguồn tham khảo và giới hạn.
+- [SECURITY_AUTOMATION.md](docs/SECURITY_AUTOMATION.md): phạm vi kiểm chứng và cấu trúc bằng chứng.
+- [SECURITY_REQUIREMENTS_TRACEABILITY.md](docs/SECURITY_REQUIREMENTS_TRACEABILITY.md): truy vết yêu cầu tới mã và kiểm thử.
 
-1. **Đăng nhập** `demo.user` — thử sai mật khẩu, rồi thử tài khoản không tồn tại:
-   cả hai cho **cùng một thông báo lỗi**, không tiết lộ tài khoản có tồn tại hay
-   không (chống user enumeration). Mật khẩu băm bằng Argon2id.
-2. **Gửi tin nhắn**, rồi mở tab **Dữ liệu mã hóa** xem bản mã trong DB — chứng
-   minh AES-256-GCM at-rest: ciphertext base64, nonce riêng từng bản ghi, khóa
-   không nằm trong database.
-3. **Thử DLP**: gửi một câu có email hoặc số thẻ, ví dụ
-   `Email của tôi là nguyenvana@gmail.com, số thẻ 4111 1111 1111 1111`. Băng DLP
-   hiện ra liệt kê **loại** dữ liệu đã che, **không** hiện lại giá trị gốc.
-4. **Bật 2FA**: quét QR bằng Google Authenticator → kích hoạt → lưu mã khôi phục
-   (chỉ hiện một lần) → đăng xuất → đăng nhập lại 2 bước.
-5. **Tấn công IDOR**: lấy `session_id` của user khác, gọi
-   `GET /api/sessions/{id}/messages` qua Swagger → **403/404**, audit ghi lại
-   `authorization.denied`. Nhấn mạnh: **admin cũng không đọc được** chat người khác.
-6. **Brute-force**: nhập sai mật khẩu 6 lần → tài khoản bị khóa, IDS ghi cảnh báo.
-7. **Đăng nhập `demo.boss`** → trang quản trị: thống kê, cảnh báo an ninh, nhật ký
-   kiểm toán.
-8. **Xác minh audit chain**: `GET /api/admin/audit/verify` → chuỗi HMAC-SHA256
-   nguyên vẹn. Sửa trộm một dòng bằng `sqlite3` rồi xác minh lại → chuỗi **gãy**,
-   chỉ đúng vị trí bản ghi bị sửa.
-
-**Bước 9 (tùy chọn, ghi điểm thêm) — xử lý lỗi an toàn, CWE-209.** Dừng server →
-làm hỏng key trong `.env` (`GOOGLE_GENAI_API_KEY=AIzaSyHONG`) → chạy lại → gửi một
-tin nhắn. Hệ thống trả **503** với thông báo chung chung *"Dịch vụ AI tạm thời
-không khả dụng…"*: không traceback, không tên model, không mảnh API key nào.
-Nguyên nhân thật (401 UNAUTHENTICATED) nằm đầy đủ trong log máy chủ — chỉ vào
-terminal cho giảng viên thấy. Hành vi này có test tự động khóa lại:
-`tests/test_ai_provider_errors.py`. **Nhớ khôi phục key đúng sau khi demo xong.**
-
----
-
-## 9. Tài liệu liên quan
-
-| File | Nội dung |
-|---|---|
-| `docs/DEMO_SCRIPT.md` | Kịch bản demo chi tiết: từng thao tác, kết quả mong đợi, câu nên nói, và phần trả lời câu hỏi phản biện |
-| `SECURITY_REVIEW.md` | Kết quả rà soát bảo mật |
-| `SECURITY.md` | Chính sách bảo mật, quy trình báo lỗi |
-| `HUONG_DAN_DOCKER.md` | Chi tiết bản triển khai Docker/PostgreSQL |
+`run_app.py`, cấu hình `.env` và Docker vẫn phục vụ các cách chạy khác. Với đồ
+án demo trên máy cá nhân, dùng `scripts.demo_local` để có một điểm bắt đầu
+nhất quán và dễ diễn tập lại.

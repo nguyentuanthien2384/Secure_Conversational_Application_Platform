@@ -25,12 +25,17 @@ tuyệt đối; người dùng cần đăng nhập lại. Hết hạn phiên kh�
 Mỗi yêu cầu có hoạt động ghi lại thời điểm ở database dưới khóa phiên/tài khoản;
 cần đánh giá tải ghi khi triển khai nhiều người dùng đồng thời.
 
-Schema thêm cột nullable `auth_sessions.last_activity_at`. Migration lặp lại
-an toàn; dữ liệu cũ lấy `issued_at` làm mốc bảo thủ, nên một số phiên cũ có thể
+Schema thêm cột nullable `auth_sessions.last_activity_at`, dùng `TIMESTAMP WITH
+TIME ZONE` trên PostgreSQL để giữ đúng thời điểm khi máy chủ đổi múi giờ
+([quy tắc thời gian PostgreSQL](https://www.postgresql.org/docs/current/datatype-datetime.html#DATATYPE-DATETIME-INPUT)).
+Migration lặp lại an toàn; dữ liệu cũ lấy `issued_at` làm mốc bảo thủ, nên một số phiên cũ có thể
 phải đăng nhập lại. Development tự nâng schema lúc khởi động; production dùng
 quy trình migration riêng với tài khoản owner hiện có trước khi khởi động bản
 app mới. `assert_schema_ready()` từ chối schema thiếu cột. Không cấp quyền DDL
 cho tài khoản web để tránh bước migration.
+Trong Docker Compose của dự án, service `migrate` chạy
+[`scripts/migrate_database.py`](../scripts/migrate_database.py) bằng tài khoản
+owner; service `app` chỉ khởi động sau khi migration thành công.
 
 ## 2. DLP kiểm tra nội dung mã hóa nhiều lớp
 

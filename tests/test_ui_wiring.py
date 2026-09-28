@@ -3,8 +3,8 @@
 Gradio nối input/output theo **thứ tự vị trí**. Thêm một component vào ``STAGE2``
 mà quên cập nhật ``load_workspace`` hoặc ``_reset_tuple`` sẽ làm mọi output lệch
 một ô — giao diện hỏng theo kiểu rất khó lần ra. Các test dưới đây khoá lại bất
-biến đó bằng cách phân tích cú pháp chính mã nguồn, nên không cần khởi động
-server.
+biến đó bằng cấu trúc mã và chạy handler đã được Gradio đăng ký, không cần
+khởi động server.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import ast
 from pathlib import Path
 
 import gradio as gr
+import pytest
 
 UI_SOURCE = Path(__file__).resolve().parents[1] / "src" / "app" / "gradio_ui.py"
 
@@ -51,17 +52,129 @@ def _final_return_len(fn: ast.FunctionDef) -> int:
     return len(returns[-1].value.elts)
 
 
-def test_stage_lists_and_reset_tuple_have_matching_arity():
-    body = _build_ui_body()
-    stage1 = len(_find_list_assign(body, "STAGE1").elts)
-    stage2 = len(_find_list_assign(body, "STAGE2").elts)
-    reset_len = _final_return_len(_find_func(body, "_reset_tuple"))
-    # RESET_OUTS = STAGE1 + STAGE2 + [qr_html, tb_secret, md_countdown, st_warned]
-    assert reset_len == stage1 + stage2 + 4, (
-        f"_reset_tuple trả {reset_len} giá trị nhưng RESET_OUTS cần "
-        f"{stage1 + stage2 + 4} (STAGE1={stage1}, STAGE2={stage2}, "
-        "+QR/khóa tạm, +countdown/warned)"
-    )
+@pytest.fixture(scope="module")
+def runtime_demo():
+    from src.app.gradio_ui import build_ui
+
+    return build_ui()
+
+
+def _event_for(demo, target, event="click"):
+    dependency = next(item for item in demo.config["dependencies"]
+                      if (target._id, event) in item["targets"])
+    return demo.fns[dependency["id"]], dependency
+
+
+def _button_event(demo, label):
+    button = next(component for component in demo.blocks.values()
+                  if isinstance(component, gr.Button) and component.value == label)
+    return _event_for(demo, button)
+
+
+@pytest.mark.parametrize("reason", ["logout", "logout_all", "password_change", "expiry"])
+def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypatch, reason):
+    """Run the registered callbacks, including wrappers and actual output wiring."""
+    from src.app import gradio_ui
+
+    calls = []
+    monkeypatch.setattr(gradio_ui, "_api", lambda *args: calls.append(args) or {})
+    monkeypatch.setattr(gradio_ui.time, "time", lambda: 1000)
+    monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gr, "Warning", lambda *args, **kwargs: None)
+    logout, logout_dependency = _button_event(runtime_demo, "Đăng xuất")
+    if reason == "expiry":
+        timer = next(component for component in runtime_demo.blocks.values()
+                     if isinstance(component, gr.Timer))
+        callback, dependency = _event_for(runtime_demo, timer, "tick")
+        result = callback.fn(999, True)
+        assert calls == []
+    else:
+        label, args, expected_endpoint = {
+            "logout": ("Đăng xuất", ("previous-token",), "/api/auth/logout"),
+            "logout_all": ("Đăng xuất mọi thiết bị", ("previous-token",), "/api/auth/logout-all"),
+            "password_change": (
+                "Cập nhật mật khẩu", ("previous-token", "Old-password-for-lab", "New-password-for-lab"),
+                "/api/auth/password",
+            ),
+        }[reason]
+        callback, dependency = _button_event(runtime_demo, label)
+        result = callback.fn(*args)
+        assert calls[0][2] == expected_endpoint
+
+    assert dependency["outputs"] == logout_dependency["outputs"]
+    assert len(result) == len(callback.outputs) == len(dependency["outputs"])
+    assert len(set(dependency["outputs"])) == len(result), "Duplicate output causes ambiguous resets"
+    updates = dict(zip(dependency["outputs"], result, strict=True))
+    # A simulated prior browser view has another user's data in every textbox,
+    # table and download control. Each must receive an actual value replacement.
+    for component in runtime_demo.blocks.values():
+        if isinstance(component, (gr.Textbox, gr.Dataframe, gr.Chatbot, gr.DownloadButton)):
+            assert component._id in updates, f"Reset omitted {component.label}"
+            update = updates[component._id]
+            value = update.get("value", "previous-account-data") if isinstance(update, dict) else update
+            if isinstance(component, gr.DownloadButton):
+                assert value is None and update["visible"] is False
+            elif isinstance(component, (gr.Dataframe, gr.Chatbot)):
+                assert value == []
+            else:
+                assert value == "", f"Retained text in {component.label}"
+
+    notice = next(component for component in runtime_demo.blocks.values()
+                  if component.elem_id == "chat-notice")
+    assert updates[notice._id] == gr.update(value="", visible=False)
+    qr = next(component for component in runtime_demo.blocks.values()
+              if isinstance(component, gr.HTML) and component.label == "Quét bằng ứng dụng xác thực")
+    assert updates[qr._id] == gr.update(value="", visible=False)
+    mfa_activation, _ = _button_event(runtime_demo, "Kích hoạt")
+    recovery = mfa_activation.outputs[5]
+    assert updates[recovery._id] == gr.update(value="", visible=False)
+    # Previously fetched dashboard/log/security values are outputs of refresh
+    # events: they must all belong to the reset, even while their tabs are hidden.
+    for label in ("Làm mới dashboard", "Tải nhật ký", "Làm mới toàn bộ",
+                  "Xác minh chuỗi", "Chạy kiểm chứng Hit/Miss"):
+        _, refresh_dependency = _button_event(runtime_demo, label)
+        assert set(refresh_dependency["outputs"]) <= updates.keys()
+        assert all(updates[item] != gr.skip() for item in refresh_dependency["outputs"])
+    assert result[-2:] == ("", False)
+    assert isinstance(logout.outputs[-2], gr.Markdown)
+    assert isinstance(logout.outputs[-1], gr.State)
+    token, expiry, mfa_token = callback.outputs[:3]
+    assert [updates[item._id] for item in (token, expiry, mfa_token)] == ["", 0.0, ""]
+    password = next(component for component in runtime_demo.blocks.values()
+                    if component.elem_id == "li-pass")
+    assert updates[password._id]["type"] == "password"
+
+
+def test_live_countdown_preserves_work_and_only_updates_final_two_outputs(runtime_demo, monkeypatch):
+    from src.app import gradio_ui
+
+    monkeypatch.setattr(gradio_ui.time, "time", lambda: 1000)
+    timer = next(component for component in runtime_demo.blocks.values()
+                 if isinstance(component, gr.Timer))
+    callback, dependency = _event_for(runtime_demo, timer, "tick")
+    result = callback.fn(1600, False)
+    assert len(result) == len(dependency["outputs"])
+    assert all(value == gr.skip() for value in result[:-2])
+    assert "10:00" in result[-2]
+    assert result[-1] is False
+
+
+def test_logout_still_clears_local_state_when_server_cannot_confirm(runtime_demo, monkeypatch):
+    from src.app import gradio_ui
+
+    def unavailable(*args):
+        raise gr.Error("server unavailable")
+
+    monkeypatch.setattr(gradio_ui, "_api", unavailable)
+    monkeypatch.setattr(gr, "Warning", lambda *args, **kwargs: None)
+    callback, dependency = _button_event(runtime_demo, "Đăng xuất")
+    result = callback.fn("previous-token")
+    assert len(result) == len(dependency["outputs"])
+    assert result[0] == ""
+    search_table = next(component for component in runtime_demo.blocks.values()
+                        if isinstance(component, gr.Dataframe)
+                        and component.headers == ["Hội thoại", "Vai trò", "Nội dung", "Thời điểm"])
+    assert result[dependency["outputs"].index(search_table._id)] == []
 
 
 def test_load_workspace_returns_one_value_per_stage2_component():

@@ -1,418 +1,239 @@
-# Kịch bản demo chi tiết
+# Kịch bản demo đồ án SCAP trên máy cá nhân
 
-Tài liệu này viết cho người **đứng trước giảng viên và bấm từng nút**. Mỗi mục
-có: thao tác cụ thể, kết quả mong đợi, và một câu giải thích ngắn để nói ra
-miệng. Thời lượng đầy đủ ~12 phút; bản rút gọn ~6 phút (chỉ làm các mục ★).
+Demo dùng dữ liệu giả, SQLite tạm và AI ngoại tuyến. Mục tiêu là chứng minh
+kiểm soát bảo mật của ứng dụng bằng thao tác có thể lặp lại. Không cần Gemini
+API key, Docker, máy chủ, tên miền hoặc kết nối Internet trong buổi trình bày
+sau khi đã cài đủ thư viện.
 
-> Quy ước: `[Tab X]` là tab trên giao diện web, `→` là thao tác kế tiếp.
-> Bản tóm tắt của kịch bản này nằm ở mục 8 của `HUONG_DAN_CHAY.md`.
+## Chuẩn bị trước buổi trình bày
 
----
+1. Từ thư mục dự án, kiểm tra sẵn sàng:
 
-## 0. Chuẩn bị trước khi vào phòng (làm trước 15 phút)
+   ```powershell
+   .\.venv\Scripts\python.exe -m scripts.demo_local --check
+   ```
 
-### Ba chốt kiểm tra — làm lần lượt, chốt trước pass rồi mới sang chốt sau
+2. Chạy bộ kiểm chứng; lưu kết quả để dùng trong báo cáo:
 
-| # | Lệnh | Đạt khi thấy |
-|---|---|---|
-| 1 | `uv run python src/core/ai_core/gemini_ai.py` | In ra câu trả lời thật, vd. *"Hello! How can I help you today?"* |
-| 2 | `uv run pytest -q` | Toàn bộ test `passed` |
-| 3 | `uv run python run_app.py` | `Uvicorn running on http://127.0.0.1:8000` |
+   ```powershell
+   .\.venv\Scripts\python.exe -m scripts.validate_security --output-dir reports/security-validation-rehearsal
+   ```
 
-Chạy tuần tự để khoanh vùng lỗi cho dễ: chốt 1 hỏng là vấn đề key/model/mạng,
-chưa liên quan tới mã ứng dụng.
+3. Mở ứng dụng và giữ terminal này chạy:
 
-**Chốt 2 quan trọng nhất với đồ án:** ảnh chụp màn hình kết quả `pytest` là
-**bằng chứng trực tiếp** cho phần kiểm thử trong báo cáo. Chụp cả dòng tổng kết
-không có test lỗi. Muốn kèm độ phủ thì dùng lệnh đầy đủ ở mục 10.
+   ```powershell
+   .\.venv\Scripts\python.exe -m scripts.demo_local
+   ```
 
-> **Nếu máy chưa cài `uv`** (`uv: command not found`): chạy `bash setup.sh --no-run`
-> để cài, hoặc dùng thẳng môi trường ảo — thay `uv run` bằng
-> `.venv\Scripts\python.exe` (Windows) / `.venv/bin/python` (macOS, Linux).
+4. Mở <http://127.0.0.1:8000> trong cửa sổ chính; mở cùng địa chỉ trong cửa sổ
+   ẩn danh cho quản trị viên. Nếu đổi cổng bằng `--port`, dùng đúng cổng đó.
+5. Đăng nhập thử `demo.user` và `demo.boss`. Mật khẩu chung:
+   **`Phenikaa-Vault#2026-Lab`**. Chuẩn bị ứng dụng TOTP trên điện thoại nếu chọn
+   bản 12 phút. Không cần mạng để sinh mã TOTP sau khi thiết lập.
 
-### Danh sách chuẩn bị
+Mỗi lần launcher chạy là một lượt demo mới, có khóa và dữ liệu riêng, không
+dùng `.env` hoặc dữ liệu đang có. Muốn làm lại, dừng bằng `Ctrl+C`, chạy lại
+và đăng nhập lại. Lưu bằng chứng cần giữ trước khi dừng. Không cần tắt IDS,
+xóa cơ sở dữ liệu đang sử dụng hoặc sửa chuỗi audit để tiếp tục bài trình bày.
 
-| Việc | Lệnh / thao tác | Xác nhận |
-|---|---|---|
-| Cài đặt & sinh secrets | `bash setup.sh --no-run` | Có file `.env` |
-| Dán Gemini key | Sửa `.env`: `GOOGLE_GENAI_API_KEY=<key>`, `GEMINI_MODEL=gemini-flash-lite-latest` | — |
-| Thử key (chốt 1) | `uv run python src/core/ai_core/gemini_ai.py` | In ra câu trả lời |
-| Chạy test (chốt 2) | `uv run pytest -q` | Toàn bộ test `passed` |
-| Khởi động (chốt 3) | `uv run python run_app.py` | `Uvicorn running on …:8000` |
-| Bật đồng ý AI | Đăng nhập `demo.user` → `[Tab Tài khoản]` → tick ô đồng ý | Ô được tick |
-| Gửi thử 1 tin | `[Tab Trò chuyện]` | Trả lời **không** có tiền tố `[DEMO AI]` |
+Phân biệt ba loại bằng chứng khi nói với hội đồng:
 
-> **Về tên model:** dùng alias `gemini-flash-lite-latest`, đừng ghim số phiên bản.
-> Google khai tử model cũ theo thời gian — `gemini-2.5-flash-lite` nay trả **404**
-> *"no longer available to new users"*. Alias tự trỏ sang thế hệ còn hiệu lực.
+- **Thao tác trực tiếp:** yêu cầu thật gửi tới ứng dụng đang chạy trên máy.
+- **Dữ liệu mẫu:** sự kiện và hội thoại được seed để minh họa màn hình.
+- **Kiểm chứng tự động:** runner gửi yêu cầu tới ứng dụng thử nghiệm riêng,
+  đối chiếu trạng thái HTTP, audit và tác động lên dữ liệu. Nhánh AI bên ngoài
+  dùng nhà cung cấp giả lập, không gọi một dịch vụ AI thật.
 
-**Mở sẵn 3 tab trình duyệt:**
+## Bản 6 phút
 
-1. `http://127.0.0.1:8000` — giao diện chính
-2. `http://127.0.0.1:8000/docs` — Swagger (dùng cho mục 5)
-3. Một cửa sổ ẩn danh — để đăng nhập tài khoản thứ hai mà không mất phiên đầu
+### 1. Đăng nhập và phạm vi quyền — 45 giây
 
-**Chuẩn bị thêm:** điện thoại có Google Authenticator; cửa sổ terminal đang
-chạy server để trỏ vào log khi cần (mục 9).
+**Thao tác:** đăng nhập `demo.user`. Chỉ vào các tab Trò chuyện, Dữ liệu mã
+hóa, Tìm kiếm và Tài khoản. So sánh với cửa sổ ẩn danh đang đăng nhập
+`demo.boss`, có thêm chức năng quản trị.
 
-**Tài khoản** (mật khẩu chung `Phenikaa-Vault#2026-Lab`):
+**Kết quả:** hai tài khoản có quyền khác nhau. Việc ẩn tab chỉ là cách hiển
+thị; quyền vẫn được kiểm tra tại API.
 
-| Tài khoản | Vai trò | Tab nhìn thấy |
-|---|---|---|
-| `demo.user` | user | Trò chuyện, Dữ liệu mã hóa, Tìm kiếm, Tài khoản |
-| `demo.mod` | moderator | + Nhật ký kiểm toán, Bảo mật |
-| `demo.boss` | admin | + Quản trị (đầy đủ) |
+**Nói:** “Mật khẩu được băm bằng Argon2id. Mỗi phiên đăng nhập được theo dõi
+ở máy chủ. Vai trò quyết định thao tác quản trị, còn quyền sở hữu quyết định
+ai được đọc từng hội thoại.”
 
-> **Nếu lỡ bị IDS chặn IP giữa buổi demo:** chờ 15 phút, hoặc dừng server,
-> đặt `IDS_ENABLED=false` trong `.env`, chạy lại. Biết trước đường thoát này
-> quan trọng hơn bạn tưởng — mục 6 và 7 rất dễ tự chặn chính mình.
+### 2. Chat và kiểm tra dữ liệu mã hóa — 1 phút
 
----
+**Thao tác:** ở Trò chuyện, nhập tiêu đề `Demo đồ án`, giữ chế độ **Secure**,
+bấm **+ Hội thoại mới**. Gửi:
 
-## 1. ★ Xác thực — Argon2id và thông báo lỗi chung chung (1 phút)
-
-**Thao tác**
-
-1. Ở màn hình đăng nhập, nhập `demo.user` với mật khẩu **sai** → Đăng nhập
-2. Nhập tài khoản **không tồn tại** `khong.ton.tai` với mật khẩu bất kỳ → Đăng nhập
-3. Đăng nhập đúng bằng `demo.user` / `Phenikaa-Vault#2026-Lab`
-
-**Kết quả mong đợi:** hai lần sai cho ra **cùng một thông báo lỗi**, không phân
-biệt "sai mật khẩu" với "không có tài khoản này".
-
-**Nói gì:** mật khẩu lưu bằng Argon2id — hàm băm thắng Password Hashing
-Competition, có tham số điều chỉnh chi phí bộ nhớ nên chống được tấn công bằng
-GPU/ASIC, khác hẳn MD5 hay SHA-1 vốn tính rất nhanh. Thông báo lỗi cố tình
-giống nhau để không cho phép **liệt kê tài khoản** (user enumeration): nếu hệ
-thống nói "tài khoản không tồn tại", kẻ tấn công có ngay danh sách username
-hợp lệ để dồn sức brute-force.
-
----
-
-## 2. ★ Mã hóa dữ liệu khi lưu trữ — AES-256-GCM (2 phút)
-
-**Thao tác**
-
-1. `[Tab Trò chuyện]` → chọn một hội thoại → gửi tin nhắn, ví dụ:
-   `Mã số sinh viên của tôi là 21010999 và tôi đang học môn An toàn ứng dụng`
-2. Đợi bot trả lời
-3. Chuyển sang `[Tab Dữ liệu mã hóa]` → chọn đúng hội thoại đó → **Tải bản mã**
-
-**Kết quả mong đợi:** bảng hiện `ciphertext` base64, `nonce` riêng cho từng
-bản ghi, và cột `Key ver.`. Không đọc được chữ nào của tin nhắn gốc.
-
-**Nói gì:** đây là dữ liệu **thật sự nằm trong database**. Chọn AES-256-GCM vì
-nó là chế độ mã hóa có xác thực (AEAD) — vừa bảo mật vừa chống sửa đổi; nếu ai
-đó lật một bit trong ciphertext, thẻ xác thực sẽ không khớp và giải mã thất bại
-thay vì trả về rác. Mỗi bản ghi có nonce riêng, không bao giờ tái sử dụng.
-Khóa **không nằm trong database** mà đọc từ biến môi trường, nên kẻ tấn công
-chỉ dump được file DB thì vẫn không đọc được gì.
-
-**Điểm nhấn thêm:** cột `Key ver.` phục vụ xoay vòng khóa —
-`scripts/rotate_encryption_key.py` cho phép đổi khóa mà dữ liệu cũ vẫn giải mã
-được, vì mỗi bản ghi nhớ nó được mã bằng khóa phiên bản nào.
-
-> **Lưu ý nhỏ:** mã số 8 chữ số như `21010999` **không** bị DLP che (luật chỉ
-> bắt dãy 9–12 chữ số), nên bot vẫn "thấy" nó — đúng ý đồ ở mục này. Nếu bạn
-> đổi sang mã 9–12 chữ số, nó sẽ bị che và bot trả lời chung chung hơn.
-
----
-
-## 3. ★ Chống rò rỉ dữ liệu ra bên thứ ba — DLP + đồng thuận (2 phút)
-
-Đây là mục dễ ghi điểm nhất vì hầu hết đồ án chat AI không có.
-
-**Thao tác**
-
-1. `[Tab Tài khoản]` → **bỏ tick** ô đồng ý gửi dữ liệu ra AI bên ngoài
-2. Quay lại `[Tab Trò chuyện]` → gửi một tin bất kỳ
-
-   **Kết quả:** báo lỗi 403 *"Cần đồng ý trước khi gửi nội dung đến nhà cung
-   cấp AI bên ngoài."*
-
-3. Tick lại ô đồng ý
-4. Gửi tin nhắn có dữ liệu nhạy cảm, ví dụ:
-
-   `Email của tôi là nguyenvana@gmail.com, số thẻ 4111 1111 1111 1111, api_key=SECRET123. Hãy tóm tắt giúp tôi.`
-
-**Kết quả mong đợi:** dải băng DLP hiện dưới khung chat, liệt kê đúng **ba loại**
-đã che — `API key / token`, `số thẻ`, `email` — mà **không hiện lại giá trị**.
-Cái mà Gemini thực sự nhận được là:
-
-```
-Email của tôi là [REDACTED-EMAIL], số thẻ [REDACTED-CARD], api_key=[REDACTED] Hãy tóm tắt giúp tôi.
+```text
+Tôi muốn tìm hiểu bảo mật ứng dụng trong đồ án này.
 ```
 
-**Nói gì:** trước khi bất kỳ nội dung nào rời khỏi biên tin cậy sang Google,
-lớp DLP quét và thay thế các mẫu nhạy cảm. Quan trọng: báo cáo chỉ nêu *loại*
-dữ liệu bị che, không echo lại giá trị — nếu in ra "đã che thẻ
-4111-1111-1111-1111" thì chính báo cáo lại là chỗ rò rỉ mới, và nó còn bị ghi
-vào nhật ký kiểm toán.
+Chuyển sang **Dữ liệu mã hóa**, chọn hội thoại vừa tạo và bấm **Tải bản mã**.
 
-Cơ chế đồng thuận (`ai_data_consent`) mặc định **tắt**: hệ thống không gửi dữ
-liệu người dùng cho bên thứ ba khi chưa được cho phép tường minh — đúng nguyên
-tắc privacy by default của GDPR.
+**Kết quả:** bot trả lời với tiền tố `[DEMO AI]`. Bảng bản mã hiển thị
+ciphertext, nonce và phiên bản khóa; nội dung câu vừa gửi không xuất hiện
+dưới dạng bản rõ trong các trường bản mã.
 
-**Nếu giảng viên hỏi "DLP này có tuyệt đối không?":** trả lời thẳng là không.
-Đây là phòng thủ theo chiều sâu, không thay thế được sản phẩm DLP thương mại;
-biểu thức chính quy luôn có thể bị lách bằng cách viết biến thể. Giá trị của
-nó là chặn được các trường hợp vô ý phổ biến. Trả lời trung thực như vậy ghi
-điểm cao hơn là khẳng định quá đà.
+**Nói:** “Đây là AI ngoại tuyến để trình diễn luồng xử lý. Nội dung tin nhắn
+được mã hóa AES-256-GCM, có khóa dữ liệu riêng cho hội thoại và dữ liệu xác
+thực bổ sung gắn với bản ghi. Tiêu đề và metadata không phải toàn bộ đều
+được mã hóa. Chế độ Secure là mã hóa phía máy chủ, không phải E2EE.”
 
----
+### 3. DLP nhận diện cả email mã hóa — 1 phút
 
-## 4. ★ Xác thực hai lớp TOTP (2 phút)
+**Thao tác:** gửi trong cùng hội thoại:
 
-**Thao tác**
-
-1. `[Tab Tài khoản]` → mục *Xác thực hai lớp (TOTP)* → **Bắt đầu thiết lập 2FA**
-2. Mở Google Authenticator trên điện thoại → quét mã QR
-3. Nhập mã 6 số đang hiện trên điện thoại → **Kích hoạt**
-4. **Chụp/lưu lại danh sách mã khôi phục hiện ra** — nó chỉ hiện đúng một lần
-5. Đăng xuất → đăng nhập lại `demo.user` → hệ thống hỏi mã 6 số → nhập → vào được
-
-**Nói gì:** TOTP theo RFC 6238, mã đổi mỗi 30 giây, sinh từ một bí mật chia sẻ
-nên **không cần mạng** — khác OTP qua SMS vốn dễ bị SIM swap và chặn ở tầng
-mạng viễn thông. Mã khôi phục chỉ hiện một lần và được lưu dưới dạng băm, dùng
-được đúng một lần mỗi mã, để người dùng mất điện thoại không mất luôn tài khoản.
-
-**Mẹo:** nếu điện thoại quét QR không ra, dùng ô *Khóa thủ công* để nhập tay
-vào app xác thực.
-
----
-
-## 5. ★ Kiểm soát truy cập — thử tấn công IDOR (2 phút)
-
-Đây là mục nên demo bằng Swagger để giảng viên thấy rõ là bạn gọi API trực tiếp,
-không bị giao diện che.
-
-**Chuẩn bị:** đăng nhập `demo.boss` ở cửa sổ ẩn danh, tạo một hội thoại mới,
-copy `session_id` của nó.
-
-**Thao tác**
-
-1. Ở cửa sổ chính (đang là `demo.user`), mở `/docs`
-2. Lấy access token của `demo.user`: gọi `POST /api/auth/login` trong Swagger,
-   copy `access_token` → bấm **Authorize** dán vào
-3. Gọi `GET /api/sessions/{session_id}/messages` với `session_id` **của
-   demo.boss**
-
-**Kết quả mong đợi:** 404 (hoặc 403), không trả về nội dung.
-
-4. Chuyển sang `demo.mod` hoặc `demo.boss` → `[Tab Nhật ký kiểm toán]` →
-   **Tải nhật ký** → tìm dòng `authorization.denied`
-
-**Nói gì:** IDOR là lỗ hổng đứng đầu OWASP Top 10 2021 ở hạng mục A01 Broken
-Access Control. Ở đây mọi truy vấn hội thoại đều gắn điều kiện `owner_id =
-người dùng hiện tại` ngay trong câu truy vấn, chứ không phải lấy ra rồi mới
-kiểm tra — nên không có đường nào quên kiểm tra.
-
-**Điểm nhấn đáng nói:** kể cả tài khoản **admin cũng không đọc được** nội dung
-chat của người khác qua API. Đây là quyết định thiết kế có chủ đích: trang quản
-trị dùng để giám sát an ninh, không phải để giám sát người dùng. Trả lời trước
-câu hỏi này thường gây ấn tượng tốt.
-
----
-
-## 6. Chống brute-force và khóa tài khoản (1 phút)
-
-> Làm mục này **sau** mục 5, vì nó có thể kích hoạt IDS.
-
-**Thao tác**
-
-1. Đăng xuất → nhập sai mật khẩu `demo.user` **6 lần liên tiếp**
-2. Lần thứ 6 trở đi, kể cả nhập **đúng** mật khẩu vẫn không vào được
-
-**Nói gì:** hai lớp chặn cùng lúc — giới hạn tần suất theo cửa sổ trượt trên
-địa chỉ nguồn (`LOGIN_MAX_ATTEMPTS`/`LOGIN_WINDOW_SECONDS`), và khóa tài khoản
-tạm thời sau số lần sai (`LOGIN_LOCKOUT_SECONDS`, mặc định 15 phút). Lớp thứ
-nhất chặn kẻ tấn công dò nhiều tài khoản từ một IP; lớp thứ hai chặn kẻ tấn
-công dò một tài khoản từ nhiều IP (credential stuffing).
-
-**Khôi phục để demo tiếp:** chờ 15 phút, hoặc dừng server → xóa
-`secure_chat.db` → chạy lại (dữ liệu mẫu sẽ tự tạo lại). Chuẩn bị sẵn tài
-khoản `demo.mod` để đăng nhập tiếp mà không phải chờ.
-
----
-
-## 7. IDS/IPS tầng ứng dụng (1,5 phút)
-
-**Thao tác**
-
-1. Đăng nhập `demo.mod` hoặc `demo.boss`
-2. Trên thanh địa chỉ, gọi thẳng một URL mang chữ ký tấn công:
-
-   ```
-   http://127.0.0.1:8000/api/search/messages?q=' OR 1=1--
-   ```
-
-   rồi thử một đường dẫn mồi nhử:
-
-   ```
-   http://127.0.0.1:8000/wp-admin
-   ```
-
-3. `[Tab Bảo mật]` → **Làm mới toàn bộ** → xem mục *2 · IDS — mẫu tấn công đã
-   phát hiện*: có dòng `SQLI-002` và dòng đường dẫn mồi nhử
-4. Mục *3 · IDS — hành vi bất thường* → **Phân tích**: thấy cụm sự kiện đăng
-   nhập thất bại từ mục 6
-5. Mục *4 · IPS — nguồn đang bị chặn*: nếu điểm rủi ro tích lũy vượt ngưỡng,
-   IP của bạn xuất hiện ở đây
-
-**Nói gì:** hai engine phản ánh đúng phân loại trong bài giảng. Engine **chữ
-ký** khớp mẫu trên URL và header — nhanh, bắt tốt công cụ quét đã biết, nhưng
-mù trước tấn công mới. Engine **bất thường** thống kê trên chính luồng audit
-của ứng dụng — phát hiện được credential stuffing và chuỗi từ chối quyền liên
-tiếp kiểu dò IDOR. Khi điểm rủi ro vượt ngưỡng, hệ thống chuyển từ *phát hiện*
-sang *ngăn chặn*, tạm chặn địa chỉ nguồn.
-
-**Câu nên nói thêm để tránh bị phản biện:** SQL injection ở dự án này vốn đã
-bất khả thi về mặt cấu trúc, vì mọi truy vấn đi qua tham số hóa của SQLAlchemy.
-Engine chữ ký tồn tại để **ghi nhận nỗ lực tấn công**, không phải là lý do ứng
-dụng an toàn. Khớp mẫu trên URL rất dễ lách. Nói rõ giới hạn này thường được
-đánh giá cao hơn là trình bày nó như lớp phòng thủ chính.
-
-**Lưu ý:** IDS chỉ quét URL và header, **không đọc body** — cố ý, vì đệm body
-trong middleware sẽ phá streaming và tạo ra một sơ hở khuếch đại bộ nhớ. Vì
-vậy gõ `' OR 1=1` vào ô chat sẽ **không** kích hoạt IDS; phải đưa vào query
-string như bước 2.
-
----
-
-## 8. ★ Nhật ký kiểm toán chống giả mạo (1,5 phút)
-
-Đây là mục kỹ thuật ấn tượng nhất, nên để cuối.
-
-**Thao tác**
-
-1. Đăng nhập `demo.boss` → `[Tab Bảo mật]` → mục 1 → **Xác minh chuỗi**
-
-   **Kết quả:** báo chuỗi nguyên vẹn, kèm số bản ghi đã xác minh.
-
-2. Giờ đóng vai kẻ tấn công có quyền ghi vào database. Mở terminal thứ hai:
-
-   ```bash
-   sqlite3 secure_chat.db "UPDATE audit_events SET outcome='success' WHERE outcome='denied' LIMIT 1;"
-   ```
-
-3. Quay lại giao diện → **Xác minh chuỗi** lần nữa
-
-   **Kết quả:** chuỗi **gãy**, chỉ đúng vị trí bản ghi bị sửa.
-
-**Nói gì:** mỗi bản ghi kiểm toán cam kết vào bản ghi trước bằng
-`HMAC-SHA256(khóa, prev_hash ‖ nội_dung_bản_ghi)` — cùng ý tưởng với chuỗi khối,
-nhưng chỉ cần một khóa bí mật thay vì cả mạng đồng thuận. Kẻ tấn công chiếm
-được quyền ghi database vẫn không sửa được lịch sử một cách im lặng: sửa một
-dòng làm gãy toàn bộ chuỗi từ điểm đó về sau, và muốn tính lại chuỗi thì phải
-có khóa HMAC, mà khóa đó không nằm trong database.
-
-Đây là thuộc tính **Accounting** trong bộ AAA — và là thứ thường bị bỏ qua:
-nhật ký kiểm toán mà kẻ tấn công sửa được thì không phải bằng chứng.
-
-**Khôi phục:** `uv run python scripts/repair_audit_chain.py` hoặc xóa
-`secure_chat.db` rồi seed lại.
-
----
-
-## 9. Xử lý lỗi an toàn — CWE-209 (1 phút, tùy chọn)
-
-Mục này chứng minh bạn hiểu rằng *thông báo lỗi cũng là bề mặt tấn công*.
-
-**Thao tác**
-
-1. Dừng server → sửa `.env`, làm hỏng key: `GOOGLE_GENAI_API_KEY=AIzaSyHONG`
-2. Chạy lại server → đăng nhập → gửi một tin nhắn
-
-**Kết quả mong đợi:** thông báo *"Dịch vụ AI tạm thời không khả dụng. Vui lòng
-thử lại sau. Thử lại sau 30 giây."* — **không** có traceback, không có tên
-model, không có mã lỗi của Google, không có mảnh API key nào. Mã trạng thái là
-**503** kèm header `Retry-After: 30`.
-
-3. Chỉ vào terminal đang chạy server: nguyên nhân thật (401 UNAUTHENTICATED)
-   nằm đầy đủ trong log phía máy chủ, logger `secure_chat.ai`.
-
-**Nói gì:** đây là CWE-209 — *Information Exposure Through an Error Message*,
-thuộc A09 trong OWASP Top 10. Nếu để exception của SDK lọt ra client, kẻ tấn
-công biết được stack công nghệ, phiên bản thư viện, đôi khi cả đường dẫn hệ
-thống. Nguyên tắc: **chi tiết cho người vận hành, thông báo chung cho người
-dùng**. Và mã trạng thái phải đúng ngữ nghĩa — đây là 503 (lỗi tạm thời phía
-nhà cung cấp, có thể thử lại), không phải 500.
-
-Có test tự động khóa hành vi này: `tests/test_ai_provider_errors.py`, trong đó
-một test khẳng định chuỗi `AIzaSy`, `googleapis.com` và `Traceback` không bao
-giờ xuất hiện trong response HTTP.
-
-**Nhớ khôi phục key đúng sau khi demo xong.**
-
----
-
-## 10. Bằng chứng kiểm thử và quét bảo mật (1 phút)
-
-Chạy trước buổi demo, chụp màn hình đưa vào báo cáo; trên lớp chỉ cần chiếu ảnh.
-
-```bash
-uv run pytest --cov=src.app --cov-report=term-missing   # kiểm thử + độ phủ
-uv run ruff check src tests scripts                      # lint
-uv run bandit -q -r src/app -ll -ii                      # SAST
-uv export --frozen --no-dev --no-emit-project --output-file /tmp/req.txt
-uv run pip-audit -r /tmp/req.txt                         # SCA — CVE của dependency
+```text
+Email giả của tôi là demo@example.com; dạng mã hóa là demo%40example.com.
 ```
 
-DAST bằng OWASP ZAP (cần Docker, server đang chạy):
+**Kết quả:** phần trả lời `[DEMO AI]` chứa bản xem trước sau DLP, email và
+dạng mã hóa được thay bằng nhãn che. Thông báo nêu loại dữ liệu đã xử lý;
+bản gốc vẫn được mã hóa để lưu trong hội thoại của người gửi.
 
-```bash
-bash scripts/run_zap_baseline.sh http://host.docker.internal:8000
+**Nói:** “DLP kiểm tra một số dạng mã hóa với giới hạn số lớp và dung lượng,
+rồi ánh xạ kết quả về đoạn gốc để che. Chế độ ngoại tuyến chỉ minh họa bản
+xem trước. Khi dùng AI bên ngoài, phải có đồng thuận; secret, khóa riêng và
+số thẻ bị chính sách chặn gửi ra ngoài, không chỉ che rồi gửi.”
+
+Không bỏ tick consent rồi chờ lỗi 403 trong chế độ này: bot ngoại tuyến
+không cần đồng thuận gửi dữ liệu sang bên thứ ba. Bằng chứng chặn secret mã
+hóa, che email và lọc phản hồi AI ngoài nằm trong tình huống `encoded-dlp`
+với nhà cung cấp giả lập đã bật consent. Kiểm thử từ chối do thiếu consent
+nằm trong bộ pytest.
+
+### 4. Thời hạn phiên — 45 giây
+
+**Thao tác:** mở **Tài khoản → Thiết bị đang đăng nhập**. Chỉ vào các cột hoạt
+động gần nhất, hết hạn nếu không hoạt động và giới hạn phiên tối đa. Bấm
+**Làm mới** để cho thấy bảng có thể được kiểm tra lại.
+
+**Kết quả:** phiên hiện tại có mốc thời gian do máy chủ cung cấp. Làm mới
+bảng và refresh token không tự kéo dài mốc không hoạt động. Các yêu cầu
+nghiệp vụ hợp lệ khác có thể cập nhật hoạt động.
+
+**Nói:** “Mặc định phiên hết hạn sau 30 phút không hoạt động và tối đa 8 giờ
+kể từ lúc đăng nhập. Kiểm tra nằm ở máy chủ. Tình huống tự động điều chỉnh
+thời gian trên dữ liệu thử để kiểm tra ngay, không phải chờ 30 phút.”
+
+### 5. Audit và phát hiện bất thường — 1 phút
+
+**Thao tác:** chuyển sang cửa sổ `demo.boss`, vào **Bảo mật**. Bấm **Xác minh
+chuỗi**, sau đó **Phân tích** ở mục **IDS — hành vi bất thường**.
+
+**Kết quả:** chuỗi audit hợp lệ. Danh sách bất thường có thể đọc được từ các
+sự kiện mẫu trong cửa sổ thời gian. Nêu rõ các sự kiện do seed tạo là mô phỏng.
+
+**Nói:** “Chuỗi HMAC giúp phát hiện sửa dữ liệu audit. Hệ thống còn tương
+quan nhiều lần đăng nhập sai từ nhiều IP và trường hợp thất bại rồi đăng
+nhập thành công. Đây là tín hiệu để kiểm tra, không tự kết luận tài khoản
+đã bị chiếm và không tự khóa tài khoản chỉ vì tương quan này.”
+
+### 6. Bằng chứng kiểm chứng — 1 phút 30 giây
+
+**Thao tác:** trình chiếu kết quả đã chạy ở terminal và mở
+`reports/security-validation-rehearsal/security-validation.json`. Chỉ vào các mục
+`session-timeout`, `encoded-dlp`, `auth-correlation`, `browser-origin` và một
+mục `idor` hoặc `audit-tamper`.
+
+**Kết quả:** từng tình huống đạt các kiểm tra bên trong; có bằng chứng như
+trạng thái HTTP, mã audit hoặc kết quả đối chiếu. Nếu kết quả chưa đạt,
+trình bày lỗi thực tế, không gọi đó là một tình huống thành công.
+
+**Nói:** “Các tình huống chạy trên SQLite và khóa tạm riêng. Nhà cung cấp AI
+được giả lập để kiểm tra chặn gửi và lọc phản hồi mà không cần Internet.
+Kết quả chứng minh các kiểm soát trong phạm vi test; không phải một chứng
+nhận chống được mọi tấn công hoặc đã kiểm thử hạ tầng thật.”
+
+## Bản 12 phút
+
+Giữ bản 6 phút và thêm ba phần dưới đây. Nếu muốn tự gọi Swagger, diễn tập
+riêng trước buổi bảo vệ; không đưa bearer token lên ảnh báo cáo.
+
+### 7. MFA và thu hồi thiết bị — thêm 2 phút 30 giây
+
+**Thao tác:** dùng `demo.user`, vào **Tài khoản → Xác thực hai lớp (TOTP)**:
+bấm **Bắt đầu thiết lập 2FA**, quét QR, nhập mã rồi **Kích hoạt**. Giữ riêng
+mã khôi phục cho lượt demo, không đưa vào slide. Đăng xuất, đăng nhập lại;
+đợi mã TOTP mới nếu mã hiện tại vừa được dùng để kích hoạt.
+
+**Kết quả:** mật khẩu đúng mới qua bước đầu; phải có TOTP hoặc mã khôi phục
+hợp lệ mới hoàn tất đăng nhập. Mã TOTP đã dùng không được dùng lại trong
+cùng bước thời gian.
+
+**Nói:** “MFA thêm yếu tố sở hữu ngoài mật khẩu. Mã khôi phục chỉ hiện một
+lần, được lưu dạng băm và mỗi mã chỉ dùng một lần. Khi khởi động lại lượt
+demo, dữ liệu MFA tạm này cũng được tạo lại từ đầu.”
+
+Nếu còn thời gian, đăng nhập cùng tài khoản ở một cửa sổ riêng, làm mới
+danh sách thiết bị và thu hồi đúng phiên đó. Ở cửa sổ bị thu hồi, thao tác
+API tiếp theo phải yêu cầu đăng nhập lại. Không thu hồi phiên đang dùng để
+trình chiếu trước khi hoàn tất phần này.
+
+### 8. IDOR, chặn dò mật khẩu và audit bị sửa — thêm 2 phút
+
+**Thao tác:** tại terminal thứ hai, chạy:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.validate_security --scenario idor --scenario brute-force --scenario audit-tamper --output-dir reports/security-validation-access
 ```
 
-**Nói gì:** bốn tầng kiểm thử khác nhau — unit/regression test cho logic, SAST
-đọc mã nguồn tìm mẫu nguy hiểm, SCA đối chiếu thư viện với cơ sở dữ liệu CVE,
-DAST tấn công ứng dụng đang chạy từ bên ngoài. Không tầng nào thay được tầng
-nào: SAST không thấy lỗi cấu hình runtime, DAST không thấy nhánh code không
-được kích hoạt.
+**Kết quả:** đọc/xóa tài nguyên của người khác bị từ chối, tài nguyên của
+chủ sở hữu vẫn truy cập được; dò mật khẩu bị giới hạn; audit bị sửa trong
+SQLite thử nghiệm được phát hiện. Xem kết quả từng kiểm tra trong JSON.
 
----
+**Nói:** “Phần thử âm tính chạy riêng nên không làm khóa tài khoản hoặc
+chặn IP của giao diện đang trình chiếu. Sửa audit chỉ xảy ra trên bản thử
+nghiệm tạm. Tôi không sửa cơ sở dữ liệu của ứng dụng để dàn dựng kết quả.”
 
-## Bản rút gọn 6 phút
+### 9. Kiểm tra yêu cầu khác nguồn và luật IDS — thêm 1 phút 30 giây
 
-Nếu bị giục thời gian, làm đúng các mục ★ theo thứ tự: **1 → 2 → 3 → 4 → 5 →
-8**. Bỏ mục 6, 7, 9, 10 và chỉ nhắc bằng lời rằng chúng có trong báo cáo.
+**Thao tác:** chạy kiểm chứng yêu cầu trình duyệt:
 
----
+```powershell
+.\.venv\Scripts\python.exe -m scripts.validate_security --scenario browser-origin --output-dir reports/security-validation-origin
+```
 
-## Những câu hỏi giảng viên hay hỏi
+Sau đó ở cửa sổ `demo.boss`, mở **Bảo mật → Purple Team — kiểm chứng luật
+phát hiện**, bấm **Chạy kiểm chứng Hit/Miss**.
 
-**"Nếu mất `MASTER_ENCRYPTION_KEY` thì sao?"**
-Mất toàn bộ dữ liệu chat — đúng theo thiết kế, vì khóa không nằm trong database.
-Đó là cái giá của mã hóa thật. Có `scripts/rotate_encryption_key.py` để xoay
-khóa mà giữ dữ liệu, nhờ trường `key_version` trên từng bản ghi.
+**Kết quả:** kiểm chứng khác nguồn từ chối yêu cầu thay đổi dữ liệu có nguồn
+không được tin cậy và cho phép ca hợp lệ; luật IDS được đối chiếu các mẫu
+trong ứng dụng, không gửi payload khai thác ra mạng.
 
-**"Sao không mã hóa đầu cuối luôn?"**
-Vì tính năng cốt lõi là gửi nội dung cho AI xử lý — máy chủ buộc phải đọc được
-plaintext tại thời điểm đó. E2EE thật sự sẽ loại bỏ luôn tính năng này. Phạm vi
-bảo vệ ở đây là **at-rest**, và nói rõ giới hạn đó là trung thực hơn là gán
-nhãn E2EE cho một hệ thống không phải E2EE.
+**Nói:** “Kiểm tra Origin và Fetch Metadata áp dụng cả API lẫn Gradio.
+Header giả lập trong test chứng minh nhánh xử lý phía máy chủ. Nút Hit/Miss
+kiểm tra engine IDS nội bộ; nó không phải một lần pentest từ bên ngoài.”
 
-**"IDS này chặn được tấn công thật không?"**
-Chặn được công cụ quét tự động và kẻ tấn công nghiệp dư. Người biết việc lách
-được dễ dàng vì nó khớp mẫu trên chuỗi. Giá trị chính là **phát hiện và ghi
-nhận**, phục vụ điều tra sau sự cố, chứ không phải là lớp bảo vệ chính.
+## Bằng chứng nên giữ cho báo cáo
 
-**"Rate limit lưu ở đâu, nhiều instance thì sao?"**
-Mặc định lưu trong bộ nhớ tiến trình — chỉ đúng khi chạy một instance. Vì vậy
-cấu hình production **bắt buộc** `REDIS_URL`; `src/app/config.py` từ chối khởi
-động ở môi trường production nếu thiếu biến này.
+1. Ảnh giao diện chat ngoại tuyến có email được che và ảnh các trường bản mã.
+2. Ảnh thời hạn phiên; ảnh audit hợp lệ và bất thường có ghi chú “dữ liệu mẫu”.
+3. Dòng tổng kết bộ kiểm chứng, JSON/JUnit cùng ngày chạy và mã phiên bản mã
+   nguồn nếu có. Các lần chạy dùng thư mục đầu ra riêng để tránh ghi đè.
+4. Dòng tổng kết pytest, Ruff và Bandit thực tế. Lệnh nằm trong
+   [HUONG_DAN_CHAY.md](../HUONG_DAN_CHAY.md).
+5. Một video 6 phút quay trước để dự phòng. Không quay QR, khóa MFA, mã khôi
+   phục, token hoặc dữ liệu cá nhân thật.
 
-**"Nếu Gemini bị prompt injection thì sao?"**
-Nội dung người dùng được bọc trong JSON và đánh dấu là dữ liệu không tin cậy,
-chỉ thị hệ thống truyền qua trường `system_instruction` của SDK chứ không nối
-vào chuỗi prompt. Nhưng cần nói thẳng: đây là giảm thiểu, không phải giải pháp
-triệt để — prompt injection hiện chưa có cách phòng chống hoàn toàn. Điều bảo
-đảm được là mô hình **không có quyền gọi công cụ hay truy cập dữ liệu người
-dùng khác**, nên injection thành công cũng chỉ ảnh hưởng nội dung câu trả lời
-trong chính phiên đó.
+## Các câu hỏi nên trả lời rõ
 
-**"Sao model lại là `gemini-flash-lite-latest` mà không ghim phiên bản?"**
-Vì Google khai tử model theo thời gian: bản ghim `gemini-2.5-flash-lite` nay
-trả 404 *"no longer available to new users"*. Alias `-latest` tự trỏ sang thế hệ
-còn hiệu lực. Đánh đổi là hành vi model có thể thay đổi giữa các lần chạy — với
-đồ án thì tính chạy được quan trọng hơn tính tái lập tuyệt đối.
+- **“AI này có trả lời thông minh không?”** Bot hiện tại là mô phỏng ngoại
+  tuyến cho bài bảo mật. Tích hợp provider có sẵn nhưng không được gọi trong
+  lượt demo này.
+- **“Mã hóa rồi thì quản trị viên không thể xem gì?”** API chặn đọc hội thoại
+  của người khác. Với Secure, tiến trình máy chủ vẫn có khả năng giải mã để
+  phục vụ chủ sở hữu; đây không phải cam kết E2EE.
+- **“DLP có phát hiện mọi cách che giấu không?”** Không. Bộ dò hỗ trợ các dạng
+  và ngân sách kiểm tra được nêu trong tài liệu; có thể có cảnh báo nhầm hoặc
+  cách né chưa được hỗ trợ.
+- **“Đã chứng minh chạy trên PostgreSQL/Redis chưa?”** Lượt demo và runner
+  này dùng SQLite, một tiến trình. Không suy rộng kết quả sang hạ tầng chưa
+  được kiểm chứng.
+- **“Chuỗi audit có chống được chiếm toàn bộ máy không?”** Không đầy đủ. Nếu
+  kẻ tấn công có cả dữ liệu và khóa HMAC, họ có thể tính lại chuỗi. Checkpoint
+  ngoài/WORM là phần mở rộng, không được dựng thành dịch vụ thật trong demo.
+
+Nguồn nghiên cứu và giới hạn bốn tính năng nâng cấp nằm tại
+[ADVANCED_SECURITY.md](ADVANCED_SECURITY.md); phạm vi runner nằm tại
+[SECURITY_AUTOMATION.md](SECURITY_AUTOMATION.md).

@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.app.audit_chain import derive_audit_key  # noqa: E402
 from src.app.config import Settings  # noqa: E402
 from src.app.db import Database  # noqa: E402
 from src.app.demo_seed import (  # noqa: E402
@@ -32,12 +33,19 @@ from src.app.security import CryptoService, PasswordService  # noqa: E402
 
 if __name__ == "__main__":
     settings = Settings.from_env()
+    if settings.environment not in {"development", "test"}:
+        raise SystemExit("Dữ liệu demo chỉ được tạo trong development hoặc test.")
     seed_demo_data(
         Database(settings.database_url),
         PasswordService(),
-        CryptoService(settings.master_encryption_key),
+        CryptoService(
+            settings.master_encryption_key,
+            keyring=dict(settings.master_encryption_keys) or None,
+            active_key_version=settings.active_key_version,
+        ),
         reset="--reset" in sys.argv,
         refresh_telemetry="--refresh-telemetry" in sys.argv,
+        audit_key=derive_audit_key(settings.secret_key) if settings.audit_chain_enabled else None,
     )
     print("\n=== TÀI KHOẢN DEMO ===")
     print(f"Mật khẩu chung : {DEMO_PASSPHRASE}")
@@ -50,6 +58,7 @@ if __name__ == "__main__":
         "  1. Đăng nhập demo.user  → tab Trò chuyện có sẵn 4 hội thoại giải thích dự án.\n"
         "  2. Tab 'Dữ liệu mã hóa' → xem ciphertext/nonce thật trong DB.\n"
         "  3. Tab 'Tìm kiếm'       → thử từ khóa 'AAD' hoặc 'Argon2id'.\n"
-        "  4. Đăng nhập demo.boss  → tab Quản trị: thống kê, cảnh báo brute-force, audit.\n"
+        "  4. Đăng nhập demo.boss  → tab Quản trị: brute-force, dò phân tán, đăng nhập "
+        "sau chuỗi thất bại, audit. Telemetry seed đều có synthetic=true.\n"
         "  5. Đăng nhập demo.mod   → chỉ thấy nhật ký kiểm toán (đúng RBAC 3 cấp)."
     )

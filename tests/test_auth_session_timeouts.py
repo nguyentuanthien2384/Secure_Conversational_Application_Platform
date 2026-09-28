@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import threading
 from datetime import timedelta, timezone
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from sqlalchemy import event, func, select, text
+from sqlalchemy.dialects import postgresql, sqlite
 
 from src.app.config import Settings
-from src.app.db import Database, utcnow
+from src.app.db import Base, Database, utcnow
 from src.app.models import AuditEvent, AuthSession, RevokedToken
 from tests.conftest import register_and_login
 from tests.test_auth_rotation_race import AUTH_SESSION_CLAIM_SQL
@@ -342,6 +344,44 @@ def test_logout_winning_account_lock_prevents_stale_activity_update(client, app,
     db_session.expire_all()
     assert session.revoked_at is not None
     assert session.last_activity_at.replace(tzinfo=timezone.utc) == old_activity
+
+
+@pytest.mark.parametrize(
+    ("dialect", "timestamp_type"),
+    [(postgresql.dialect(), "TIMESTAMP WITH TIME ZONE"), (sqlite.dialect(), "DATETIME")],
+    ids=["postgresql", "sqlite"],
+)
+def test_activity_migration_uses_timezone_aware_type_for_dialect(
+    monkeypatch, dialect, timestamp_type
+):
+    # Run the legacy migration branch with real SQL dialects but no database
+    # connection. All columns except the new activity timestamp already exist.
+    inspector = Mock()
+    inspector.get_columns.side_effect = lambda table: [
+        {"name": column.name}
+        for column in Base.metadata.tables[table].columns
+        if not (table == "auth_sessions" and column.name == "last_activity_at")
+    ]
+    inspector.get_indexes.return_value = [{"name": "ix_auth_sessions_family_active"}]
+    inspector.get_table_names.return_value = list(Base.metadata.tables)
+    monkeypatch.setattr("src.app.db.inspect", lambda _engine: inspector)
+    monkeypatch.setattr(Base.metadata, "create_all", Mock())
+    database = Database.__new__(Database)
+    database.engine = MagicMock()
+    database.engine.dialect = dialect
+
+    database.create_all()
+
+    connection = database.engine.begin.return_value.__enter__.return_value
+    activity_statements = [
+        str(call.args[0])
+        for call in connection.execute.call_args_list
+        if "last_activity_at" in str(call.args[0])
+    ]
+    assert activity_statements == [
+        f"ALTER TABLE auth_sessions ADD COLUMN last_activity_at {timestamp_type}",
+        "UPDATE auth_sessions SET last_activity_at = issued_at",
+    ]
 
 
 def test_activity_migration_preserves_original_timestamp_and_is_idempotent(tmp_path):

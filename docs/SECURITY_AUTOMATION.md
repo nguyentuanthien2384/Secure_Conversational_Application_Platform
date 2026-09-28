@@ -67,11 +67,15 @@ trong cơ sở dữ liệu, không tự cài đặt hoặc kết nối Elasticse
 
 ## Chạy kiểm chứng tự động
 
-Chạy tại thư mục gốc của dự án sau khi cài nhóm phụ thuộc phát triển:
+Với đồ án demo trên máy, dùng [launcher ngoại tuyến](../HUONG_DAN_CHAY.md) cho
+giao diện và runner dưới đây cho bằng chứng. Hai tiến trình dùng dữ liệu tạm
+riêng; chạy runner không chặn IP hay khóa tài khoản của giao diện demo.
+
+Chạy tại thư mục gốc của dự án sau khi cài nhóm phụ thuộc phát triển. Bước cài
+đầu tiên cần mạng:
 
 ```powershell
 uv sync --frozen --group dev
-uv run python -m scripts.validate_security
 ```
 
 Nếu đã có môi trường Python trên Windows:
@@ -80,7 +84,7 @@ Nếu đã có môi trường Python trên Windows:
 .\.venv\Scripts\python.exe -m scripts.validate_security
 ```
 
-Bảy tình huống hiện có:
+Các tình huống của runner:
 
 1. Không có xác thực: trả 401 và có `auth.access.denied` tương ứng.
 2. Token sai: trả 401 và ghi nhận từ chối mà không lưu token.
@@ -89,10 +93,25 @@ Bảy tình huống hiện có:
 5. SQL injection mã hoá hai lớp: phát hiện `ids.signature`, sau đó có chặn IPS.
 6. Mẫu hợp lệ: đăng ký/đăng nhập/truy cập thành công, không phát cảnh báo IDS.
 7. Sửa một dòng audit trong SQLite tạm: phát hiện hỏng chuỗi và đúng dòng bị sửa.
+8. `session-timeout`: kiểm tra thời hạn không hoạt động/tuyệt đối ở máy chủ;
+   dùng thời gian trên dữ liệu thử, không chờ hàng chục phút trên giao diện.
+9. `encoded-dlp`: bật đồng thuận, rồi kiểm tra chặn secret mã hóa, che email
+   và lọc phản hồi với nhà cung cấp AI **giả lập**, không gọi dịch vụ ngoài.
+   Nhánh từ chối do thiếu đồng thuận được kiểm tra trong bộ pytest.
+10. `auth-correlation`: đối chiếu sự kiện đăng nhập phân tán và chuỗi thất bại
+    rồi thành công với kết quả tương quan; sự kiện đầu vào là dữ liệu mô phỏng.
+11. `browser-origin`: kiểm tra yêu cầu thay đổi dữ liệu khác nguồn bị từ chối,
+    sự kiện bảo mật có mã yêu cầu tương ứng và ca cùng nguồn hợp lệ.
 
 Mỗi lần chạy tạo khoá và SQLite riêng, không đọc `.env`, không nhận URL mục tiêu
 và không dùng cơ sở dữ liệu đã cấu hình. Runner được thiết kế cho tiến trình
 CLI/CI riêng; không gọi nó từ một ứng dụng đang phục vụ người dùng.
+
+Bot `[DEMO AI]` trên giao diện chỉ minh họa bản xem trước đã che và không cần
+consent gửi dữ liệu ra ngoài. Bằng chứng cho nhánh provider đến từ test giả lập
+ở runner: không được diễn giải thành việc đã gọi hoặc kiểm thử Gemini thật.
+Chính sách AI ngoài chặn secret, khóa riêng và thẻ thanh toán thay vì chỉ che
+rồi gửi. Chi tiết và giới hạn nằm trong [ADVANCED_SECURITY.md](ADVANCED_SECURITY.md).
 
 Đầu ra nằm tại `reports/security-validation/security-validation.json` và
 `reports/security-validation/security-validation.junit.xml`. Kết quả gồm mã
@@ -103,7 +122,13 @@ khẩu, token, nội dung chat hoặc payload thô. Thư mục kết quả đư�
 Có thể chạy một phần:
 
 ```powershell
-uv run python -m scripts.validate_security --scenario idor --scenario encoded-sqli
+.\.venv\Scripts\python.exe -m scripts.validate_security --scenario idor --scenario encoded-sqli
+```
+
+Kiểm chứng riêng bốn tính năng mới, đồng thời giữ kết quả cho buổi diễn tập:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.validate_security --scenario session-timeout --scenario encoded-dlp --scenario auth-correlation --scenario browser-origin --output-dir reports/security-validation-advanced
 ```
 
 Workflow `.github/workflows/security.yml` chạy bộ kiểm chứng trên pull request,
@@ -114,7 +139,7 @@ Các nhãn ATT&CK là ánh xạ phạm vi tình huống ứng dụng: dò mật 
 [T1110.001](https://attack.mitre.org/techniques/T1110/001/), tín hiệu khai thác Web
 [T1190](https://attack.mitre.org/techniques/T1190/) và sửa dữ liệu lưu trữ
 [T1565.001](https://attack.mitre.org/techniques/T1565/001/). Chúng không chứng minh
-độ bao phủ các kỹ thuật hệ điều hành trong báo cáo. Kết quả 7/7 cũng không phải
+độ bao phủ các kỹ thuật hệ điều hành trong báo cáo. Kết quả toàn bộ tình huống đạt cũng không phải
 tỷ lệ phát hiện ngoài thực tế hay phép đo tỷ lệ cảnh báo giả thống kê.
 
 ## Bật tác vụ bảo mật định kỳ

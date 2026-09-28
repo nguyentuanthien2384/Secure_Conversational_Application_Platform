@@ -106,6 +106,33 @@ def test_encoded_pii_is_redacted_under_existing_confidential_policy(email):
     assert decision.output_text == "Contact ([REDACTED:EMAIL])"
 
 
+@pytest.mark.parametrize("suffix", [".", "...", ". Next sentence", ",", ";", ":", "!", "?", ")", '"'])
+def test_email_sentence_punctuation_preserved_and_encoded_email_is_redacted(suffix):
+    text = "person@example.com" + suffix
+    scanner = DLPScanner()
+    redacted, findings = scanner.redact(text)
+    assert redacted == "[REDACTED:EMAIL]" + suffix
+    assert [item.finding_type for item in findings] == [FindingType.EMAIL]
+    encoded = _base64(text)
+    encoded_result, encoded_findings = scanner.redact(f"({encoded})")
+    assert encoded_result == "([REDACTED:EMAIL])"
+    assert [item.finding_type for item in encoded_findings] == [FindingType.EMAIL]
+
+
+@pytest.mark.parametrize("suffix", [".123", ".com7", ".invalid_label", "-suffix", "_suffix", "..example", ".đề", "7"])
+def test_email_does_not_redact_only_prefix_of_invalid_domain(suffix):
+    text = "person@example.com" + suffix
+    result, findings = DLPScanner().redact(text)
+    assert result == text
+    assert not findings
+
+
+def test_email_valid_multilabel_domain_is_redacted_completely_before_fullstop():
+    result, findings = DLPScanner().redact("Contact person@mail.example.co.uk.")
+    assert result == "Contact [REDACTED:EMAIL]."
+    assert [item.finding_type for item in findings] == [FindingType.EMAIL]
+
+
 def test_different_encoded_occurrences_and_adjacent_plain_secret_are_all_removed():
     encoded = _base64("person@example.com")
     source = f"({encoded}) {_percent('other@example.com')} ({encoded}) password:last-secret"
@@ -226,6 +253,35 @@ def _service(settings, response="Safe answer"):
     provider = _RecordingProvider(response)
     service._client = provider
     return service, provider
+
+
+def test_demo_sample_redacts_plain_and_encoded_email_before_offline_echo(settings):
+    email = "sinhvien@example.com"
+    encoded = _base64(email)
+    sample = f"Email mẫu của tôi: {email}. Chuỗi Base64: {encoded}"
+    service = AIService(replace(settings, google_genai_api_key="", allow_demo_ai=True))
+    response, labels = service.generate(sample, [], allow_external_ai=False)
+    assert response.startswith("[DEMO AI]")
+    assert response.count("[REDACTED:EMAIL]") == 2
+    assert email not in response and encoded not in response
+    assert labels == ["email"]
+
+
+def test_punctuated_email_removed_from_provider_prompt_history_and_output(settings):
+    email = "sinhvien@example.com"
+    encoded = _base64(email + ".")
+    service, provider = _service(settings, f"Contact {email}. Encoded: ({encoded})")
+    response, labels = service.generate(
+        f"Email mẫu của tôi: {email}. Chuỗi Base64: {encoded}",
+        [{"role": "user", "content": f"Previous email {email}."}],
+        allow_external_ai=True,
+    )
+    assert len(provider.calls) == 1
+    prompt = provider.calls[0][0]
+    assert prompt.count("[REDACTED:EMAIL]") == 3
+    assert response.count("[REDACTED:EMAIL]") == 2
+    assert email not in prompt + response and encoded not in prompt + response
+    assert labels == ["email"]
 
 
 def test_encoded_credential_rejects_before_history_decryption_and_provider_call(settings):

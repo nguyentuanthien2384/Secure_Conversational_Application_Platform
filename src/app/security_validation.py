@@ -20,7 +20,7 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -28,11 +28,13 @@ from xml.etree import ElementTree
 
 import httpx
 from fastapi.testclient import TestClient
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
+from src.app.audit_chain import append_lock, seal_event
 from src.app.config import Settings
+from src.app.db import utcnow
 from src.app.ids import detect_anomalies
-from src.app.models import AuditEvent, User
+from src.app.models import AuditEvent, AuthSession, RevokedToken, SecureMessage, User
 
 
 class ValidationFailure(RuntimeError):
@@ -56,6 +58,7 @@ class Probe:
         self.prefix = f"sv-{run_id[:12]}-{scenario_id}"
         self.requests: list[dict[str, Any]] = []
         self.checks: list[dict[str, Any]] = []
+        self.observations: list[dict[str, Any]] = []
         # Generated credentials never appear in reports or failure messages.
         self.password = "Validation-" + secrets.token_urlsafe(24) + "Aa1"
 
@@ -78,14 +81,16 @@ class Probe:
         rule: str | None = None,
         phase: str = "exercise",
         token: str | None = None,
+        headers: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         request_id = f"{self.prefix}-{len(self.requests) + 1}"
-        headers = {"X-Request-ID": request_id}
+        request_headers = dict(headers or {})
+        request_headers["X-Request-ID"] = request_id
         if token:
-            headers["Authorization"] = f"Bearer {token}"
+            request_headers["Authorization"] = f"Bearer {token}"
         started = time.perf_counter()
-        response = self.client.request(method, path, headers=headers, **kwargs)
+        response = self.client.request(method, path, headers=request_headers, **kwargs)
         latency_ms = (time.perf_counter() - started) * 1000
         with self.app.state.database.session_factory() as db:
             rows = db.scalars(
@@ -226,6 +231,213 @@ def _audit_tamper(probe: Probe) -> None:
     probe.check("tampering detected at changed row", response.json().get("chain_intact") is False and response.json().get("first_broken_id") == event_id)
 
 
+def _session_timeout(probe: Probe) -> None:
+    token = probe.account("validation-timeout")
+    old_jti = probe.app.state.token_service.decode(token)["jti"]
+    old_activity = utcnow() - timedelta(minutes=5)
+    with probe.app.state.database.session_factory() as db:
+        original = db.get(AuthSession, old_jti)
+        original.last_activity_at = old_activity
+        original_root = original.root_issued_at or original.issued_at
+        db.commit()
+    probe.observations.append({
+        "source": "temporary_session_timestamp_fixture",
+        "scope": "Server-side timestamps are moved backwards; no real-time wait or token forgery.",
+    })
+    refreshed = probe.request(
+        "POST", "/api/auth/refresh", expected_status=200, token=token,
+        event="auth.session.refresh", outcome="success",
+    )
+    probe.require("active session refresh completed", refreshed.status_code == 200)
+    new_token = refreshed.json()["access_token"]
+    new_jti = probe.app.state.token_service.decode(new_token)["jti"]
+    with probe.app.state.database.session_factory() as db:
+        renewed = db.get(AuthSession, new_jti)
+        # SQLite strips UTC metadata on storage, so compare the same UTC form.
+        probe.check("refresh preserves the idle clock", renewed.last_activity_at.replace(tzinfo=timezone.utc) == old_activity)
+        probe.check("refresh preserves the absolute clock", renewed.root_issued_at == original_root)
+        probe.check("refresh revokes the previous token", db.get(RevokedToken, old_jti) is not None)
+        renewed.last_activity_at = utcnow() - timedelta(minutes=probe.app.state.settings.session_idle_minutes + 1)
+        db.commit()
+    expired = probe.request(
+        "POST", "/api/auth/refresh", expected_status=401, token=new_token,
+        event="auth.session.expired", outcome="denied",
+    )
+    probe.check("idle expiry cannot mint another token", "access_token" not in expired.json())
+    with probe.app.state.database.session_factory() as db:
+        revoked = db.get(RevokedToken, new_jti)
+        probe.check("idle expiry is persisted in revocation store", revoked is not None and revoked.reason == "idle_timeout")
+
+    login = probe.request(
+        "POST", "/api/auth/login", expected_status=200, phase="setup",
+        event="auth.login", outcome="success",
+        json={"username": "validation-timeout", "password": probe.password},
+    )
+    probe.require("fresh login setup completed", login.status_code == 200)
+    fresh_token = login.json()["access_token"]
+    fresh_jti = probe.app.state.token_service.decode(fresh_token)["jti"]
+    with probe.app.state.database.session_factory() as db:
+        fresh_session = db.get(AuthSession, fresh_jti)
+        fresh_session.root_issued_at = utcnow() - timedelta(hours=probe.app.state.settings.session_absolute_hours + 1)
+        db.commit()
+    probe.request(
+        "GET", "/api/auth/me", expected_status=401, token=fresh_token,
+        event="auth.session.expired", outcome="denied",
+    )
+    with probe.app.state.database.session_factory() as db:
+        revoked = db.get(RevokedToken, fresh_jti)
+        probe.check("absolute expiry applies even after recent activity", revoked is not None and revoked.reason == "absolute_lifetime_exceeded")
+
+
+def _encoded_dlp(probe: Probe) -> None:
+    token = probe.account("validation-encoded-dlp")
+    consent = probe.request(
+        "PATCH", "/api/auth/ai-consent", expected_status=200, token=token, phase="setup",
+        event="privacy.ai_consent", outcome="success", json={"ai_data_consent": True},
+    )
+    probe.require("AI consent setup completed", consent.status_code == 200)
+    created = probe.request(
+        "POST", "/api/sessions", expected_status=201, token=token, phase="setup",
+        json={"title": "Offline DLP validation"},
+    )
+    probe.require("DLP conversation setup completed", created.status_code == 201)
+    path = f"/api/sessions/{created.json()['id']}/messages"
+    calls: list[str] = []
+    provider_response = "Safe local provider response"
+
+    class RecordingProvider:
+        def generate(self, prompt: str, **_kwargs: Any) -> str:
+            calls.append(prompt)
+            return provider_response
+
+    # This replaces only the external provider boundary. DLP, consent, audit,
+    # encryption and persistence use the application's real implementation.
+    probe.app.state.chat_service.ai._client = RecordingProvider()
+    secret = "password:validation-only-encoded-secret"
+    encoded_secret = base64.b64encode(secret.encode()).decode("ascii")
+    denied = probe.request(
+        "POST", path, expected_status=422, token=token,
+        event="dlp.policy", outcome="blocked", json={"content": encoded_secret},
+    )
+    probe.check("encoded credential uses the DLP block response", denied.json().get("detail", {}).get("code") == "dlp_block")
+    probe.check("blocked credential never reaches the provider boundary", not calls)
+    with probe.app.state.database.session_factory() as db:
+        probe.check("blocked credential persists no messages", db.scalar(select(func.count()).select_from(SecureMessage)) == 0)
+        details = "".join(db.scalars(select(AuditEvent.details_json)).all())
+    probe.check("denial and audit metadata omit credential payload", all(value not in denied.text + details for value in (secret, encoded_secret)))
+
+    email = "validation-person@example.com"
+    encoded_email = base64.b64encode(email.encode()).decode("ascii")
+    response = probe.request(
+        "POST", path, expected_status=201, token=token,
+        event="dlp.redacted", outcome="success", json={"content": f"Contact ({encoded_email})"},
+    )
+    probe.check("redacted message reaches the local provider exactly once", len(calls) == 1)
+    probe.check("provider prompt contains a redaction marker and no encoded email", len(calls) == 1 and "[REDACTED:EMAIL]" in calls[0] and email not in calls[0] and encoded_email not in calls[0])
+    probe.check("sanitized provider response returns normally", response.json().get("content") == provider_response)
+
+    provider_response = "a " * 3990 + encoded_secret
+    output = probe.request(
+        "POST", path, expected_status=201, token=token,
+        event="dlp.redacted", outcome="success", json={"content": "Explain safe data handling"},
+    )
+    content = output.json().get("content", "")
+    probe.check("output DLP scans encoded secret across display cutoff", content.startswith("a " * 3990) and "[REDACTED:" in content and "cGFzc3dvcmQ" not in content and len(content) <= 8000)
+    probe.check("both accepted messages invoke only the local recording provider", len(calls) == 2)
+    probe.observations.append({
+        "source": "local_recording_provider",
+        "provider_calls": len(calls), "external_network_calls": 0,
+        "scope": "Input and output DLP exercise a local provider stub; no live AI service is contacted.",
+    })
+
+
+def _auth_correlation(probe: Probe) -> None:
+    token = probe.account("validation-correlations", admin=True)
+    now = utcnow()
+
+    def append_fixture(event_type: str, outcome: str, index: int, age: int) -> int:
+        with probe.app.state.database.session_factory() as db, append_lock(db):
+            row = AuditEvent(
+                actor_id="synthetic-validation-target", event_type=event_type,
+                outcome=outcome, ip_address=f"192.0.2.{index}",
+                request_id=f"{probe.prefix}-fixture-{index}",
+                details_json='{"evidence_source":"synthetic_validation_fixture"}',
+                created_at=now - timedelta(seconds=age),
+            )
+            seal_event(db, row, probe.app.state.audit_key)
+            db.add(row)
+            db.commit()
+            probe.observations.append({
+                "source": "synthetic_audit_fixture", "audit_id": row.id,
+                "event_type": row.event_type, "outcome": row.outcome,
+                "sealed": bool(row.entry_hash),
+            })
+            return row.id
+
+    for index in range(1, 6):
+        append_fixture("auth.login", "failure", index, 120 - index)
+    append_fixture("auth.mfa.challenge", "success", 6, 30)
+    before = probe.request("GET", "/api/admin/ids/anomalies", expected_status=200, token=token)
+    probe.require("anomaly API returns findings", before.status_code == 200)
+    distributed = [item for item in before.json() if item["code"] == "IDS-DISTRIBUTED-BRUTEFORCE"]
+    probe.check("distributed guessing correlates five distinct sources", len(distributed) == 1 and distributed[0]["count"] == 5 and distributed[0]["source_count"] == 5)
+    probe.check("MFA challenge alone is not completed authentication", not any(item["code"] == "IDS-AUTH-SUCCESS-AFTER-FAILURES" for item in before.json()))
+    success_id = append_fixture("auth.mfa.verify", "success", 7, 10)
+    after = probe.request("GET", "/api/admin/ids/anomalies", expected_status=200, token=token)
+    probe.require("post-success anomaly API returns findings", after.status_code == 200)
+    sequences = [item for item in after.json() if item["code"] == "IDS-AUTH-SUCCESS-AFTER-FAILURES"]
+    probe.check("completed authentication closes suspicious failure sequence", len(sequences) == 1 and sequences[0]["count"] == 5 and sequences[0]["evidence_event_id"] == success_id)
+    for finding in after.json():
+        if finding["code"] in {"IDS-DISTRIBUTED-BRUTEFORCE", "IDS-AUTH-SUCCESS-AFTER-FAILURES"}:
+            probe.observations.append({
+                "source": "anomaly_api_over_synthetic_fixtures", "code": finding["code"],
+                "count": finding["count"], "source_count": finding["source_count"],
+                "evidence_event_id": finding["evidence_event_id"],
+                "mitre_technique": finding["mitre_technique"],
+            })
+    verified = probe.request(
+        "GET", "/api/admin/audit/verify", expected_status=200, token=token,
+        event="audit.chain.verify", outcome="success", phase="control",
+    )
+    probe.check("synthesized fixture events retain an intact sealed audit chain", verified.json().get("chain_intact") is True)
+    probe.check("correlation remains observational without automatic source blocks", not probe.app.state.intrusion_state.blocked_sources())
+
+
+def _browser_origin(probe: Probe) -> None:
+    token = probe.account("validation-browser")
+    untrusted = {"Origin": "https://untrusted.example", "Sec-Fetch-Site": "cross-site"}
+    module = sys.modules["src.app.main"]
+    with patch.object(module, "emit_security_event", wraps=module.emit_security_event) as emitted:
+        denied = probe.request(
+            "POST", "/api/sessions", expected_status=403, token=token,
+            headers=untrusted, json={"title": "Must never exist"},
+        )
+        probe.check("cross-origin denial has protective response headers", denied.headers.get("cache-control") == "no-store" and "Origin" in denied.headers.get("vary", ""))
+        sessions = probe.request("GET", "/api/sessions", expected_status=200, token=token, phase="control")
+        probe.check("denied cross-origin write has no side effects", sessions.json() == [])
+        probe.request(
+            "POST", "/gradio_api/queue/join", expected_status=403,
+            headers=untrusted, json={"data": []},
+        )
+        for call in emitted.call_args_list:
+            if call.args == ("browser.origin.denied",):
+                probe.observations.append({
+                    "source": "in_process_security_telemetry", "event_type": call.args[0],
+                    "request_id": call.kwargs.get("request_id"),
+                    "outcome": call.kwargs.get("outcome"),
+                })
+    denials = [item for item in probe.requests if item["expected_status"] == 403]
+    for denial in denials:
+        probe.check("origin denial has correlated security telemetry", any(item.get("request_id") == denial["request_id"] for item in probe.observations))
+    probe.check("two origin denials emit two bounded telemetry events", len(probe.observations) == 2)
+    allowed = probe.request(
+        "POST", "/api/sessions", expected_status=201, token=token, phase="control",
+        headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
+        json={"title": "Allowed browser conversation"},
+    )
+    probe.check("same-origin write succeeds with authentication", allowed.status_code == 201 and bool(allowed.json().get("id")))
+
+
 SCENARIOS = (
     Scenario("missing-auth", "Unauthenticated access", "attack", None, "Authentication boundary; no ATT&CK technique asserted.", _missing_auth),
     Scenario("invalid-token", "Malformed bearer token", "attack", None, "Token verification boundary; no valid-account compromise asserted.", _invalid_token),
@@ -234,6 +446,10 @@ SCENARIOS = (
     Scenario("encoded-sqli", "Double-encoded injection signature", "attack", "T1190", "Application IDS signature and IPS prevention only; no exploitation proven.", _encoded_injection),
     Scenario("benign", "Benign authenticated control", "control", None, "False-positive control for a small fixed benign sample.", _benign_control),
     Scenario("audit-tamper", "Tampered audit fixture", "attack", "T1565.001", "Mutation of a temporary audit row; no host or production database access.", _audit_tamper),
+    Scenario("session-timeout", "Server-enforced session deadlines", "control", None, "Real authentication API with simulated timestamps in temporary session rows; no real-time waiting.", _session_timeout),
+    Scenario("encoded-dlp", "Encoded data at the AI boundary", "control", None, "Real chat API and DLP with a local recording provider; no external AI service.", _encoded_dlp),
+    Scenario("auth-correlation", "Distributed failures followed by completed authentication", "attack", "T1110", "Real anomaly API over explicitly synthesized, sealed audit fixtures; not network traffic from multiple hosts.", _auth_correlation),
+    Scenario("browser-origin", "Cross-origin browser writes", "control", None, "HTTP middleware denies untrusted API and mounted Gradio writes; same-origin authenticated control remains usable.", _browser_origin),
 )
 
 
@@ -323,6 +539,7 @@ def run_validation(scenario_ids: Sequence[str] | None = None) -> dict[str, Any]:
                     "scope": scenario.scope, "status": "pass" if passed else "fail",
                     "duration_ms": round((time.perf_counter() - case_started) * 1000, 3),
                     "checks": checks, "requests": probe.requests if probe is not None else [],
+                    "observations": probe.observations if probe is not None else [],
                     "error_type": error_type,
                 })
     passed_count = sum(item["status"] == "pass" for item in results)

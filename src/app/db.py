@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from datetime import datetime, timezone
 
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import DateTime, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -161,8 +161,11 @@ class Database:
                     text("ALTER TABLE auth_sessions ADD COLUMN last_step_up_at TIMESTAMP")
                 )
             if "last_activity_at" not in auth_session_columns:
+                # Match the model's timezone-aware type so PostgreSQL preserves
+                # issued_at's instant even when the session timezone is not UTC.
+                activity_type = DateTime(timezone=True).compile(dialect=self.engine.dialect)
                 connection.execute(
-                    text("ALTER TABLE auth_sessions ADD COLUMN last_activity_at TIMESTAMP")
+                    text(f"ALTER TABLE auth_sessions ADD COLUMN last_activity_at {activity_type}")
                 )
                 # Preserve a conservative existing timestamp rather than grant
                 # every old session a new inactivity window at deployment.
