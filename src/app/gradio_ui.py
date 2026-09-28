@@ -11,15 +11,21 @@ import html
 import os
 import time
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 
 import gradio as gr
 
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
+from src.app.ui_session import COOKIE_NAME, BrowserSessionStore, UISessionCapacityError
 
 BASE_URL = os.getenv("SELF_BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", BASE_URL).rstrip("/")
 PASSWORD_MIN = 15
+
+# Fixed markup consumed by our static CSP-compatible session bridge. Bearer
+# tokens never enter this DOM component, cookies readable by JS, or storage.
+SESSION_CLEAR_MARKUP = '<span data-scap-session-clear="1"></span>'
 
 # Vùng lịch sử co theo chiều cao màn hình để ô soạn và nút Gửi luôn ở gần nội
 # dung. Giới hạn dưới vẫn đủ đọc hội thoại; giới hạn trên tránh khoảng trắng lớn
@@ -89,6 +95,8 @@ CUSTOM_CSS = """
 }
 
 footer { display: none !important; }
+#session-bridge { display: none !important; }
+#scap-session-warning { padding: 12px; color: var(--scap-warn-fg); background: var(--scap-warn-bg); }
 
 /* ── Khung ngoài: một workspace full-width duy nhất cho mọi tab ─────────
    Gradio tự thêm padding cho cả .gradio-container và div.main. Nếu giữ cả hai,
@@ -483,19 +491,24 @@ footer { display: none !important; }
 }
 #session-list label:hover { background: var(--background-fill-secondary) !important; }
 #session-list label.selected {
-  border-color: var(--scap-ok-bd) !important;
-  background: var(--scap-ok-bg) !important;
+  border-color: var(--scap-blue) !important;
+  background: #dbeafe !important;
+  color: #1e3a8a !important;
   font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--scap-blue);
+}
+#session-list label.selected span {
+  color: inherit !important;
+  font-weight: inherit;
+}
+.dark #session-list label.selected {
+  background: #1e3a5f !important;
+  color: #dbeafe !important;
 }
 #session-list input[type="radio"] { display: none !important; }
 #session-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── Khối trạng thái ───────────────────────────────────────────────────── */
-#enc-note { margin-bottom: 8px; }
-#enc-note p {
-  margin: 0; font-size: 14px; font-family: var(--font-mono);
-  color: var(--body-text-color-subdued);
-}
 #chat-notice, #sec-verdict, #sec-ids-verdict {
   border-radius: 8px; padding: 12px 15px; margin-top: 6px;
   border-left: 3px solid var(--scap-warn-bd);
@@ -691,6 +704,7 @@ def _guard(fn, n_outputs):
     """Chạy handler; nếu API trả lỗi (gr.Error) thì hiển thị toast cảnh báo
     thay vì để Gradio gắn nhãn "Error" kẹt trên các component output."""
 
+    @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
@@ -858,7 +872,8 @@ def _pw_meter_html(password: str) -> str:
 
 
 # ────────────────────────── giao diện ──────────────────────────
-def build_ui() -> gr.Blocks:
+def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
+    session_store = session_store if session_store is not None else BrowserSessionStore()
     # Gradio 6 applies theme and CSS when the UI is mounted/launched.  Supplying
     # them to Blocks itself is deprecated and emits a warning on every startup.
     with gr.Blocks(
@@ -872,6 +887,7 @@ def build_ui() -> gr.Blocks:
         st_token = gr.State("")
         st_exp = gr.State(0.0)
         st_mfa = gr.State("")
+        resume_ticket = _static_html("", elem_id="session-bridge")
         # Đã hiện cảnh báo "sắp hết phiên" chưa — để chỉ nhắc một lần cho mỗi
         # phiên thay vì mỗi giây một lần trong suốt hai phút cuối.
         st_warned = gr.State(False)
@@ -1047,13 +1063,6 @@ def build_ui() -> gr.Blocks:
                                 label="Tải tệp JSON", visible=False, size="sm"
                             )
                         with gr.Column(scale=3, min_width=600):
-                            # Nhắc trạng thái mã hoá ngay trên khung chat.
-                            gr.Markdown(
-                                "🔒 **Secure/Confidential:** DEK riêng từng phiên, được KEK bọc. "
-                                "🔐 **Private E2EE:** dùng client Double Ratchet/MLS riêng; "
-                                "Gradio không giữ khóa và chỉ hiển thị trạng thái.",
-                                elem_id="enc-note",
-                            )
                             chatbot = gr.Chatbot(
                                 label="Nội dung",
                                 height=CHAT_HISTORY_HEIGHT,
@@ -1395,6 +1404,7 @@ def build_ui() -> gr.Blocks:
         # không nhìn thấy kết quả còn sót lại của tài khoản trước.
         # Ghép component với giá trị reset ngay tại đây để không lệch vị trí.
         EXTRA_RESET = [
+            (resume_ticket, SESSION_CLEAR_MARKUP),
             (li_user, ""),
             (re_user, ""),
             (re_pass, ""),
@@ -1454,7 +1464,11 @@ def build_ui() -> gr.Blocks:
             md_countdown, st_warned,
         ]
 
-        def _reset_tuple():
+        def _cookie(request):
+            return dict(request.cookies).get(COOKIE_NAME) if request is not None else None
+
+        def _reset_tuple(request=None):
+            session_store.revoke(_cookie(request))
             return (
                 "",
                 0.0,
@@ -1578,12 +1592,49 @@ def build_ui() -> gr.Blocks:
                 gr.Timer(active=True),
             )
 
-        btn_login.click(_guard(do_login, len(STAGE1)), [li_user, li_pass], STAGE1).then(
-            _guard(load_workspace, len(STAGE2)), [st_token], STAGE2
-        )
-        li_pass.submit(_guard(do_login, len(STAGE1)), [li_user, li_pass], STAGE1).then(
-            _guard(load_workspace, len(STAGE2)), [st_token], STAGE2
-        )
+        def remember_session(token, exp):
+            if not token or exp <= time.time():
+                return ""
+            try:
+                ticket = session_store.issue(token, exp)
+                return f'<span data-scap-session-ticket="{html.escape(ticket, quote=True)}"></span>'
+            except UISessionCapacityError as exc:
+                raise gr.Error("Không lưu được phiên trình duyệt lúc này. Vui lòng thử lại.") from exc
+
+        def persist_after(event):
+            return event.then(
+                _guard(remember_session, 1), [st_token, st_exp], [resume_ticket], api_name=False,
+                show_progress="hidden",
+            )
+
+        def restore_session(request: gr.Request = None):
+            saved = session_store.restore(_cookie(request))
+            if saved is None:
+                return _reset_tuple(request)[:len(STAGE1)]
+            token, expires_at = saved
+            try:
+                # Revalidate with the real auth service on every page load.
+                # This rejects revoked/disabled/password-changed/idle-expired
+                # sessions, without rotating tokens or extending their expiry.
+                _api(token, "GET", "/api/auth/me")
+            except gr.Error:
+                return _reset_tuple(request)[:len(STAGE1)]
+            return (
+                token, expires_at, "", gr.update(visible=False), gr.update(visible=True),
+                gr.update(visible=False), "", "", gr.update(visible=True),
+            )
+
+        demo.load(
+            _guard(restore_session, len(STAGE1)), None, STAGE1,
+            api_name=False, show_progress="hidden",
+        ).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
+
+        persist_after(btn_login.click(
+            _guard(do_login, len(STAGE1)), [li_user, li_pass], STAGE1,
+        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
+        persist_after(li_pass.submit(
+            _guard(do_login, len(STAGE1)), [li_user, li_pass], STAGE1,
+        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
 
         def do_mfa_verify(mfa_token, code):
             if not mfa_token:
@@ -1608,12 +1659,12 @@ def build_ui() -> gr.Blocks:
                 gr.update(visible=True),
             )
 
-        btn_mfa_verify.click(
+        persist_after(btn_mfa_verify.click(
             _guard(do_mfa_verify, len(STAGE1)), [st_mfa, tb_mfa_code], STAGE1
-        ).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
-        tb_mfa_code.submit(_guard(do_mfa_verify, len(STAGE1)), [st_mfa, tb_mfa_code], STAGE1).then(
-            _guard(load_workspace, len(STAGE2)), [st_token], STAGE2
-        )
+        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
+        persist_after(tb_mfa_code.submit(
+            _guard(do_mfa_verify, len(STAGE1)), [st_mfa, tb_mfa_code], STAGE1,
+        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
         btn_mfa_cancel.click(
             lambda: ("", gr.update(visible=False), "", gr.update(visible=True)),
             None,
@@ -1621,14 +1672,20 @@ def build_ui() -> gr.Blocks:
         )
 
         # ---- đăng xuất + đồng hồ token ----
-        def do_logout(token):
-            if token:
+        def do_logout(token, request: gr.Request = None):
+            saved = session_store.restore(_cookie(request))
+            # Another tab may have renewed the browser's token since this tab
+            # was loaded. Revoke both, so the current cookie cannot resurrect it.
+            tokens = dict.fromkeys([token, saved[0] if saved else ""])
+            for active_token in tokens:
+                if not active_token:
+                    continue
                 try:
-                    _api(token, "POST", "/api/auth/logout")
+                    _api(active_token, "POST", "/api/auth/logout")
                     gr.Info("Đã đăng xuất và thu hồi token trên máy chủ.")
                 except Exception:
                     gr.Warning("Không xác nhận được với máy chủ; trạng thái cục bộ đã xóa.")
-            return _reset_tuple()
+            return _reset_tuple(request)
 
         btn_logout.click(_guard(do_logout, len(RESET_OUTS)), [st_token], RESET_OUTS)
 
@@ -1661,7 +1718,11 @@ def build_ui() -> gr.Blocks:
             left = int(exp - time.time())
             if left <= 0:
                 gr.Warning("Phiên đã hết hạn — vui lòng đăng nhập lại.")
-                return _reset_tuple()
+                # A newer token in another tab may still be valid. Clear only
+                # this tab; expired cookie records are pruned by the store.
+                result = list(_reset_tuple())
+                result[RESET_OUTS.index(resume_ticket)] = ""
+                return tuple(result)
             if left <= WARN_BEFORE_EXPIRY and not warned:
                 gr.Warning(
                     f"Phiên sẽ hết hạn sau {left} giây. "
@@ -1683,12 +1744,14 @@ def build_ui() -> gr.Blocks:
             từ lần đăng nhập gốc — nên phiên không thể được gia hạn vô hạn.
             """
             data = _api(token, "POST", "/api/auth/refresh")
+            expires_at = time.time() + data["expires_in"]
+            session_store.rotate_token(token, data["access_token"], expires_at)
             gr.Info("Đã gia hạn phiên.")
-            return data["access_token"], time.time() + data["expires_in"], False
+            return data["access_token"], expires_at, False
 
-        btn_extend.click(
+        persist_after(btn_extend.click(
             _guard(extend_session, 3), [st_token], [st_token, st_exp, st_warned]
-        )
+        ))
 
         # ---- trò chuyện ----
         def refresh_sessions(token, selected=None):
@@ -1972,7 +2035,7 @@ def build_ui() -> gr.Blocks:
 
         chk_consent.input(_guard(set_consent, 1), [st_token, chk_consent], [chk_consent])
 
-        def change_password(token, current, new):
+        def change_password(token, current, new, request: gr.Request = None):
             if not (current or "").strip() or not (new or "").strip():
                 gr.Warning("Nhập cả mật khẩu hiện tại và mật khẩu mới.")
                 return tuple(gr.skip() for _ in RESET_OUTS)
@@ -1986,7 +2049,7 @@ def build_ui() -> gr.Blocks:
                 {"current_password": current, "new_password": new},
             )
             gr.Info("Đã đổi mật khẩu — mọi phiên bị thu hồi, mời đăng nhập lại.")
-            return _reset_tuple()
+            return _reset_tuple(request)
 
         btn_pw.click(
             _guard(change_password, len(RESET_OUTS)),
@@ -2089,14 +2152,14 @@ def build_ui() -> gr.Blocks:
 
         btn_revoke.click(_guard(revoke_device, 2), [st_token, dd_revoke], [df_devices, dd_revoke])
 
-        def logout_all(token):
+        def logout_all(token, request: gr.Request = None):
             try:
                 _api(token, "POST", "/api/auth/logout-all")
             except Exception:
                 gr.Warning("Không thể thu hồi phiên lúc này. Vui lòng thử lại.")
                 return tuple(gr.skip() for _ in RESET_OUTS)
             gr.Info("Đã thu hồi mọi phiên đăng nhập.")
-            return _reset_tuple()
+            return _reset_tuple(request)
 
         btn_logout_all.click(_guard(logout_all, len(RESET_OUTS)), [st_token], RESET_OUTS)
 

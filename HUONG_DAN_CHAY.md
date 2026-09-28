@@ -61,6 +61,14 @@ vừa tạo, thay đổi tài khoản và thiết lập MFA của lượt cũ kh
 
 ## 3. Đăng nhập và hiểu đúng dữ liệu mẫu
 
+Sau khi đăng nhập thành công, F5 sẽ khôi phục tài khoản nếu phiên vẫn hợp lệ.
+Ứng dụng dùng cookie HttpOnly và xác minh lại phiên với máy chủ; không lưu mật
+khẩu hay bearer token vào localStorage/sessionStorage. F5 không gia hạn token.
+Sau khi đăng xuất, bị thu hồi phiên, hết hạn hoặc khởi động lại tiến trình ứng
+dụng, bạn cần đăng nhập lại. Hãy dùng nhất quán `localhost` hoặc `127.0.0.1`
+vì cookie của hai địa chỉ này tách biệt. Cơ chế khôi phục này dành cho một tiến
+trình phục vụ demo; trạng thái khôi phục nằm trong bộ nhớ máy chủ.
+
 Mật khẩu chung của các tài khoản mẫu: **`Phenikaa-Vault#2026-Lab`**.
 
 - `demo.user`: người dùng, dùng để chat, xem bản mã, thiết bị và MFA.
@@ -153,7 +161,25 @@ và để kết quả ở terminal thứ hai.
 - Nếu cần giữ ảnh/video/báo cáo: lưu trước khi dừng lượt demo. Không đưa QR,
   khóa MFA, mã khôi phục hay bearer token vào ảnh báo cáo.
 
-## 6. Tài liệu dùng trong báo cáo
+## 6. Cập nhật giao diện khi đang chạy bằng Docker
+
+Nếu ứng dụng tại cổng 8000 đang chạy bằng Docker, mã nguồn nằm trong image.
+Sau khi sửa mã nguồn, cần dựng lại image. Khi cập nhật cả phiên bản dự án,
+chạy bước nâng cấp schema trước khi thay ứng dụng:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.local.yml build app migrate
+docker compose -f docker-compose.yml -f docker-compose.local.yml run --rm migrate
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --no-build --no-deps app
+```
+
+Chỉ tiếp tục nếu mỗi lệnh trước đã thành công. Đợi ứng dụng sẵn sàng rồi tải
+lại trang và đăng nhập. Các lệnh này giữ dữ liệu hội thoại đã lưu, cập nhật
+schema nếu phiên bản mới yêu cầu và thay riêng ứng dụng. Chỉ F5 hoặc restart
+container cũ sẽ không đưa mã nguồn vừa sửa vào image. Đây là cách chạy khác
+với `scripts.demo_local`, vốn tạo dữ liệu tạm cho mỗi lượt demo.
+
+## 7. Tài liệu dùng trong báo cáo
 
 - [DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md): thao tác, kết quả mong đợi và lời giải thích.
 - [ADVANCED_SECURITY.md](docs/ADVANCED_SECURITY.md): bốn tính năng mới, nguồn tham khảo và giới hạn.

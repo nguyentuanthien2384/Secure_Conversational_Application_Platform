@@ -127,6 +127,7 @@ from src.app.security import (
 )
 from src.app.services import AIProviderError, AIService, ChatService, DLPPolicyViolation
 from src.app.siem import configure_siem_logging, emit_security_event
+from src.app.ui_session import BrowserSessionStore, register_ui_session_routes
 
 logger = logging.getLogger("secure_chat")
 
@@ -4602,7 +4603,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The Gradio interface is the only supported web client. Keeping the former
     # static SPA alongside it duplicated authentication and security-sensitive
     # client code without serving the production workflow.
-    gradio_demo = build_ui()
+    ui_session_store = BrowserSessionStore()
+    app.state.ui_session_store = ui_session_store
+    register_ui_session_routes(app, ui_session_store, production=settings.environment == "production")
+    gradio_demo = build_ui(session_store=ui_session_store)
     gradio_auth_dependency = None
     if settings.gradio_auth_mode == "oidc":
         try:
@@ -4639,6 +4643,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         path="/",
         theme=THEME,
         css=CUSTOM_CSS,
+        head='<script src="/api/ui-session/bridge.js" defer></script>',
         auth_dependency=gradio_auth_dependency,
         blocked_paths=["/app/.env", "/run/secrets", "/proc", "/sys", "/etc"],
         show_error=False,
