@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import os
+import secrets
 import time
 from datetime import datetime
 from functools import wraps
@@ -95,7 +96,7 @@ CUSTOM_CSS = """
 }
 
 footer { display: none !important; }
-#session-bridge { display: none !important; }
+#session-bridge, #login-ready { display: none !important; }
 #scap-session-warning { padding: 12px; color: var(--scap-warn-fg); background: var(--scap-warn-bg); }
 
 /* ── Khung ngoài: một workspace full-width duy nhất cho mọi tab ─────────
@@ -888,6 +889,7 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
         st_exp = gr.State(0.0)
         st_mfa = gr.State("")
         resume_ticket = _static_html("", elem_id="session-bridge")
+        login_ready = _static_html("", elem_id="login-ready")
         # Đã hiện cảnh báo "sắp hết phiên" chưa — để chỉ nhắc một lần cho mỗi
         # phiên thay vì mỗi giây một lần trong suốt hai phút cuối.
         st_warned = gr.State(False)
@@ -908,8 +910,13 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                                 label="Tên đăng nhập",
                                 placeholder="Nhập tên đăng nhập",
                                 max_length=64,
+                                max_lines=1,
                                 autofocus=True,
                                 elem_id="li-user",
+                                html_attributes=gr.InputHTMLAttributes(
+                                    autocomplete="username", autocapitalize="none",
+                                    autocorrect="off", spellcheck=False, enterkeyhint="go",
+                                ),
                             )
                             li_pass = gr.Textbox(
                                 label="Mật khẩu",
@@ -917,6 +924,9 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                                 max_length=128,
                                 placeholder="Nhập mật khẩu",
                                 elem_id="li-pass",
+                                html_attributes=gr.InputHTMLAttributes(
+                                    autocomplete="current-password", enterkeyhint="go",
+                                ),
                             )
                             with gr.Row(elem_id="auth-util"):
                                 chk_showpw = gr.Checkbox(
@@ -925,7 +935,19 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                                     container=False,
                                     elem_id="chk-showpw",
                                 )
-                            btn_login = gr.Button("Đăng nhập", variant="primary")
+                            gr.Checkbox(
+                                label="Lưu tài khoản và mật khẩu",
+                                value=True,
+                                interactive=True,
+                                elem_id="chk-remember-login",
+                            )
+                            gr.Markdown(
+                                "Chọn **Lưu** khi trình duyệt hỏi để tự điền vào lần sau.",
+                                elem_id="login-save-hint",
+                            )
+                            btn_login = gr.Button(
+                                "Đăng nhập", variant="primary", elem_id="btn-login",
+                            )
                             # Nút viền: vừa là lối sang tab tạo tài khoản, vừa là
                             # thứ thay cho thanh tab đã ẩn.
                             btn_goto_register = gr.Button(
@@ -946,8 +968,13 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                                 label="Tên đăng nhập",
                                 placeholder="3–32 ký tự",
                                 max_length=32,
+                                max_lines=1,
                                 info="Cho phép chữ, số và các ký tự . _ -",
                                 elem_id="re-user",
+                                html_attributes=gr.InputHTMLAttributes(
+                                    autocomplete="username", autocapitalize="none",
+                                    autocorrect="off", spellcheck=False,
+                                ),
                             )
                             re_pass = gr.Textbox(
                                 label="Mật khẩu",
@@ -955,6 +982,7 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                                 max_length=128,
                                 placeholder=f"Tối thiểu {PASSWORD_MIN} ký tự",
                                 elem_id="re-pass",
+                                html_attributes=gr.InputHTMLAttributes(autocomplete="new-password"),
                             )
                             html_pw_meter = _static_html(_pw_meter_html(""), elem_id="pw-meter")
                             btn_register = gr.Button("Tạo tài khoản", variant="primary")
@@ -982,7 +1010,7 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                     )
                     with gr.Row(elem_id="mfa-row"):
                         btn_mfa_verify = gr.Button("Xác minh", variant="primary")
-                        btn_mfa_cancel = gr.Button("Quay lại")
+                        btn_mfa_cancel = gr.Button("Quay lại", elem_id="btn-mfa-cancel")
 
         # ============ ỨNG DỤNG ============
         with gr.Column(visible=False, elem_id="app-sec") as app_sec:
@@ -994,7 +1022,8 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                     "Gia hạn phiên", size="sm", elem_classes=["topbar-action", "topbar-extend"]
                 )
                 btn_logout = gr.Button(
-                    "Đăng xuất", size="sm", elem_classes=["topbar-action", "topbar-logout"]
+                    "Đăng xuất", size="sm", elem_id="btn-logout",
+                    elem_classes=["topbar-action", "topbar-logout"]
                 )
             timer = gr.Timer(1, active=False)
 
@@ -1217,7 +1246,8 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                             btn_revoke = gr.Button("Thu hồi", size="sm", scale=1)
                             btn_dev_refresh = gr.Button("Làm mới", size="sm", scale=1)
                         btn_logout_all = gr.Button(
-                            "Đăng xuất mọi thiết bị", variant="stop", size="sm"
+                            "Đăng xuất mọi thiết bị", variant="stop", size="sm",
+                            elem_id="btn-logout-all",
                         )
 
                 # ---------- QUẢN TRỊ ----------
@@ -1593,13 +1623,19 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
             )
 
         def remember_session(token, exp):
+            # Acknowledge every submitted attempt, including failures and MFA
+            # challenges, so the password manager can ignore overlapping submits.
+            completed = f'<span data-scap-login-result="{secrets.token_hex(16)}"></span>'
             if not token or exp <= time.time():
-                return ""
+                return completed
             try:
                 ticket = session_store.issue(token, exp)
-                return f'<span data-scap-session-ticket="{html.escape(ticket, quote=True)}"></span>'
-            except UISessionCapacityError as exc:
-                raise gr.Error("Không lưu được phiên trình duyệt lúc này. Vui lòng thử lại.") from exc
+                return completed + (
+                    f'<span data-scap-session-ticket="{html.escape(ticket, quote=True)}"></span>'
+                )
+            except UISessionCapacityError:
+                gr.Warning("Không lưu được phiên trình duyệt lúc này. Vui lòng thử lại.")
+                return completed
 
         def persist_after(event):
             return event.then(
@@ -1627,13 +1663,15 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
         demo.load(
             _guard(restore_session, len(STAGE1)), None, STAGE1,
             api_name=False, show_progress="hidden",
-        ).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
+        ).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+            lambda: '<span data-scap-login-ready="1"></span>', None, [login_ready],
+            api_name=False, show_progress="hidden",
+        )
 
-        persist_after(btn_login.click(
-            _guard(do_login, len(STAGE1)), [li_user, li_pass], STAGE1,
-        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
-        persist_after(li_pass.submit(
-            _guard(do_login, len(STAGE1)), [li_user, li_pass], STAGE1,
+        persist_after(gr.on(
+            triggers=[btn_login.click, li_user.submit, li_pass.submit],
+            fn=_guard(do_login, len(STAGE1)), inputs=[li_user, li_pass], outputs=STAGE1,
+            trigger_mode="once",
         )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
 
         def do_mfa_verify(mfa_token, code):

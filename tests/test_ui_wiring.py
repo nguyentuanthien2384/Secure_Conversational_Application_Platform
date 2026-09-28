@@ -71,6 +71,71 @@ def _button_event(demo, label):
     return _event_for(demo, button)
 
 
+def test_login_click_and_enter_share_authentication_and_workspace_chain(runtime_demo, monkeypatch):
+    from src.app import gradio_ui
+
+    calls = []
+    monkeypatch.setattr(gradio_ui, "_api", lambda *args: calls.append(args) or {
+        "access_token": "authenticated-token", "expires_in": 900,
+    })
+    monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
+    fields = {component.elem_id: component for component in runtime_demo.blocks.values()}
+    click, dependency = _button_event(runtime_demo, "Đăng nhập")
+    for field in ("li-user", "li-pass"):
+        submit, submit_dependency = _event_for(runtime_demo, fields[field], "submit")
+        assert submit is click
+        assert submit_dependency == dependency
+    assert dependency["inputs"] == [fields["li-user"]._id, fields["li-pass"]._id]
+    assert dependency["trigger_mode"] == "once"
+    result = click.fn("  saved-user  ", "saved-password")
+    assert calls == [(None, "POST", "/api/auth/login", {
+        "username": "saved-user", "password": "saved-password",
+    })]
+    assert result[0] == "authenticated-token"
+    assert len(result) == len(dependency["outputs"])
+    remember = next(item for item in runtime_demo.config["dependencies"]
+                    if item["trigger_after"] == dependency["id"])
+    assert runtime_demo.fns[remember["id"]].fn.__name__ == "remember_session"
+    workspace = next(item for item in runtime_demo.config["dependencies"]
+                     if item["trigger_after"] == remember["id"])
+    assert runtime_demo.fns[workspace["id"]].fn.__name__ == "load_workspace"
+
+
+def test_login_password_manager_hints_and_ready_signal(runtime_demo):
+    fields = {component.elem_id: component for component in runtime_demo.blocks.values()}
+    assert fields["li-user"].html_attributes.autocomplete == "username"
+    assert fields["li-user"].max_lines == 1
+    assert fields["li-pass"].html_attributes.autocomplete == "current-password"
+    assert fields["re-pass"].html_attributes.autocomplete == "new-password"
+    ready = next(item for item in runtime_demo.config["dependencies"]
+                 if item["outputs"] == [fields["login-ready"]._id])
+    workspace = runtime_demo.fns[ready["trigger_after"]]
+    assert workspace.fn.__name__ == "load_workspace"
+    assert "data-scap-login-ready" in runtime_demo.fns[ready["id"]].fn()
+
+
+def test_login_completion_is_acknowledged_even_without_a_session_ticket(runtime_demo, monkeypatch):
+    from src.app.ui_session import BrowserSessionStore, UISessionCapacityError
+
+    callback = next(item for item in runtime_demo.fns.values()
+                    if item.fn is not None and item.fn.__name__ == "remember_session")
+    first = callback.fn("", 0)
+    second = callback.fn("", 0)
+    assert first != second
+    assert "data-scap-login-result" in first
+    assert "data-scap-session-ticket" not in first
+
+    def full(*args):
+        raise UISessionCapacityError()
+
+    monkeypatch.setattr(BrowserSessionStore, "issue", full)
+    monkeypatch.setattr(gr, "Warning", lambda *args, **kwargs: None)
+    full_result = callback.fn("private-token", float("inf"))
+    assert "data-scap-login-result" in full_result
+    assert "data-scap-session-ticket" not in full_result
+    assert "private-token" not in full_result
+
+
 @pytest.mark.parametrize("reason", ["logout", "logout_all", "password_change", "expiry"])
 def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypatch, reason):
     """Run the registered callbacks, including wrappers and actual output wiring."""

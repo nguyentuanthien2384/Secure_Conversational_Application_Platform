@@ -59,6 +59,20 @@ thường hoặc khi kiểm tra xong. Khởi động lại tạo một lượt d
 vừa tạo, thay đổi tài khoản và thiết lập MFA của lượt cũ không được giữ lại.
 Đây là cách làm lại bài trình bày; không cần xóa cơ sở dữ liệu hay tắt IDS.
 
+### Ghi nhớ thông tin đăng nhập
+
+Giữ chọn **Lưu tài khoản và mật khẩu**, đăng nhập thành công rồi chọn **Lưu**
+khi trình duyệt hỏi. Lần sau, trình duyệt điền thông tin đã lưu (hoặc cho chọn
+tài khoản); chỉ cần bấm **Đăng nhập** hoặc nhấn **Enter** ở ô tên đăng nhập hay
+mật khẩu. Tài khoản bật 2FA vẫn cần mã xác thực.
+
+Mật khẩu do trình quản lý mật khẩu của trình duyệt lưu, không được ghi vào
+localStorage của ứng dụng. Chrome/Edge hỗ trợ thao tác lưu và lấy mật khẩu;
+trình duyệt khác dùng chức năng tự điền sẵn có. Cần bật tính năng lưu mật khẩu
+trong trình duyệt và mở ứng dụng qua localhost/127.0.0.1 hoặc HTTPS.
+Bỏ chọn để ứng dụng ngừng đề nghị lưu và lấy mật khẩu. Muốn xóa mật khẩu đã
+lưu, xóa trong trình quản lý mật khẩu của trình duyệt.
+
 ## 3. Đăng nhập và hiểu đúng dữ liệu mẫu
 
 Sau khi đăng nhập thành công, F5 sẽ khôi phục tài khoản nếu phiên vẫn hợp lệ.

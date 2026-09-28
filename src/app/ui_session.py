@@ -32,6 +32,7 @@ COOKIE_NAME = "scap_ui_session"
 _HANDLE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _NO_STORE = {"Cache-Control": "no-store", "Vary": "Origin, Sec-Fetch-Site"}
 _BRIDGE_PATH = Path(__file__).resolve().parent / "ui_assets" / "session_bridge.js"
+_LOGIN_CREDENTIALS_PATH = _BRIDGE_PATH.with_name("login_credentials.js")
 
 
 class UISessionCapacityError(RuntimeError):
@@ -191,6 +192,13 @@ def register_ui_session_routes(
         # script works with the existing CSP without requiring unsafe-eval.
         return FileResponse(
             _BRIDGE_PATH, media_type="text/javascript",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/api/ui-session/login-credentials.js", include_in_schema=False)
+    def login_credentials_script():
+        return FileResponse(
+            _LOGIN_CREDENTIALS_PATH, media_type="text/javascript",
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 

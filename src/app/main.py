@@ -4643,7 +4643,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         path="/",
         theme=THEME,
         css=CUSTOM_CSS,
-        head='<script src="/api/ui-session/bridge.js" defer></script>',
+        head=(
+            '<script src="/api/ui-session/bridge.js" defer></script>'
+            '<script src="/api/ui-session/login-credentials.js" defer></script>'
+        ),
         auth_dependency=gradio_auth_dependency,
         blocked_paths=["/app/.env", "/run/secrets", "/proc", "/sys", "/etc"],
         show_error=False,

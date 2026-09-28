@@ -35,6 +35,7 @@ jobs:
       - run: uv lock --check
       - run: uv sync --frozen --group dev
       - run: uv run python -m pytest --cov=src.app --cov-report=xml
+      - run: node --test tests/login_credentials.test.cjs
       - name: Validate security controls and correlated detection evidence offline
         if: ${{ !cancelled() }}
         run: uv run python -m scripts.validate_security --output-dir reports/security-validation

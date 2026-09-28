@@ -245,3 +245,14 @@ def test_packaged_bridge_route_is_javascript_without_evaluating_inline_code(stor
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["cache-control"] == "no-store"
         assert "set-cookie" not in response.headers
+
+
+def test_packaged_login_credentials_script_is_served_without_credentials(store):
+    with client_for(store) as client:
+        response = client.get("/api/ui-session/login-credentials.js")
+        assert response.status_code == 200
+        assert "PasswordCredential" in response.text
+        assert response.headers["content-type"].startswith("text/javascript")
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["cache-control"] == "no-store"
+        assert "set-cookie" not in response.headers

@@ -129,7 +129,9 @@ def test_mfa_challenge_is_not_remembered_until_second_factor_succeeds(ui):
     _, _, recovery_codes = enroll_and_enable(ui.client, "reload-mfa")
     challenged = _invoke(ui.demo, "do_login", "reload-mfa", PASSWORD)
     assert challenged[0] == "" and challenged[1] == 0 and challenged[2]
-    assert _invoke(ui.demo, "remember_session", challenged[0], challenged[1]) == ""
+    result = _invoke(ui.demo, "remember_session", challenged[0], challenged[1])
+    assert "data-scap-login-result" in result
+    assert "data-scap-session-ticket" not in result
     _assert_logged_out(_invoke(ui.demo, "restore_session"))
 
     authenticated = _invoke(ui.demo, "do_mfa_verify", challenged[2], recovery_codes[0])
