@@ -1,0 +1,255 @@
+"""Guided defensive coursework; descriptions never execute host commands.
+
+The five-stage grouping is a teaching model from the supplied course material.
+Scenario coverage remains explicitly scoped to SCAP's application boundaries.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any
+
+STAGES = (
+    {
+        "id": "reconnaissance",
+        "title": "1. Trinh sát và bề mặt công khai",
+        "scope": "Kiểm tra truy cập công khai và đối chứng hợp lệ của SCAP; chưa kiểm chứng OSINT, DNS công khai hoặc tài sản Internet.",
+        "scenario_ids": ["benign", "missing-auth"],
+    },
+    {
+        "id": "scanning",
+        "title": "2. Thăm dò và nhận diện dấu hiệu",
+        "scope": "Kiểm chứng chữ ký IDS, IPS và nguồn yêu cầu trình duyệt; không phải quét cổng, đánh giá CVE hay khai thác thành công.",
+        "scenario_ids": ["encoded-sqli", "browser-origin"],
+    },
+    {
+        "id": "initial_access",
+        "title": "3. Ngăn truy cập ban đầu",
+        "scope": "Xác thực API, giới hạn đăng nhập và tương quan audit tổng hợp; không tạo lưu lượng từ nhiều máy thật.",
+        "scenario_ids": ["brute-force", "invalid-token", "auth-correlation"],
+    },
+    {
+        "id": "persistence",
+        "title": "4. Giới hạn phiên và quyền truy cập",
+        "scope": "Phân quyền đối tượng và hết hạn phiên của ứng dụng; chưa kiểm chứng persistence hệ điều hành hoặc lateral movement giữa máy.",
+        "scenario_ids": ["idor", "session-timeout"],
+    },
+    {
+        "id": "objectives",
+        "title": "5. Bảo vệ dữ liệu và dấu vết",
+        "scope": "DLP tại biên AI và phát hiện sửa audit trong CSDL tạm; chưa kiểm chứng EDR, SIEM ngoài hệ thống hoặc WORM thực tế.",
+        "scenario_ids": ["encoded-dlp", "audit-tamper"],
+    },
+)
+
+LESSONS = (
+    {
+        "id": "network-addresses",
+        "title": "Đọc IP, subnet, gateway và DNS",
+        "category": "Mạng máy tính",
+        "stage": "reconnaissance",
+        "objective": "Phân biệt cấu hình card mạng với địa chỉ loopback của SCAP và giải thích đường đi của yêu cầu.",
+        "steps": [
+            "Trong terminal Windows của máy lab, chạy ipconfig /all; ghi IPv4, subnet mask, gateway và DNS của card đang dùng.",
+            "Chạy ping -n 4 127.0.0.1 rồi ping -n 4 localhost; so sánh kết quả IP và tên máy. Loopback không đi qua gateway.",
+            "Chạy route print và tracert -d 127.0.0.1 để quan sát bảng định tuyến và đường đi loopback.",
+            "Chạy ipconfig /displaydns để đọc cache DNS. localhost có thể được xử lý cục bộ nên không nhất thiết sinh gói DNS.",
+            "Vẽ đường trình duyệt → 127.0.0.1:8000 → SCAP; khi triển khai Docker, bổ sung Caddy, app, PostgreSQL và Redis theo compose.",
+        ],
+        "expected_evidence": ["Bản ghi cấu hình card mạng do người học thu trên máy lab.", "Bốn phản hồi ping, độ trễ và số gói mất.", "Sơ đồ đường đi có ghi cổng và biên TLS."],
+        "questions": ["Vì sao truy cập 127.0.0.1 không cần DNS/gateway?", "Ping thành công có chứng minh API hoặc cổng 8000 hoạt động không?", "Khi IP hoạt động còn tên miền lỗi, cần kiểm tra nguồn phân giải tên nào?"],
+        "completion": ["Giải thích đúng IP/subnet/gateway/DNS bằng cấu hình đã quan sát.", "Phân biệt kiểm tra ICMP với kiểm tra HTTP/TCP.", "Ghi rõ kết quả nào thu thật và kết quả nào chỉ là mô hình."],
+        "scope": "Bài thực hành thủ công, chỉ đọc trên máy lab. SCAP không tự thu cấu hình card mạng hoặc thông tin hệ điều hành.",
+    },
+    {
+        "id": "packet-analysis",
+        "title": "Đọc DNS, TCP handshake và HTTP bằng Wireshark",
+        "category": "Mạng máy tính",
+        "stage": "scanning",
+        "objective": "Nối tên miền, IP, cổng, ba bước TCP và nội dung HTTP từ một dấu vết có đáp án kiểm chứng.",
+        "steps": [
+            "Từ thư mục dự án, chạy .\\.venv\\Scripts\\python.exe -m scripts.practice_lab --stage reconnaissance --output-dir reports/practice-lab.",
+            "Mở reports/practice-lab/network-training.pcap trong Wireshark. Đây là gói tin tổng hợp để học, không phải capture mạng thực.",
+            "Lọc dns; ghi tên training.invalid, transaction ID và địa chỉ trả về. Đối chiếu network-training.json.",
+            "Lọc tcp; xác định SYN, SYN ACK, ACK, hai cổng và số thứ tự/acknowledgement của kết nối.",
+            "Lọc http hoặc chọn Follow TCP Stream; xác định yêu cầu, phản hồi và nội dung được truyền rõ.",
+            "Nếu cần bằng chứng thật, chạy demo ngoại tuyến và tự capture adapter loopback khi chỉ gọi GET /api/health; lọc tcp.port == 8000. Capture trước khi kết nối để thấy handshake.",
+        ],
+        "expected_evidence": ["Ảnh ba bước TCP có số gói rõ ràng.", "Cặp DNS query/response cùng transaction ID.", "Dòng HTTP request/status và phần nội dung của mẫu tổng hợp.", "Capture loopback do người học tự thu nếu làm phần mở rộng."],
+        "questions": ["DNS trả IP nào và TCP kết nối tới IP nào?", "SYN và ACK thay đổi sequence number thế nào?", "Tại sao lọc dns có thể không thấy gì khi mở URL bằng IP?"],
+        "completion": ["Đối chiếu đúng số gói với hướng dẫn JSON.", "Nhận diện đủ SYN → SYN ACK → ACK.", "Phân biệt PCAP tổng hợp và capture tự thu."],
+        "scope": "File tổng hợp gồm DNS/TCP/HTTP hợp lệ; không chứng minh lưu lượng TLS, hành vi tấn công hay tình trạng mạng thật.",
+    },
+    {
+        "id": "http-tls",
+        "title": "Đối chiếu HTTP nội bộ và TLS khi triển khai",
+        "category": "Mạng máy tính",
+        "stage": "reconnaissance",
+        "objective": "Xác định nơi mã hóa đường truyền bắt đầu/kết thúc, khác với mã hóa dữ liệu trong CSDL.",
+        "steps": [
+            "Mở bản demo http://127.0.0.1:8000/api/health và ghi scheme, địa chỉ, cổng.",
+            "Đọc Caddyfile và docker-compose.yml: chỉ ra cổng công khai và tuyến Caddy → app; không sửa firewall của máy học.",
+            "Ở môi trường TLS đã được quản trị viên dựng, xem chứng chỉ trong trình duyệt và capture riêng yêu cầu health; ghi giao thức TLS và điểm kết thúc TLS.",
+            "So sánh khả năng đọc HTTP mẫu trong PCAP với TLS capture thực đã thu. Nếu chưa có môi trường TLS, đánh dấu phần này chưa thực hiện.",
+        ],
+        "expected_evidence": ["Sơ đồ đường truyền với TLS boundary.", "Thông tin chứng chỉ và capture TLS thật nếu có môi trường triển khai."],
+        "questions": ["AES-GCM khi lưu CSDL có bảo vệ đoạn HTTP trên mạng không?", "TLS kết thúc tại reverse proxy hay trong app?", "Metadata nào vẫn quan sát được khi nội dung được mã hóa?"],
+        "completion": ["Phân biệt mã hóa khi truyền và khi lưu.", "Ghi phần TLS chưa kiểm chứng nếu chỉ chạy demo HTTP."],
+        "scope": "Demo mặc định là HTTP loopback; PCAP tổng hợp không chứa TLS. Triển khai TLS và capture thật là bài mở rộng có điều kiện.",
+    },
+    {
+        "id": "host-process",
+        "title": "Nối cổng với PID, tiến trình và log Windows",
+        "category": "Hệ điều hành",
+        "stage": "persistence",
+        "objective": "Trả lời tiến trình nào phục vụ SCAP và phân biệt log ứng dụng với log đăng nhập Windows.",
+        "steps": [
+            "Chạy .\\.venv\\Scripts\\python.exe -m scripts.demo_local trong terminal riêng và ghi thời điểm bắt đầu.",
+            "Chạy netstat -ano; tìm LISTENING trên 127.0.0.1:8000 và ghi PID.",
+            "Mở Task Manager tab Details, đối chiếu PID và tiến trình Python; xem CPU/RAM trong lúc gửi một tin nhắn mẫu.",
+            "Mở Event Viewer → Windows Logs → Application/System; đối chiếu mốc thời gian. Xem Security nếu tài khoản và chính sách máy lab cho phép.",
+            "Đăng nhập SCAP, mở Nhật ký kiểm toán và tìm auth.login. Đăng nhập SCAP không đồng nghĩa tạo sự kiện đăng nhập Windows.",
+            "Mở Windows Defender Firewall để xem rule inbound/outbound hiện có. Ghi nhận rule liên quan; bài này không yêu cầu thay đổi firewall.",
+        ],
+        "expected_evidence": ["Dòng netstat kèm PID và ảnh tiến trình tương ứng.", "Mốc thời gian bắt đầu demo và audit đăng nhập SCAP.", "Nhận xét về log Windows quan sát được và log ứng dụng."],
+        "questions": ["Cổng LISTENING có đồng nghĩa kết nối đang ESTABLISHED không?", "Vì sao auth.login SCAP có thể không xuất hiện trong Security của Windows?", "CPU tăng có đủ để kết luận tiến trình độc hại không?"],
+        "completion": ["Nối đúng cổng → PID → tiến trình.", "Phân biệt chủ thể và nguồn của hai loại log.", "Không suy diễn persistence/malware chỉ từ một ảnh tiến trình."],
+        "scope": "Quan sát thủ công trên Windows. Chưa có agent Sysmon/EDR hay collector Event Viewer trong SCAP.",
+    },
+    {
+        "id": "linux-service",
+        "title": "Đọc quyền và tiến trình của dịch vụ Linux",
+        "category": "Hệ điều hành",
+        "stage": "persistence",
+        "objective": "Đối chiếu user chạy app, quyền file và tiến trình trong môi trường Linux/container của lab.",
+        "steps": [
+            "Trong terminal Linux của môi trường lab đã dựng, chạy pwd, id và ls -l; ghi chủ sở hữu và quyền read/write/execute.",
+            "Chạy ps -ef và ss -lntp nếu các công cụ này có trong image; xác định app đang chạy và cổng lắng nghe.",
+            "Nếu dùng Docker, xem Dockerfile và docker compose logs --tail 50 app; đối chiếu user runtime và log dịch vụ. Không yêu cầu cài công cụ vào image production.",
+            "Ở máy Linux lab có systemd, dùng journalctl của đúng dịch vụ; vị trí auth.log và khả năng đọc tùy bản phân phối/chính sách máy.",
+        ],
+        "expected_evidence": ["Danh tính user runtime và quyền file đã đọc.", "Tiến trình/cổng hoặc kết quả công cụ không có trong image.", "Log dịch vụ đúng mốc thời gian."],
+        "questions": ["User không phải root giảm phạm vi tác động thế nào?", "Vì sao container có thể không có systemd/auth.log?", "Cổng app trong container khác cổng công khai như thế nào?"],
+        "completion": ["Giải thích quyền file đã quan sát.", "Phân biệt host, container và ứng dụng.", "Ghi rõ công cụ/phần lab chưa khả dụng."],
+        "scope": "Bài thủ công cho Linux/container đã dựng. Không thay đổi quyền file, tạo persistence hoặc tự thu log host.",
+    },
+    {
+        "id": "surface-controls",
+        "title": "Trinh sát bề mặt và đối chứng hợp lệ",
+        "category": "Bảo mật ứng dụng",
+        "stage": "reconnaissance",
+        "objective": "Chứng minh tài nguyên công khai và tài nguyên cần xác thực có ranh giới rõ ràng.",
+        "steps": [
+            "Mở /api/health trong demo; quan sát status và security headers trong Network của trình duyệt.",
+            "Chạy bộ thực hành với --stage reconnaissance; mở practice-report.html.",
+            "Đối chiếu missing-auth trả 401 và audit auth.access.denied với benign thành công, không có IDS false positive trên mẫu đối chứng.",
+            "Ghi request ID, audit ID và check đã đạt; đừng xem không có cảnh báo trên một mẫu là tỷ lệ false positive toàn hệ thống.",
+        ],
+        "expected_evidence": ["Status 401/200 và protective headers.", "Audit từ chối có request ID khớp."],
+        "questions": ["Endpoint health công khai cung cấp điều gì?", "Vì sao cần mẫu hợp lệ khi đánh giá detector?"],
+        "completion": ["Kiểm chứng cả yêu cầu bị từ chối và đối chứng hợp lệ.", "Giải thích đúng phạm vi đánh giá."],
+        "scope": "API trong tiến trình và CSDL tạm; không thực hiện OSINT Internet.",
+    },
+    {
+        "id": "signature-prevention",
+        "title": "Thăm dò ứng dụng và xem IDS ngăn chặn",
+        "category": "Bảo mật ứng dụng",
+        "stage": "scanning",
+        "objective": "Phân biệt nhận diện chữ ký nghi vấn, chặn nguồn và lỗ hổng khai thác được.",
+        "steps": [
+            "Chạy bộ thực hành với --stage scanning; đọc encoded-sqli và browser-origin.",
+            "Đối chiếu request đầu có ids.signature với request tiếp theo bị IPS chặn 403; tìm audit ID và rule SQLI-001.",
+            "Đối chiếu nguồn trình duyệt không tin cậy bị từ chối với thao tác cùng nguồn hợp lệ.",
+            "Trong tab Bảo mật, chạy Kiểm chứng IDS để xem kiểm tra chữ ký thuần; phân biệt kết quả đó với kiểm chứng API toàn luồng trong báo cáo CLI.",
+        ],
+        "expected_evidence": ["Rule ID, status và audit ID tương ứng.", "Đối chứng cùng nguồn và kết quả từ chối khác nguồn."],
+        "questions": ["Phát hiện SQLI-001 có chứng minh SQL injection thành công không?", "Chặn một nguồn có thay thế truy vấn tham số hóa không?"],
+        "completion": ["Chỉ ra khác biệt giữa detect và prevent.", "Giữ kết luận ở phạm vi chữ ký/biên nguồn đã kiểm chứng."],
+        "scope": "Fixture cố định chỉ dùng API nội bộ; không quét mạng hoặc truy vấn CSDL bằng payload.",
+    },
+    {
+        "id": "account-access",
+        "title": "Điều tra đăng nhập thất bại và khóa tài khoản",
+        "category": "Bảo mật ứng dụng",
+        "stage": "initial_access",
+        "objective": "Đọc mẫu đăng nhập thất bại, token sai, giới hạn thử và tương quan đăng nhập đáng ngờ.",
+        "steps": [
+            "Chạy bộ thực hành với --stage initial_access; đọc brute-force, invalid-token và auth-correlation.",
+            "Tìm các phản hồi 401, phản hồi giới hạn 429, Retry-After và bằng chứng tài khoản tạm bị khóa.",
+            "Đọc auth-correlation: phần audit được tổng hợp và niêm phong để kiểm chứng detector; không có nhiều máy tấn công thật.",
+            "Trong demo, vào tab Bảo mật và Nhật ký kiểm toán; chọn audit đăng nhập nghi vấn để lập hồ sơ sự cố trong Thực hành ANM.",
+        ],
+        "expected_evidence": ["Chuỗi status 401 → 429 và Retry-After.", "Audit ID/request ID và finding IDS-BRUTEFORCE hoặc finding tương quan."],
+        "questions": ["Một lần đăng nhập thành công sau nhiều lần thất bại cần điều tra thêm gì?", "Token không hợp lệ và tài khoản bị chiếm quyền khác nhau thế nào?"],
+        "completion": ["Nối đúng phản hồi với audit.", "Lập hồ sơ bằng ID audit thật trong demo, không dùng ID của CSDL tạm CLI."],
+        "scope": "Bài xác thực SCAP; không phá mật khẩu, phishing hoặc chứng minh chiếm quyền máy.",
+    },
+    {
+        "id": "session-ownership",
+        "title": "Kiểm tra quyền sở hữu và phiên hết hạn",
+        "category": "Bảo mật ứng dụng",
+        "stage": "persistence",
+        "objective": "Chứng minh tài khoản khác không đọc/xóa hội thoại và phiên cũ không giữ quyền truy cập vô hạn.",
+        "steps": [
+            "Chạy bộ thực hành với --stage persistence; đọc idor và session-timeout.",
+            "Đối chiếu tài khoản khác bị từ chối 404/authorization.denied và chủ sở hữu vẫn đọc được hội thoại.",
+            "Đọc cách runner đặt timestamp cũ trong CSDL tạm để kiểm tra thời hạn; đây không phải chờ hết hạn thật trên demo.",
+            "Trong demo bằng tài khoản của chính mình, xem danh sách phiên ở tab Tài khoản và thử thu hồi một phiên của mình; xác minh phiên đó không truy cập được nữa.",
+        ],
+        "expected_evidence": ["Audit từ chối phân quyền và đối chứng chủ sở hữu.", "Check hết hạn/refresh bị từ chối.", "Kết quả thu hồi phiên thủ công nếu thực hiện."],
+        "questions": ["Vì sao API dùng 404 cho tài nguyên thuộc người khác?", "Phiên bị thu hồi còn JWT chưa hết hạn có truy cập được không?"],
+        "completion": ["Kiểm tra từ chối và tài nguyên vẫn còn nguyên.", "Phân biệt kiểm soát phiên ứng dụng với persistence của hệ điều hành."],
+        "scope": "Ứng dụng và CSDL tạm; không kiểm chứng lateral movement mạng hay tác vụ khởi động host.",
+    },
+    {
+        "id": "data-audit",
+        "title": "Ngăn rò rỉ dữ liệu và phát hiện sửa log",
+        "category": "Bảo mật ứng dụng",
+        "stage": "objectives",
+        "objective": "Chứng minh DLP ngăn dữ liệu mẫu đi ra provider và audit phát hiện thay đổi bằng chứng.",
+        "steps": [
+            "Chạy bộ thực hành với --stage objectives; đọc encoded-dlp và audit-tamper.",
+            "Đọc check của provider ghi nhận cục bộ để biết dữ liệu nào bị chặn/che; không có cuộc gọi AI bên ngoài.",
+            "Đối chiếu audit chain trước và sau khi runner sửa duy nhất fixture trong CSDL tạm; tìm first_broken_id.",
+            "Trong demo, dùng Kiểm tra toàn vẹn audit để đối chiếu chuỗi hiện tại; không sửa/xóa log thật để làm bài.",
+        ],
+        "expected_evidence": ["Kết quả chính sách DLP và bằng chứng provider cục bộ.", "first_broken_id và audit.chain.broken của fixture."],
+        "questions": ["DLP trước khi gửi khác mã hóa khi lưu thế nào?", "Chuỗi HMAC cục bộ có đủ chứng minh chống rollback cuối chuỗi khi cả host bị chiếm không?"],
+        "completion": ["Nêu được kiểm soát dữ liệu và kiểm soát bằng chứng.", "Phân biệt HMAC cục bộ với neo WORM ngoài hệ thống."],
+        "scope": "Sửa log chỉ trong CSDL tạm; WORM và SIEM ngoài hệ thống chưa được bài này kiểm chứng.",
+    },
+    {
+        "id": "incident-response",
+        "title": "Từ cảnh báo đến hồ sơ và kết luận sự cố",
+        "category": "Điều tra và ứng phó",
+        "stage": "objectives",
+        "objective": "Thực hành lập hồ sơ có bằng chứng, theo dõi tiến độ điều tra và xác minh trước khi đóng.",
+        "steps": [
+            "Đăng nhập demo bằng tài khoản moderator/admin; mở Nhật ký kiểm toán, ghi tối đa 20 ID sự kiện liên quan đã niêm phong.",
+            "Trong Thực hành ANM, nhập tiêu đề mô tả chung, chọn giai đoạn, mức độ và ID audit để tạo hồ sơ mới.",
+            "Chọn hồ sơ, xem thời điểm, event type, outcome và request ID; chuyển từ new sang investigating.",
+            "Nếu xác nhận sự cố, thực hiện biện pháp phù hợp theo runbook: thu hồi phiên, vô hiệu hóa tài khoản hoặc xử lý cấu hình qua luồng quản trị sẵn có.",
+            "Chỉ ghi contained sau khi tự xác minh biện pháp; trạng thái này là mốc do người điều tra ghi nhận, không tự chặn tài khoản/mạng.",
+            "Đối chiếu kết quả kiểm tra lại và đóng với confirmed. Nếu cảnh báo sai/trùng, có thể đóng từ investigating với false_positive/duplicate.",
+            "Xem lịch sử chuyển trạng thái và audit incident.*. Nếu hai người cùng cập nhật, người dùng phiên bản cũ cần tải lại khi nhận 409.",
+        ],
+        "expected_evidence": ["Hồ sơ lưu trong CSDL của lượt demo và snapshot audit đã niêm phong.", "Lịch sử new → investigating → contained → closed hoặc kết luận cảnh báo sai/trùng.", "Audit ghi thao tác lập/cập nhật hồ sơ."],
+        "questions": ["Bằng chứng có đủ xác nhận hay chỉ là dấu hiệu nghi vấn?", "Đã kiểm tra lại biện pháp khắc phục bằng thao tác nào?", "Tại sao cần phiên bản khi nhiều người điều tra cùng hồ sơ?"],
+        "completion": ["Có bằng chứng, diễn tiến và kết luận hợp lệ.", "Không coi trạng thái contained là bằng chứng biện pháp đã tự động thực hiện.", "Phân biệt ID audit demo với ID trong từng CSDL tạm của báo cáo CLI."],
+        "scope": "Hồ sơ ứng phó ở tầng ứng dụng; biện pháp containment được thực hiện và xác minh riêng. Demo tạm được xóa khi kết thúc.",
+    },
+)
+
+
+def catalog() -> dict[str, Any]:
+    """Return independent JSON-ready data, with no runner or host side effects."""
+    return deepcopy({
+        "schema_version": 1,
+        "stages": list(STAGES),
+        "lessons": list(LESSONS),
+        "sources": [
+            "03. Thực hành cơ bản cho ANM.docx",
+            "02. 5 giai đoạn tấn công mạng.docx",
+        ],
+        "scope": "Bài có hướng dẫn, kiểm chứng API trên CSDL tạm và dấu vết mạng tổng hợp; mạng/hệ điều hành thật được người học quan sát thủ công.",
+    })

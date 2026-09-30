@@ -215,6 +215,8 @@ reports/*.xml
 reports/security-validation/
 reports/security-validation-*/
 reports/demo-evidence/
+reports/practice-lab/
+reports/practice-lab-*/
 # Local document-rendering scratch space; source PDFs live outside the repo.
 tmp/pdfs/
 

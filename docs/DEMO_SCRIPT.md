@@ -237,3 +237,27 @@ kiểm tra engine IDS nội bộ; nó không phải một lần pentest từ bê
 Nguồn nghiên cứu và giới hạn bốn tính năng nâng cấp nằm tại
 [ADVANCED_SECURITY.md](ADVANCED_SECURITY.md); phạm vi runner nằm tại
 [SECURITY_AUTOMATION.md](SECURITY_AUTOMATION.md).
+
+## Phần thực hành ANM bổ sung khoảng 15 phút
+
+1. **Quan sát mạng và tiến trình, 3 phút:** mở demo, tìm cổng SCAP trong
+   `netstat -ano` rồi đối chiếu PID với Task Manager. Giải thích vì sao
+   127.0.0.1 không đi qua gateway và không cần DNS khi truy cập bằng IP.
+2. **Đọc gói tin, 3 phút:** chạy `python -m scripts.practice_lab` bằng Python
+   của `.venv`, mở `network-training.pcap` trong Wireshark. Tìm hai gói DNS,
+   ba bước TCP và HTTP request/response; đối chiếu đáp án JSON. Nêu rõ mẫu
+   được tổng hợp và không có TLS.
+3. **Kiểm chứng phòng thủ, 4 phút:** mở `practice-report.html`; chọn phần
+   truy cập ban đầu và quyền phiên. Chỉ ra 401/429, request ID, audit ID và
+   check đã đạt. Phân biệt chữ ký nghi vấn với khai thác thành công và audit
+   tổng hợp với lưu lượng nhiều máy thật.
+4. **Lập hồ sơ điều tra, 5 phút:** đăng nhập `demo.mod` hoặc `demo.boss`,
+   lấy audit ID từ tab Nhật ký kiểm toán của chính demo, rồi tạo hồ sơ trong
+   Thực hành ANM. Chuyển sang investigating, xem bằng chứng và lịch sử. Với
+   hồ sơ luyện tập dùng sự kiện đăng nhập bình thường, kết luận false_positive
+   và đóng từ investigating; đừng ghi contained khi chưa thực hiện, xác minh
+   biện pháp xử lý. Nhấn mạnh audit ID trong báo cáo CLI thuộc CSDL tạm khác.
+
+Các mục tiêu, câu hỏi, tiêu chí hoàn thành và giới hạn nằm trong
+[PRACTICAL_ANM.md](PRACTICAL_ANM.md). Kết thúc demo sẽ xóa hồ sơ của lượt demo;
+vận hành thông thường lưu hồ sơ trong CSDL ứng dụng.

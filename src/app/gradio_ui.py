@@ -745,6 +745,87 @@ def _safe_chat_text(content: str) -> str:
     return html.escape(content, quote=True)
 
 
+def _safe_markdown_text(value) -> str:
+    """Keep API values inert inside the UI's own Markdown structure.
+
+    HTML escaping alone still permits Markdown links and remote images. Each
+    value occupies one text span, so newlines and Markdown syntax are escaped
+    as well. The surrounding guide headings/lists are trusted UI markup.
+    """
+    text = " ".join(str(value if value is not None else "—").split())
+    for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)):
+        text = text.replace(chr(codepoint), f"\\u{codepoint:04X}")
+    text = text.replace("\\", "\\\\")
+    for char in "`*_{}[]()#+-.!|~":
+        text = text.replace(char, "\\" + char)
+    return html.escape(text, quote=True)
+
+
+def _practice_lesson_markdown(lesson) -> str:
+    if not lesson:
+        return "*Chọn một bài thực hành để xem quy trình và bằng chứng cần thu thập.*"
+    safe = _safe_markdown_text
+    lines = [
+        f"### {safe(lesson.get('title'))}",
+        f"**Mục tiêu:** {safe(lesson.get('objective'))}",
+        f"**Phạm vi:** {safe(lesson.get('scope'))}",
+    ]
+    if lesson.get("stage"):
+        lines.append(f"**Giai đoạn:** {safe(lesson['stage'])}")
+    for heading, key in (
+        ("Các bước thực hiện", "steps"),
+        ("Bằng chứng cần lưu", "expected_evidence"),
+        ("Câu hỏi đối soát", "questions"),
+        ("Điều kiện hoàn thành", "completion"),
+    ):
+        items = lesson.get(key) or []
+        lines.extend([f"#### {heading}", "\n".join(f"{i}. {safe(item)}" for i, item in enumerate(items, 1)) or "—"])
+    return "\n\n".join(lines)
+
+
+def _incident_markdown(incident) -> str:
+    safe = _safe_markdown_text
+    lines = [
+        f"### {safe(incident.get('title'))}",
+        f"**Mã:** {safe(incident.get('id'))} · **Phiên bản:** {safe(incident.get('version'))}",
+        f"**Giai đoạn:** {safe(incident.get('stage'))} · **Mức độ:** {safe(incident.get('severity'))} · "
+        f"**Trạng thái:** {safe(incident.get('status'))}",
+        "#### Bằng chứng kiểm toán",
+    ]
+    for row in incident.get("evidence") or []:
+        lines.append(
+            f"- **Audit #{safe(row.get('audit_id'))}** · {safe(row.get('event_type'))} · "
+            f"{safe(row.get('outcome'))} · request ID: {safe(row.get('request_id'))} · "
+            f"thời điểm: {safe(row.get('created_at'))} · hash: {safe(row.get('entry_hash'))}"
+        )
+    if not incident.get("evidence"):
+        lines.append("*Chưa có bằng chứng.*")
+    lines.append("#### Lịch sử xử lý")
+    for row in incident.get("transitions") or []:
+        lines.append(
+            f"- {safe(row.get('from_status'))} → {safe(row.get('to_status'))} · "
+            f"người xử lý: {safe(row.get('actor_id'))} · thời điểm: {safe(row.get('created_at'))} · "
+            f"kết luận: {safe(row.get('resolution'))}"
+        )
+    if not incident.get("transitions"):
+        lines.append("*Chưa có chuyển trạng thái.*")
+    return "\n\n".join(lines)
+
+
+def _incident_evidence_ids(raw) -> list[int]:
+    if len(raw or "") > 420:
+        raise gr.Error("Danh sách audit ID quá dài; nhập tối đa 20 ID từ nhật ký kiểm toán.")
+    parts = [part.strip() for part in (raw or "").split(",")]
+    if not raw or not raw.strip():
+        raise gr.Error("Nhập ít nhất một audit ID để gắn bằng chứng vào hồ sơ.")
+    if len(parts) > 20 or any(not part.isascii() or not part.isdigit() for part in parts):
+        raise gr.Error("Nhập tối đa 20 audit ID nguyên dương, ngăn cách bằng dấu phẩy.")
+    ids = [int(part) for part in parts]
+    if any(value <= 0 or value > 2**63 - 1 for value in ids) or len(ids) != len(set(ids)):
+        raise gr.Error("Audit ID không hợp lệ hoặc bị trùng lặp; hãy dùng ID trong nhật ký kiểm toán.")
+    return ids
+
+
 def _chat_history(token, session_id):
     if not session_id:
         return []
@@ -1321,6 +1402,93 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                         elem_classes="mono-df",
                     )
 
+                # ---------- THỰC HÀNH ANM ----------
+                with gr.Tab("Thực hành ANM", visible=False) as practice_tab:
+                    gr.Markdown(
+                        "### Thực hành và xử lý sự cố\n\n"
+                        "Theo dõi năm giai đoạn tấn công qua bài lab có mục tiêu, bằng chứng và "
+                        "điều kiện hoàn thành. Chỉ thực hiện trên máy, mạng và tài khoản lab "
+                        "thuộc phạm vi được cho phép."
+                    )
+                    with gr.Accordion("Quy trình thực hành", open=True):
+                        with gr.Row():
+                            dd_practice_lesson = gr.Dropdown(
+                                label="Bài thực hành", choices=[], scale=3,
+                                elem_id="practice-lesson",
+                            )
+                            btn_practice_catalog = gr.Button("Làm mới bài thực hành", size="sm", scale=1)
+                        md_practice_guide = gr.Markdown("", elem_id="practice-guide")
+                        md_practice_stages = gr.Markdown("", elem_id="practice-stages")
+                        gr.Markdown(
+                            "**Thực hành mạng và máy trạm:** theo hướng dẫn của từng bài, ghi lại "
+                            "sơ đồ mạng lab, địa chỉ máy, bộ lọc bắt gói và mốc thời gian; đối chiếu "
+                            "DNS/TCP/TLS trong Wireshark với kết nối, tiến trình và dịch vụ trên máy. "
+                            "Lưu ảnh hoặc bản ghi đã loại bỏ dữ liệu nhạy cảm trong hồ sơ lab tại máy.\n\n"
+                            "**Kiểm chứng SCAP:** mở terminal ở thư mục dự án và xem hướng dẫn bằng "
+                            "`.\\.venv\\Scripts\\python.exe -m scripts.practice_lab --help`. "
+                            "Chạy đủ năm giai đoạn bằng "
+                            "`.\\.venv\\Scripts\\python.exe -m scripts.practice_lab --output-dir reports/practice-lab`. "
+                            "Đối chiếu `practice-report.html`, `practice-summary.json`, "
+                            "`security-validation.json` và kết quả JUnit trong `reports/practice-lab/` "
+                            "với audit ID và request ID. Audit ID trong báo cáo thuộc CSDL tạm của lượt lab; "
+                            "khi tạo hồ sơ tại đây, dùng ID từ tab Nhật ký kiểm toán của hệ thống đang mở. "
+                            "Tệp `network-training.pcap` và "
+                            "`network-training.json` là mẫu mạng phục vụ học tập; "
+                            "hãy đối chiếu với bài bắt gói tại máy lab khi thực hành. Giao diện này cung cấp "
+                            "hướng dẫn và quản lý sự cố; công cụ kiểm chứng được chạy trực tiếp tại máy."
+                        )
+                    with gr.Accordion("Hồ sơ sự cố", open=True):
+                        btn_incident_refresh = gr.Button("Làm mới sự cố", size="sm")
+                        df_incidents = gr.Dataframe(
+                            headers=["Mã", "Tiêu đề", "Giai đoạn", "Mức độ", "Trạng thái", "Phiên bản", "Bằng chứng"],
+                            interactive=False, wrap=True, elem_id="practice-incidents",
+                        )
+                        dd_incident = gr.Dropdown(label="Sự cố cần xem", choices=[], elem_id="practice-incident")
+                        md_incident_detail = gr.Markdown("", elem_id="practice-incident-detail")
+                        # Only the identifier and revision are retained;
+                        # evidence and incident contents stay out of client state.
+                        st_incident_revision = gr.State(None)
+                        with gr.Row():
+                            dd_incident_status = gr.Dropdown(
+                                label="Trạng thái xử lý", choices=["investigating", "contained", "closed"],
+                                value="investigating", elem_id="practice-incident-status",
+                            )
+                            dd_incident_resolution = gr.Dropdown(
+                                label="Kết luận khi đóng", choices=[
+                                    ("Chưa có kết luận", ""), ("Xác nhận sự cố", "confirmed"),
+                                    ("Cảnh báo nhầm", "false_positive"), ("Trùng hồ sơ", "duplicate"),
+                                ], value="", elem_id="practice-incident-resolution",
+                            )
+                            btn_incident_update = gr.Button("Ghi nhận xử lý", variant="primary", size="sm")
+                        gr.Markdown(
+                            "Quy trình: `new → investigating → contained → closed`. "
+                            "Cảnh báo sai hoặc hồ sơ trùng có thể đóng từ `investigating` với kết luận tương ứng. "
+                            "`contained` là mốc người phân tích ghi nhận đã kiểm soát sự cố. "
+                            "Thu hồi phiên, khóa tài khoản hoặc chặn trên firewall vẫn cần thực hiện "
+                            "qua quy trình và chức năng tương ứng. Khi hồ sơ đã thay đổi ở phiên khác, "
+                            "hãy làm mới và xem lại bằng chứng trước khi cập nhật."
+                        )
+                        with gr.Accordion("Tạo hồ sơ từ bằng chứng kiểm toán", open=False):
+                            tb_incident_title = gr.Textbox(label="Tiêu đề sự cố", max_length=120, elem_id="practice-incident-title")
+                            with gr.Row():
+                                dd_incident_stage = gr.Dropdown(
+                                    label="Giai đoạn tấn công", choices=[
+                                        ("1 · Trinh sát", "reconnaissance"), ("2 · Quét", "scanning"),
+                                        ("3 · Truy cập ban đầu", "initial_access"), ("4 · Duy trì truy cập", "persistence"),
+                                        ("5 · Thực hiện mục tiêu", "objectives"),
+                                    ], value="reconnaissance", elem_id="practice-incident-stage",
+                                )
+                                dd_incident_severity = gr.Dropdown(
+                                    label="Mức độ sự cố", choices=["low", "medium", "high", "critical"],
+                                    value="medium", elem_id="practice-incident-severity",
+                                )
+                            tb_incident_evidence = gr.Textbox(
+                                label="Audit ID (tối đa 20, ngăn cách bằng dấu phẩy)",
+                                placeholder="Ví dụ: 12, 13, 15", max_lines=1, max_length=420,
+                                elem_id="practice-incident-evidence",
+                            )
+                            btn_incident_create = gr.Button("Tạo hồ sơ sự cố", variant="primary", size="sm")
+
                 # ---------- TRUNG TÂM BẢO MẬT ----------
                 # Màn hình giám sát cho moderator/admin: xác minh chuỗi băm audit
                 # (Bài 1 §Accounting) và theo dõi IDS/IPS (Bài 7 §7.3).
@@ -1427,6 +1595,7 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
             df_devices,
             dd_revoke,
             timer,
+            practice_tab,
         ]
         # Chỉ ẩn app_sec không xóa dữ liệu khỏi trình duyệt. Mọi dữ liệu theo
         # tài khoản, bản nháp, thông tin xác thực và URL tải xuống phải được
@@ -1488,6 +1657,19 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
             (md_sec_ids_verdict, md_sec_ids_verdict.value),
             (df_sec_block, []),
             (tb_sec_ip, ""),
+            (dd_practice_lesson, gr.update(choices=[], value=None)),
+            (md_practice_guide, ""),
+            (md_practice_stages, ""),
+            (df_incidents, []),
+            (dd_incident, gr.update(choices=[], value=None)),
+            (md_incident_detail, ""),
+            (st_incident_revision, None),
+            (dd_incident_status, "investigating"),
+            (dd_incident_resolution, ""),
+            (tb_incident_title, ""),
+            (dd_incident_stage, "reconnaissance"),
+            (dd_incident_severity, "medium"),
+            (tb_incident_evidence, ""),
         ]
         # _alive() cập nhật đúng hai output cuối, giữ nguyên mọi ô đang nhập.
         RESET_OUTS = STAGE1 + STAGE2 + [item[0] for item in EXTRA_RESET] + [
@@ -1524,6 +1706,7 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                 [],
                 gr.update(choices=[], value=None),
                 gr.Timer(active=False),
+                gr.update(visible=False),  # practice_tab
             ) + tuple(
                 value.copy() if isinstance(value, (dict, list)) else value
                 for _, value in EXTRA_RESET
@@ -1620,6 +1803,7 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                 devices,
                 gr.update(choices=revoke, value=None),
                 gr.Timer(active=True),
+                gr.update(visible=(role in ("moderator", "admin"))),
             )
 
         def remember_session(token, exp):
@@ -2339,6 +2523,115 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
             [df_audit],
             show_progress="hidden",
             trigger_mode="always_last",
+        )
+
+        # ---- THỰC HÀNH ANM VÀ HỒ SƠ SỰ CỐ ----
+        def refresh_practice_catalog(token):
+            catalog = _api(token, "GET", "/api/admin/practice/catalog")
+            lessons = catalog.get("lessons") or []
+            choices = [(f"{row.get('category', '')} · {row['title']}", row["id"]) for row in lessons]
+            stage_lines = ["#### Phạm vi năm giai đoạn"]
+            for stage in catalog.get("stages") or []:
+                scenarios = ", ".join(str(item) for item in stage.get("scenario_ids") or []) or "thực hành tại máy"
+                stage_lines.append(
+                    f"- **{_safe_markdown_text(stage.get('title'))}:** {_safe_markdown_text(stage.get('scope'))} · "
+                    f"kịch bản: {_safe_markdown_text(scenarios)}"
+                )
+            return (
+                gr.update(choices=choices, value=lessons[0]["id"] if lessons else None),
+                _practice_lesson_markdown(lessons[0] if lessons else None),
+                "\n\n".join(stage_lines),
+            )
+
+        def select_practice_lesson(token, lesson_id):
+            if not lesson_id:
+                return ""
+            catalog = _api(token, "GET", "/api/admin/practice/catalog")
+            lesson = next((row for row in catalog.get("lessons") or [] if row["id"] == lesson_id), None)
+            if lesson is None:
+                raise gr.Error("Bài thực hành không còn trong danh mục. Hãy làm mới danh mục.")
+            return _practice_lesson_markdown(lesson)
+
+        def incident_list(token, selected=None):
+            rows = _api(token, "GET", "/api/admin/incidents", params={"limit": "50"})
+            table = [
+                [row["id"], row["title"], row["stage"], row["severity"], row["status"], row["version"], row["evidence_count"]]
+                for row in rows
+            ]
+            choices = [(f"{row['title']} · {row['status']}", row["id"]) for row in rows]
+            if selected not in {row["id"] for row in rows}:
+                selected = None
+            return table, gr.update(choices=choices, value=selected)
+
+        def incident_detail_outputs(data):
+            # The exact loaded revision is submitted later. A failed PATCH never
+            # fetches a newer revision or hides a concurrent-edit conflict.
+            resolution = data.get("resolution") or ""
+            if not resolution and data["status"] == "closed":
+                transitions = data.get("transitions") or []
+                if transitions:
+                    resolution = transitions[-1].get("resolution") or ""
+            return (
+                _incident_markdown(data),
+                {"id": data["id"], "version": data["version"]},
+                data["status"] if data["status"] in ("investigating", "contained", "closed") else "investigating",
+                resolution,
+            )
+
+        def refresh_incidents(token):
+            return (*incident_list(token), "", None, "investigating", "")
+
+        def select_incident(token, incident_id):
+            if not incident_id:
+                return "", None, "investigating", ""
+            data = _api(token, "GET", f"/api/admin/incidents/{incident_id}")
+            return incident_detail_outputs(data)
+
+        def create_incident(token, title, stage, severity, evidence):
+            title = (title or "").strip()
+            if not 3 <= len(title) <= 120:
+                raise gr.Error("Tiêu đề sự cố phải từ 3 đến 120 ký tự.")
+            data = _api(token, "POST", "/api/admin/incidents", {
+                "title": title, "stage": stage, "severity": severity,
+                "evidence_ids": _incident_evidence_ids(evidence),
+            })
+            result = (*incident_list(token, data["id"]), *incident_detail_outputs(data), "", "")
+            gr.Info("Đã tạo hồ sơ gắn với bằng chứng kiểm toán.")
+            return result
+
+        def update_incident(token, incident_id, revision, status, resolution):
+            if not incident_id or not revision or revision.get("id") != incident_id:
+                raise gr.Error("Chọn và tải chi tiết sự cố trước khi ghi nhận xử lý.")
+            if status == "closed" and not resolution:
+                raise gr.Error("Chọn kết luận trước khi đóng hồ sơ.")
+            if status != "closed" and resolution:
+                raise gr.Error("Kết luận chỉ được ghi khi đóng hồ sơ. Chọn 'Chưa có kết luận' để tiếp tục.")
+            data = _api(token, "PATCH", f"/api/admin/incidents/{incident_id}", {
+                "version": revision["version"], "status": status, "resolution": resolution or None,
+            })
+            result = (*incident_list(token, data["id"]), *incident_detail_outputs(data))
+            gr.Info("Đã ghi nhận trạng thái xử lý và lịch sử chuyển trạng thái.")
+            return result
+
+        PRACTICE_CATALOG_OUTS = [dd_practice_lesson, md_practice_guide, md_practice_stages]
+        INCIDENT_DETAIL_OUTS = [md_incident_detail, st_incident_revision, dd_incident_status, dd_incident_resolution]
+        INCIDENT_OUTS = [df_incidents, dd_incident, *INCIDENT_DETAIL_OUTS]
+        btn_practice_catalog.click(_guard(refresh_practice_catalog, 3), [st_token], PRACTICE_CATALOG_OUTS)
+        dd_practice_lesson.input(_guard(select_practice_lesson, 1), [st_token, dd_practice_lesson], [md_practice_guide])
+        btn_incident_refresh.click(_guard(refresh_incidents, 6), [st_token], INCIDENT_OUTS)
+        dd_incident.input(_guard(select_incident, 4), [st_token, dd_incident], INCIDENT_DETAIL_OUTS)
+        btn_incident_create.click(
+            _guard(create_incident, 8),
+            [st_token, tb_incident_title, dd_incident_stage, dd_incident_severity, tb_incident_evidence],
+            INCIDENT_OUTS + [tb_incident_title, tb_incident_evidence],
+        )
+        btn_incident_update.click(
+            _guard(update_incident, 6),
+            [st_token, dd_incident, st_incident_revision, dd_incident_status, dd_incident_resolution],
+            INCIDENT_OUTS,
+        )
+        practice_tab.select(_guard(refresh_practice_catalog, 3), [st_token], PRACTICE_CATALOG_OUTS).then(
+            _guard(refresh_incidents, 6), [st_token], INCIDENT_OUTS,
         )
 
         # ---- TRUNG TÂM BẢO MẬT ----

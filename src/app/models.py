@@ -399,6 +399,73 @@ class AuditCheckpoint(Base):
     )
 
 
+class SecurityIncident(Base):
+    """Analyst case record; its status never performs a containment action."""
+
+    __tablename__ = "security_incidents"
+    __table_args__ = (
+        CheckConstraint(
+            "stage IN ('reconnaissance', 'scanning', 'initial_access', 'persistence', 'objectives')",
+            name="ck_incident_stage",
+        ),
+        CheckConstraint("severity IN ('low', 'medium', 'high', 'critical')", name="ck_incident_severity"),
+        CheckConstraint("status IN ('new', 'investigating', 'contained', 'closed')", name="ck_incident_status"),
+        CheckConstraint("version >= 1", name="ck_incident_version"),
+        CheckConstraint("evidence_count BETWEEN 1 AND 20", name="ck_incident_evidence_count"),
+        Index("ix_security_incidents_created", "created_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    stage: Mapped[str] = mapped_column(String(24), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="new", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    evidence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class IncidentEvidence(Base):
+    """Immutable, allow-listed snapshot of a verified audit entry."""
+
+    __tablename__ = "incident_evidence"
+
+    incident_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("security_incidents.id", ondelete="RESTRICT"), primary_key=True
+    )
+    audit_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("audit_events.id", ondelete="RESTRICT"), primary_key=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    entry_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class IncidentTransition(Base):
+    """Append-only analyst decisions, linked to sealed audit changes."""
+
+    __tablename__ = "incident_transitions"
+    __table_args__ = (
+        CheckConstraint("resolution IS NULL OR resolution IN ('confirmed', 'false_positive', 'duplicate')", name="ck_incident_resolution"),
+        UniqueConstraint("incident_id", "version", name="uq_incident_transition_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    incident_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("security_incidents.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    from_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Keep the stable actor ID after an account is removed; never copy usernames.
+    actor_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    resolution: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class RevokedToken(Base):
     """Server-side JWT denylist used for logout and incident response in the course deployment."""
 

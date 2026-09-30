@@ -4,6 +4,12 @@ Bản demo này dùng SQLite, AI ngoại tuyến và dữ liệu mẫu. Không c
 tên miền, Docker, Gemini API key hay sửa `.env`. Sau khi cài đủ thư viện, có thể
 chạy phần demo ứng dụng và kiểm chứng bảo mật mà không cần Internet.
 
+Để thực hành theo hai tài liệu Word, đăng nhập bằng moderator/admin rồi mở
+tab **Thực hành ANM**. Bộ bài có hướng dẫn mạng/hệ điều hành, kiểm chứng ứng
+dụng theo 5 giai đoạn và lập hồ sơ sự cố từ audit. Xuất báo cáo cùng PCAP mẫu
+bằng `.\.venv\Scripts\python.exe -m scripts.practice_lab`; xem
+[hướng dẫn thực hành](docs/PRACTICAL_ANM.md) để đọc kết quả và phạm vi kiểm chứng.
+
 ## 1. Chuẩn bị một lần
 
 Mở PowerShell tại thư mục gốc dự án, nơi có `pyproject.toml` và `uv.lock`.

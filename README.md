@@ -6,6 +6,13 @@ Lượt demo có SQLite và khóa tạm riêng, tự nạp tài khoản mẫu v�
 không cần máy chủ, Docker, API key hoặc sửa `.env`. Xem
 [hướng dẫn chạy](HUONG_DAN_CHAY.md) và [kịch bản 6/12 phút](docs/DEMO_SCRIPT.md).
 
+**Thực hành ANM theo hai tài liệu Word:** tab **Thực hành ANM** dành cho
+moderator/admin có 11 bài mạng, hệ điều hành, bảo mật ứng dụng và xử lý sự cố.
+Chạy `.\.venv\Scripts\python.exe -m scripts.practice_lab` để xuất báo cáo kiểm
+chứng theo 5 giai đoạn cùng PCAP DNS/TCP/HTTP tổng hợp cho Wireshark. Hồ sơ
+sự cố gắn với audit thực có lịch sử điều tra và kết luận. Xem
+[hướng dẫn thực hành và phạm vi đã kiểm chứng](docs/PRACTICAL_ANM.md).
+
 Đợt phát triển theo báo cáo Vũ Văn Mạnh bổ sung kiểm soát body/URI thực nhận,
 IDS xử lý mã hoá nhiều lớp, bằng chứng từ chối xác thực/phân quyền, bộ kiểm chứng
 bảo mật API/audit/IDS và tác vụ bảo mật định kỳ. Xem
@@ -97,10 +104,10 @@ cấu hình riêng; guard production (`APP_ENV=production`) yêu cầu hạ tầ
 | [src/app/audit_checkpoint.py](src/app/audit_checkpoint.py) | Ký mốc cuối chuỗi và giao qua HTTPS tới WORM/SIEM ngoài máy chủ |
 | [src/app/retention.py](src/app/retention.py) | Retention theo mode, không gia hạn ngầm, xóa wrapped DEK và metadata phiên hết hạn |
 | [src/app/siem.py](src/app/siem.py) | Xuất sự kiện an ninh ra stdout dạng JSON một dòng (ECS-like) cho SIEM |
-| [src/app/models.py](src/app/models.py) | ORM: `User`, `AuthSession`, `ChatSession`, `SecureMessage`, `AuditEvent`, `RevokedToken`, `MfaRecoveryCode` |
+| [src/app/models.py](src/app/models.py) | ORM tài khoản, hội thoại, audit, `SecurityIncident`, `IncidentEvidence` và `IncidentTransition` |
 | [src/app/schemas.py](src/app/schemas.py) | Pydantic request/response, ràng buộc đầu vào |
 | [src/app/db.py](src/app/db.py) | Engine/session SQLAlchemy, `create_all`, `assert_schema_ready` |
-| [src/app/gradio_ui.py](src/app/gradio_ui.py) | Toàn bộ giao diện (theme, CSS, 7 tab) — chỉ nói chuyện với API qua `httpx` |
+| [src/app/gradio_ui.py](src/app/gradio_ui.py) | Toàn bộ giao diện (theme, CSS, 8 tab) — chỉ nói chuyện với API qua `httpx` |
 | [src/app/demo_seed.py](src/app/demo_seed.py) | Sinh tài khoản/hội thoại mẫu (idempotent) |
 | [src/core/ai_core/gemini_ai.py](src/core/ai_core/gemini_ai.py) | Wrapper mỏng quanh SDK `google-genai` |
 
@@ -354,6 +361,14 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | `GET` | `/api/admin/audit/verify` | admin — xác minh chuỗi HMAC |
 | `POST` | `/api/admin/audit/checkpoint` | admin + step-up — ký/giao mốc chuỗi tới WORM |
 | `GET`/`DELETE` | `/api/admin/ids/blocklist[/{ip}]` | admin |
+
+### Thực hành và hồ sơ sự cố
+
+Moderator/admin dùng `GET /api/admin/practice/catalog` để đọc bài thực hành;
+`GET`/`POST` `/api/admin/incidents` để liệt kê/tạo hồ sơ; `GET`/`PATCH`
+`/api/admin/incidents/{id}` để đọc và chuyển trạng thái. Hồ sơ dùng 1–20 audit
+ID đã kiểm chứng, cập nhật theo phiên bản và có audit niêm phong. Phạm vi,
+quy trình và kết quả lab nằm trong [hướng dẫn thực hành](docs/PRACTICAL_ANM.md).
 | `GET` | `/api/health` | công khai, cố ý tối giản |
 | `GET` | `/api/ready` | công khai, readiness DB + WORM trong high profile |
 
@@ -586,7 +601,7 @@ Secure_Conversational_Application_Platform/
 │   │   ├── models.py                # ORM SQLAlchemy
 │   │   ├── schemas.py               # Pydantic schema
 │   │   ├── db.py                    # Engine/session, kiểm tra schema
-│   │   ├── gradio_ui.py             # Giao diện Gradio 6 (theme, CSS, 7 tab)
+│   │   ├── gradio_ui.py             # Giao diện Gradio 6 (theme, CSS, 8 tab)
 │   │   ├── demo_seed.py             # Dữ liệu mẫu idempotent
 │   │   └── ui_assets/               # Ảnh tĩnh của giao diện
 │   ├── core/ai_core/gemini_ai.py    # Wrapper SDK google-genai

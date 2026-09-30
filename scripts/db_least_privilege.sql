@@ -104,6 +104,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 -- trên database đã có bảng.
 SELECT to_regclass('public.audit_events') IS NOT NULL AS audit_table_exists \gset
 SELECT to_regclass('public.audit_checkpoints') IS NOT NULL AS checkpoint_table_exists \gset
+SELECT to_regclass('public.security_incidents') IS NOT NULL AS incident_table_exists \gset
+SELECT to_regclass('public.incident_evidence') IS NOT NULL AS evidence_table_exists \gset
+SELECT to_regclass('public.incident_transitions') IS NOT NULL AS transition_table_exists \gset
 \if :audit_table_exists
   REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_events FROM scap_app;
   GRANT  SELECT, INSERT            ON TABLE audit_events TO   scap_app;
@@ -111,6 +114,17 @@ SELECT to_regclass('public.audit_checkpoints') IS NOT NULL AS checkpoint_table_e
 \if :checkpoint_table_exists
   REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_checkpoints FROM scap_app;
   GRANT  SELECT, INSERT            ON TABLE audit_checkpoints TO   scap_app;
+\endif
+\if :incident_table_exists
+  REVOKE DELETE, TRUNCATE ON TABLE security_incidents FROM scap_app;
+\endif
+\if :evidence_table_exists
+  REVOKE UPDATE, DELETE, TRUNCATE ON TABLE incident_evidence FROM scap_app;
+  GRANT SELECT, INSERT ON TABLE incident_evidence TO scap_app;
+\endif
+\if :transition_table_exists
+  REVOKE UPDATE, DELETE, TRUNCATE ON TABLE incident_transitions FROM scap_app;
+  GRANT SELECT, INSERT ON TABLE incident_transitions TO scap_app;
 \endif
 
 -- ── 6. Vai trò kiểm toán chỉ đọc ───────────────────────────────────────────
@@ -121,6 +135,15 @@ GRANT USAGE   ON SCHEMA public        TO scap_auditor;
 \endif
 \if :checkpoint_table_exists
   GRANT SELECT ON TABLE audit_checkpoints TO scap_auditor;
+\endif
+\if :incident_table_exists
+  GRANT SELECT ON TABLE security_incidents TO scap_auditor;
+\endif
+\if :evidence_table_exists
+  GRANT SELECT ON TABLE incident_evidence TO scap_auditor;
+\endif
+\if :transition_table_exists
+  GRANT SELECT ON TABLE incident_transitions TO scap_auditor;
 \endif
 -- KHÔNG cấp quyền đọc secure_messages: kiểm toán viên xem được "ai làm gì",
 -- không xem được nội dung hội thoại (dù có đọc cũng chỉ thấy bản mã AES-GCM).

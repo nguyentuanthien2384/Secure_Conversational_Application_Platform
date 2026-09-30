@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 import unicodedata
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -440,6 +441,101 @@ class SecurityAlertResponse(BaseModel):
     count: int
     window_minutes: int
     message: str
+
+
+IncidentStage = Literal["reconnaissance", "scanning", "initial_access", "persistence", "objectives"]
+IncidentSeverity = Literal["low", "medium", "high", "critical"]
+IncidentStatus = Literal["new", "investigating", "contained", "closed"]
+IncidentResolution = Literal["confirmed", "false_positive", "duplicate"]
+
+
+class IncidentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=3, max_length=120)
+    stage: IncidentStage
+    severity: IncidentSeverity
+    evidence_ids: list[Annotated[int, Field(strict=True, ge=1, le=2**63 - 1)]] = Field(
+        min_length=1, max_length=20
+    )
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def clean_title(cls, value):
+        if not isinstance(value, str):
+            return value
+        value = unicodedata.normalize("NFC", value).strip()
+        if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
+            raise ValueError("Tiêu đề không được chứa ký tự điều khiển.")
+        return value
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def unique_evidence(cls, value: list[int]) -> list[int]:
+        if len(set(value)) != len(value):
+            raise ValueError("Mỗi audit ID chỉ được chọn một lần.")
+        return value
+
+
+class IncidentUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(strict=True, ge=1, le=2**31 - 2)
+    status: IncidentStatus
+    resolution: IncidentResolution | None = None
+
+    @model_validator(mode="after")
+    def closure_resolution(self):
+        if self.status == "closed" and self.resolution is None:
+            raise ValueError("Đóng hồ sơ phải chọn kết luận.")
+        if self.status != "closed" and self.resolution is not None:
+            raise ValueError("Kết luận chỉ áp dụng khi đóng hồ sơ.")
+        return self
+
+
+class IncidentSummaryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    title: str
+    stage: IncidentStage
+    severity: IncidentSeverity
+    status: IncidentStatus
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    evidence_count: int
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def normalize_incident_time(cls, value: datetime) -> datetime:
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+class IncidentEvidenceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    audit_id: int
+    event_type: str
+    outcome: str
+    request_id: str | None
+    created_at: datetime
+    entry_hash: str
+
+
+class IncidentTransitionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    from_status: IncidentStatus | None
+    to_status: IncidentStatus
+    actor_id: str
+    created_at: datetime
+    resolution: IncidentResolution | None
+
+
+class IncidentDetailResponse(IncidentSummaryResponse):
+    evidence: list[IncidentEvidenceResponse]
+    transitions: list[IncidentTransitionResponse]
 
 
 class E2eeChallengeResponse(BaseModel):

@@ -14,6 +14,8 @@ from urllib.parse import unquote, urlsplit
 import gradio as gr
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -53,6 +55,7 @@ from src.app.ids import (
     run_safe_detection_verification,
     scan_text,
 )
+from src.app.incidents import create_incident, get_incident, incident_detail, transition_incident
 from src.app.key_management import (
     AwsKmsKeyProvider,
     GcpKmsKeyProvider,
@@ -73,6 +76,7 @@ from src.app.models import (
     MfaRecoveryCode,
     RevokedToken,
     SecureMessage,
+    SecurityIncident,
     User,
 )
 from src.app.request_limits import RequestLimitsMiddleware
@@ -90,6 +94,10 @@ from src.app.schemas import (
     E2eeMemberUpdate,
     E2eePreKeyBundleResponse,
     ExportTicketResponse,
+    IncidentCreate,
+    IncidentDetailResponse,
+    IncidentSummaryResponse,
+    IncidentUpdate,
     LoginRequest,
     MessageResponse,
     MessageSend,
@@ -761,6 +769,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details=details,
             )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.exception_handler(RequestValidationError)
+    async def incident_validation_error(request: Request, exc: RequestValidationError):
+        if request.url.path == "/api/admin/incidents" or request.url.path.startswith("/api/admin/incidents/"):
+            # A rejected title/unsupported note can itself contain sensitive
+            # material. Pydantic's default error projection echoes its input.
+            return JSONResponse(status_code=422, content={"detail": "Thông tin hồ sơ sự cố không hợp lệ; kiểm tra độ dài, lựa chọn và audit ID."})
+        return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -4385,6 +4401,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "recent_login_failures": recent_login_failures,
             "recent_auth_denials": recent_auth_denials,
         }
+
+    @app.get("/api/admin/practice/catalog")
+    def practice_catalog(_: Annotated[User, Depends(moderator_or_admin)]):
+        from src.app.practice import catalog
+
+        return catalog()
+
+    @app.get("/api/admin/incidents", response_model=list[IncidentSummaryResponse])
+    def list_incidents(
+        _: Annotated[User, Depends(moderator_or_admin)],
+        db: Annotated[Session, Depends(get_db)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    ):
+        return db.scalars(
+            select(SecurityIncident)
+            .order_by(SecurityIncident.created_at.desc(), SecurityIncident.id.desc())
+            .limit(limit)
+        ).all()
+
+    @app.post("/api/admin/incidents", response_model=IncidentDetailResponse, status_code=201)
+    def open_incident(
+        payload: IncidentCreate,
+        request: Request,
+        analyst: Annotated[User, Depends(moderator_or_admin)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        return create_incident(db, request, analyst.id, payload)
+
+    @app.get("/api/admin/incidents/{incident_id}", response_model=IncidentDetailResponse)
+    def read_incident(
+        incident_id: uuid.UUID,
+        _: Annotated[User, Depends(moderator_or_admin)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        return incident_detail(db, get_incident(db, str(incident_id)))
+
+    @app.patch("/api/admin/incidents/{incident_id}", response_model=IncidentDetailResponse)
+    def update_incident(
+        incident_id: uuid.UUID,
+        payload: IncidentUpdate,
+        request: Request,
+        analyst: Annotated[User, Depends(moderator_or_admin)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        return transition_incident(db, request, analyst.id, str(incident_id), payload)
 
     @app.get("/api/admin/security/maintenance")
     def security_maintenance_status(_: Annotated[User, Depends(admin_user)]):

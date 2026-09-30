@@ -360,6 +360,9 @@ class Database:
                 "encryption_scheme",
             },
             "e2ee_envelopes": {"replay_key"},
+            "security_incidents": {"stage", "severity", "status", "version", "evidence_count"},
+            "incident_evidence": {"incident_id", "audit_id", "entry_hash", "request_id"},
+            "incident_transitions": {"incident_id", "version", "from_status", "to_status", "resolution"},
         }
         incomplete: list[str] = []
         inspector = inspect(self.engine)
@@ -396,10 +399,16 @@ class Database:
             "GRANT SELECT, INSERT ON TABLE audit_events TO scap_app",
             "REVOKE UPDATE, DELETE, TRUNCATE ON TABLE audit_checkpoints FROM scap_app",
             "GRANT SELECT, INSERT ON TABLE audit_checkpoints TO scap_app",
+            "REVOKE DELETE, TRUNCATE ON TABLE security_incidents FROM scap_app",
+            "REVOKE UPDATE, DELETE, TRUNCATE ON TABLE incident_evidence FROM scap_app",
+            "GRANT SELECT, INSERT ON TABLE incident_evidence TO scap_app",
+            "REVOKE UPDATE, DELETE, TRUNCATE ON TABLE incident_transitions FROM scap_app",
+            "GRANT SELECT, INSERT ON TABLE incident_transitions TO scap_app",
             "GRANT CONNECT ON DATABASE " + quoted_db + " TO scap_auditor",
             "GRANT USAGE ON SCHEMA public TO scap_auditor",
             "GRANT SELECT ON TABLE audit_events TO scap_auditor",
             "GRANT SELECT ON TABLE audit_checkpoints TO scap_auditor",
+            "GRANT SELECT ON TABLE security_incidents, incident_evidence, incident_transitions TO scap_auditor",
         )
         with self.engine.begin() as connection:
             for statement in statements:

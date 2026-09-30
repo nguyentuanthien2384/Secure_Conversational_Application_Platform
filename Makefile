@@ -1,4 +1,4 @@
-.PHONY: install run test security security-validate docker
+.PHONY: install run test security security-validate practice-lab docker
 
 install:
 	uv sync --group dev
@@ -15,6 +15,9 @@ security:
 
 security-validate:
 	uv run python -m scripts.validate_security
+
+practice-lab:
+	uv run python -m scripts.practice_lab --output-dir reports/practice-lab
 
 docker:
 	docker compose up --build
