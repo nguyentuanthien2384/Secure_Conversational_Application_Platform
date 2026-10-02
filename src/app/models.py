@@ -501,3 +501,99 @@ class MfaRecoveryCode(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="recovery_codes")
+
+
+class AccountEmail(Base):
+    """A verified recovery/notification address, at most one per account.
+
+    The normalized address is unique so a password-reset request by email can
+    never be ambiguous between two accounts.
+    """
+
+    __tablename__ = "account_emails"
+
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    email: Mapped[str] = mapped_column(String(254), nullable=False)
+    normalized_email: Mapped[str] = mapped_column(String(254), unique=True, nullable=False)
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class AccountRecoveryCode(Base):
+    """Short-lived, attempt-limited code sent by email.
+
+    Purposes: ``password_reset`` and ``email_verify`` (which also carries the
+    address being verified). Only a keyed HMAC of the code is stored, so a
+    database dump does not reveal usable codes.
+    """
+
+    __tablename__ = "account_recovery_codes"
+    __table_args__ = (
+        Index("ix_account_recovery_user_purpose", "user_id", "purpose", "consumed_at"),
+        CheckConstraint(
+            "purpose IN ('password_reset', 'email_verify')", name="ck_account_recovery_purpose"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    purpose: Mapped[str] = mapped_column(String(16), nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class WebAuthnCredential(Base):
+    """A registered passkey. Only public material and counters are stored."""
+
+    __tablename__ = "webauthn_credentials"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    credential_id: Mapped[str] = mapped_column(String(1400), unique=True, nullable=False)
+    public_key: Mapped[str] = mapped_column(Text, nullable=False)
+    sign_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    transports: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    aaguid: Mapped[str] = mapped_column(String(36), default="", nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    backed_up: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WebAuthnChallenge(Base):
+    """Single-use ceremony challenge. ``user_id`` is NULL for usernameless sign-in."""
+
+    __tablename__ = "webauthn_challenges"
+    __table_args__ = (
+        CheckConstraint(
+            "purpose IN ('register', 'authenticate')", name="ck_webauthn_challenge_purpose"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    purpose: Mapped[str] = mapped_column(String(16), nullable=False)
+    challenge: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )

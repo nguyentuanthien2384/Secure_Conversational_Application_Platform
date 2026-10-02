@@ -14,12 +14,14 @@ dependencies = [
     "pydantic>=2.11.7",
     "pillow>=12.3.0",
     "psycopg[binary]>=3.2.9",
-    "PyJWT>=2.10.1",
+    # 2.15.0 fixes PYSEC-2026-4140..4152 (signature/JWKS parsing); keep pip-audit green.
+    "PyJWT>=2.15.0",
     "python-dotenv>=1.1.1",
     "qrcode[pil]>=7.4.2",
     "redis>=5.0.0,<7.0.0",
     "sqlalchemy>=2.0.40",
     "uvicorn[standard]>=0.35.0",
+    "webauthn>=2.7.0,<3.0.0",
 ]
 
 [dependency-groups]

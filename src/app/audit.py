@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import ipaddress
 import logging
+import re
+import time
 from typing import Any
 
 from fastapi import Request
@@ -23,14 +28,120 @@ def safe_user_agent(value: str) -> str | None:
     return sanitized or None
 
 
+# The Gradio UI runs in this process and calls the REST API over loopback, so
+# without help every browser would share the UI's own address: one attacker
+# could exhaust the per-IP login budget or trip an IDS block for all users.
+# The UI therefore vouches for the browser it is serving with these headers.
+UI_CLIENT_IP_HEADER = "X-SCAP-UI-Client-IP"
+UI_CLIENT_UA_HEADER = "X-SCAP-UI-Client-UA"
+UI_CLIENT_TS_HEADER = "X-SCAP-UI-Client-TS"
+UI_CLIENT_PROOF_HEADER = "X-SCAP-UI-Client-Proof"
+UI_CLIENT_MAX_SKEW_SECONDS = 60
+_HEADER_UNSAFE = re.compile(r"[^\x20-\x7e]")
+_UNSET = object()
+
+
+def derive_ui_client_context_key(secret_key: str) -> bytes:
+    """Derive the UI forwarding key from the app secret with domain separation.
+
+    Every worker derives the same key, so the UI may reach any worker, while the
+    label keeps it distinct from the JWT signing and audit-chain keys.
+    """
+    return hashlib.sha256(
+        ("secure-chat:ui-client-context:v1:" + secret_key).encode("utf-8")
+    ).digest()
+
+
+def _ui_client_context_mac(key: bytes, timestamp: str, ip: str, user_agent: str) -> str:
+    message = "\n".join(("v1", timestamp, ip, user_agent)).encode("utf-8")
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def sign_ui_client_context(
+    key: bytes, ip: str, user_agent: str, *, now: float | None = None
+) -> dict[str, str]:
+    """Return headers attributing an internal API call to the browser's address.
+
+    Returns nothing for a malformed address so a broken context degrades to the
+    loopback peer instead of inventing an identity.
+    """
+    try:
+        ip = str(ipaddress.ip_address(ip.strip()))
+    except ValueError:
+        return {}
+    # HTTP header values must stay printable ASCII on the internal hop.
+    user_agent = _HEADER_UNSAFE.sub("?", user_agent or "")[:512]
+    timestamp = str(int(time.time() if now is None else now))
+    return {
+        UI_CLIENT_IP_HEADER: ip,
+        UI_CLIENT_UA_HEADER: user_agent,
+        UI_CLIENT_TS_HEADER: timestamp,
+        UI_CLIENT_PROOF_HEADER: _ui_client_context_mac(key, timestamp, ip, user_agent),
+    }
+
+
+def _verified_ui_client_context(request: Request) -> tuple[str, str] | None:
+    headers = request.headers
+    proof = headers.get(UI_CLIENT_PROOF_HEADER)
+    if not proof:
+        return None
+    try:
+        key = getattr(request.app.state, "ui_client_context_key", None)
+    except Exception:  # pragma: no cover - defensive; request may lack an app
+        return None
+    if not key:
+        return None
+    ip = headers.get(UI_CLIENT_IP_HEADER, "")
+    user_agent = headers.get(UI_CLIENT_UA_HEADER, "")
+    timestamp = headers.get(UI_CLIENT_TS_HEADER, "")
+    if not timestamp.isdigit() or len(timestamp) > 12:
+        return None
+    if abs(time.time() - int(timestamp)) > UI_CLIENT_MAX_SKEW_SECONDS:
+        return None
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    expected = _ui_client_context_mac(key, timestamp, ip, user_agent)
+    if not hmac.compare_digest(proof.encode("ascii", "replace"), expected.encode("ascii")):
+        return None
+    return ip, user_agent
+
+
+def trusted_ui_client_context(request: Request) -> tuple[str, str] | None:
+    """Return the browser (ip, user-agent) the in-process UI vouched for, if any.
+
+    Middleware and handlers share one ASGI scope, so the decision is cached:
+    a long handler cannot see a different source than the IDS saw on entry.
+    """
+    cached = getattr(request.state, "scap_ui_client_context", _UNSET)
+    if cached is _UNSET:
+        cached = _verified_ui_client_context(request)
+        request.state.scap_ui_client_context = cached
+    return cached
+
+
 def client_ip(request: Request) -> str:
-    """Return the peer address.
+    """Return the peer address, or the browser address vouched for by the UI.
 
     ``X-Forwarded-For`` is user-controlled unless a trusted reverse proxy strips it,
     so accepting it here would let clients evade rate limits and poison audit logs.
-    Configure proxy-aware address handling at the deployment edge instead.
+    Configure proxy-aware address handling at the deployment edge instead. The
+    UI headers are different: they are accepted only with a fresh HMAC proof
+    under a key that never leaves the server.
     """
+    context = trusted_ui_client_context(request)
+    if context is not None:
+        return context[0][:64]
     return (request.client.host if request.client else "unknown")[:64]
+
+
+def client_user_agent(request: Request) -> str:
+    """Return the caller's User-Agent, preferring the browser behind the UI."""
+    context = trusted_ui_client_context(request)
+    if context is not None:
+        return context[1]
+    return request.headers.get("user-agent", "")
 
 
 def _audit_key(request: Request) -> bytes | None:
@@ -58,7 +169,7 @@ def record_audit(
     loudly but never turned into a 500 for the end user.
     """
     ip = client_ip(request)
-    user_agent = safe_user_agent(request.headers.get("user-agent", ""))
+    user_agent = safe_user_agent(client_user_agent(request))
     request_id = getattr(request.state, "request_id", None)
     event = AuditEvent(
         actor_id=actor_id,

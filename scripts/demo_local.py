@@ -46,6 +46,13 @@ def demo_settings(directory: Path, port: int) -> Settings:
         google_genai_api_key="",
         password_breach_check=False,
         siem_json_logs=False,
+        # Recovery/notification mail lands as .eml files inside this run's
+        # temporary directory, so the demo needs no mail server.
+        mail_backend="outbox",
+        mail_outbox_dir=str(directory / "outbox"),
+        # Browsers accept passkeys for a domain, never for an IP address.
+        webauthn_rp_id="localhost",
+        webauthn_origins=(f"http://localhost:{port}",),
     )
 
 
@@ -144,6 +151,9 @@ def check_demo(app: Any, port: int) -> list[tuple[str, bool]]:
         if "demo.user" in tokens:
             headers = {"Authorization": f"Bearer {tokens['demo.user']}"}
             checks.append(("RBAC", client.get("/api/admin/users", headers=headers).status_code == 403))
+            checks.append(("passkey ceremony options", client.post(
+                "/api/auth/passkeys/authentication/options",
+            ).status_code == 200))
             created = client.post("/api/sessions", json={"title": "Kiểm tra demo"}, headers=headers)
             checks.append(("create conversation", created.status_code == 201))
             if created.status_code == 201:
@@ -162,6 +172,14 @@ def check_demo(app: Any, port: int) -> list[tuple[str, bool]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Redirected output on Windows may use a legacy code page without Vietnamese
+    # letters; degrade to "?" instead of crashing the demo at its first print.
+    for stream in (sys.stdout, sys.stderr):
+        if (getattr(stream, "encoding", "") or "").lower().replace("-", "") != "utf8":
+            try:
+                stream.reconfigure(errors="replace")
+            except (AttributeError, ValueError):
+                pass
     parser = argparse.ArgumentParser(description="Chạy demo SCAP ngoại tuyến, dữ liệu tạm riêng.")
     parser.add_argument("--port", type=int, default=8000, help="Cổng localhost (mặc định 8000).")
     parser.add_argument("--check", action="store_true", help="Kiểm tra demo rồi thoát, không mở cổng.")
@@ -185,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
                 print("Tài khoản: " + ", ".join(username for username, _role in DEMO_USERS))
                 print(f"Mật khẩu mẫu: {DEMO_PASSPHRASE}")
                 print("Dữ liệu mẫu và cảnh báo được dựng cho buổi demo; AI trả lời mô phỏng.")
+                print(f"Passkey cần mở bằng tên miền: http://localhost:{args.port}")
+                print(f"Email xác minh/đặt lại mật khẩu (.eml) được ghi vào: {Path(temporary) / 'outbox'}")
                 print("Ctrl+C để dừng. Lần chạy tiếp theo tạo dữ liệu mới; dữ liệu hiện có của bạn được giữ nguyên.")
                 config = uvicorn.Config(app, host="127.0.0.1", port=args.port,
                                         access_log=False, proxy_headers=False, log_level="warning",

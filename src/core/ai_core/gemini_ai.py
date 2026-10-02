@@ -23,12 +23,24 @@ class GeminiClient:
         api_key: Khóa truy cập Google GenAI. Nếu None, sẽ đọc từ
             biến môi trường `GOOGLE_GENAI_API_KEY`.
         model: Tên model mặc định. Ví dụ: "gemini-flash-lite-latest".
+        timeout_seconds: Thời hạn mỗi lần gọi. SDK mặc định KHÔNG có timeout,
+            nên một kết nối treo giữ luồng xử lý của máy chủ vô thời hạn.
+        retry_attempts: Tổng số lần thử (kể cả lần đầu) khi gặp lỗi tạm thời
+            408/429/5xx hoặc mạng. SDK mặc định chỉ thử một lần, nên một lỗi
+            "model overloaded" thoáng qua cũng trả lỗi cho người dùng.
 
     Raises:
         ValueError: Nếu không tìm thấy `api_key`.
     """
 
-    def __init__(self, api_key: str | None = None, model: str = "gemini-flash-lite-latest"):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "gemini-flash-lite-latest",
+        *,
+        timeout_seconds: float | None = None,
+        retry_attempts: int = 1,
+    ):
         if api_key is None:
             api_key = os.getenv("GOOGLE_GENAI_API_KEY", "")
         self.api_key: str = api_key
@@ -36,7 +48,20 @@ class GeminiClient:
             raise ValueError(
                 "Thiếu API key. Truyền `api_key=` hoặc đặt biến môi trường GOOGLE_GENAI_API_KEY."
             )
-        self.client = genai.Client(api_key=self.api_key)
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("timeout_seconds phải dương.")
+        if retry_attempts < 1:
+            raise ValueError("retry_attempts phải ít nhất là 1.")
+        http_options = types.HttpOptions(
+            # HttpOptions.timeout tính bằng mili giây.
+            timeout=int(timeout_seconds * 1000) if timeout_seconds is not None else None,
+            retry_options=(
+                types.HttpRetryOptions(attempts=retry_attempts, initial_delay=1.0, max_delay=4.0)
+                if retry_attempts > 1
+                else None
+            ),
+        )
+        self.client = genai.Client(api_key=self.api_key, http_options=http_options)
         self.model = model
 
     # ------------------------ helpers ------------------------
@@ -124,10 +149,12 @@ class GeminiClient:
             config=generate_content_config,
         )
 
-        # Rút trích text an toàn
+        # Rút trích text an toàn. Prompt bị bộ lọc an toàn chặn không có
+        # candidate; candidate dừng vì SAFETY/MAX_TOKENS có thể có content mà
+        # parts=None — cả hai đều phải thành RuntimeError rõ ràng, không TypeError.
         try:
             cand = resp.candidates[0]
-            parts = getattr(cand, "content", None).parts  # type: ignore[attr-defined]
+            parts = getattr(cand, "content", None).parts or []  # type: ignore[attr-defined]
         except Exception as e:
             raise RuntimeError(f"Không có candidate hợp lệ trong phản hồi: {e}") from e
 

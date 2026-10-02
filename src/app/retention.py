@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from src.app.db import utcnow
 from src.app.models import (
+    AccountRecoveryCode,
     AuthSession,
     ChatSession,
     E2eeDeviceChallenge,
@@ -17,6 +18,7 @@ from src.app.models import (
     E2eePreKey,
     RevokedToken,
     SecureMessage,
+    WebAuthnChallenge,
 )
 
 
@@ -31,6 +33,8 @@ class RetentionResult:
     expired_tokens: int = 0
     expired_auth_sessions: int = 0
     stale_prekeys: int = 0
+    expired_recovery_codes: int = 0
+    expired_passkey_challenges: int = 0
     dry_run: bool = False
 
     def as_dict(self) -> dict[str, int | bool]:
@@ -235,8 +239,26 @@ def enforce_retention(
             .limit(batch_size)
         )
     )
+    # Recovery codes and passkey challenges are single-use and short-lived;
+    # the anonymous passkey challenge endpoint must not grow the table forever.
+    expired_recovery_codes = list(
+        db.scalars(
+            select(AccountRecoveryCode)
+            .where(AccountRecoveryCode.expires_at <= now)
+            .limit(batch_size)
+        )
+    )
+    expired_passkey_challenges = list(
+        db.scalars(
+            select(WebAuthnChallenge).where(WebAuthnChallenge.expires_at <= now).limit(batch_size)
+        )
+    )
     if not dry_run:
         for item in sessions:
+            db.delete(item)
+        for item in expired_recovery_codes:
+            db.delete(item)
+        for item in expired_passkey_challenges:
             db.delete(item)
         for item in expired_challenges:
             db.delete(item)
@@ -257,5 +279,7 @@ def enforce_retention(
         expired_tokens=len(expired_tokens),
         expired_auth_sessions=len(expired_auth_sessions),
         stale_prekeys=len(stale_prekeys),
+        expired_recovery_codes=len(expired_recovery_codes),
+        expired_passkey_challenges=len(expired_passkey_challenges),
         dry_run=dry_run,
     )

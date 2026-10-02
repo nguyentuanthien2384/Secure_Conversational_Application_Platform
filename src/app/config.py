@@ -4,7 +4,7 @@ import base64
 import hashlib
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
 
@@ -173,6 +173,9 @@ class Settings:
     allow_demo_ai: bool = True
     google_genai_api_key: str = ""
     gemini_model: str = "gemini-flash-lite-latest"
+    # Per-attempt provider deadline; one retry is allowed. 2 x 25 s plus backoff
+    # still ends before the UI gives up on the API call at 60 s.
+    gemini_timeout_seconds: int = 20
     bootstrap_admin_username: str = ""
     bootstrap_admin_password: str = ""
     docs_enabled: bool = True
@@ -206,6 +209,29 @@ class Settings:
     aws_region: str = ""
     gcp_kms_key_name: str = ""
     step_up_minutes: int = 5
+    # Completed sign-ins from this many days back make an address familiar
+    # (smart lockout) and a browser/OS family known (new-device alerts).
+    sign_in_history_days: int = 90
+    # RFC 9700 §4.14.2: a rotated token presented after this grace period is
+    # treated as stolen and the whole device session family is revoked.
+    token_reuse_grace_seconds: int = 30
+    # Lifetime of the signed browser-recognition cookie (OWASP device cookies).
+    device_token_days: int = 365
+    # Security email. Direct construction (tests) defaults to disabled;
+    # from_env() defaults to a local outbox outside production.
+    mail_backend: str = "disabled"
+    mail_outbox_dir: str = "mail_outbox"
+    mail_from: str = "SCAP <no-reply@scap.local>"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = field(default="", repr=False)
+    smtp_security: str = "starttls"
+    password_reset_minutes: int = 15
+    # Passkeys (WebAuthn). The RP ID must be a registrable domain, never an IP.
+    webauthn_rp_id: str = "localhost"
+    webauthn_rp_name: str = "SCAP"
+    webauthn_origins: tuple[str, ...] = ("http://localhost:8000",)
     max_messages_per_session: int = 10_000
     confidential_retention_days: int = 7
     secure_retention_days: int = 90
@@ -471,6 +497,12 @@ class Settings:
             "SECURITY_MAINTENANCE_INTERVAL_SECONDS": (300, 10, 86_400),
             "SECURITY_MAINTENANCE_BATCH_SIZE": (500, 1, 5_000),
             "SECURITY_MAINTENANCE_ANOMALY_WINDOW_MINUTES": (60, 1, 1_440),
+            "SIGN_IN_HISTORY_DAYS": (90, 1, 730),
+            "GEMINI_TIMEOUT_SECONDS": (20, 5, 25),
+            "TOKEN_REUSE_GRACE_SECONDS": (30, 5, 300),
+            "DEVICE_TOKEN_DAYS": (365, 1, 730),
+            "PASSWORD_RESET_MINUTES": (15, 5, 60),
+            "SMTP_PORT": (587, 1, 65_535),
         }
         for name, (default, minimum, maximum) in maintenance_limits.items():
             try:
@@ -518,6 +550,32 @@ class Settings:
             oidc_proxy_secret_header
         ):
             raise RuntimeError("Tên header OIDC/proxy không hợp lệ.")
+
+        mail_backend = os.getenv(
+            "MAIL_BACKEND", "disabled" if environment == "production" else "outbox"
+        ).strip().lower()
+        if mail_backend not in {"disabled", "outbox", "smtp"}:
+            raise RuntimeError("MAIL_BACKEND chỉ chấp nhận disabled, outbox hoặc smtp.")
+        if environment == "production" and mail_backend == "outbox":
+            raise RuntimeError(
+                "MAIL_BACKEND=outbox ghi mã khôi phục ra đĩa; production phải dùng smtp hoặc disabled."
+            )
+        smtp_host = os.getenv("SMTP_HOST", "").strip()
+        if mail_backend == "smtp" and not smtp_host:
+            raise RuntimeError("SMTP_HOST bắt buộc khi MAIL_BACKEND=smtp.")
+        smtp_security = os.getenv("SMTP_SECURITY", "starttls").strip().lower()
+        if smtp_security not in {"starttls", "ssl"}:
+            raise RuntimeError("SMTP_SECURITY chỉ chấp nhận starttls hoặc ssl (không gửi thư thô).")
+        webauthn_rp_id = (
+            os.getenv("WEBAUTHN_RP_ID", "").strip().lower()
+            or os.getenv("PUBLIC_DOMAIN", "").strip().lower()
+            or "localhost"
+        )
+        webauthn_origins = _csv_env("WEBAUTHN_ORIGINS") or tuple(
+            origin for origin in _csv_env("ALLOWED_ORIGINS")
+            if (urlsplit(origin).hostname or "") in {webauthn_rp_id}
+            or (urlsplit(origin).hostname or "").endswith("." + webauthn_rp_id)
+        ) or (f"http://localhost:{os.getenv('PORT', '8000')}",)
 
         return cls(
             environment=environment,
@@ -579,6 +637,22 @@ class Settings:
             aws_region=os.getenv("AWS_REGION", "").strip(),
             gcp_kms_key_name=os.getenv("GCP_KMS_KEY_NAME", "").strip(),
             step_up_minutes=numeric_limits["STEP_UP_MINUTES"],
+            sign_in_history_days=numeric_limits["SIGN_IN_HISTORY_DAYS"],
+            gemini_timeout_seconds=numeric_limits["GEMINI_TIMEOUT_SECONDS"],
+            token_reuse_grace_seconds=numeric_limits["TOKEN_REUSE_GRACE_SECONDS"],
+            device_token_days=numeric_limits["DEVICE_TOKEN_DAYS"],
+            mail_backend=mail_backend,
+            mail_outbox_dir=os.getenv("MAIL_OUTBOX_DIR", "mail_outbox").strip() or "mail_outbox",
+            mail_from=os.getenv("MAIL_FROM", "SCAP <no-reply@scap.local>").strip(),
+            smtp_host=smtp_host,
+            smtp_port=numeric_limits["SMTP_PORT"],
+            smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
+            smtp_password=_secret_setting("SMTP_PASSWORD", "SMTP_PASSWORD_FILE"),
+            smtp_security=smtp_security,
+            password_reset_minutes=numeric_limits["PASSWORD_RESET_MINUTES"],
+            webauthn_rp_id=webauthn_rp_id,
+            webauthn_rp_name=os.getenv("WEBAUTHN_RP_NAME", "SCAP").strip() or "SCAP",
+            webauthn_origins=webauthn_origins,
             max_messages_per_session=numeric_limits["MAX_MESSAGES_PER_SESSION"],
             confidential_retention_days=numeric_limits["CONFIDENTIAL_RETENTION_DAYS"],
             secure_retention_days=numeric_limits["SECURE_RETENTION_DAYS"],

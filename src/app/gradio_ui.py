@@ -7,7 +7,9 @@ trò chuyện, bản mã, tìm kiếm toàn cục, tài khoản, thiết bị, q
 
 from __future__ import annotations
 
+import base64
 import html
+import json
 import os
 import secrets
 import time
@@ -17,12 +19,18 @@ from pathlib import Path
 
 import gradio as gr
 
+from src.app.account_security import DEVICE_COOKIE_NAME, DEVICE_TOKEN_HEADER
+from src.app.audit import sign_ui_client_context
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
 from src.app.ui_session import COOKIE_NAME, BrowserSessionStore, UISessionCapacityError
 
 BASE_URL = os.getenv("SELF_BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", BASE_URL).rstrip("/")
 PASSWORD_MIN = 15
+# Set by build_ui(); lets _api() vouch for the browser behind each call.
+_CLIENT_CONTEXT_KEY: bytes | None = None
+# Set by build_ui(); lets _api() follow token rotations made by another tab.
+_SESSION_STORE: BrowserSessionStore | None = None
 
 # Fixed markup consumed by our static CSP-compatible session bridge. Bearer
 # tokens never enter this DOM component, cookies readable by JS, or storage.
@@ -96,7 +104,8 @@ CUSTOM_CSS = """
 }
 
 footer { display: none !important; }
-#session-bridge, #login-ready { display: none !important; }
+#session-bridge, #login-ready, #passkey-bridge, #passkey-result,
+#btn-passkey-login-done, #btn-passkey-register-done { display: none !important; }
 #scap-session-warning { padding: 12px; color: var(--scap-warn-fg); background: var(--scap-warn-bg); }
 
 /* ── Khung ngoài: một workspace full-width duy nhất cho mọi tab ─────────
@@ -222,6 +231,9 @@ footer { display: none !important; }
 /* Thanh tab bị ẩn: hai nút xếp dọc (đặc / viền) mới là thứ chuyển giữa đăng
    nhập và tạo tài khoản — giống mẫu, và bớt một tầng điều hướng. */
 #auth-card .tab-nav, #auth-card [role="tablist"] { display: none !important; }
+/* Gradio moves tabs that do not fit into an overflow "⋯" menu beside the list;
+   the auth card navigates with its own buttons, so hide the whole header. */
+#auth-card .tab-wrapper, #auth-card .overflow-menu { display: none !important; }
 #auth-card .tabitem, #auth-card [role="tabpanel"] {
   padding: 0 !important; border: 0 !important; background: none !important;
 }
@@ -653,10 +665,46 @@ def _totp_qr_markup(uri: str, target_px: int = QR_DISPLAY_PX) -> str:
     )
 
 
+def _browser_context_headers() -> dict[str, str]:
+    """Sign the address/User-Agent of the browser whose event is being handled.
+
+    Every UI call reaches the API from this process over loopback. Without this,
+    all users would share one source address: one person's failed logins or
+    IDS hits would rate-limit or block everyone, and the audit trail, device
+    list and anomaly engine would only ever see 127.0.0.1.
+    """
+    from gradio.context import LocalContext
+
+    request = LocalContext.request.get(None)
+    if request is None:
+        return {}
+    try:
+        client = getattr(request, "client", None)
+        host = getattr(client, "host", None) if client is not None else None
+        headers = getattr(request, "headers", None)
+        user_agent = headers.get("user-agent", "") if headers is not None else ""
+        cookies = getattr(request, "cookies", None)
+        device_cookie = cookies.get(DEVICE_COOKIE_NAME) if cookies is not None else None
+    except (AttributeError, KeyError, TypeError):
+        return {}
+    forwarded: dict[str, str] = {}
+    if _CLIENT_CONTEXT_KEY is not None and isinstance(host, str):
+        forwarded.update(
+            sign_ui_client_context(_CLIENT_CONTEXT_KEY, host, str(user_agent or ""))
+        )
+    # The HttpOnly device cookie never reaches page scripts; the server-side UI
+    # relays it so the API recognises this browser at sign-in.
+    if isinstance(device_cookie, str) and 0 < len(device_cookie) <= 200 and device_cookie.isascii():
+        forwarded[DEVICE_TOKEN_HEADER] = device_cookie
+    return forwarded
+
+
 def _api(token, method, path, body=None, *, params=None):
     import httpx
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", **_browser_context_headers()}
+    if token and _SESSION_STORE is not None:
+        token = _SESSION_STORE.current_token(token)
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
@@ -866,6 +914,157 @@ def _devices_snapshot(token):
     return table, revoke
 
 
+CONSENT_NOTICE = (
+    "⚠️ **Tin nhắn chưa được gửi.** Bấm **Đồng ý và gửi** bên dưới "
+    "để lưu lựa chọn cho tài khoản này. Trước khi gửi tới AI bên ngoài, "
+    "nội dung vẫn được lớp DLP kiểm tra và che dữ liệu nhạy cảm."
+)
+CONFIDENTIAL_CONFIRM_NOTICE = (
+    "⚠️ **Hội thoại này được phân loại mật — tin nhắn chưa được gửi.** "
+    "Bấm **Đồng ý và gửi** để xác nhận gửi riêng tin nhắn này tới AI bên ngoài. "
+    "Lớp DLP vẫn kiểm tra và che dữ liệu nhạy cảm trước khi gửi."
+)
+ACTIVITY_PLACEHOLDER = "_Hoạt động bảo mật sẽ hiển thị sau khi đăng nhập._"
+EMAIL_PLACEHOLDER = "_Thông tin email khôi phục sẽ hiển thị sau khi đăng nhập._"
+_PASSKEY_ERRORS = {
+    "NotAllowedError": "Đã hủy hoặc hết thời gian xác nhận passkey trên thiết bị.",
+    "InvalidStateError": "Thiết bị này đã có passkey cho tài khoản.",
+    "unsupported": "Trình duyệt hoặc thiết bị này không hỗ trợ passkey.",
+    "not_prepared": "Hãy bấm “Thêm passkey” trước.",
+    "http_429": "Thử passkey quá nhiều lần; vui lòng đợi rồi thử lại.",
+}
+
+
+def _with_step_up(token, password, code, call, action):
+    """Run a sensitive call, re-proving password/2FA once if the server asks."""
+    try:
+        return call()
+    except gr.Error as err:
+        if "xác thực lại" not in str(err).lower():
+            raise
+        if not password:
+            raise gr.Error(
+                "Cần xác thực lại. Nhập mật khẩu hiện tại (và mã 2FA nếu đã bật) "
+                f"rồi bấm “{action}” lần nữa."
+            ) from err
+        _api(
+            token, "POST", "/api/auth/step-up",
+            {"password": password, "code": (code or "").strip() or None},
+        )
+        return call()
+
+
+def _passkey_payload(raw, mode):
+    """Parse the browser result; it is untrusted and bounded."""
+    if not isinstance(raw, str) or not raw or len(raw) > 20_000:
+        return {"error": "not_prepared"}
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {"error": "malformed"}
+    if not isinstance(payload, dict) or payload.get("mode") != mode:
+        return {"error": "malformed"}
+    return payload
+
+
+def _passkey_error_message(payload):
+    error = str(payload.get("error", ""))
+    if error in ("wrong_host", "SecurityError"):
+        rp_id = str(payload.get("rp_id") or "localhost")
+        if not all(ch.isalnum() or ch in ".-" for ch in rp_id):
+            rp_id = "localhost"
+        return (
+            f"Passkey chỉ hoạt động khi mở ứng dụng bằng tên miền {rp_id} "
+            "(ví dụ http://localhost:8000), không dùng địa chỉ IP."
+        )
+    return _PASSKEY_ERRORS.get(error, "Không hoàn tất được passkey. Vui lòng thử lại.")
+
+
+def _passkeys_snapshot(token):
+    rows = _api(token, "GET", "/api/auth/passkeys")
+    table = [
+        [
+            row["name"],
+            _fmt(row["created_at"]),
+            _fmt(row.get("last_used_at")),
+            "Có" if row.get("backed_up") else "Không",
+        ]
+        for row in rows
+    ]
+    choices = [(f"{row['name']} · {_fmt(row['created_at'])}", row["id"]) for row in rows]
+    return table, choices
+
+
+def _email_markdown(data):
+    lines = []
+    if data.get("email"):
+        lines.append(
+            f"**Email khôi phục:** {_safe_markdown_text(data['email'])} — đã xác minh "
+            f"{_fmt(data.get('verified_at'))}. Dùng để tự đặt lại mật khẩu và nhận cảnh báo bảo mật."
+        )
+    else:
+        lines.append(
+            "**Chưa có email khôi phục.** Thêm email để có thể tự đặt lại mật khẩu "
+            "và nhận cảnh báo khi có đăng nhập lạ."
+        )
+    if data.get("pending_email"):
+        lines.append(
+            f"⏳ Đang chờ xác minh: {_safe_markdown_text(data['pending_email'])} — nhập mã trong email."
+        )
+    if not data.get("delivery_available", True):
+        lines.append("⚠️ Máy chủ chưa được cấu hình gửi email nên chưa thể thêm email.")
+    return "\n\n".join(lines)
+_SEVERITY_MARKS = {"critical": "🔴", "warning": "🟠", "info": "🟢"}
+
+
+def _security_activity_snapshot(token):
+    """Return (summary markdown, table rows, alerts) like an account security page."""
+    data = _api(token, "GET", "/api/auth/security-activity", params={"limit": 30})
+    rows = [
+        [
+            _fmt(event["created_at"]),
+            f"{_SEVERITY_MARKS.get(event['severity'], '')} {event['title']}".strip(),
+            event["outcome_label"],
+            event.get("ip_address") or ("Quản trị viên" if event["by_administrator"] else "—"),
+            event.get("device") or "—",
+        ]
+        for event in data["events"]
+    ]
+    previous = data.get("previous_sign_in")
+    if previous:
+        where = " · ".join(
+            part for part in (
+                f"IP `{previous['ip_address']}`" if previous.get("ip_address") else "",
+                previous.get("device") or "",
+            ) if part
+        )
+        lines = [f"**Lần đăng nhập trước:** {_fmt(previous['at'])}" + (f" · {where}" if where else "")]
+    else:
+        lines = ["**Chưa có lần đăng nhập nào trước phiên này.**"]
+    alerts = []
+    failed = data["failed_sign_ins_since_previous"]
+    mfa_failed = data["mfa_failures_since_previous"]
+    new_devices = data["new_device_sign_ins_since_previous"]
+    if mfa_failed:
+        alerts.append(
+            f"{mfa_failed} lần có người nhập ĐÚNG mật khẩu nhưng sai mã 2FA. "
+            "Nếu không phải bạn, hãy đổi mật khẩu ngay."
+        )
+    if failed > mfa_failed:
+        alerts.append(
+            f"{failed - mfa_failed} lần đăng nhập thất bại vào tài khoản kể từ lần đăng nhập trước."
+        )
+    if new_devices:
+        alerts.append(
+            f"{new_devices} lần đăng nhập từ thiết bị mới. Nếu không phải bạn, "
+            "hãy thu hồi thiết bị đó và đổi mật khẩu."
+        )
+    lines.extend(f"⚠️ {alert}" for alert in alerts)
+    if not alerts:
+        lines.append("✅ Không có dấu hiệu bất thường kể từ lần đăng nhập trước.")
+    return "\n\n".join(lines), rows, alerts
+
+
 # ─────────────────── mảnh HTML tĩnh của trang đăng nhập ───────────────────
 # Trang đăng nhập chỉ giữ đúng hai việc: đăng nhập và tạo tài khoản. Dấu nhận
 # diện dưới đây là thứ duy nhất còn lại — đủ để người dùng biết mình đang gõ
@@ -954,8 +1153,16 @@ def _pw_meter_html(password: str) -> str:
 
 
 # ────────────────────────── giao diện ──────────────────────────
-def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
+def build_ui(
+    session_store: BrowserSessionStore | None = None,
+    *,
+    client_context_key: bytes | None = None,
+) -> gr.Blocks:
+    global _CLIENT_CONTEXT_KEY, _SESSION_STORE
     session_store = session_store if session_store is not None else BrowserSessionStore()
+    _SESSION_STORE = session_store
+    if client_context_key is not None:
+        _CLIENT_CONTEXT_KEY = client_context_key
     # Gradio 6 applies theme and CSS when the UI is mounted/launched.  Supplying
     # them to Blocks itself is deprecated and emits a warning on every startup.
     with gr.Blocks(
@@ -971,6 +1178,17 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
         st_mfa = gr.State("")
         resume_ticket = _static_html("", elem_id="session-bridge")
         login_ready = _static_html("", elem_id="login-ready")
+        # Passkey bridge: the server publishes ceremony options here, the static
+        # passkey.js script returns the public result through this hidden box.
+        passkey_bridge = _static_html("", elem_id="passkey-bridge")
+        tb_passkey_result = gr.Textbox(
+            label="Kết quả passkey", elem_id="passkey-result", max_lines=1, container=False,
+        )
+        btn_passkey_login_done = gr.Button("Hoàn tất passkey", elem_id="btn-passkey-login-done")
+        btn_passkey_register_done = gr.Button(
+            "Lưu passkey", elem_id="btn-passkey-register-done"
+        )
+        st_passkey = gr.State({})
         # Đã hiện cảnh báo "sắp hết phiên" chưa — để chỉ nhắc một lần cho mỗi
         # phiên thay vì mỗi giây một lần trong suốt hai phút cuối.
         st_warned = gr.State(False)
@@ -1029,10 +1247,20 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                             btn_login = gr.Button(
                                 "Đăng nhập", variant="primary", elem_id="btn-login",
                             )
+                            # Handled by passkey.js inside the click itself, as
+                            # browsers require for the passkey prompt.
+                            gr.Button(
+                                "🔑 Đăng nhập bằng passkey",
+                                elem_id="btn-passkey-login",
+                                elem_classes="auth-alt",
+                            )
                             # Nút viền: vừa là lối sang tab tạo tài khoản, vừa là
                             # thứ thay cho thanh tab đã ẩn.
                             btn_goto_register = gr.Button(
                                 "Tạo tài khoản", elem_classes="auth-alt"
+                            )
+                            btn_goto_reset = gr.Button(
+                                "Quên mật khẩu?", elem_classes="auth-alt"
                             )
 
                             # Ô mật khẩu che ký tự là nguyên nhân gõ sai phổ biến
@@ -1072,6 +1300,33 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                             )
 
                             re_pass.change(_pw_meter_html, re_pass, html_pw_meter)
+                        with gr.Tab("Quên mật khẩu", id="tab_reset"):
+                            gr.Markdown(
+                                "Nhập tên đăng nhập hoặc email khôi phục đã xác minh. "
+                                "Mã đặt lại được gửi tới email đó; xác thực hai lớp vẫn giữ nguyên."
+                            )
+                            tb_reset_identifier = gr.Textbox(
+                                label="Tên đăng nhập hoặc email khôi phục",
+                                max_length=254,
+                                max_lines=1,
+                                elem_id="reset-identifier",
+                            )
+                            btn_reset_send = gr.Button("Gửi mã qua email", variant="primary")
+                            tb_reset_code = gr.Textbox(
+                                label="Mã trong email", max_length=32, max_lines=1,
+                                placeholder="xxxxx-xxxxx",
+                            )
+                            tb_reset_new = gr.Textbox(
+                                label="Mật khẩu mới",
+                                type="password",
+                                max_length=128,
+                                placeholder=f"Tối thiểu {PASSWORD_MIN} ký tự",
+                                html_attributes=gr.InputHTMLAttributes(autocomplete="new-password"),
+                            )
+                            btn_reset_confirm = gr.Button("Đặt lại mật khẩu", variant="primary")
+                            btn_reset_back = gr.Button(
+                                "Quay lại đăng nhập", elem_classes="auth-alt"
+                            )
 
                     # Thanh tab đã ẩn bằng CSS nên hai nút này là đường duy nhất
                     # đi lại giữa hai biểu mẫu.
@@ -1079,6 +1334,8 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                         lambda: gr.Tabs(selected="tab_register"), None, auth_tabs
                     )
                     btn_goto_login.click(lambda: gr.Tabs(selected="tab_login"), None, auth_tabs)
+                    btn_goto_reset.click(lambda: gr.Tabs(selected="tab_reset"), None, auth_tabs)
+                    btn_reset_back.click(lambda: gr.Tabs(selected="tab_login"), None, auth_tabs)
 
                 # ---- bước 2: xác thực hai lớp ----
                 with gr.Column(visible=False, elem_id="mfa-panel") as grp_mfa_login:
@@ -1330,6 +1587,72 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                             "Đăng xuất mọi thiết bị", variant="stop", size="sm",
                             elem_id="btn-logout-all",
                         )
+                    with gr.Accordion("Email khôi phục & passkey", open=True):
+                        gr.Markdown(
+                            "Đổi email khôi phục hoặc passkey là thao tác nhạy cảm. Khi hệ thống "
+                            "báo cần xác thực lại, nhập mật khẩu (và mã 2FA nếu đã bật) rồi bấm lại."
+                        )
+                        with gr.Row():
+                            tb_acct_pw = gr.Textbox(
+                                label="Mật khẩu hiện tại (khi cần xác thực lại)",
+                                type="password", max_length=128,
+                            )
+                            tb_acct_code = gr.Textbox(label="Mã 2FA (nếu đã bật)", max_length=32)
+                        md_email_state = gr.Markdown(EMAIL_PLACEHOLDER)
+                        with gr.Row():
+                            tb_email_new = gr.Textbox(
+                                label="Email khôi phục mới", max_length=254, max_lines=1, scale=3
+                            )
+                            btn_email_send = gr.Button("Gửi mã xác minh", size="sm", scale=1)
+                        with gr.Row():
+                            tb_email_code = gr.Textbox(
+                                label="Mã xác minh trong email", max_length=32, max_lines=1,
+                                scale=3,
+                            )
+                            btn_email_verify = gr.Button("Xác minh email", size="sm", scale=1)
+                        btn_email_remove = gr.Button(
+                            "Gỡ email khôi phục", size="sm", variant="stop"
+                        )
+                        gr.Markdown(
+                            "**Passkey** cho phép đăng nhập không cần mật khẩu bằng vân tay, khuôn mặt "
+                            "hoặc PIN của thiết bị. Khóa riêng không bao giờ rời thiết bị và passkey "
+                            "chỉ dùng được trên đúng trang này, nên kẻ lừa đảo không thể đánh cắp."
+                        )
+                        df_passkeys = gr.Dataframe(
+                            headers=["Tên", "Tạo lúc", "Dùng gần nhất", "Đồng bộ đám mây"],
+                            interactive=False,
+                            wrap=True,
+                        )
+                        with gr.Row():
+                            tb_passkey_name = gr.Textbox(
+                                label="Tên passkey (tuỳ chọn)", max_length=64, max_lines=1,
+                                scale=3,
+                            )
+                            btn_passkey_add = gr.Button("Thêm passkey", size="sm", scale=1)
+                        md_passkey_hint = gr.Markdown("", visible=False)
+                        btn_passkey_create = gr.Button(
+                            "Xác nhận trên thiết bị này", variant="primary", visible=False,
+                            elem_id="btn-passkey-create",
+                        )
+                        with gr.Row():
+                            dd_passkey_remove = gr.Dropdown(
+                                label="Passkey cần xóa", choices=[], scale=3
+                            )
+                            btn_passkey_remove = gr.Button(
+                                "Xóa passkey", size="sm", variant="stop", scale=1
+                            )
+                    with gr.Accordion("Hoạt động bảo mật gần đây", open=True):
+                        md_activity = gr.Markdown(ACTIVITY_PLACEHOLDER)
+                        df_activity = gr.Dataframe(
+                            headers=["Thời gian", "Sự kiện", "Kết quả", "IP", "Thiết bị"],
+                            interactive=False,
+                            wrap=True,
+                        )
+                        gr.Markdown(
+                            "Gồm cả các lần người khác thử đăng nhập vào tài khoản của bạn. "
+                            "Thao tác của quản trị viên được ghi nhận nhưng ẩn địa chỉ của họ."
+                        )
+                        btn_activity_refresh = gr.Button("Làm mới hoạt động", size="sm")
 
                 # ---------- QUẢN TRỊ ----------
                 with gr.Tab("Quản trị", visible=False) as adm_tab:
@@ -1633,6 +1956,24 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
             (md_recovery, gr.update(value="", visible=False)),
             (tb_dis_pw, ""),
             (tb_dis_code, ""),
+            (md_activity, ACTIVITY_PLACEHOLDER),
+            (df_activity, []),
+            (passkey_bridge, ""),
+            (tb_passkey_result, ""),
+            (st_passkey, {}),
+            (md_passkey_hint, gr.update(value="", visible=False)),
+            (btn_passkey_create, gr.update(visible=False)),
+            (df_passkeys, []),
+            (dd_passkey_remove, gr.update(choices=[], value=None)),
+            (tb_passkey_name, ""),
+            (tb_acct_pw, ""),
+            (tb_acct_code, ""),
+            (md_email_state, EMAIL_PLACEHOLDER),
+            (tb_email_new, ""),
+            (tb_email_code, ""),
+            (tb_reset_identifier, ""),
+            (tb_reset_code, ""),
+            (tb_reset_new, ""),
             (md_metric_users, md_metric_users.value),
             (md_metric_sessions, md_metric_sessions.value),
             (md_metric_login, md_metric_login.value),
@@ -1756,6 +2097,8 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                     "",
                     gr.update(visible=False),  # ẩn form đăng nhập ở bước 2
                 )
+            if data.get("device_token"):
+                session_store.remember_device(data["access_token"], data["device_token"])
             gr.Info("Đăng nhập thành công.")
             return (
                 data["access_token"],
@@ -1844,19 +2187,63 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                 gr.update(visible=False), "", "", gr.update(visible=True),
             )
 
+        # ---- email khôi phục & passkey ----
+        ACCOUNT_SECURITY_OUTS = [md_email_state, df_passkeys, dd_passkey_remove]
+
+        def load_account_security(token):
+            if not token:
+                return gr.skip(), gr.skip(), gr.skip()
+            table, choices = _passkeys_snapshot(token)
+            email = _api(token, "GET", "/api/auth/email")
+            return _email_markdown(email), table, gr.update(choices=choices, value=None)
+
+        # ---- hoạt động bảo mật (kiểu trang bảo mật tài khoản Google/GitHub) ----
+        ACTIVITY_OUTS = [md_activity, df_activity]
+
+        def load_security_activity(token):
+            if not token:
+                return gr.skip(), gr.skip()
+            summary, rows, _ = _security_activity_snapshot(token)
+            return summary, rows
+
+        def announce_security_activity(token):
+            """After a fresh sign-in, surface what happened since the last visit."""
+            if not token:
+                return gr.skip(), gr.skip()
+            summary, rows, alerts = _security_activity_snapshot(token)
+            for alert in alerts:
+                gr.Warning(alert)
+            return summary, rows
+
         demo.load(
             _guard(restore_session, len(STAGE1)), None, STAGE1,
             api_name=False, show_progress="hidden",
         ).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
             lambda: '<span data-scap-login-ready="1"></span>', None, [login_ready],
             api_name=False, show_progress="hidden",
+        ).then(
+            _guard(load_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
+            api_name=False, show_progress="hidden",
+        ).then(
+            _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
+            ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        )
+        btn_activity_refresh.click(
+            _guard(load_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
+            api_name=False,
         )
 
         persist_after(gr.on(
             triggers=[btn_login.click, li_user.submit, li_pass.submit],
             fn=_guard(do_login, len(STAGE1)), inputs=[li_user, li_pass], outputs=STAGE1,
             trigger_mode="once",
-        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
+        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+            _guard(announce_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
+            api_name=False,
+        ).then(
+            _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
+            ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        )
 
         def do_mfa_verify(mfa_token, code):
             if not mfa_token:
@@ -1868,6 +2255,8 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                 "/api/auth/mfa/verify",
                 {"mfa_token": mfa_token, "code": (code or "").strip()},
             )
+            if data.get("device_token"):
+                session_store.remember_device(data["access_token"], data["device_token"])
             gr.Info("Đăng nhập thành công.")
             return (
                 data["access_token"],
@@ -1883,14 +2272,105 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
 
         persist_after(btn_mfa_verify.click(
             _guard(do_mfa_verify, len(STAGE1)), [st_mfa, tb_mfa_code], STAGE1
-        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
+        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+            _guard(announce_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
+            api_name=False,
+        ).then(
+            _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
+            ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        )
         persist_after(tb_mfa_code.submit(
             _guard(do_mfa_verify, len(STAGE1)), [st_mfa, tb_mfa_code], STAGE1,
-        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2)
+        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+            _guard(announce_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
+            api_name=False,
+        ).then(
+            _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
+            ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        )
         btn_mfa_cancel.click(
             lambda: ("", gr.update(visible=False), "", gr.update(visible=True)),
             None,
             [st_mfa, grp_mfa_login, tb_mfa_code, grp_auth_forms],
+        )
+
+        # ---- đăng nhập bằng passkey ----
+        def finish_passkey_login(result):
+            payload = _passkey_payload(result, "get")
+            if "error" in payload:
+                gr.Warning(_passkey_error_message(payload))
+                return tuple(gr.skip() for _ in STAGE1) + ("",)
+            data = _api(
+                None,
+                "POST",
+                "/api/auth/passkeys/authentication/verify",
+                {
+                    "challenge_id": str(payload.get("challenge_id", "")),
+                    "credential": payload.get("credential"),
+                },
+            )
+            if data.get("device_token"):
+                session_store.remember_device(data["access_token"], data["device_token"])
+            gr.Info("Đăng nhập bằng passkey thành công.")
+            return (
+                data["access_token"],
+                time.time() + data["expires_in"],
+                "",
+                gr.update(visible=False),
+                gr.update(visible=True),
+                gr.update(visible=False),
+                "",
+                "",
+                gr.update(visible=True),
+                "",
+            )
+
+        persist_after(btn_passkey_login_done.click(
+            _guard(finish_passkey_login, len(STAGE1) + 1), [tb_passkey_result],
+            STAGE1 + [tb_passkey_result], api_name=False,
+        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+            _guard(announce_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
+            api_name=False,
+        ).then(
+            _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
+            ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        )
+
+        # ---- quên mật khẩu ----
+        def send_reset_code(identifier):
+            identifier = (identifier or "").strip()
+            if len(identifier) < 3:
+                gr.Warning("Nhập tên đăng nhập hoặc email khôi phục.")
+                return
+            data = _api(
+                None, "POST", "/api/auth/password-reset/request", {"identifier": identifier}
+            )
+            gr.Info(data.get("message") or "Đã tiếp nhận yêu cầu.")
+
+        btn_reset_send.click(_guard(send_reset_code, 0), [tb_reset_identifier], None)
+
+        def confirm_reset(identifier, code, new_password):
+            identifier = (identifier or "").strip()
+            if len(identifier) < 3 or not (code or "").strip():
+                gr.Warning("Nhập tên đăng nhập/email và mã trong email.")
+                return gr.skip(), gr.skip(), gr.skip(), gr.skip()
+            if len(new_password or "") < PASSWORD_MIN:
+                gr.Warning(f"Mật khẩu mới phải có ít nhất {PASSWORD_MIN} ký tự.")
+                return gr.skip(), gr.skip(), gr.skip(), gr.skip()
+            _api(
+                None,
+                "POST",
+                "/api/auth/password-reset/confirm",
+                {"identifier": identifier, "code": code.strip(), "new_password": new_password},
+            )
+            gr.Info("Đã đặt lại mật khẩu. Hãy đăng nhập bằng mật khẩu mới.")
+            username = identifier if "@" not in identifier else gr.skip()
+            return "", "", gr.Tabs(selected="tab_login"), username
+
+        btn_reset_confirm.click(
+            _guard(confirm_reset, 4),
+            [tb_reset_identifier, tb_reset_code, tb_reset_new],
+            [tb_reset_code, tb_reset_new, auth_tabs, li_user],
         )
 
         # ---- đăng xuất + đồng hồ token ----
@@ -2096,6 +2576,7 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
             message = (message or "").strip()
             if not message:
                 return gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False)
+            created_session = False
             if not session_id:
                 # Never copy plaintext message content into the unencrypted
                 # conversation-title metadata column.
@@ -2106,6 +2587,7 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                     {"title": "Cuộc hội thoại mới"},
                 )
                 session_id = created["id"]
+                created_session = True
                 gr.Info("Đã tự tạo hội thoại mới.")
             try:
                 session_metadata = _api(token, "GET", f"/api/sessions/{session_id}")
@@ -2122,25 +2604,20 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
             except gr.Error as err:
                 # Consent là lựa chọn người dùng, không phải lỗi kỹ thuật. Hiển thị
                 # ngay cạnh ô nhập và giữ nguyên nội dung để họ có thể gửi lại sau.
-                if EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err) or (
-                    "xác nhận riêng" in str(err).lower()
-                ):
-                    consent_notice = gr.update(
-                        value=(
-                            "⚠️ **Tin nhắn chưa được gửi.** Bấm **Đồng ý và gửi** bên dưới "
-                            "để lưu lựa chọn cho tài khoản này. Trước khi gửi tới AI bên ngoài, "
-                            "nội dung vẫn được lớp DLP kiểm tra và che dữ liệu nhạy cảm."
-                        ),
+                needs_consent = EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err)
+                if needs_consent or "xác nhận riêng" in str(err).lower():
+                    notice = gr.update(
+                        value=CONSENT_NOTICE if needs_consent else CONFIDENTIAL_CONFIRM_NOTICE,
                         visible=True,
                     )
-                    return (
-                        gr.skip(),
-                        gr.skip(),
-                        gr.skip(),
-                        gr.skip(),
-                        consent_notice,
-                        gr.update(visible=True),
+                    # Keep an auto-created conversation selected; otherwise the
+                    # retry would create (and orphan) another empty one.
+                    selection = (
+                        refresh_sessions(token, session_id)
+                        if created_session
+                        else (gr.skip(), gr.skip(), gr.skip())
                     )
+                    return (*selection, gr.skip(), notice, gr.update(visible=True))
                 raise
             dd1, dd2, history = refresh_sessions(token, session_id)
             # Nếu DLP đã che dữ liệu nhạy cảm, nói rõ cho người dùng biết đã che
@@ -2164,7 +2641,13 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
         tb_msg.submit(_guard(send_message, 6), [st_token, dd_session, tb_msg], SEND_OUTS)
 
         def consent_and_resend(token, session_id, message):
-            """Persist explicit consent, then retry the still-visible message once."""
+            """Record one explicit decision, then retry the still-visible message once.
+
+            Account consent and confirming a confidential message are separate
+            decisions. Without consent, this click only grants consent; if the
+            conversation is confidential the server then asks again, and only
+            that second click confirms sending this message.
+            """
             if not (message or "").strip():
                 return (
                     gr.skip(),
@@ -2174,7 +2657,9 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
                     gr.update(value="", visible=False),
                     gr.update(visible=False),
                 )
-            _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
+            if not _api(token, "GET", "/api/auth/me").get("ai_data_consent"):
+                _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
+                return send_message(token, session_id, message, False)
             return send_message(token, session_id, message, True)
 
         btn_consent_send.click(
@@ -2355,6 +2840,132 @@ def build_ui(session_store: BrowserSessionStore | None = None) -> gr.Blocks:
             _guard(mfa_disable, 6),
             [st_token, tb_dis_pw, tb_dis_code],
             [grp_mfa_enroll, grp_mfa_manage, md_recovery, md_mfa_state, tb_dis_pw, tb_dis_code],
+        )
+
+        # ---- email khôi phục ----
+        def send_email_code(token, email, password, code):
+            email = (email or "").strip()
+            if not email:
+                gr.Warning("Nhập địa chỉ email khôi phục.")
+                return gr.skip(), gr.skip(), gr.skip()
+            data = _with_step_up(
+                token, password, code,
+                lambda: _api(token, "POST", "/api/auth/email", {"email": email}),
+                "Gửi mã xác minh",
+            )
+            gr.Info("Đã gửi mã xác minh tới email mới. Mã có hiệu lực trong vài phút.")
+            return _email_markdown(data), "", ""
+
+        btn_email_send.click(
+            _guard(send_email_code, 3), [st_token, tb_email_new, tb_acct_pw, tb_acct_code],
+            [md_email_state, tb_acct_pw, tb_acct_code],
+        )
+
+        def verify_email_code(token, code):
+            if not (code or "").strip():
+                gr.Warning("Nhập mã xác minh trong email.")
+                return gr.skip(), gr.skip(), gr.skip()
+            data = _api(token, "POST", "/api/auth/email/verify", {"code": code.strip()})
+            gr.Info("Đã xác minh email khôi phục.")
+            return _email_markdown(data), "", ""
+
+        btn_email_verify.click(
+            _guard(verify_email_code, 3), [st_token, tb_email_code],
+            [md_email_state, tb_email_code, tb_email_new],
+        )
+
+        def remove_email(token, password, code):
+            _with_step_up(
+                token, password, code,
+                lambda: _api(token, "DELETE", "/api/auth/email"),
+                "Gỡ email khôi phục",
+            )
+            gr.Info("Đã gỡ email khôi phục.")
+            return _email_markdown(_api(token, "GET", "/api/auth/email")), "", ""
+
+        btn_email_remove.click(
+            _guard(remove_email, 3), [st_token, tb_acct_pw, tb_acct_code],
+            [md_email_state, tb_acct_pw, tb_acct_code],
+        )
+
+        # ---- passkey: thêm / xóa ----
+        def prepare_passkey(token, name, password, code):
+            options = _with_step_up(
+                token, password, code,
+                lambda: _api(token, "POST", "/api/auth/passkeys/registration/options"),
+                "Thêm passkey",
+            )
+            nonce = secrets.token_hex(16)
+            encoded = base64.urlsafe_b64encode(
+                json.dumps(options["public_key"], separators=(",", ":")).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            markup = (
+                f'<span data-scap-passkey-request="{nonce}" data-scap-passkey-mode="create" '
+                f'data-scap-passkey-options="{encoded}"></span>'
+            )
+            state = {"challenge_id": options["challenge_id"], "nonce": nonce,
+                     "name": (name or "").strip()[:64]}
+            hint = gr.update(
+                value=(
+                    "Bấm **Xác nhận trên thiết bị này**, sau đó làm theo hộp thoại của trình duyệt "
+                    "(vân tay, khuôn mặt hoặc PIN). Yêu cầu hết hạn sau 3 phút."
+                ),
+                visible=True,
+            )
+            return markup, state, hint, gr.update(visible=True), "", ""
+
+        btn_passkey_add.click(
+            _guard(prepare_passkey, 6), [st_token, tb_passkey_name, tb_acct_pw, tb_acct_code],
+            [passkey_bridge, st_passkey, md_passkey_hint, btn_passkey_create, tb_acct_pw,
+             tb_acct_code],
+        )
+
+        def finish_passkey_registration(token, result, state):
+            payload = _passkey_payload(result, "create")
+            closed = ("", {}, gr.update(value="", visible=False), gr.update(visible=False), "")
+            if not state or payload.get("nonce") != state.get("nonce"):
+                gr.Warning("Yêu cầu tạo passkey đã hết hạn; hãy bấm “Thêm passkey” lại.")
+                return closed + (gr.skip(), gr.skip(), gr.skip())
+            if "error" in payload:
+                gr.Warning(_passkey_error_message(payload))
+                return closed + (gr.skip(), gr.skip(), gr.skip())
+            row = _api(
+                token,
+                "POST",
+                "/api/auth/passkeys/registration/verify",
+                {
+                    "challenge_id": state["challenge_id"],
+                    "credential": payload.get("credential"),
+                    "name": state.get("name") or None,
+                },
+            )
+            gr.Info(f"Đã thêm passkey “{row['name']}”.")
+            table, choices = _passkeys_snapshot(token)
+            return closed + (table, gr.update(choices=choices, value=None), "")
+
+        btn_passkey_register_done.click(
+            _guard(finish_passkey_registration, 8), [st_token, tb_passkey_result, st_passkey],
+            [passkey_bridge, st_passkey, md_passkey_hint, btn_passkey_create, tb_passkey_result,
+             df_passkeys, dd_passkey_remove, tb_passkey_name],
+            api_name=False,
+        )
+
+        def remove_passkey(token, passkey_id, password, code):
+            if not passkey_id:
+                gr.Warning("Chọn passkey cần xóa.")
+                return gr.skip(), gr.skip(), gr.skip(), gr.skip()
+            _with_step_up(
+                token, password, code,
+                lambda: _api(token, "DELETE", f"/api/auth/passkeys/{passkey_id}"),
+                "Xóa passkey",
+            )
+            gr.Info("Đã xóa passkey.")
+            table, choices = _passkeys_snapshot(token)
+            return table, gr.update(choices=choices, value=None), "", ""
+
+        btn_passkey_remove.click(
+            _guard(remove_passkey, 4), [st_token, dd_passkey_remove, tb_acct_pw, tb_acct_code],
+            [df_passkeys, dd_passkey_remove, tb_acct_pw, tb_acct_code],
         )
 
         # ---- thiết bị ----

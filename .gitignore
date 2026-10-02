@@ -232,3 +232,6 @@ tmp/pdfs/
 *.safetensors
 *.onnx
 *.bin
+
+# Local security-mail outbox (development/demo only; contains one-time codes)
+mail_outbox/

@@ -26,6 +26,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
+from src.app.account_security import DEVICE_COOKIE_NAME
 from src.app.browser_security import browser_request_denial
 
 COOKIE_NAME = "scap_ui_session"
@@ -33,6 +34,7 @@ _HANDLE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _NO_STORE = {"Cache-Control": "no-store", "Vary": "Origin, Sec-Fetch-Site"}
 _BRIDGE_PATH = Path(__file__).resolve().parent / "ui_assets" / "session_bridge.js"
 _LOGIN_CREDENTIALS_PATH = _BRIDGE_PATH.with_name("login_credentials.js")
+_PASSKEY_PATH = _BRIDGE_PATH.with_name("passkey.js")
 
 
 class UISessionCapacityError(RuntimeError):
@@ -43,12 +45,18 @@ class UISessionCapacityError(RuntimeError):
 class _Session:
     token: str = field(repr=False)
     expires_at: float
+    # Browser-recognition token to place in an HttpOnly cookie at handoff.
+    device_token: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
 class _Ticket:
     session: _Session = field(repr=False)
     expires_at: float
+
+
+def _token_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()
 
 
 def _key(handle: str | None) -> str | None:
@@ -76,6 +84,12 @@ class BrowserSessionStore:
         self._ticket_ttl = ticket_ttl
         self._tickets: dict[str, _Ticket] = {}
         self._sessions: dict[str, _Session] = {}
+        # sha256(rotated token) -> successor. Another tab of the same browser
+        # may still hold the rotated token; presenting it to the API after the
+        # grace period would look like token theft and revoke the device.
+        self._successors: dict[str, _Session] = {}
+        # sha256(access token) -> device token awaiting the cookie handoff.
+        self._pending_devices: dict[str, _Session] = {}
         self._lock = threading.RLock()
 
     def _prune(self, now: float) -> None:
@@ -83,6 +97,9 @@ class BrowserSessionStore:
             del self._tickets[key]
         for key in [key for key, row in self._sessions.items() if row.expires_at <= now]:
             del self._sessions[key]
+        for table in (self._successors, self._pending_devices):
+            for key in [key for key, row in table.items() if row.expires_at <= now]:
+                del table[key]
 
     def issue(self, token: str, expires_at: float) -> str:
         """Mint a handoff only after successful password/MFA authentication."""
@@ -100,10 +117,34 @@ class BrowserSessionStore:
             if len(self._tickets) >= self._max_tickets:
                 raise UISessionCapacityError("Browser session handoff capacity reached.")
             ticket = secrets.token_urlsafe(32)
+            device = self._pending_devices.pop(_token_key(token), None)
             self._tickets[_key(ticket)] = _Ticket(
-                _Session(token, expires_at), min(now + self._ticket_ttl, expires_at)
+                _Session(token, expires_at, device.token if device else None),
+                min(now + self._ticket_ttl, expires_at),
             )
             return ticket
+
+    def remember_device(self, access_token: str, device_token: str) -> None:
+        """Queue a device token so the next handoff for this login sets its cookie."""
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            if len(self._pending_devices) >= self._max_tickets:
+                return
+            self._pending_devices[_token_key(access_token)] = _Session(
+                device_token, now + self._ticket_ttl
+            )
+
+    def current_token(self, token: str) -> str:
+        """Follow rotations so a stale tab presents the newest token of its login."""
+        with self._lock:
+            self._prune(self._clock())
+            for _ in range(16):
+                successor = self._successors.get(_token_key(token))
+                if successor is None:
+                    break
+                token = successor.token
+            return token
 
     def attach(self, ticket: str, previous_cookie: str | None = None) -> str:
         """Consume once, rotate the browser handle, and discard its old record."""
@@ -123,6 +164,16 @@ class BrowserSessionStore:
             handle = secrets.token_urlsafe(32)
             self._sessions[_key(handle)] = row.session
             return handle
+
+    def take_device_token(self, cookie: str | None) -> str | None:
+        """Hand the pending device token to the cookie response exactly once."""
+        with self._lock:
+            key = _key(cookie)
+            row = self._sessions.get(key) if key is not None else None
+            if row is None or row.device_token is None:
+                return None
+            self._sessions[key] = _Session(row.token, row.expires_at)
+            return row.device_token
 
     def restore(self, cookie: str | None) -> tuple[str, float] | None:
         """Read without extending expiry; API validation remains mandatory."""
@@ -145,6 +196,8 @@ class BrowserSessionStore:
         with self._lock:
             self._prune(self._clock())
             updated = _Session(token, expires_at)
+            if len(self._successors) < self._max_sessions * 4:
+                self._successors[_token_key(previous)] = updated
             for key, row in self._sessions.items():
                 if secrets.compare_digest(row.token, previous):
                     self._sessions[key] = updated
@@ -168,7 +221,11 @@ def _secure_cookie(request: Request) -> bool:
 
 
 def register_ui_session_routes(
-    app: FastAPI, store: BrowserSessionStore, *, production: bool = False
+    app: FastAPI,
+    store: BrowserSessionStore,
+    *,
+    production: bool = False,
+    device_cookie_days: int = 365,
 ) -> None:
     """Register same-origin cookie handoff endpoints before mounting Gradio.
 
@@ -199,6 +256,13 @@ def register_ui_session_routes(
     def login_credentials_script():
         return FileResponse(
             _LOGIN_CREDENTIALS_PATH, media_type="text/javascript",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/api/ui-session/passkey.js", include_in_schema=False)
+    def passkey_script():
+        return FileResponse(
+            _PASSKEY_PATH, media_type="text/javascript",
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
@@ -242,6 +306,19 @@ def register_ui_session_routes(
             samesite="strict",
             path="/",
         )
+        device_token = store.take_device_token(handle)
+        if device_token:
+            # Recognition only (never authorization); it outlives logout so
+            # the next sign-in from this browser is not a "new device".
+            response.set_cookie(
+                DEVICE_COOKIE_NAME,
+                device_token,
+                max_age=min(device_cookie_days, 400) * 86_400,
+                httponly=True,
+                secure=_secure_cookie(request),
+                samesite="strict",
+                path="/",
+            )
         return response
 
     @app.post("/api/ui-session/clear", include_in_schema=False)

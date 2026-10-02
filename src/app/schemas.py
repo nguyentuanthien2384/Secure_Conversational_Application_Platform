@@ -125,6 +125,61 @@ class StepUpRequest(BaseModel):
         return value.strip() if value is not None else None
 
 
+class EmailUpdateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class RecoveryCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=32)
+
+
+class AccountEmailResponse(BaseModel):
+    email: str | None
+    verified_at: datetime | None
+    pending_email: str | None
+    delivery_available: bool
+
+
+class PasswordResetRequest(BaseModel):
+    identifier: str = Field(min_length=3, max_length=254)
+
+
+class PasswordResetConfirm(BaseModel):
+    identifier: str = Field(min_length=3, max_length=254)
+    code: str = Field(min_length=6, max_length=32)
+    new_password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, value: str) -> str:
+        return RegisterRequest.validate_password(value)
+
+
+class PasskeyCeremonyResponse(BaseModel):
+    challenge_id: str
+    public_key: dict
+
+
+class PasskeyRegistrationVerify(BaseModel):
+    challenge_id: str = Field(min_length=36, max_length=36)
+    credential: dict
+    name: str | None = Field(default=None, max_length=64)
+
+
+class PasskeyAuthenticationVerify(BaseModel):
+    challenge_id: str = Field(min_length=36, max_length=36)
+    credential: dict
+
+
+class PasskeyResponse(BaseModel):
+    id: str
+    name: str
+    created_at: datetime
+    last_used_at: datetime | None
+    backed_up: bool
+    transports: list[str]
+
+
 class StepUpResponse(BaseModel):
     verified_at: datetime
     valid_for_seconds: int
@@ -181,6 +236,9 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     expires_in: int
+    # Browser-recognition token: send it back in X-SCAP-Device at the next
+    # sign-in so the device is recognised. It never authorizes a request.
+    device_token: str | None = None
 
 
 class MfaChallengeResponse(BaseModel):
@@ -253,6 +311,33 @@ class AuthSessionResponse(BaseModel):
     ip_address: str | None
     user_agent: str | None
     is_current: bool
+
+
+class SecurityActivityEventResponse(BaseModel):
+    id: int
+    created_at: datetime
+    event_type: str
+    title: str
+    outcome: str
+    outcome_label: str
+    severity: Literal["info", "warning", "critical"]
+    ip_address: str | None
+    device: str | None
+    by_administrator: bool
+
+
+class PreviousSignInResponse(BaseModel):
+    at: datetime
+    ip_address: str | None
+    device: str | None
+
+
+class SecurityActivityResponse(BaseModel):
+    previous_sign_in: PreviousSignInResponse | None
+    failed_sign_ins_since_previous: int
+    mfa_failures_since_previous: int
+    new_device_sign_ins_since_previous: int
+    events: list[SecurityActivityEventResponse]
 
 
 class UserResponse(BaseModel):

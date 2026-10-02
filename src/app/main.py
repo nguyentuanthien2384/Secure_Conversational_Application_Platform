@@ -24,7 +24,26 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.app.audit import client_ip, record_audit, safe_user_agent
+from src.app.account_recovery import derive_recovery_code_key, notify
+from src.app.account_routes import AccountRouteContext, register_account_routes
+from src.app.account_security import (
+    DEVICE_TOKEN_HEADER,
+    NEW_DEVICE_EVENT,
+    TOKEN_REUSE_EVENT,
+    DeviceTokenService,
+    SignInSource,
+    assess_sign_in_source,
+    build_security_activity,
+    describe_user_agent,
+    device_ref,
+)
+from src.app.audit import (
+    client_ip,
+    client_user_agent,
+    derive_ui_client_context_key,
+    record_audit,
+    safe_user_agent,
+)
 from src.app.audit_chain import append_lock, derive_audit_key, seal_event, verify_chain
 from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
 from src.app.browser_security import browser_request_denial
@@ -63,6 +82,7 @@ from src.app.key_management import (
     LocalAesKeyProvider,
     VaultTransitKeyProvider,
 )
+from src.app.mailer import build_mailer
 from src.app.maintenance import SecurityMaintenance
 from src.app.models import (
     AuditEvent,
@@ -79,6 +99,7 @@ from src.app.models import (
     SecurityIncident,
     User,
 )
+from src.app.passkeys import PasskeyService
 from src.app.request_limits import RequestLimitsMiddleware
 from src.app.retention import enforce_retention
 from src.app.schemas import (
@@ -110,6 +131,7 @@ from src.app.schemas import (
     PasswordChangeRequest,
     RawMessageResponse,
     RegisterRequest,
+    SecurityActivityResponse,
     SecurityAlertResponse,
     SessionCreate,
     SessionResponse,
@@ -306,6 +328,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.registration_max_attempts,
             settings.message_window_seconds,
             settings.message_max_attempts,
+            settings.sign_in_history_days,
         )
     ):
         raise ValueError("Security duration and rate-limit settings must be positive integers.")
@@ -326,6 +349,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     password_change_limiter = limiter_type(*limiter_args)
     refresh_limiter = limiter_type(*limiter_args)
     auth_audit_limiter = limiter_type(*limiter_args)
+    recovery_limiter = limiter_type(*limiter_args)
+    device_tokens = DeviceTokenService(settings.secret_key, settings.device_token_days)
+    mailer = build_mailer(settings)
+    passkey_service = PasskeyService(
+        settings.webauthn_rp_id, settings.webauthn_rp_name, settings.webauthn_origins
+    )
     totp_service = TotpService()
     chat_service = ChatService(envelope_crypto_service, AIService(settings))
     # Structured JSON security log on stdout for SIEM ingestion (Bài 7 §SIEM).
@@ -465,6 +494,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             await maintenance.stop()
+            mailer.flush()
             envelope_crypto_service.clear_cache()
             database.engine.dispose()
 
@@ -487,6 +517,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.chat_service = chat_service
     app.state.intrusion_state = intrusion_state
     app.state.audit_key = audit_key
+    # Lets the in-process UI attribute its API calls to the browser it serves.
+    ui_client_context_key = derive_ui_client_context_key(settings.secret_key)
+    app.state.ui_client_context_key = ui_client_context_key
+    app.state.mailer = mailer
+    app.state.device_tokens = device_tokens
+    app.state.passkeys = passkey_service
     app.state.audit_checkpoint_service = audit_checkpoint_service
     app.state.security_maintenance = maintenance
 
@@ -604,7 +640,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         mitre_technique=mitre_technique_for_rule(rule_id),
                     )
                 )
-            user_agent = request.headers.get("user-agent", "")
+            user_agent = client_user_agent(request)
             if SCANNER_AGENTS.search(user_agent):
                 detections.append(
                     Detection(
@@ -1085,6 +1121,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             outcome="denied", details={"reason": reason},
         )
 
+    def detect_rotated_token_reuse(
+        db: Session,
+        request: Request,
+        user: User,
+        auth_session: AuthSession,
+        revoked: RevokedToken,
+    ) -> None:
+        """RFC 9700 section 4.14.2: a rotated token coming back means two holders.
+
+        Either the legitimate client or a thief already exchanged it, and the
+        server cannot tell which one is presenting it now. Revoking the whole
+        device family stops the thief's copy; the real user simply signs in
+        again. A short grace period absorbs requests that were already in
+        flight when the client rotated.
+        """
+        rotated_at = as_utc(revoked.created_at)
+        if utcnow() - rotated_at < timedelta(seconds=settings.token_reuse_grace_seconds):
+            return
+        if lock_user_row(db, user) is None:
+            return
+        family_id = auth_session.session_family_id or auth_session.jti
+        revoked_count = revoke_auth_session_family(
+            db, user_id=user.id, family_id=family_id, reason="token_reuse"
+        )
+        db.commit()
+        if revoked_count == 0:
+            # Family already closed (for example by logout): nothing to steal.
+            return
+        record_audit(
+            db,
+            request,
+            TOKEN_REUSE_EVENT,
+            actor_id=user.id,
+            target_type="auth_session",
+            target_id=family_id,
+            outcome="blocked",
+            details={"revoked_tokens": revoked_count, "mitre_technique": "T1550.001"},
+        )
+        notify(
+            db, mailer, user_id=user.id, username=user.username, kind="token_reuse",
+            ip=client_ip(request),
+        )
+
     def current_user(
         request: Request,
         credentials: Annotated[HTTPAuthorizationCredentials | None, Security(bearer)],
@@ -1102,6 +1181,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ) from exc
         user = db.get(User, payload.get("sub"))
         auth_session = db.get(AuthSession, payload.get("jti"))
+        revoked = db.get(RevokedToken, payload.get("jti"))
         if (
             user is None
             or not user.is_active
@@ -1109,8 +1189,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             or auth_session is None
             or auth_session.user_id != user.id
             or auth_session.revoked_at is not None
-            or db.get(RevokedToken, payload.get("jti")) is not None
+            or revoked is not None
         ):
+            if (
+                revoked is not None
+                and revoked.reason == "refresh"
+                and user is not None
+                and auth_session is not None
+                and auth_session.user_id == user.id
+            ):
+                detect_rotated_token_reuse(db, request, user, auth_session, revoked)
             audit_access_denial(db, request, "inactive_session")
             raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
 
@@ -1402,13 +1490,108 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 issued_at=issued_at,
                 expires_at=datetime.fromtimestamp(int(token_payload["exp"]), tz=timezone.utc),
                 ip_address=ip,
-                user_agent=safe_user_agent(request.headers.get("user-agent", "")),
-                root_issued_at=root_issued_at or issued_at,
+                user_agent=safe_user_agent(client_user_agent(request)),
+                # JWT ``iat`` is whole seconds; a sub-second root orders this
+                # sign-in after any earlier one in the same second, which the
+                # security activity page relies on to find the previous visit.
+                root_issued_at=root_issued_at or max(issued_at, utcnow()),
                 last_activity_at=last_activity_at or issued_at,
                 last_step_up_at=issued_at if mark_step_up else last_step_up_at,
             )
         )
         return token
+
+    def presented_device_id(request: Request, user: User | None) -> str | None:
+        if user is None:
+            return None
+        return device_tokens.verify(request.headers.get(DEVICE_TOKEN_HEADER), user.id)
+
+    def sign_in_source(
+        db: Session,
+        request: Request,
+        user_id: str | None,
+        ip: str,
+        device_id: str | None = None,
+    ) -> SignInSource:
+        return assess_sign_in_source(
+            db,
+            user_id,
+            ip,
+            safe_user_agent(client_user_agent(request)),
+            now=utcnow(),
+            history_days=settings.sign_in_history_days,
+            device_id=device_id,
+        )
+
+    def finish_sign_in(
+        db: Session,
+        request: Request,
+        user: User,
+        ip: str,
+        source: SignInSource,
+        device_id: str | None,
+        *,
+        event_type: str,
+        details: dict[str, object] | None = None,
+    ) -> TokenResponse:
+        """Shared tail of password, TOTP and passkey sign-in.
+
+        Issues the session and a browser-recognition token, records the
+        sign-in with its source classification, and raises new-device alerts.
+        """
+        token = issue_access_session(db, request, user, ip, mark_step_up=True)
+        db.commit()
+        device_id = device_id or DeviceTokenService.new_device_id()
+        record_audit(
+            db,
+            request,
+            event_type,
+            actor_id=user.id,
+            target_type="user",
+            target_id=user.id,
+            details={
+                **(details or {}),
+                "sign_in_source": source.classification,
+                "device_ref": device_ref(device_id),
+            },
+        )
+        alert_new_device_sign_in(db, request, user, source)
+        return TokenResponse(
+            access_token=token,
+            expires_in=settings.access_token_minutes * 60,
+            device_token=device_tokens.issue(user.id, device_id),
+        )
+
+    def alert_new_device_sign_in(
+        db: Session, request: Request, user: User, source: SignInSource
+    ) -> None:
+        """Tell the user and the SIEM about a completed sign-in from a new device."""
+        if source.classification != "new_device":
+            return
+        record_audit(
+            db,
+            request,
+            NEW_DEVICE_EVENT,
+            actor_id=user.id,
+            target_type="user",
+            target_id=user.id,
+            details={
+                "device": describe_user_agent(client_user_agent(request)) or "unknown",
+                "known_network": source.known_ip,
+            },
+        )
+        notify(
+            db, mailer, user_id=user.id, username=user.username, kind="new_device",
+            ip=client_ip(request), device=describe_user_agent(client_user_agent(request)),
+        )
+
+    def clear_account_login_throttle(username: str, ip: str) -> None:
+        """After a proven password reset, lift the per-account login budgets.
+
+        The per-IP budget stays: it limits a source, not an account.
+        """
+        login_limiter.reset(f"login:account:{username}")
+        login_limiter.reset(f"login:account-familiar:{username}:{ip}")
 
     def require_recent_step_up(
         credentials: HTTPAuthorizationCredentials,
@@ -1656,10 +1839,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> TokenResponse | MfaChallengeResponse:
         normalized_username = payload.username.strip().lower()
         ip = client_ip(request)
-        limiter_keys = (f"login:account:{normalized_username}", f"login:ip:{ip}")
+        user = db.scalar(select(User).where(User.username == normalized_username))
+        # Smart lockout: an address that already completed a sign-in for this
+        # account keeps its own budget. Strangers elsewhere can still lock the
+        # account against unfamiliar sources, but not against its owner.
+        device_id = presented_device_id(request, user)
+        source = sign_in_source(
+            db, request, user.id if user is not None else None, ip, device_id
+        )
+        familiar = source.familiar
+        if familiar:
+            account_key = f"login:account-familiar:{normalized_username}:{ip}"
+            account_window = max(settings.login_window_seconds, settings.login_lockout_seconds)
+        else:
+            account_key = f"login:account:{normalized_username}"
+            account_window = settings.login_window_seconds
+        ip_key = f"login:ip:{ip}"
         attempts = [
-            login_limiter.allow(key, settings.login_max_attempts, settings.login_window_seconds)
-            for key in limiter_keys
+            login_limiter.allow(account_key, settings.login_max_attempts, account_window),
+            login_limiter.allow(ip_key, settings.login_max_attempts, settings.login_window_seconds),
         ]
         if not all(allowed for allowed, _ in attempts):
             retry_after = max(retry for allowed, retry in attempts if not allowed)
@@ -1676,15 +1874,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={"Retry-After": str(retry_after)},
             )
 
-        user = db.scalar(select(User).where(User.username == normalized_username))
         now = utcnow()
         locked = False
+        lock_active = False
         if user is not None and user.locked_until is not None:
             locked_until = user.locked_until
             if locked_until.tzinfo is None:
                 locked_until = locked_until.replace(tzinfo=timezone.utc)
             if locked_until > now:
-                locked = True
+                lock_active = True
+                # The persisted lock is enforced against unfamiliar sources;
+                # a familiar address is throttled by its own bucket above.
+                locked = not familiar
             else:
                 user.failed_login_attempts = 0
                 user.locked_until = None
@@ -1698,6 +1899,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             outcome = "blocked" if locked else "failure"
             details = {"reason": "account_locked" if locked else "invalid_credentials"}
             if user is not None and user.is_active and not locked:
+                # Familiar failures still count, so the lock that strangers
+                # face (persisted across restarts) is never weakened.
                 user.failed_login_attempts += 1
                 if user.failed_login_attempts >= settings.login_max_attempts:
                     user.locked_until = now + timedelta(seconds=settings.login_lockout_seconds)
@@ -1717,10 +1920,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if password_service.needs_rehash(user.password_hash):
             user.password_hash = password_service.hash(payload.password)
             db.commit()
-        for key in limiter_keys:
-            login_limiter.reset(key)
-        user.failed_login_attempts = 0
-        user.locked_until = None
+        login_limiter.reset(account_key)
+        # Return only this attempt's slot: wiping the shared per-IP bucket would
+        # let an attacker erase failed guesses by signing in to their own account.
+        login_limiter.refund(ip_key)
+        if not lock_active:
+            # An active lock is never lifted by a familiar sign-in, or each
+            # visit by the owner would hand a stranger fresh guesses.
+            user.failed_login_attempts = 0
+            user.locked_until = None
 
         # Password proven. If MFA is on, stop here and return a short-lived
         # challenge instead of an access token; the session is created only after
@@ -1745,14 +1953,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expires_in=settings.mfa_challenge_minutes * 60,
             )
 
-        token = issue_access_session(db, request, user, ip, mark_step_up=True)
-        db.commit()
-        record_audit(
-            db, request, "auth.login", actor_id=user.id, target_type="user", target_id=user.id
-        )
-        return TokenResponse(
-            access_token=token,
-            expires_in=settings.access_token_minutes * 60,
+        return finish_sign_in(
+            db, request, user, ip, source, device_id, event_type="auth.login"
         )
 
     @app.post("/api/auth/mfa/verify", response_model=TokenResponse)
@@ -1896,18 +2098,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details={"reason": "challenge_replayed"},
             )
             raise HTTPException(status_code=401, detail="Phiên MFA đã được sử dụng.") from exc
-        token = issue_access_session(db, request, user, ip, mark_step_up=True)
-        db.commit()
-        record_audit(
+        # Assess before this sign-in's own audit row makes the source familiar.
+        device_id = presented_device_id(request, user)
+        source = sign_in_source(db, request, user.id, ip, device_id)
+        return finish_sign_in(
             db,
             request,
-            "auth.mfa.verify",
-            actor_id=user.id,
-            target_type="user",
-            target_id=user.id,
+            user,
+            ip,
+            source,
+            device_id,
+            event_type="auth.mfa.verify",
             details={"method": "recovery_code" if used_recovery else "totp"},
         )
-        return TokenResponse(access_token=token, expires_in=settings.access_token_minutes * 60)
 
     @app.post("/api/auth/mfa/enroll", response_model=MfaEnrollResponse)
     def mfa_enroll(
@@ -2155,6 +2358,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             actor_id=user.id,
             target_type="user",
             target_id=user.id,
+        )
+        notify(
+            db, mailer, user_id=user.id, username=user.username, kind="mfa_disabled",
+            ip=client_ip(request),
         )
         return Response(status_code=204)
 
@@ -2489,6 +2696,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             target_id=user.id,
             details={"token_version": user.token_version},
         )
+        notify(
+            db, mailer, user_id=user.id, username=user.username, kind="password_changed",
+            ip=client_ip(request),
+        )
         return Response(status_code=204)
 
     @app.get("/api/auth/sessions", response_model=list[AuthSessionResponse])
@@ -2530,6 +2741,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 is_current=session.jti == current_jti,
             ))
         return active
+
+    @app.get("/api/auth/security-activity", response_model=SecurityActivityResponse)
+    def security_activity(
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 30,
+    ):
+        """The caller's own security log, scoped like a GitHub/Google account page.
+
+        Only events about the caller are returned. Administrator actions on the
+        account are shown without the administrator's address or browser.
+        """
+        current_jti = str(token_service.decode(credentials.credentials)["jti"])
+        current_session = db.get(AuthSession, current_jti)
+        current_sign_in_at = (
+            as_utc(current_session.root_issued_at or current_session.issued_at)
+            if current_session is not None
+            else None
+        )
+        return build_security_activity(
+            db, user.id, current_sign_in_at=current_sign_in_at, limit=limit
+        )
 
     @app.delete("/api/auth/sessions/{session_jti}", status_code=204)
     def revoke_auth_session(
@@ -4661,13 +4895,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return Response(status_code=204)
 
+    register_account_routes(
+        app,
+        AccountRouteContext(
+            settings=settings,
+            get_db=get_db,
+            current_user=current_user,
+            bearer=bearer,
+            password_service=password_service,
+            mailer=mailer,
+            passkeys=passkey_service,
+            limiter=recovery_limiter,
+            recovery_key=derive_recovery_code_key(settings.secret_key),
+            require_recent_step_up=require_recent_step_up,
+            revoke_all_auth_sessions=revoke_all_auth_sessions,
+            lock_user_row=lock_user_row,
+            password_is_compromised=password_is_compromised,
+            presented_device_id=presented_device_id,
+            sign_in_source=sign_in_source,
+            finish_sign_in=finish_sign_in,
+            clear_login_throttle=clear_account_login_throttle,
+        ),
+    )
+
     # The Gradio interface is the only supported web client. Keeping the former
     # static SPA alongside it duplicated authentication and security-sensitive
     # client code without serving the production workflow.
     ui_session_store = BrowserSessionStore()
     app.state.ui_session_store = ui_session_store
-    register_ui_session_routes(app, ui_session_store, production=settings.environment == "production")
-    gradio_demo = build_ui(session_store=ui_session_store)
+    register_ui_session_routes(
+        app,
+        ui_session_store,
+        production=settings.environment == "production",
+        device_cookie_days=settings.device_token_days,
+    )
+    gradio_demo = build_ui(
+        session_store=ui_session_store, client_context_key=ui_client_context_key
+    )
     gradio_auth_dependency = None
     if settings.gradio_auth_mode == "oidc":
         try:
@@ -4707,6 +4971,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         head=(
             '<script src="/api/ui-session/bridge.js" defer></script>'
             '<script src="/api/ui-session/login-credentials.js" defer></script>'
+            '<script src="/api/ui-session/passkey.js" defer></script>'
         ),
         auth_dependency=gradio_auth_dependency,
         blocked_paths=["/app/.env", "/run/secrets", "/proc", "/sys", "/etc"],

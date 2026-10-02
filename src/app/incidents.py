@@ -18,7 +18,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from src.app.audit import client_ip, safe_user_agent
+from src.app.audit import client_ip, client_user_agent, safe_user_agent
 from src.app.audit_chain import append_lock, compute_hash, entry_canonical, seal_event
 from src.app.db import utcnow
 from src.app.dlp import DLPScanner
@@ -56,7 +56,7 @@ def _commit_change(
     event = AuditEvent(
         actor_id=actor_id, event_type=event_type, target_type="security_incident",
         target_id=incident_id, outcome="success", ip_address=client_ip(request),
-        user_agent=safe_user_agent(request.headers.get("user-agent", "")),
+        user_agent=safe_user_agent(client_user_agent(request)),
         request_id=getattr(request.state, "request_id", None), details_json=safe_json(details),
     )
     with append_lock(db):

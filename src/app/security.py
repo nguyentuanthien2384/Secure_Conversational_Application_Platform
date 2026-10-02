@@ -504,6 +504,18 @@ class SlidingWindowRateLimiter:
             bucket.append(now)
             return True, 0
 
+    def refund(self, key: str) -> None:
+        """Give back the newest slot while keeping earlier attempts in the window.
+
+        A successful login refunds its own slot on the shared per-IP bucket.
+        Resetting that bucket instead would let an attacker erase their failed
+        guesses by signing in to an account they own.
+        """
+        with self._lock:
+            bucket = self._events.get(key)
+            if bucket:
+                bucket.pop()
+
     def reset(self, key: str) -> None:
         with self._lock:
             self._events.pop(key, None)
@@ -559,6 +571,9 @@ return {1, 0}
             secrets.token_urlsafe(18),
         )
         return bool(int(result[0])), int(result[1])
+
+    def refund(self, key: str) -> None:
+        self._client.zpopmax(self._key_prefix + key)
 
     def reset(self, key: str) -> None:
         self._client.delete(self._key_prefix + key)

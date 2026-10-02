@@ -23,6 +23,14 @@ bật lịch kiểm tra và đối chiếu từng thay đổi với nội dung P
 mã hóa nhiều lớp, tương quan đăng nhập phân tán và chặn yêu cầu trình duyệt từ
 nguồn không tin cậy. Xem [nguồn tham khảo và cách vận hành](docs/ADVANCED_SECURITY.md).
 
+Đợt bảo vệ tài khoản sửa lỗi mọi người dùng giao diện chung một IP loopback (một người
+đăng nhập sai có thể làm cả hệ thống nhận 429, một tìm kiếm độc hại làm IDS chặn tất cả),
+không xóa bộ đếm theo IP khi đăng nhập thành công, và bổ sung smart lockout, cảnh báo
+thiết bị mới, trang hoạt động bảo mật cho người dùng. Đợt sau đó bổ sung **passkey
+(WebAuthn)** đăng nhập không mật khẩu, **khôi phục mật khẩu qua email** đã xác minh,
+**phát hiện dùng lại token đã xoay** (RFC 9700) và **cookie nhận diện thiết bị** (OWASP).
+Xem [bảo vệ tài khoản](docs/ACCOUNT_PROTECTION.md).
+
 > **Đồ án môn học:** Bảo mật Ứng dụng và Hệ thống
 > **Kiến trúc:** FastAPI + Gradio 6 + envelope encryption (Vault/KMS) + DLP phân loại + E2EE ciphertext relay + audit anchor/WORM + IDS/IPS
 
@@ -99,7 +107,12 @@ cấu hình riêng; guard production (`APP_ENV=production`) yêu cầu hạ tầ
 | [src/app/dlp.py](src/app/dlp.py) | Detector + policy allow/redact/confirm/block/local-only độc lập với provider |
 | [src/app/services.py](src/app/services.py) | Tích hợp DLP, consent/context minimization, AIService và ChatService |
 | [src/app/ids.py](src/app/ids.py) | IDS/IPS: engine `signature` (SQLi/XSS/traversal/scanner UA) + engine `anomaly` (dò trên chính audit log), trạng thái chặn nguồn |
-| [src/app/audit.py](src/app/audit.py) | Ghi sự kiện audit, xác định IP nguồn |
+| [src/app/audit.py](src/app/audit.py) | Ghi sự kiện audit, xác định IP nguồn (kể cả IP trình duyệt do UI ký HMAC) |
+| [src/app/account_security.py](src/app/account_security.py) | Smart lockout, cookie nhận diện thiết bị, cảnh báo thiết bị mới, nhật ký hoạt động bảo mật |
+| [src/app/passkeys.py](src/app/passkeys.py) | Passkey/WebAuthn: challenge một lần, UV bắt buộc, kiểm tra origin/RP ID, phát hiện nhân bản |
+| [src/app/account_recovery.py](src/app/account_recovery.py) | Mã khôi phục qua email (HMAC, giới hạn lần thử) và mẫu email cảnh báo bảo mật |
+| [src/app/account_routes.py](src/app/account_routes.py) | Endpoint email khôi phục, quên mật khẩu và passkey |
+| [src/app/mailer.py](src/app/mailer.py) | Gửi email nền qua SMTP (TLS bắt buộc) hoặc outbox `.eml` cho demo |
 | [src/app/audit_chain.py](src/app/audit_chain.py) | Chuỗi băm chống giả mạo: `entry_hash = HMAC-SHA256(key, prev_hash ‖ canonical(entry))` |
 | [src/app/audit_checkpoint.py](src/app/audit_checkpoint.py) | Ký mốc cuối chuỗi và giao qua HTTPS tới WORM/SIEM ngoài máy chủ |
 | [src/app/retention.py](src/app/retention.py) | Retention theo mode, không gia hạn ngầm, xóa wrapped DEK và metadata phiên hết hạn |
@@ -205,6 +218,27 @@ sequenceDiagram
   tồn tại vẫn verify một hash giả để giảm rò rỉ qua thời gian phản hồi.
 - **Khóa tài khoản**: quá `LOGIN_MAX_ATTEMPTS` lần sai → khóa `LOGIN_LOCKOUT_SECONDS`.
 - **Rate limit hai chiều**: theo *tài khoản* và theo *IP* — chặn cả brute force lẫn password spraying.
+  Đăng nhập thành công chỉ hoàn lại suất của chính nó trên bucket IP, không xóa các lần sai trước đó.
+- **Smart lockout**: khóa do nhiều lần sai chỉ áp dụng với nguồn lạ; địa chỉ đã từng đăng nhập
+  thành công có bucket riêng nên người lạ không thể khóa chủ tài khoản khỏi mạng quen.
+- **IP/UA thật của trình duyệt sau UI**: UI ký `HMAC-SHA256` lên IP và User-Agent của trình duyệt;
+  API chỉ tin khi chữ ký đúng và còn hạn 60 giây, nên rate limit, IDS và audit tách biệt từng người dùng.
+- **Passkey (WebAuthn/FIDO2)**: đăng nhập không mật khẩu, chống phishing vì chữ ký gắn với origin;
+  bắt buộc xác minh người dùng (PIN/sinh trắc), challenge dùng một lần, phát hiện authenticator nhân bản
+  qua bộ đếm. Chỉ lưu public key. Trình duyệt yêu cầu tên miền: demo mở bằng `http://localhost:8000`.
+- **Khôi phục mật khẩu qua email đã xác minh**: mã 10 ký tự, 15 phút, tối đa 5 lần nhập, chỉ lưu HMAC;
+  phản hồi giống hệt nhau dù tài khoản có tồn tại hay không. Đặt lại mật khẩu thu hồi mọi phiên nhưng
+  **không** tắt 2FA. Đổi email khôi phục cần xác thực lại và báo về địa chỉ cũ.
+- **Phát hiện dùng lại token đã xoay** (RFC 9700 §4.14.2): token cũ quay lại sau 30 giây ân hạn ⇒ thu hồi
+  cả họ phiên của thiết bị đó, cảnh báo `auth.session.token_reuse` (T1550.001). UI tự dùng token mới nhất
+  nên tab cũ không bị nhận nhầm là kẻ trộm.
+- **Cookie nhận diện thiết bị** (OWASP device cookie): token HMAC gắn với tài khoản, HttpOnly, SameSite=Strict.
+  Khi tài khoản đã dùng cơ chế này, client không có token là thiết bị mới dù User-Agent giống hệt.
+- **Email cảnh báo bảo mật**: thiết bị mới, đổi/đặt lại mật khẩu, tắt 2FA, đổi email, thêm/xóa passkey,
+  token bị dùng lại. Gửi nền (SMTP + TLS bắt buộc) để thời gian phản hồi không lộ thông tin.
+- **Cảnh báo thiết bị mới & hoạt động bảo mật**: đăng nhập từ trình duyệt/hệ điều hành chưa từng thấy
+  sinh `auth.login.new_device`; người dùng xem lần đăng nhập trước, số lần thất bại, số lần đúng mật khẩu
+  nhưng sai 2FA và thao tác của quản trị viên trên tài khoản mình.
 - **TOTP (RFC 6238)** cài đặt trực tiếp bằng thư viện chuẩn để báo cáo giải thích được HOTP/TOTP;
   lưu `mfa_last_counter` để một mã đã dùng không thể replay trong cùng bước thời gian.
 - **Recovery code** chỉ lưu hash Argon2id, dùng một lần.
@@ -293,7 +327,7 @@ dữ liệu mật mã, cột nội dung giới hạn 1400px, có token màu riê
 | **Trò chuyện** | Danh sách phiên (tạo/đổi tên/xóa/xuất JSON), khung chat có avatar, cảnh báo DLP | mọi vai trò |
 | **Dữ liệu mã hóa** | Soi bản mã AES-256-GCM thật của từng tin nhắn (ciphertext, nonce, key version) | mọi vai trò |
 | **Tìm kiếm** | Tìm toàn cục trên các phiên *thuộc sở hữu người gọi* (giải mã phía server) | mọi vai trò |
-| **Tài khoản** | Đổi mật khẩu kèm thanh đo độ mạnh, bật/tắt 2FA (QR + recovery code), đồng ý gửi dữ liệu cho AI, quản lý & thu hồi thiết bị | mọi vai trò |
+| **Tài khoản** | Đổi mật khẩu kèm thanh đo độ mạnh, bật/tắt 2FA (QR + recovery code), đồng ý gửi dữ liệu cho AI, quản lý & thu hồi thiết bị, hoạt động bảo mật gần đây | mọi vai trò |
 | **Quản trị** | Thống kê hệ thống, tạo/xóa người dùng, đổi vai trò, khóa/mở khóa tài khoản | admin |
 | **Nhật ký kiểm toán** | Bảng `audit_events` gần nhất | moderator, admin |
 | **Bảo mật** | Phát hiện IDS & bất thường; **admin thêm**: xác minh chuỗi audit, danh sách chặn (gỡ chặn được) | moderator (một phần), admin |
@@ -327,6 +361,12 @@ Tài liệu tương tác: `/docs` và `/redoc` (tự tắt khi `APP_ENV=producti
 | `POST` | `/api/auth/refresh` | Xoay token, giữ `root_issued_at` để áp trần phiên |
 | `POST` | `/api/auth/logout` · `/logout-all` | Thu hồi họ token hiện tại / mọi phiên; `logout-all` cần recent step-up |
 | `GET`/`DELETE` | `/api/auth/sessions[/{jti}]` | Liệt kê / thu hồi cả họ token của thiết bị; `DELETE` cần recent step-up |
+| `GET` | `/api/auth/security-activity` | Nhật ký bảo mật của chính người gọi + tóm tắt kể từ lần đăng nhập trước |
+| `GET`/`POST`/`DELETE` | `/api/auth/email` · `POST /api/auth/email/verify` | Email khôi phục: gửi mã tới địa chỉ mới (cần step-up), xác minh, gỡ |
+| `POST` | `/api/auth/password-reset/request` · `/confirm` | Quên mật khẩu: luôn trả 202 giống nhau; xác nhận bằng mã email + mật khẩu mới |
+| `GET`/`DELETE` | `/api/auth/passkeys[/{id}]` | Liệt kê / xóa passkey (xóa cần step-up) |
+| `POST` | `/api/auth/passkeys/registration/options` · `/verify` | Tạo passkey (cần step-up) |
+| `POST` | `/api/auth/passkeys/authentication/options` · `/verify` | Đăng nhập bằng passkey, không cần mật khẩu/TOTP |
 
 ### Hội thoại
 | Method | Đường dẫn | Ghi chú |
@@ -395,6 +435,10 @@ Sau đó dùng PowerShell:
 Trên macOS/Linux dùng `./.venv/bin/python`. Launcher lắng nghe trên loopback, bỏ qua
 `.env`, dùng SQLite/khóa tạm mới mỗi lần, tự seed và ép AI ngoại tuyến. Dừng bằng `Ctrl+C`;
 khởi động lại là lượt demo mới, không xóa hoặc thay đổi cơ sở dữ liệu đang có của dự án.
+
+**Passkey và email trong demo:** mở bằng <http://localhost:8000> (trình duyệt không cho passkey
+trên địa chỉ IP như `127.0.0.1`). Mã xác minh email và mã đặt lại mật khẩu được ghi thành file `.eml`
+trong thư mục `outbox` mà launcher in ra lúc khởi động; mở bằng trình soạn thảo hoặc ứng dụng thư.
 
 Bot `[DEMO AI]` cho xem nội dung đã qua DLP. Nó không gọi AI ngoài nên không chứng minh
 nhánh đồng thuận/chặn gửi/kiểm tra phản hồi provider. Runner bật consent rồi kiểm chứng
@@ -488,11 +532,17 @@ Bộ test ([tests/](tests/)) không chỉ kiểm chức năng mà kiểm **chín
 | File | Trọng tâm |
 | :--- | :--- |
 | [tests/test_api_security.py](tests/test_api_security.py) | RBAC, IDOR, rate limit, thu hồi token |
+| [tests/test_account_protection.py](tests/test_account_protection.py) | IP/UA ký từ UI, chống spraying, smart lockout, thiết bị mới, hoạt động bảo mật |
+| [tests/test_passkeys.py](tests/test_passkeys.py) | WebAuthn với authenticator phần mềm thật (ES256/CBOR): UV, origin giả, replay, nhân bản |
+| [tests/test_account_recovery.py](tests/test_account_recovery.py) | Email khôi phục, đặt lại mật khẩu, chống dò tài khoản, email cảnh báo |
+| [tests/test_token_reuse_and_devices.py](tests/test_token_reuse_and_devices.py) | Dùng lại token đã xoay, cookie thiết bị, tab cũ của UI |
+| [tests/test_account_ui.py](tests/test_account_ui.py) | Callback Gradio cho passkey, email khôi phục, quên mật khẩu |
 | [tests/test_security_v2.py](tests/test_security_v2.py) | DLP, security headers, audit chain, IDS |
 | [tests/test_crypto.py](tests/test_crypto.py) | AES-GCM, ràng buộc AAD |
 | [tests/test_mfa.py](tests/test_mfa.py) | TOTP, chống replay, recovery code |
 | [tests/test_hardening.py](tests/test_hardening.py) | Guard production, trần phiên, CSP |
 | [tests/test_ai_provider_errors.py](tests/test_ai_provider_errors.py) | Lỗi provider → 503, không rò rỉ chi tiết |
+| [tests/test_gemini_integration.py](tests/test_gemini_integration.py) | Timeout/retry Gemini, phản hồi rỗng/bị chặn, consent và xác nhận dữ liệu mật trên UI |
 | [tests/test_fixes_2026_07.py](tests/test_fixes_2026_07.py) | Regression cho từng lỗi đã sửa |
 | [tests/test_ui_wiring.py](tests/test_ui_wiring.py) | UI gọi đúng API, không đi tắt |
 | [tests/test_e2ee_core.py](tests/test_e2ee_core.py) | Canonical JSON, Ed25519 proofs, fingerprint, opaque envelope |
@@ -558,13 +608,15 @@ Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Nh
 | Hồ sơ/KMS | `SECURITY_PROFILE`, `KEY_PROVIDER`, `VAULT_*`, `AWS_KMS_KEY_ID`, `GCP_KMS_KEY_NAME`, `DEK_CACHE_SECONDS` |
 | Bí mật local/legacy | `APP_SECRET_KEY`, `MASTER_ENCRYPTION_KEY`, `MASTER_ENCRYPTION_KEYS`, `ACTIVE_KEY_VERSION` |
 | Hạ tầng | `DATABASE_URL`, `REDIS_URL`, `ALLOWED_ORIGINS`, `ALLOWED_HOSTS`, `PUBLIC_DOMAIN` |
-| Phiên & token | `ACCESS_TOKEN_MINUTES`, `SESSION_IDLE_MINUTES`, `SESSION_ABSOLUTE_HOURS`, `REFRESH_WINDOW_SECONDS`, `REFRESH_MAX_ATTEMPTS` |
+| Phiên & token | `ACCESS_TOKEN_MINUTES`, `SESSION_IDLE_MINUTES`, `SESSION_ABSOLUTE_HOURS`, `REFRESH_WINDOW_SECONDS`, `REFRESH_MAX_ATTEMPTS`, `SIGN_IN_HISTORY_DAYS`, `TOKEN_REUSE_GRACE_SECONDS`, `DEVICE_TOKEN_DAYS` |
+| Email bảo mật | `MAIL_BACKEND` (`outbox`/`smtp`/`disabled`), `MAIL_OUTBOX_DIR`, `MAIL_FROM`, `SMTP_*`, `PASSWORD_RESET_MINUTES` |
+| Passkey | `WEBAUTHN_RP_ID`, `WEBAUTHN_RP_NAME`, `WEBAUTHN_ORIGINS` |
 | Hạn mức/retention | `MAX_SESSIONS_PER_USER`, `MAX_MESSAGES_PER_SESSION`, `SECURE_RETENTION_DAYS`, `CONFIDENTIAL_RETENTION_DAYS` |
 | Chống lạm dụng | `LOGIN_*`, `ALLOW_SELF_REGISTRATION`, `REGISTRATION_*`, `MESSAGE_*`, `PASSWORD_CHANGE_*` |
 | 2FA | `MFA_ISSUER`, `MFA_CHALLENGE_MINUTES`, `MFA_RECOVERY_CODES`, `MFA_*_ATTEMPTS` |
 | IDS/Audit/SIEM | `IDS_*`, `AUDIT_CHAIN_ENABLED`, `AUDIT_WORM_*`, `AUDIT_CHECKPOINT_INTERVAL`, `AUDIT_MAX_UNANCHORED_EVENTS`, `SIEM_JSON_LOGS` |
 | UI/SSO | `GRADIO_AUTH_MODE`, `OIDC_*`, `GRADIO_MAX_FILE_SIZE`, `CSP_*` |
-| AI/DLP | `GOOGLE_GENAI_API_KEY`, `GEMINI_MODEL`, `ALLOW_DEMO_AI`, `AI_CONSENT_VERSION`, `DLP_CUSTOM_TERMS` |
+| AI/DLP | `GOOGLE_GENAI_API_KEY`, `GEMINI_MODEL`, `GEMINI_TIMEOUT_SECONDS`, `ALLOW_DEMO_AI`, `AI_CONSENT_VERSION`, `DLP_CUSTOM_TERMS` |
 
 Đặt `APP_ENV=production` sẽ kích hoạt các guard trong [src/app/config.py](src/app/config.py):
 ứng dụng **từ chối khởi động** nếu thiếu `APP_SECRET_KEY` đủ mạnh, thiếu khóa mã hóa, thiếu
