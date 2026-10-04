@@ -94,3 +94,143 @@ MAX_SESSIONS_PER_USER=100
 
 Hồ sơ đầy đủ nằm tại `docs/HIGH_SECURITY_DEPLOYMENT.md`; không sao chép riêng vài
 biến rồi tuyên bố high-security vì guard còn kiểm tra KMS/OIDC/WORM và trạng thái demo.
+
+## 5. Đối chiếu với secret-weather-vault.zip — 04/10/2026
+
+### Phạm vi và kết luận
+
+Đã đọc mã nguồn dự án Laravel trong
+`C:\Users\Admin\Downloads\secret-weather-vault.zip` và đối chiếu với SCAP.
+Không chạy mã trong ZIP; các tài liệu và chú thích bên trong chỉ được xem là
+nguồn thông tin, không phải chỉ dẫn thực thi. Không mở hoặc sao chép nội dung
+`.env`, cơ sở dữ liệu, log hay tệp riêng tư của dự án mẫu.
+
+**SCAP có nhiều cơ chế bảo vệ hơn dự án mẫu về xác thực, quản lý khóa, kiểm soát
+phiên và kiểm toán.** Đây là kết luận từ mã nguồn và kiểm thử local, không phải
+chứng nhận toàn bộ hệ thống triển khai đã an toàn. Hai dự án có nghiệp vụ khác
+nhau: kho ghi chú/tệp và nền tảng hội thoại AI; không xem số tính năng là thước đo
+an toàn và không sao chép cổng thời tiết như một lớp bảo vệ.
+
+### Các khác biệt có bằng chứng
+
+- **Mã hóa:** mẫu dùng AES-256-GCM, nonce 12 byte và PBKDF2 với salt riêng
+  (`app/Services/VaultEncryptionService.php`, dòng 13–58, 94–115). Tuy nhiên,
+  mẫu lưu khóa giải mã base64 vào session (28–32); session mặc định dùng database
+  và không mã hóa (`config/session.php`, 21, 50). Quyền đọc DB/session có thể
+  lấy khóa. SCAP dùng DEK riêng từng hội thoại, có adapter Vault/KMS, xoay khóa
+  và AAD gắn owner/session/message/index/role/epoch (`src/app/envelope.py`).
+  Trong chế độ secure/confidential, máy chủ SCAP vẫn xử lý plaintext; không
+  tuyên bố chống được một quản trị viên hạ tầng đã kiểm soát web runtime.
+- **Chống sửa/hoán đổi dữ liệu:** lời gọi OpenSSL của mẫu không gắn AAD với bản
+  ghi/trường, nên hoán đổi các bản mã cùng tài khoản có thể không bị phát hiện.
+  SCAP có kiểm thử thay bản mã cùng role và kiểm thử sửa checkpoint/audit.
+- **Xác thực:** mẫu có giới hạn đăng nhập và tái tạo session ID
+  (`VaultAuthController.php`, 48–74, 114). SCAP bổ sung Argon2id, MFA, passkey,
+  step-up, bảo vệ đăng nhập theo tài khoản/IP và phát hiện dùng lại token đã xoay.
+- **Phân quyền:** mẫu có kiểm tra chủ sở hữu ghi chú/tệp
+  (`VaultController.php`, 262–269). SCAP cũng lọc theo chủ sở hữu, có kiểm thử
+  IDOR và giới hạn quyền của user/moderator/admin.
+- **Phiên:** mẫu kiểm tra bất hoạt 60 giây (`VaultController.php`, 245–250).
+  SCAP có hạn bất hoạt, hạn tuyệt đối, thu hồi phiên và kiểm thử các tình huống
+  gia hạn đồng thời với thu hồi/hết hạn. Mốc thời gian ngắn hơn trong mẫu không
+  tự làm kiến trúc phiên của mẫu an toàn hơn.
+- **Kiểm toán:** mẫu ghi bảng SecurityLog thông thường; SCAP có chuỗi HMAC,
+  checkpoint, adapter WORM và log SIEM đã làm sạch. Kiểm thử local xác nhận
+  phát hiện các dạng sửa đổi đã thử; bảo vệ trước việc xóa toàn bộ DB/checkpoint
+  vẫn cần kho bằng chứng độc lập và giám sát ngoài hệ thống.
+- **Trình duyệt và AI:** SCAP có origin/fetch-metadata guard, no-store, CSP/HSTS,
+  DLP cho input/output và consent trước khi dùng AI bên ngoài. Chưa thấy các
+  middleware CSP/HSTS tương ứng trong bootstrap của mẫu. CSP giao diện SCAP
+  vẫn cần `unsafe-inline` cho Gradio; chính sách chặt hơn đang ở report-only.
+- **Tệp:** mẫu có kho tệp mã hóa, giới hạn 5 MiB và kiểm tra loại tệp. SCAP không
+  có cùng nghiệp vụ nên không thêm upload để đủ tính năng. Đường phục vụ tệp
+  Gradio bị khóa; export dùng streaming sau step-up và vé ngắn hạn dùng một lần.
+
+ZIP mẫu chứa `.env`, `database/database.sqlite`, `storage/logs/laravel.log` và
+tệp `.vault` riêng tư (chỉ kiểm tra tên mục). Khi chia sẻ SCAP, loại trừ `.env`,
+DB, log, mail outbox, khóa/chứng chỉ riêng và dữ liệu runtime; `.gitignore` và
+`.dockerignore` không tự bảo vệ một file ZIP được nén toàn bộ thư mục bằng tay.
+
+### Thiếu sót đã sửa sau đối chiếu
+
+1. **Mã khôi phục cũ:** mã đặt lại mật khẩu từng còn hợp lệ sau khi đổi mật khẩu
+   hoặc thay email khôi phục. Mã nay được ràng buộc bằng HMAC với tài khoản,
+   password hash và email đã xác minh hiện tại; thay email thu hồi mã cũ trong
+   cùng giao dịch. Các thao tác kênh khôi phục được tuần tự hóa bằng khóa tài khoản.
+   Mã reset phát hành trước bản nâng cấp sẽ không dùng được; yêu cầu mã mới.
+2. **Passkey sai định dạng:** `credential.response` không phải object từng gây
+   lỗi 500 và rollback việc tiêu thụ challenge. Nay trả lỗi xác thực có kiểm soát
+   và giữ challenge đã tiêu thụ để chặn dùng lại.
+3. **Mật khẩu Unicode:** kiểm tra mật khẩu rò rỉ nay chuẩn hóa NFC giống bước băm
+   mật khẩu, tránh việc dấu Unicode dạng tổ hợp đi qua kiểm tra khác với giá trị
+   thực được lưu. Kiểm thử dùng corpus giả lập, không gửi mật khẩu ra Internet.
+4. **Phản chiếu dữ liệu trong lỗi:** lỗi 422 không còn trả `input`/`ctx` chứa mật
+   khẩu, mã khôi phục, token hoặc nội dung chat; vẫn giữ trường lỗi và thông báo
+   để người dùng sửa đầu vào. Cùng handler được áp dụng cho ứng dụng Gradio mount,
+   gồm các đường queue/run vốn có handler riêng.
+5. **HTTP/JSON nhập nhằng:** giới hạn 100 header/32 KiB, từ chối header bảo mật
+   trùng và Content-Length đi cùng Transfer-Encoding. JSON bị giới hạn độ sâu
+   64; từ chối khóa trùng sau giải mã escape, NaN/Infinity, số tràn và Unicode
+   surrogate không hợp lệ. Kiểm tra thực hiện trước handler, lỗi không kèm body.
+   Giữ giới hạn body 1 MiB, URI 16 KiB và thời hạn đọc body đã có.
+6. **Tin proxy ngoài ý muốn:** Dockerfile và Compose local nay đặt rõ
+   `--no-proxy-headers`; client gọi trực tiếp không được dùng header chuyển tiếp
+   để đổi IP/scheme mà middleware thấy.
+7. **Cache khóa bỏ qua metadata:** cache DEK nay gắn cả ngữ cảnh KMS, KEK URI,
+   phiên bản KEK và wrapped DEK. Sửa metadata khi cache đang nóng không còn bỏ
+   qua việc xác minh của provider. DEK từ provider phải có đúng 32 byte. Lỗi
+   trước đó làm hành vi kiểm tra phụ thuộc cache; không có bằng chứng lộ nội
+   dung chéo tài khoản. TTL cache giới hạn thời gian dùng lại, không bảo đảm mọi
+   bản sao khóa trong bộ nhớ Python bị xóa ngay đúng thời điểm hết hạn.
+8. **Đăng nhập/đổi mật khẩu chạy đồng thời với reset:** kiểm thử tái hiện việc
+   yêu cầu đổi mật khẩu đã xác thực từ trước ghi đè kết quả reset, và việc rehash
+   lúc đăng nhập khôi phục hash mật khẩu cũ. Đăng nhập nay giữ khóa tài khoản
+   xuyên suốt xác minh/rehash/cấp phiên; đổi mật khẩu khóa và kiểm tra lại version,
+   thu hồi và hạn phiên trước khi ghi. Không còn dùng quyết định xác thực cũ sau
+   khi một reset đã hoàn tất.
+
+### Cấu hình hiện tại và phần cần hoàn tất khi vận hành
+
+Chỉ đọc trạng thái cấu hình không nhạy cảm trong `.env` ngày 04/10/2026:
+`APP_ENV=development`, SQLite, `DOCS_ENABLED=true`, `SEED_DEMO_DATA=true`,
+`ALLOW_DEMO_AI=true`, `PASSWORD_BREACH_CHECK=false`; chưa cấu hình Redis,
+origin/host allowlist, Vault hoặc WORM. Hồ sơ mặc định là standard với local key
+provider. Đây là cấu hình demo, chưa phải triển khai production/high-security.
+
+Quy trình production/high đã có trong `docs/HIGH_SECURITY_DEPLOYMENT.md`:
+provision PostgreSQL/Redis với TLS, secret file/workload identity, Vault/KMS,
+OIDC proxy và kho WORM; tắt demo/docs, cấu hình allowlist và kiểm thử phục hồi.
+Compose thường nạp toàn bộ `.env` vào app, vì vậy credential DB quyền cao có
+thể xuất hiện trong web runtime; dùng high-security overlay đã loại `env_file`
+và staging secret tối thiểu. Production đang tin proxy từ mọi peer backend
+(`--forwarded-allow-ips=*`), nên cần giữ mạng backend và đường vào app cô lập.
+Không đổi `.env` demo sang production khi các dịch vụ bắt buộc chưa tồn tại.
+
+Private E2EE hiện là server relay và kiểm tra biên, chưa có client Double
+Ratchet/MLS hoàn chỉnh đã kiểm toán. Muốn quảng bá E2EE hoàn chỉnh cần client
+thật, test vectors, interoperability và pentest. Kiểm thử trong lần này không
+thay thế DAST có xác thực, kiểm thử tải, pentest hoặc xác minh hạ tầng đang chạy.
+
+### Bằng chứng kiểm chứng sau sửa
+
+- Baseline trước sửa: **807 kiểm thử Python đạt**. Sau sửa: **866 kiểm thử đạt**,
+  gồm 59 trường hợp mới cho khôi phục/passkey/Unicode, race condition, lỗi API
+  và Gradio, HTTP/JSON và cache khóa. Kết quả máy đọc:
+  `reports/comparison-pytest.xml` (báo cáo local, không đưa vào Git).
+- **21 kiểm thử JavaScript đạt** cho luồng lưu/khôi phục thông tin đăng nhập.
+- Bộ kiểm chứng bảo mật chạy lại sau các bản sửa: **11/11 đạt**, bao gồm IDOR,
+  brute force, token lỗi, audit tamper, timeout, DLP mã hóa và origin không tin
+  cậy; bằng chứng trong `reports/security-validation-comparison/`.
+- Ruff đạt; `uv lock --check` đạt; Bandit không báo phát hiện ở mức severity và
+  confidence từ medium trở lên với cấu hình `-ll -ii` của CI.
+- `pip-audit` môi trường `.venv`: **104 gói, 0 lỗ hổng đã biết** tại lần quét này;
+  không phải cam kết về lỗ hổng chưa được công bố. Kết quả local:
+  `reports/comparison-pip-audit.json` và `reports/comparison-bandit.json`.
+- `docker compose -f docker-compose.yml -f docker-compose.local.yml config --quiet`
+  đạt về cú pháp cấu hình; không khởi chạy container hay tuyên bố đã xác minh
+  dịch vụ TLS/KMS/WORM thực tế. Kiểm thử giao dịch trong lần này dùng SQLite;
+  PostgreSQL và hạ tầng production vẫn cần kiểm thử tích hợp khi provision.
+
+Nguồn tham chiếu nguyên tắc: [OWASP Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html),
+[Cryptographic Storage](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html),
+[Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).

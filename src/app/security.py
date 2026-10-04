@@ -454,7 +454,10 @@ class PwnedPasswordChecker:
         if not self.enabled:
             return False
         # The HIBP range protocol mandates SHA-1; it is not used for password storage.
-        sha1 = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()  # nosec B324
+        # Screen the same NFC spelling that PasswordService hashes/verifies;
+        # decomposed accents must not bypass the corpus for a stored password.
+        normalized = unicodedata.normalize("NFC", password)
+        sha1 = hashlib.sha1(normalized.encode("utf-8")).hexdigest().upper()  # nosec B324
         prefix, suffix = sha1[:5], sha1[5:]
         # The base URL is a fixed HTTPS constant; only a five-character hash prefix is appended.
         request = urllib.request.Request(

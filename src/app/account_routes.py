@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from src.app.account_recovery import (
     consume_code,
+    derive_password_reset_key,
     issue_code,
     notify,
     send_code,
@@ -115,6 +116,13 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             ip=client_ip(request), **kwargs,
         )
 
+    def lock_current_account(db: Session, user: User) -> None:
+        # Authentication updated activity in an earlier transaction. Serialize
+        # recovery-channel mutations with resets and re-check account version.
+        expected_version = user.token_version
+        if ctx.lock_user_row(db, user) is None or user.token_version != expected_version:
+            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+
     # ───────────────────────── recovery email ─────────────────────────
 
     def email_view(db: Session, user: User) -> AccountEmailResponse:
@@ -157,6 +165,7 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             raise HTTPException(status_code=422, detail="Địa chỉ email không hợp lệ.")
         throttle(db, request, f"email-verify:{user.id}", 5, 3600, "account.email.verification",
                  user.id)
+        lock_current_account(db, user)
         code = issue_code(
             db, ctx.recovery_key, user_id=user.id, purpose="email_verify", now=utcnow(),
             minutes=settings.password_reset_minutes, target_email=normalized,
@@ -178,6 +187,7 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
     ):
         throttle(db, request, f"email-verify-code:{user.id}", 10, 3600, "account.email.verify",
                  user.id)
+        lock_current_account(db, user)
         now = utcnow()
         record = consume_code(
             db, ctx.recovery_key, user_id=user.id, purpose="email_verify", code=payload.code,
@@ -200,6 +210,19 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             existing.email = target
             existing.normalized_email = target
             existing.verified_at = now
+        if previous != target:
+            # A code delivered to the previous mailbox must not recover an
+            # account after its owner has replaced that recovery channel.
+            db.execute(
+                update(AccountRecoveryCode)
+                .where(
+                    AccountRecoveryCode.user_id == user.id,
+                    AccountRecoveryCode.purpose == "password_reset",
+                    AccountRecoveryCode.consumed_at.is_(None),
+                )
+                .values(consumed_at=now)
+                .execution_options(synchronize_session=False)
+            )
         try:
             db.commit()
         except IntegrityError as exc:
@@ -221,6 +244,7 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
         request: Request, credentials: Credentials, user: CurrentUser, db: DB
     ):
         ctx.require_recent_step_up(credentials, user, db)
+        lock_current_account(db, user)
         record = db.get(AccountEmail, user.id)
         if record is None:
             raise HTTPException(status_code=404, detail="Tài khoản chưa có email khôi phục.")
@@ -258,13 +282,15 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
         ip = client_ip(request)
         throttle(db, request, f"reset-request:ip:{ip}", 5, 900, "auth.password_reset.request")
         user = find_account(db, payload.identifier)
-        if user is None or not user.is_active:
+        if user is None or ctx.lock_user_row(db, user) is None:
             record_audit(
                 db, request, "auth.password_reset.request", outcome="failure",
                 details={"reason": "unknown_or_inactive_account"},
             )
             return RESET_ACCEPTED
         email = db.get(AccountEmail, user.id)
+        if email is not None:
+            db.refresh(email)
         allowed, _ = ctx.limiter.allow(f"reset-request:user:{user.id}", 3, 3600)
         if email is None or not allowed:
             record_audit(
@@ -273,7 +299,10 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             )
             return RESET_ACCEPTED
         code = issue_code(
-            db, ctx.recovery_key, user_id=user.id, purpose="password_reset", now=utcnow(),
+            db, derive_password_reset_key(
+                ctx.recovery_key, user_id=user.id, password_hash=user.password_hash,
+                normalized_email=email.normalized_email,
+            ), user_id=user.id, purpose="password_reset", now=utcnow(),
             minutes=settings.password_reset_minutes,
         )
         db.commit()
@@ -311,9 +340,14 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             )
             raise generic
         now = utcnow()
-        record = consume_code(
-            db, ctx.recovery_key, user_id=user.id, purpose="password_reset", code=payload.code,
-            now=now,
+        email = db.get(AccountEmail, user.id)
+        if email is not None:
+            db.refresh(email)
+        record = None if email is None else consume_code(
+            db, derive_password_reset_key(
+                ctx.recovery_key, user_id=user.id, password_hash=user.password_hash,
+                normalized_email=email.normalized_email,
+            ), user_id=user.id, purpose="password_reset", code=payload.code, now=now,
         )
         if record is None:
             db.commit()  # keep the failed-attempt count

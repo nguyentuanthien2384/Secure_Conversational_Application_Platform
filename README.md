@@ -31,6 +31,12 @@ thiết bị mới, trang hoạt động bảo mật cho người dùng. Đợt 
 **phát hiện dùng lại token đã xoay** (RFC 9700) và **cookie nhận diện thiết bị** (OWASP).
 Xem [bảo vệ tài khoản](docs/ACCOUNT_PROTECTION.md).
 
+Đợt đối chiếu với `secret-weather-vault.zip` bổ sung ràng buộc mã khôi phục với
+mật khẩu/email hiện tại, bảo vệ giao dịch đăng nhập/đổi mật khẩu khi reset đồng
+thời, kiểm tra passkey sai định dạng, JSON/header chặt chẽ, cache khóa gắn metadata
+và phản hồi lỗi không kèm dữ liệu nhạy cảm cho cả REST API lẫn Gradio. Xem
+[kết quả đối chiếu, thay đổi và giới hạn vận hành](SECURITY_REVIEW.md#5-đối-chiếu-với-secret-weather-vaultzip--04102026).
+
 > **Đồ án môn học:** Bảo mật Ứng dụng và Hệ thống
 > **Kiến trúc:** FastAPI + Gradio 6 + envelope encryption (Vault/KMS) + DLP phân loại + E2EE ciphertext relay + audit anchor/WORM + IDS/IPS
 

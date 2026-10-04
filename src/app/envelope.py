@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from src.app.db import utcnow
-from src.app.key_management import KeyProvider, KeyProviderError
+from src.app.key_management import KeyProvider, KeyProviderError, canonical_context
 from src.app.models import ChatSession, SecureMessage, SessionKeyEpoch, User
 from src.app.security import CryptoService
 
@@ -124,15 +124,25 @@ class EnvelopeCryptoService:
         self._cache_lock = threading.RLock()
 
     @staticmethod
-    def _session_cache_key(session_id: str, epoch: int, wrapped_dek: str) -> str:
-        # The wrapped value is not secret and differentiates a rewrapped epoch.
-        wrapped_digest = hashlib.sha256(wrapped_dek.encode("utf-8")).hexdigest()
-        return f"session:{session_id}:{epoch}:{wrapped_digest}"
-
-    @staticmethod
-    def _user_cache_key(user_id: str, epoch: int, wrapped_dek: str) -> str:
-        wrapped_digest = hashlib.sha256(wrapped_dek.encode("utf-8")).hexdigest()
-        return f"user:{user_id}:{epoch}:{wrapped_digest}"
+    def _dek_cache_key(
+        wrapped_dek: str,
+        *,
+        context: dict[str, str],
+        kek_uri: str,
+        kek_version: str,
+    ) -> str:
+        # A cache hit must preserve every stored input validated by the provider.
+        # Otherwise changing an owner, KEK URI or version would silently reuse a
+        # key that a fresh unwrap rejects. Hash the canonical document so cache
+        # identities retain neither raw wrapped keys nor provider metadata.
+        document = {
+            "context": canonical_context(context).decode("utf-8"),
+            "kek_uri": kek_uri,
+            "kek_version": kek_version,
+            "wrapped_digest": hashlib.sha256(wrapped_dek.encode("utf-8")).hexdigest(),
+        }
+        encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def _cache_get(self, key: str) -> bytes | None:
         now = time.monotonic()
@@ -147,6 +157,8 @@ class EnvelopeCryptoService:
             return bytes(entry.value)
 
     def _cache_put(self, key: str, dek: bytes) -> None:
+        if len(dek) != 32:
+            raise EnvelopeEncryptionError("Key provider returned an invalid DEK length.")
         if self.cache_ttl_seconds == 0:
             return
         with self._cache_lock:
@@ -202,7 +214,12 @@ class EnvelopeCryptoService:
         session.kek_uri = generated.kek_uri
         session.kek_version = generated.kek_version
         self._cache_put(
-            self._session_cache_key(session.id, epoch, generated.wrapped_dek),
+            self._dek_cache_key(
+                generated.wrapped_dek,
+                context=session_key_context(session, epoch),
+                kek_uri=generated.kek_uri,
+                kek_version=generated.kek_version,
+            ),
             generated.plaintext_dek,
         )
         db.flush()
@@ -221,7 +238,12 @@ class EnvelopeCryptoService:
 
     def _session_dek(self, db: Session, session: ChatSession, epoch: int) -> bytes:
         epoch_row = self._epoch_row(db, session, epoch)
-        cache_key = self._session_cache_key(session.id, epoch, epoch_row.wrapped_dek)
+        cache_key = self._dek_cache_key(
+            epoch_row.wrapped_dek,
+            context=session_key_context(session, epoch),
+            kek_uri=epoch_row.kek_uri,
+            kek_version=epoch_row.kek_version,
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
@@ -368,7 +390,12 @@ class EnvelopeCryptoService:
         session.kek_uri = generated.kek_uri
         session.kek_version = generated.kek_version
         self._cache_put(
-            self._session_cache_key(session.id, epoch, generated.wrapped_dek),
+            self._dek_cache_key(
+                generated.wrapped_dek,
+                context=session_key_context(session, epoch),
+                kek_uri=generated.kek_uri,
+                kek_version=generated.kek_version,
+            ),
             generated.plaintext_dek,
         )
         db.flush()
@@ -410,7 +437,12 @@ class EnvelopeCryptoService:
             or user.secret_crypto_epoch <= 0
         ):
             raise EnvelopeEncryptionError("Protected account key metadata is unavailable.")
-        cache_key = self._user_cache_key(user.id, user.secret_crypto_epoch, user.secret_wrapped_dek)
+        cache_key = self._dek_cache_key(
+            user.secret_wrapped_dek,
+            context=user_key_context(user, user.secret_crypto_epoch),
+            kek_uri=user.secret_kek_uri,
+            kek_version=user.secret_kek_version,
+        )
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
@@ -439,7 +471,12 @@ class EnvelopeCryptoService:
         user.secret_kek_uri = generated.kek_uri
         user.secret_kek_version = generated.kek_version
         self._cache_put(
-            self._user_cache_key(user.id, epoch, generated.wrapped_dek),
+            self._dek_cache_key(
+                generated.wrapped_dek,
+                context=user_key_context(user, epoch),
+                kek_uri=generated.kek_uri,
+                kek_version=generated.kek_version,
+            ),
             generated.plaintext_dek,
         )
 

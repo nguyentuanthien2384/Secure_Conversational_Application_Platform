@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -31,6 +32,24 @@ MAX_CODE_ATTEMPTS = 5
 
 def derive_recovery_code_key(secret_key: str) -> bytes:
     return hashlib.sha256(("secure-chat:account-recovery:v1:" + secret_key).encode("utf-8")).digest()
+
+
+def derive_password_reset_key(
+    key: bytes, *, user_id: str, password_hash: str, normalized_email: str
+) -> bytes:
+    """Bind a reset capability to the account's current recovery credentials.
+
+    A password or mailbox change immediately invalidates a previously emailed
+    code, without storing either value in the recovery row. Codes issued before
+    this binding was introduced are intentionally invalid after the upgrade;
+    their owners must request a fresh code.
+    """
+    context = json.dumps(
+        ["secure-chat:password-reset:v1", user_id, password_hash, normalized_email],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hmac.new(key, context, hashlib.sha256).digest()
 
 
 def _hash_code(key: bytes, code: str) -> str:

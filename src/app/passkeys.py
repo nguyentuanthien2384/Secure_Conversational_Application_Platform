@@ -106,6 +106,8 @@ def _parse_credential(credential: Any) -> dict[str, Any]:
             raise PasskeyError("malformed_credential") from exc
     if not isinstance(credential, dict):
         raise PasskeyError("malformed_credential")
+    if not isinstance(credential.get("response"), dict):
+        raise PasskeyError("malformed_credential")
     if len(json.dumps(credential)) > MAX_CREDENTIAL_JSON_BYTES:
         raise PasskeyError("credential_too_large")
     return credential

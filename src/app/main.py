@@ -14,7 +14,6 @@ from urllib.parse import unquote, urlsplit
 import gradio as gr
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status
-from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -23,6 +22,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.routing import Mount
 
 from src.app.account_recovery import derive_recovery_code_key, notify
 from src.app.account_routes import AccountRouteContext, register_account_routes
@@ -807,12 +807,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.exception_handler(RequestValidationError)
-    async def incident_validation_error(request: Request, exc: RequestValidationError):
+    async def safe_request_validation_error(request: Request, exc: RequestValidationError):
         if request.url.path == "/api/admin/incidents" or request.url.path.startswith("/api/admin/incidents/"):
             # A rejected title/unsupported note can itself contain sensitive
             # material. Pydantic's default error projection echoes its input.
             return JSONResponse(status_code=422, content={"detail": "Thông tin hồ sơ sự cố không hợp lệ; kiểm tra độ dài, lựa chọn và audit ID."})
-        return await request_validation_exception_handler(request, exc)
+        # Pydantic includes rejected input and validator context by default.
+        # These can contain passwords, recovery codes, bearer credentials or
+        # confidential prompts. Return actionable field errors without copying
+        # those values into UI error messages, telemetry or browser responses.
+        errors = [
+            {"type": error["type"], "loc": error["loc"], "msg": error["msg"]}
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": errors,
+                "request_id": getattr(request.state, "request_id", None),
+            },
+        )
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -1874,6 +1888,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={"Retry-After": str(retry_after)},
             )
 
+        # Serialize the password decision, optional rehash and session issuance
+        # with password resets/account changes. Otherwise a stale login can
+        # restore the old hash or mint a session after a reset has committed.
+        if user is not None and lock_user_row(db, user, require_active=False) is None:
+            user = None
         now = utcnow()
         locked = False
         lock_active = False
@@ -1919,7 +1938,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         if password_service.needs_rehash(user.password_hash):
             user.password_hash = password_service.hash(payload.password)
-            db.commit()
+            # Keep the account lock until MFA challenge/session issuance commits.
         login_limiter.reset(account_key)
         # Return only this attempt's slot: wiping the shared per-IP bucket would
         # let an attacker erase failed guesses by signing in to their own account.
@@ -2621,6 +2640,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def change_password(
         payload: PasswordChangeRequest,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
@@ -2645,6 +2665,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Thử đổi mật khẩu quá nhiều lần.",
                 headers={"Retry-After": str(retry_after)},
             )
+        try:
+            claims = token_service.decode(credentials.credentials)
+        except jwt.PyJWTError as exc:
+            raise HTTPException(status_code=401, detail="Token không hợp lệ.") from exc
+        if lock_user_row(db, user) is None or claims.get("ver") != user.token_version:
+            raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
+        # Bearer authentication committed before this handler acquired its lock.
+        # Recheck the exact session after waiting for a concurrent logout/reset.
+        auth_session = lock_auth_session_row(db, str(claims["jti"]), user.id)
+        if (
+            auth_session is None
+            or db.get(RevokedToken, str(claims["jti"])) is not None
+            or auth_session_expiry_reason(auth_session, utcnow()) is not None
+        ):
+            raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
         if not password_service.verify(user.password_hash, payload.current_password):
             record_audit(
                 db,
@@ -4979,6 +5014,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         max_file_size=settings.gradio_max_file_size,
         enable_monitoring=False,
     )
+
+    # Mounted FastAPI apps keep their own exception handlers. Apply the same
+    # privacy boundary to Gradio queue/run requests as to the REST API.
+    for route in app.routes:
+        if isinstance(route, Mount) and isinstance(route.app, FastAPI):
+            route.app.add_exception_handler(
+                RequestValidationError, safe_request_validation_error
+            )
 
     return app
 
