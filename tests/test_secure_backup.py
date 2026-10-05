@@ -17,7 +17,6 @@ from scripts import secure_backup as backup
 from src.app.audit_chain import derive_audit_key, seal_event, verify_chain
 from src.app.db import Database
 from src.app.main import create_app
-from src.app.private_storage import PrivateStorageError, check_private_directory, check_private_file
 from src.app.models import (
     AccountRecoveryCode,
     AuditEvent,
@@ -31,9 +30,21 @@ from src.app.models import (
     User,
     WebAuthnChallenge,
 )
+from src.app.private_storage import (
+    PrivateStorageError,
+    check_private_directory,
+    check_private_file,
+    create_private_directory,
+)
 from src.app.security import TokenService
 
 _PASSWORD = "Synthetic backup passphrase 2026!"
+
+
+@pytest.fixture
+def tmp_path(tmp_path_factory):
+    # The CLI now requires a private destination directory on every platform.
+    return create_private_directory(tmp_path_factory.mktemp("backup") / "private")
 _AUDIT_SECRET = "Synthetic-audit-key-never-in-the-archive"
 
 
@@ -408,6 +419,38 @@ def test_backup_refuses_plaintext_creation_if_private_storage_is_unavailable(
         backup.backup_database(sample_database, tmp_path / "refused.scapbak", _PASSWORD)
     assert sample_database.read_bytes() == before
     assert not (tmp_path / "refused.scapbak").exists()
+    assert not _temporary_files(tmp_path)
+
+
+def test_backup_rejects_nonprivate_output_parent_without_changing_source(
+    sample_database, tmp_path,
+):
+    directory = tmp_path / "legacy-output"
+    directory.mkdir()
+    if os.name != "nt":
+        directory.chmod(0o755)
+    before = sample_database.read_bytes()
+    with pytest.raises(backup.BackupError, match="private directory"):
+        backup.backup_database(sample_database, directory / "refused.scapbak", _PASSWORD)
+    assert sample_database.read_bytes() == before and not list(directory.iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Verify Windows pinning through SQLite and cleanup.")
+def test_backup_holds_destination_name_while_sqlite_reopens_paths(
+    sample_database, tmp_path, monkeypatch,
+):
+    snapshot = backup._snapshot
+    attempts = []
+
+    def pinned_snapshot(source, destination):
+        with pytest.raises(PermissionError):
+            tmp_path.rename(tmp_path.with_name("renamed-private"))
+        attempts.append(True)
+        return snapshot(source, destination)
+
+    monkeypatch.setattr(backup, "_snapshot", pinned_snapshot)
+    backup.backup_database(sample_database, tmp_path / "pinned.scapbak", _PASSWORD)
+    assert attempts == [True]
     assert not _temporary_files(tmp_path)
 
 

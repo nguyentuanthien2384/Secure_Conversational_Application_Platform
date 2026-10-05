@@ -10,6 +10,7 @@ an administrator able to take ownership.
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import stat
 from contextlib import contextmanager
@@ -28,16 +29,23 @@ def _path(value: str | Path) -> Path:
     candidate = Path(value)
     if ".." in candidate.parts:
         raise PrivateStorageError("Parent traversal is not supported for private storage.")
+    if os.name == "nt" and candidate.drive and not candidate.root:
+        raise PrivateStorageError("Drive-relative paths are not supported.")
+    if os.name == "nt":
+        # GetFullPathName (used by abspath) strips trailing dots/spaces. Reject
+        # the caller's spelling before it can be normalized to another object.
+        devices = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+        devices.update(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10))
+        devices.update(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in "¹²³")
+        for part in candidate.parts[1:] if candidate.anchor else candidate.parts:
+            if ":" in part or part.endswith((" ", ".")) or part.split(".")[0].rstrip().upper() in devices:
+                raise PrivateStorageError("Ambiguous Windows paths are not supported.")
     result = Path(os.path.abspath(candidate))
     if os.name == "nt":
         if not result.drive or result.drive.startswith("\\\\") or not result.root:
             raise PrivateStorageError("Private storage requires a local drive path.")
-        devices = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
-        devices.update(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10))
-        devices.update(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in "¹²³")
-        for part in result.parts[1:]:
-            if ":" in part or part.endswith((" ", ".")) or part.split(".")[0].upper() in devices:
-                raise PrivateStorageError("Ambiguous Windows paths are not supported.")
+        if _windows().kernel.GetDriveTypeW(result.anchor) not in {2, 3, 6}:
+            raise PrivateStorageError("Private storage requires an available local filesystem.")
     return result
 
 
@@ -84,12 +92,13 @@ class _Windows:
                        ("mask", wt.DWORD)]
 
         class Disposition(ctypes.Structure):
-            _fields_ = [("delete", wt.BOOL)]
+            _fields_ = [("delete", wt.BYTE)]
 
         self.SecurityAttributes, self.TokenUser = SecurityAttributes, TokenUser
         self.FileInfo, self.Acl, self.Ace, self.Disposition = FileInfo, Acl, Ace, Disposition
         voidp, handle, dword = wt.LPVOID, wt.HANDLE, wt.DWORD
         self._bind(self.kernel, "GetCurrentProcess", [], handle)
+        self._bind(self.kernel, "GetDriveTypeW", [wt.LPCWSTR], wt.UINT)
         self._bind(self.kernel, "CloseHandle", [handle], wt.BOOL)
         self._bind(self.kernel, "LocalFree", [voidp], voidp)
         self._bind(self.kernel, "CreateFileW", [wt.LPCWSTR, dword, dword,
@@ -167,7 +176,9 @@ class _Windows:
             self.kernel.LocalFree(descriptor)
 
     def open_directory(self, path: Path, *, check_acl: bool, created: bool = False):
-        access = 0x80 | (self.READ_CONTROL if check_acl else 0) | (0x10000 if created else 0)
+        # FILE_LIST_DIRECTORY makes this a read access for Windows share
+        # accounting; metadata-only handles do not pin a directory's name.
+        access = 0x81 | (self.READ_CONTROL if check_acl else 0) | (0x10000 if created else 0)
         handle = self.kernel.CreateFileW(str(path), access, 3, None, 3, 0x02200000, None)
         if handle == self.invalid_handle:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -284,13 +295,21 @@ def _directories(path: Path, *, create: bool = False, check_final: bool = False)
                         raise
                     os.mkdir(name, mode=0o700, dir_fd=opened[-1])
                     descriptor = os.open(name, flags, dir_fd=opened[-1])
+                    opened.append(descriptor)
                     _posix_private(descriptor, directory=True)
+                    continue
                 opened.append(descriptor)
                 if check_final and index == len(path.parts) - 2:
                     _posix_private(descriptor, directory=True)
             if check_final and len(path.parts) == 1:
                 _posix_private(descriptor, directory=True)
         yield opened[-1]
+    except OSError as exc:
+        # Keep missing/existing-object exceptions useful to new-only callers;
+        # a linked/non-directory ancestor must map to a fixed policy failure.
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PrivateStorageError("Private storage requires ordinary, unlinked paths.") from None
+        raise
     finally:
         for handle in reversed(opened):
             if os.name == "nt":
@@ -303,6 +322,14 @@ def check_private_directory(path: str | Path) -> None:
     """Fail closed unless an existing local directory has the private policy."""
     with _directories(_path(path), check_final=True):
         pass
+
+
+@contextmanager
+def private_directory_scope(path: str | Path):
+    """Validate and hold a private directory and its ancestor handles."""
+    destination = _path(path)
+    with _directories(destination, check_final=True):
+        yield destination
 
 
 def prepare_private_directory(path: str | Path, *, parents: bool = True) -> Path:
@@ -365,11 +392,13 @@ def create_private_file(path: str | Path) -> BinaryIO:
                 descriptor = msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
                 return os.fdopen(descriptor, "w+b")
             except BaseException:
-                api.mark_delete(handle)
-                if descriptor is None:
-                    api.kernel.CloseHandle(handle)
-                else:
-                    os.close(descriptor)
+                try:
+                    api.mark_delete(handle)
+                finally:
+                    if descriptor is None:
+                        api.kernel.CloseHandle(handle)
+                    else:
+                        os.close(descriptor)
                 raise
         descriptor = os.open(destination.name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                              0o600, dir_fd=parent)
@@ -377,8 +406,10 @@ def create_private_file(path: str | Path) -> BinaryIO:
             _posix_private(descriptor, directory=False)
             return os.fdopen(descriptor, "w+b")
         except BaseException:
-            os.unlink(destination.name, dir_fd=parent)
-            os.close(descriptor)
+            try:
+                os.unlink(destination.name, dir_fd=parent)
+            finally:
+                os.close(descriptor)
             raise
 
 
@@ -426,7 +457,7 @@ def read_regular_file(path: str | Path) -> BinaryIO:
             try:
                 api.metadata(handle, directory=False)
                 descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
-                return os.fdopen(descriptor, "rb")
+                return os.fdopen(descriptor, "rb", buffering=0)
             except BaseException:
                 if descriptor is None:
                     api.kernel.CloseHandle(handle)
@@ -439,7 +470,7 @@ def read_regular_file(path: str | Path) -> BinaryIO:
             information = os.fstat(descriptor)
             if not stat.S_ISREG(information.st_mode) or information.st_nlink != 1:
                 raise PrivateStorageError("Private storage requires an ordinary, unlinked file.")
-            return os.fdopen(descriptor, "rb")
+            return os.fdopen(descriptor, "rb", buffering=0)
         except BaseException:
             os.close(descriptor)
             raise

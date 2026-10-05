@@ -416,8 +416,9 @@ Phạm vi, ngưỡng và lệnh chạy có trong [availability.md](docs/security
 
 ### Giới hạn còn cần triển khai thực tế
 
-Windows cần ACL riêng cho outbox/thư mục backup và ổ mã hóa; chmod không thay
-ACL hoặc bảo đảm xóa an toàn trên SSD. Outbox quota là trong một tiến trình.
+Khoảng trống ACL Windows của đợt này được bổ sung ở mục 9; dữ liệu/cấu hình cũ
+vẫn cần rà quyền riêng và ổ mã hóa, không có bảo đảm xóa an toàn trên SSD.
+Outbox quota là trong một tiến trình.
 Restore phải giữ offline, tắt demo seed/bootstrap và đối chiếu tài khoản,
 mật khẩu, MFA/seed, email, passkey, E2EE device/membership/epoch cùng dữ liệu đã
 xóa từ nguồn mới hơn; kiểm chứng khóa đúng phiên bản và checkpoint ngoài.
@@ -454,3 +455,87 @@ Nguyên tắc tham chiếu: [OWASP CSP](https://cheatsheetseries.owasp.org/cheat
   data URL 352×352 đã tải thành công; không có lỗi JavaScript mới. Các server,
   tab và dữ liệu thử đã dọn. Không pentest độc lập, SMTP thật, DDoS Internet
   hoặc vận hành backup trên DB thật.
+
+## 9. Bảo vệ dữ liệu local trên Windows và reader tệp bí mật — 05/10/2026
+
+Đã đóng khoảng trống `chmod` không áp dụng DACL Windows cho đối tượng mới.
+Tất cả kiểm chứng dùng tệp/DB/khóa giả trong thư mục tạm; không chạy setup,
+backup hoặc đổi ACL trên dữ liệu thật của người dùng.
+
+- **Quyền ngay lúc tạo:** `private_storage` tạo thư mục/tệp mới với DACL bảo vệ
+  khỏi kế thừa, chỉ cấp quyền cho SID từ token tiến trình và SYSTEM. Đọc lại
+  owner/control/ACE từ handle để xác nhận filesystem lưu đúng chính sách trước
+  khi ghi nội dung. POSIX dùng `0700`/`0600`, kiểm tra chủ sở hữu và quyền khác.
+  Đối tượng có sẵn chỉ được kiểm tra, không tự sửa quyền. Không dùng subprocess,
+  tên người dùng/env hoặc dependency mới để cấp quyền.
+- **Đường dẫn và tài nguyên:** từ chối reparse/symlink/junction/hardlink, thiết bị,
+  ADS, tên Windows nhập nhằng, UNC và ổ mạng gắn ký tự. Kiểm tra tên trước
+  `abspath` vì Windows có thể bỏ dấu chấm/khoảng trắng cuối. Handle thư mục dùng
+  `FILE_LIST_DIRECTORY` cùng no-delete-sharing để thực sự chặn đổi tên; handle
+  chỉ đọc metadata không đủ, đã kiểm chứng trên Windows thật. Dọn handle độc
+  lập với kết quả xóa để lỗi cleanup không làm rò tài nguyên.
+- **Outbox:** quyền riêng áp dụng trước khi ghi mã khôi phục/xác minh. Kiểm tra
+  cả quyền từng thư giữ lại, vì ACL cha không bảo vệ tệp con có ACL riêng rộng.
+  Thư mục/thư lịch sử không đạt bị từ chối; không sửa ACL hoặc xóa thư tự động.
+  Các quota và kiểm soát reset vô danh của đợt trước vẫn được giữ.
+- **Backup/restore:** yêu cầu thư mục đầu ra private, tạo thư mục plaintext và
+  tệp bằng API riêng quyền trước khi SQLite mở. Giữ handle thư mục đầu ra và
+  mọi ancestor trên Windows xuyên suốt thao tác/dọn tệp. Hardlink xuất nguyên
+  tử giữ DACL tệp; kiểm tra đầu ra sau dọn cho thấy còn một link và quyền riêng.
+  Mọi chính sách mã hóa/quarantine/thu hồi phiên của đợt trước tiếp tục áp dụng.
+- **Tệp bí mật hữu hạn:** config, Vault, WORM và OIDC dùng reader regular-file
+  đã kiểm tra qua handle, no-follow, đọc byte có trần + 1 và UTF-8 nghiêm ngặt.
+  Config tối đa 16 KiB, workload/proxy token 4 KiB. Tệp tăng sau kiểm tra size
+  vẫn không gây đọc không giới hạn. Không đòi owner riêng cho mount service đọc
+  được; không nhận mount symlink/projected-secret trực tiếp. Vault/WORM đọc lại
+  để nhận token đã xoay, giữ normalization và lỗi chung không chứa secret/path.
+- **Cài đặt mới:** wrapper bootstrap dependency rồi gọi `scripts.local_storage
+  init`. `.env` mới private trước khi ghi khóa sinh trong Python; không truyền
+  khóa qua shell argv/env/log. DB/WAL/SHM mới nằm trong `local_data/`, outbox
+  trong `local_data/mail_outbox/`, tất cả bị loại khỏi Git. `.env` có sẵn giữ
+  nguyên bytes/quyền; thiếu cấu hình nhưng còn DB/sidecar mặc định hoặc template
+  DB tùy chỉnh thì từ chối sinh khóa mới/chọn DB trống. `mkdir --directory PATH`
+  chỉ tạo thư mục mới để operator chuẩn bị kho riêng.
+- **CI Windows:** bổ sung job kiểm tra ACL thực, setup, mail và backup trên
+  `windows-latest`, dùng cùng action/uv pins hiện có và quyền repo chỉ đọc.
+  YAML đã kiểm tra local; chưa chạy job này trên GitHub trong đợt phát triển.
+
+### Phạm vi còn phải vận hành
+
+Không suy ra `.env`, DB hoặc outbox lịch sử đã có quyền tốt từ việc `init` báo
+giữ nguyên cấu hình. Hướng dẫn tạo outbox mới và phục hồi DB offline vào kho
+private có trong [availability.md](docs/security/availability.md). Không sinh
+lại khóa để sửa lỗi quyền hay di chuyển riêng main DB đang có WAL. Sau restore
+vẫn phải đối chiếu thu hồi/thay đổi tài khoản và checkpoint từ nguồn mới hơn.
+
+ACL không cô lập malware chạy bằng chính tài khoản ứng dụng, SYSTEM/root hay
+administrator có quyền lấy ownership; ổ mã hóa, tài khoản vận hành riêng và
+ancestor đáng tin cậy vẫn cần thiết. Trên POSIX việc SQLite mở lại đường dẫn
+vẫn dựa vào ancestor đáng tin cậy. Trên Windows thay token nguyên tử có thể
+cần retry khi trùng khoảng thời gian reader đang mở tệp. Không cam kết xóa an
+toàn trên SSD, pentest độc lập hoặc chống DDoS Internet từ các kiểm tra local.
+CDN/WAF, chống DDoS upstream, bot challenge, monitoring/paging ngoài và
+KMS/WORM production vẫn cần tên miền/tài khoản/hạ tầng khi triển khai.
+
+Tham chiếu: [Microsoft file security](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights),
+[GetDriveTypeW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdrivetypew),
+[FILE_DISPOSITION_INFO](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_disposition_info).
+
+### Bằng chứng kiểm chứng đợt lưu trữ private
+
+- **1.226 kiểm thử Python đạt**, gồm 117 regression mới đạt; tổng 1.232 case,
+  sáu kiểm thử POSIX bỏ qua trên Windows, không có lỗi. Lượt tổng thể 652,7 giây;
+  báo cáo `reports/private-storage-final-pytest.xml`. Kiểm tra DACL/owner/ACE,
+  pinning chống đổi tên, ACL SQLite/WAL/SHM, cleanup failure, setup không ghi đè
+  và đọc secret hữu hạn đều chạy với filesystem Windows thật/dữ liệu giả.
+- **21 kiểm thử JavaScript đạt**, bộ kiểm chứng bảo mật **11/11 đạt**, trong
+  `reports/security-validation-private-storage/`.
+- Ruff, `uv lock --check` và whitespace đạt. Bandit quét `src/app` cùng `scripts`
+  không có phát hiện từ medium severity/confidence trở lên (`-ll -ii`), trong
+  `reports/private-storage-bandit.json`.
+- `pip-audit`: **104 gói, 0 lỗ hổng đã biết** ở lần quét này, trong
+  `reports/private-storage-pip-audit.json`; không đổi dependency.
+- PowerShell setup và YAML CI parse hợp lệ. Host không có Bash để kiểm tra
+  `setup.sh -n`; chưa chạy wrapper setup trên project thật, CI remote hoặc
+  Linux/POSIX filesystem trong đợt này. Không chạy backup/restore trên DB thật,
+  sửa ACL dữ liệu lịch sử, pentest độc lập hay thử DDoS Internet.

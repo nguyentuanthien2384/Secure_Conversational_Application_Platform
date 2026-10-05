@@ -451,6 +451,13 @@ Trên macOS/Linux dùng `./.venv/bin/python`. Launcher lắng nghe trên loopbac
 `.env`, dùng SQLite/khóa tạm mới mỗi lần, tự seed và ép AI ngoại tuyến. Dừng bằng `Ctrl+C`;
 khởi động lại là lượt demo mới, không xóa hoặc thay đổi cơ sở dữ liệu đang có của dự án.
 
+Để cài đặt local lưu dữ liệu lâu dài, dùng `setup.ps1` trên Windows hoặc `setup.sh`
+trên Linux/macOS. Với cài đặt mới, scripts tạo `.env` có quyền riêng trước khi ghi
+khóa và đặt DB/outbox trong `local_data/` có ACL/mode riêng. `.env` đã tồn tại được
+giữ nguyên; thiếu cấu hình nhưng còn DB sẽ bị từ chối sinh khóa mới. Cách tạo kho
+private, xử lý outbox cũ và backup/restore nằm trong
+[hướng dẫn lưu trữ local](docs/security/availability.md#kho-dữ-liệu-local-và-tệp-bí-mật).
+
 **Passkey và email trong demo:** mở bằng <http://localhost:8000> (trình duyệt không cho passkey
 trên địa chỉ IP như `127.0.0.1`). Mã xác minh email và mã đặt lại mật khẩu được ghi thành file `.eml`
 trong thư mục `outbox` mà launcher in ra lúc khởi động; mở bằng trình soạn thảo hoặc ứng dụng thư.
@@ -524,9 +531,9 @@ tmpfs cho `/tmp`, `pids_limit`/`mem_limit`/`ulimits` chống cạn kiệt tài n
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
 ```
 
-⚠️ Lớp phủ này publish app trực tiếp trong khi container vẫn chạy `--forwarded-allow-ips=*`,
-nên client có thể tự chèn `X-Forwarded-For` và làm sai lệch IP nguồn trong rate limit / IDS /
-audit log. **Chỉ dùng để demo cục bộ.**
+Lớp phủ bind cổng app vào `127.0.0.1` và dùng `--no-proxy-headers`; header
+`X-Forwarded-For` do client gửi không chọn được IP nguồn của rate limit/IDS/audit.
+Cấu hình này dành cho local/demo; production dùng Caddy và IP proxy tin cậy cụ thể.
 
 ---
 

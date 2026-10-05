@@ -34,7 +34,7 @@ import struct
 import sys
 import time
 import warnings
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -43,7 +43,12 @@ from argon2.low_level import Type, hash_secret_raw
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from src.app.private_storage import create_private_directory, create_private_file
+from src.app.private_storage import (
+    PrivateStorageError,
+    create_private_directory,
+    create_private_file,
+    private_directory_scope,
+)
 
 MAX_DATABASE_BYTES = 64 * 1024 * 1024
 BACKUP_DEADLINE_SECONDS = 30
@@ -137,21 +142,29 @@ def _write_new(path: Path, payload: bytes) -> None:
 @contextmanager
 def _private_temporary_directory(parent: Path, prefix: str):
     """Create private storage before SQLite can create plaintext/sidecars."""
-    for _attempt in range(32):
-        directory = parent / (prefix + secrets.token_hex(16))
+    with ExitStack() as held:
         try:
-            create_private_directory(directory)
-        except FileExistsError:
-            continue
-        break
-    else:
-        raise BackupError("Could not reserve private temporary storage.")
-    try:
-        yield directory
-    finally:
-        # Only remove the new random child that this operation created. Never
-        # clean the input, output or a caller-supplied existing directory.
-        shutil.rmtree(directory)
+            held.enter_context(private_directory_scope(parent))
+        except PrivateStorageError as exc:
+            raise BackupError(
+                "Output requires a private directory. Create a NEW directory with "
+                "python -m scripts.local_storage mkdir --directory PATH."
+            ) from exc
+        for _attempt in range(32):
+            directory = parent / (prefix + secrets.token_hex(16))
+            try:
+                create_private_directory(directory)
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise BackupError("Could not reserve private temporary storage.")
+        try:
+            yield directory
+        finally:
+            # Only remove the new random child that this operation created.
+            # Hold the Windows parent/ancestor names through SQLite and cleanup.
+            shutil.rmtree(directory)
 
 
 def _publish_new(temporary: Path, output: Path) -> None:

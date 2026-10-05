@@ -105,8 +105,16 @@ def test_reader_uses_opened_version_when_file_rotates(tmp_path):
     replacement = tmp_path / "replacement"
     replacement.write_bytes(b"new-version")
     with read_regular_file(destination) as source:
-        os.replace(replacement, destination)
+        if os.name == "nt":
+            # MoveFileEx cannot replace a destination while it is open, even
+            # with delete sharing. Rotation completes between bounded reads.
+            with pytest.raises(PermissionError):
+                os.replace(replacement, destination)
+        else:
+            os.replace(replacement, destination)
         assert source.read() == b"old-version"
+    if os.name == "nt":
+        os.replace(replacement, destination)
     with read_regular_file(destination) as source:
         assert source.read() == b"new-version"
 
@@ -309,3 +317,40 @@ def test_windows_ancestor_is_pinned_during_creation(tmp_path, monkeypatch):
         output.write(b"private")
     assert attempts == [True]
     assert (directory / "secret").read_bytes() == b"private"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Mapped Windows network drives must fail closed.")
+@pytest.mark.parametrize("drive_type", [0, 1, 4, 5])
+def test_windows_rejects_unavailable_remote_or_readonly_drives_before_creation(tmp_path, monkeypatch, drive_type):
+    api = storage._windows()
+    monkeypatch.setattr(api.kernel, "GetDriveTypeW", lambda _root: drive_type)
+    with pytest.raises(PrivateStorageError):
+        create_private_file(tmp_path / "not-created")
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Drive-relative Windows paths vary with process state.")
+def test_windows_rejects_drive_relative_before_resolution():
+    with pytest.raises(PrivateStorageError):
+        create_private_file("C:relative-secret")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native handles must close even if deletion fails.")
+def test_windows_failed_cleanup_still_closes_new_file_handle(tmp_path, monkeypatch):
+    api = storage._windows()
+
+    def failed_validation(*_arguments, **_keywords):
+        raise PrivateStorageError("Synthetic validation failure.")
+
+    def failed_delete(_handle):
+        raise OSError("Synthetic deletion failure.")
+
+    monkeypatch.setattr(api, "private", failed_validation)
+    monkeypatch.setattr(api, "mark_delete", failed_delete)
+    destination = tmp_path / "empty-private-file"
+    with pytest.raises(OSError):
+        create_private_file(destination)
+    assert destination.read_bytes() == b""
+    # A leaked exclusive native handle would prevent this deletion on Windows.
+    destination.unlink()
+    assert not destination.exists()

@@ -135,25 +135,44 @@ Không dùng `docker compose down -v`, reset dữ liệu demo hoặc sửa chu�
 
 `MAIL_MAX_PENDING=32` giới hạn cả thư đang gửi và đang chờ trong mỗi worker; tối đa hai luồng gửi. Shutdown chờ tối đa 10 giây rồi hủy thư chưa chạy; tác vụ SMTP đang chạy vẫn kết thúc theo timeout từng thao tác 15 giây. Bộ đếm `mail` trong API quản trị không chứa địa chỉ/nội dung; cần theo dõi `failed`/`rejected` vì thư nền không thể báo lỗi lại cho request đã hoàn tất. Gửi reset khi hàng đợi đầy vẫn trả cùng `202` cho tài khoản có/không tồn tại, mã chưa gửi bị thu hồi đúng yêu cầu.
 
-Outbox chỉ dùng local/demo: tối đa 512 tệp, 16 MiB và 64 KiB mỗi thư. Không tự xóa thư cũ; khi đầy, chuyển thư cần giữ ra kho riêng rồi dọn theo quyết định của người vận hành. Không trỏ tới thư mục chứa tệp khác, symlink, junction hoặc hardlink. Quota được đồng bộ trong một tiến trình; không chia sẻ cùng outbox giữa nhiều worker. POSIX dùng quyền riêng tư; trên Windows cần ACL thư mục chỉ cho tài khoản vận hành. Production tiếp tục từ chối outbox.
+Outbox chỉ dùng local/demo: tối đa 512 tệp, 16 MiB và 64 KiB mỗi thư. Không tự xóa thư cũ; khi đầy, chuyển thư cần giữ ra kho riêng rồi dọn theo quyết định của người vận hành. Không trỏ tới thư mục chứa tệp khác, symlink, junction hoặc hardlink. Quota được đồng bộ trong một tiến trình; không chia sẻ cùng outbox giữa nhiều worker. Thư mục/tệp mới có ACL riêng trên Windows hoặc quyền POSIX trước khi ghi mã. Cả quyền từng thư cũ cũng được kiểm tra; thư mục hoặc thư cũ không đạt sẽ bị từ chối, không tự sửa quyền. Production tiếp tục từ chối outbox.
 
 Host mặc định local chỉ là `127.0.0.1`, `localhost`, `::1`; muốn truy cập LAN phải khai báo host cụ thể. CSP chỉ cho script bootstrap đã xác minh dùng nonce mới và script asset cùng origin; CSS inline vẫn cần cho Gradio. Không tự cấp nonce cho HTML/dữ liệu người dùng. Adapter từ chối bootstrap/custom script không tương thích khi nâng thư viện. Báo cáo CSP giữ allowance CSS này để tránh burst báo cáo hợp lệ làm nghẽn giao diện. Deep-link lưu trạng thái plaintext bị chặn; header origin thô của thư viện bị bỏ, scope do server/proxy xác minh được giữ.
 
 ## Sao lưu SQLite mã hóa và phục hồi offline
 
-Đây là công cụ cho **SQLite local tối đa 64 MiB**; không thay quy trình PostgreSQL/Vault/WORM production. Tạo thư mục riêng trên ổ mã hóa với ACL chỉ dành cho người vận hành. Thay các đường dẫn ví dụ dưới đây bằng DB đã xác nhận và tên đầu ra mới; công cụ không suy ra cấu hình từ `.env`:
+Đây là công cụ cho **SQLite local tối đa 64 MiB**; không thay quy trình PostgreSQL/Vault/WORM production. Tạo một thư mục đầu ra **mới** trên ổ mã hóa bằng lệnh dưới đây; thư mục có ACL/mode riêng được công cụ kiểm tra trước khi tạo plaintext. Thay các đường dẫn ví dụ bằng DB đã xác nhận và tên đầu ra mới; công cụ không suy ra cấu hình từ `.env`:
 
 ```powershell
+.\.venv\Scripts\python.exe -m scripts.local_storage mkdir --directory "D:\SCAP-private"
 .\.venv\Scripts\python.exe -m scripts.secure_backup backup --database "D:\SCAP-private\current.db" --output "D:\SCAP-private\copy.scapbak"
 .\.venv\Scripts\python.exe -m scripts.secure_backup restore --archive "D:\SCAP-private\copy.scapbak" --output "D:\SCAP-private\recovered.db"
 ```
 
 Mật khẩu backup được nhập ẩn, tối thiểu 16 byte UTF-8, xác nhận khi tạo; không đưa vào argument/env/log. AES-256-GCM xác thực cả snapshot và header phiên bản/kích thước/KDF. Argon2id cố định 64 MiB, ba lượt; từ chối header/kích thước sai trước KDF. SQLite online backup giữ commit WAL; không sao chép riêng file `.db` đang chạy. Bước snapshot và validation có deadline riêng 30 giây. Tệp chỉ được xuất nguyên tử nếu chưa tồn tại, cần filesystem hỗ trợ hardlink; không có tùy chọn ghi đè. Điều này chưa bảo đảm directory entry tồn tại sau mất điện.
 
-DB chứa wrapped DEK/epoch/phiên bản khóa; công cụ **không xuất KEK, JWT key, `.env` hoặc trạng thái dịch vụ ngoài**. Cất khóa và mật khẩu backup riêng, bảo toàn các phiên bản khóa còn cần đọc. Plaintext snapshot tạm nằm trong thư mục đầu ra riêng rồi được dọn; Windows kế thừa ACL thư mục, không cam kết xóa an toàn trên SSD. Archive `.scapbak` được loại khỏi Git nhưng vẫn phải bảo vệ.
+DB chứa wrapped DEK/epoch/phiên bản khóa; công cụ **không xuất KEK, JWT key, `.env` hoặc trạng thái dịch vụ ngoài**. Cất khóa và mật khẩu backup riêng, bảo toàn các phiên bản khóa còn cần đọc. Plaintext snapshot tạm nằm trong thư mục được tạo riêng quyền trước khi SQLite mở nó; Windows giữ handle của thư mục đầu ra và các thư mục cha xuyên suốt snapshot/restore/dọn tệp để chặn đổi tên thay đường dẫn. Archive và DB phục hồi giữ ACL riêng sau xuất nguyên tử. Không cam kết xóa an toàn trên SSD. Archive `.scapbak` được loại khỏi Git nhưng vẫn phải bảo vệ.
 
 Restore thu hồi toàn bộ phiên/JWT challenge, tiêu thụ recovery code/MFA code/prekey E2EE và xóa challenge passkey/E2EE. Token version nhảy ngẫu nhiên để tránh trùng phiên bản của challenge phát sau snapshot. TOTP tiêu thụ cửa sổ hiện tại, có thể cần chờ tối đa khoảng 60 giây để dùng mã mới. Audit chain, wrapped DEK và ciphertext được giữ nguyên. **Mọi tài khoản bị khóa mặc định** vì backup cũ không biết các thay đổi/thu hồi mới hơn.
 
 Giữ DB phục hồi offline, tắt `SEED_DEMO_DATA` và bootstrap tạo admin trước khi phục vụ. Đối chiếu từ nguồn mới hơn các khóa/xóa tài khoản, mật khẩu, MFA/seed, email khôi phục, passkey, thiết bị E2EE, membership/epoch và dữ liệu đã xóa. Chỉ tài khoản đã đối chiếu mới được kích hoạt bằng cách phục hồi vào một tệp mới khác với tùy chọn `--activate-reviewed-user USERNAME` (lặp lại cho từng tài khoản); tùy chọn này là quyết định của operator, không tự chứng minh review đã hoàn tất. Phát hành prekey/recovery code mới qua luồng hiện có sau review.
 
 Trước chuyển cấu hình sang DB mới, xác minh khóa đúng/sai, chain/checkpoint ngoài và các account/phiên đã thu hồi không truy cập được. Không đổi khóa/DB đang chạy chỉ để thử công cụ. Lịch sao lưu, bản sao ngoài máy, retention và diễn tập mất máy vẫn do người vận hành thiết lập; lần phát triển này chỉ dùng dữ liệu giả trong thư mục tạm.
+
+## Kho dữ liệu local và tệp bí mật
+
+`setup.ps1`/`setup.sh` cài dependency trước, sau đó gọi `python -m scripts.local_storage init`. Với cài đặt mới, lệnh tạo `.env` độc quyền có quyền riêng trước khi ghi khóa ngẫu nhiên; khóa không đi qua argument/env của shell hoặc log. DB mới và sidecar SQLite nằm trong `local_data/`, outbox mới trong `local_data/mail_outbox/`. Thư mục này bị loại khỏi Git. Nếu `.env` đã tồn tại, chỉ kiểm tra metadata và giữ nguyên bytes/quyền/đường dẫn; lệnh không chứng nhận cài đặt cũ đã có ACL tốt. Nếu thiếu `.env` nhưng có DB/sidecar ở hai vị trí mặc định, hoặc template chọn DB tùy chỉnh, lệnh từ chối tạo khóa mới. Phải phục hồi cấu hình và các khóa khớp dữ liệu trước khi tiếp tục.
+
+Windows dùng SID từ token tiến trình, DACL được bảo vệ khỏi kế thừa và chỉ cấp quyền cho người chạy cùng SYSTEM; không dựa vào tên người dùng/env hoặc `chmod`. Chỉ nhận filesystem local khả dụng, từ chối UNC, ổ mạng gắn ký tự, đường dẫn thiết bị/ADS, reparse point, junction, symlink và hardlink. POSIX tạo thư mục/tệp với `0700`/`0600`, kiểm tra chủ sở hữu và quyền khác. Hệ thống tệp không lưu được chính sách quyền sẽ dừng an toàn. [Microsoft mô tả ACL tại thời điểm tạo và quyền riêng của từng tệp](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights).
+
+Nếu outbox cũ bị từ chối, dừng ứng dụng, tạo thư mục **mới** rồi tự đổi đúng `MAIL_OUTBOX_DIR` trong `.env` hiện có và khởi động lại:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.local_storage mkdir --directory "D:\SCAP-mail-private"
+```
+
+Không sao chép thư cũ vào thư mục mới rồi mặc định chúng đã riêng quyền: thao tác di chuyển có thể giữ ACL cũ. Công cụ không tự sửa ACL lịch sử, di chuyển DB đang chạy hoặc xoay khóa. DB cũ cần quy trình offline riêng: giữ khóa cũ, backup mã hóa, restore mới vào thư mục private, đối chiếu tài khoản/phiên và audit theo mục phục hồi trên trước khi đổi `DATABASE_URL`. Không chọn một DB trống để vượt qua lỗi quyền. `.env` cũ và quyền truy cập khóa cũng cần được người vận hành rà lại; `init` giữ nguyên chúng.
+
+Các secret `_FILE`/Vault/WORM/OIDC dùng cùng reader: kiểm tra loại tệp qua handle, đọc tối đa ngân sách byte + 1, giải mã UTF-8 nghiêm ngặt; lỗi không in đường dẫn/nội dung. Config tối đa 16 KiB, token Vault/WORM/OIDC tối đa 4 KiB. Reader không bắt buộc chủ sở hữu riêng để hỗ trợ regular-file mount đọc được của service; các thư mục cha cũng phải đọc được. Mount thông qua symlink/projected-secret không được chấp nhận: stage thành regular file trong runtime private theo entrypoint high hiện có. Vault/WORM đọc lại mỗi lần để nhận rotation. Trên Windows cần hoàn tất thay tệp giữa các lần đọc hoặc retry khi OS báo tệp bận.
+
+ACL hạn chế tài khoản khác trên cùng máy; không chặn malware chạy bằng chính tài khoản ứng dụng, SYSTEM/root hay administrator có quyền lấy ownership. Dùng tài khoản vận hành riêng và ổ mã hóa; quyền của đường dẫn cha phải tin cậy, đặc biệt với SQLite mở lại đường dẫn trên POSIX. Không suy ra bảo vệ trước DDoS Internet từ ACL local.

@@ -20,6 +20,7 @@ from src.app.private_storage import (
     check_private_directory,
     create_private_directory,
     create_private_file,
+    read_regular_file,
 )
 
 _MAX_TEMPLATE_BYTES = 64 * 1024
@@ -52,6 +53,8 @@ def _project_path(project: str | Path) -> Path:
     path = Path(project)
     if ".." in path.parts:
         raise LocalStorageError("Use a project path without parent traversal.")
+    if os.name == "nt" and path.drive and not path.root:
+        raise LocalStorageError("Use an absolute or working-directory-relative project path.")
     path = Path(os.path.abspath(path))
     for component in (*reversed(path.parents), path):
         info = _metadata(component)
@@ -76,10 +79,7 @@ def _read_template(path: Path) -> tuple[list[str], dict[str, str]]:
         raise LocalStorageError("A regular .env.example template is required.")
     if before.st_nlink != 1:
         raise LocalStorageError("The .env.example template must not be hard-linked.")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(path, flags)
-    with os.fdopen(descriptor, "rb") as stream:
+    with read_regular_file(path) as stream:
         opened = os.fstat(stream.fileno())
         if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
                 or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
@@ -109,6 +109,13 @@ def _read_template(path: Path) -> tuple[list[str], dict[str, str]]:
                 "KEY_PROVIDER": "local", "MAIL_BACKEND": "outbox"}
     if any(values[key] != value for key, value in expected.items()):
         raise LocalStorageError("The .env.example template must use the standard local profile.")
+    if values["DATABASE_URL"] not in {
+        "sqlite:///./secure_chat.db", "sqlite:///./local_data/secure_chat.db",
+    }:
+        raise LocalStorageError(
+            "Custom database storage requires its matching configuration and keys; "
+            "fresh local setup cannot replace its DATABASE_URL."
+        )
     for key in ("APP_SECRET_KEY_FILE", "MASTER_ENCRYPTION_KEYS", "ACTIVE_KEY_VERSION"):
         if values.get(key, ""):
             raise LocalStorageError("The local template must not select pre-existing secret files or keys.")
