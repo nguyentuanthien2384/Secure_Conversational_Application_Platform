@@ -12,6 +12,18 @@ reports
 tmp
 tests
 docs
+deploy/.env*
+deploy/*.tar
+# Runtime secrets and local user data must never enter a build context.
+local_data
+mail_outbox
+**/.env
+**/.env.*
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.db-journal
+**/*.scapbak
 htmlcov
 .coverage
 coverage.xml

@@ -130,7 +130,8 @@ services:
     # Caddy owns the sanitized request log. Uvicorn access logging is disabled
     # because the one-use export capability is necessarily carried in the path.
     command: ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=${SCAP_CADDY_IPV4:-172.30.45.2}", "--no-access-log", "--limit-concurrency", "${UVICORN_LIMIT_CONCURRENCY:-64}", "--backlog", "${UVICORN_BACKLOG:-128}", "--timeout-keep-alive", "${UVICORN_KEEPALIVE_SECONDS:-5}", "--timeout-graceful-shutdown", "${UVICORN_SHUTDOWN_SECONDS:-20}", "--h11-max-incomplete-event-size", "16384"]
-    env_file: .env
+    # A dedicated protected file keeps future VPS credentials separate from local demo data.
+    env_file: ${SCAP_ENV_FILE:-.env}
     environment:
       APP_ENV: production
       DATABASE_URL: postgresql+psycopg://scap_app:${APP_DB_PASSWORD:-}@db:5432/secure_chat

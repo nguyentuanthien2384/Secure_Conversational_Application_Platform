@@ -6,6 +6,12 @@ Lượt demo có SQLite và khóa tạm riêng, tự nạp tài khoản mẫu v�
 không cần máy chủ, Docker, API key hoặc sửa `.env`. Xem
 [hướng dẫn chạy](HUONG_DAN_CHAY.md) và [kịch bản 6/12 phút](docs/DEMO_SCRIPT.md).
 
+**Chuẩn bị deploy demo lên VPS:** chạy
+`.\.venv\Scripts\python.exe -m scripts.prepare_vps init --project .` để tạo
+cấu hình bí mật riêng, giữ nguyên môi trường local. Hồ sơ VPS Linux 1 CPU/3 GB
+cho 3–4 người dùng và các bước build, chuyển file, kiểm tra HTTPS nằm trong
+[hướng dẫn triển khai VPS demo](docs/VPS_DEMO_DEPLOYMENT.md).
+
 **Thực hành ANM theo hai tài liệu Word:** tab **Thực hành ANM** dành cho
 moderator/admin có 11 bài mạng, hệ điều hành, bảo mật ứng dụng và xử lý sự cố.
 Chạy `.\.venv\Scripts\python.exe -m scripts.practice_lab` để xuất báo cáo kiểm

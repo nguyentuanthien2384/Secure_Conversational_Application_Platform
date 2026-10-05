@@ -1,0 +1,102 @@
+# Controlled public demo on a small Linux VPS (1 vCPU / 3 GB RAM).
+# Use only with docker-compose.yml; never combine with local/high-security overlays.
+# These are starting resource budgets, not a measured capacity guarantee.
+# Build the shared app/migration image on a workstation, load it on the VPS,
+# and deploy with --no-build. See docs/VPS_DEMO_DEPLOYMENT.md.
+services:
+  db:
+    image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE to a verified name@sha256 digest}
+    command:
+      - postgres
+      - "-c"
+      - "log_connections=on"
+      - "-c"
+      - "log_disconnections=on"
+      - "-c"
+      - "log_statement=ddl"
+      - "-c"
+      - "log_min_duration_statement=1000"
+      - "-c"
+      - "shared_buffers=128MB"
+      - "-c"
+      - "max_connections=32"
+      - "-c"
+      - "work_mem=4MB"
+      - "-c"
+      - "maintenance_work_mem=64MB"
+    mem_limit: 512m
+    cpus: 0.5
+
+  redis:
+    image: ${REDIS_IMAGE:?set REDIS_IMAGE to a verified name@sha256 digest}
+    # Leave RAM for Redis bookkeeping; never evict active security quotas.
+    command: ["redis-server", "--appendonly", "no", "--save", "", "--maxmemory", "96mb", "--maxmemory-policy", "noeviction", "--maxclients", "128"]
+    mem_limit: 192m
+    cpus: 0.2
+
+  migrate:
+    image: ${SCAP_APP_IMAGE:?set SCAP_APP_IMAGE to the imported app image}
+    build:
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:?set BASE_IMAGE to a verified name@sha256 digest}
+        REQUIRE_BASE_IMAGE_DIGEST: "true"
+    mem_limit: 768m
+    cpus: 0.75
+
+  app:
+    # Both services use one image; migration must match the app being deployed.
+    image: ${SCAP_APP_IMAGE:?set SCAP_APP_IMAGE to the imported app image}
+    build:
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:?set BASE_IMAGE to a verified name@sha256 digest}
+        REQUIRE_BASE_IMAGE_DIGEST: "true"
+    env_file: ${SCAP_ENV_FILE:?set SCAP_ENV_FILE to the protected VPS deploy/.env.vps file}
+    environment:
+      APP_ENV: production
+      SECURITY_PROFILE: standard
+      KEY_PROVIDER: local
+      DOCS_ENABLED: "false"
+      SEED_DEMO_DATA: "false"
+      # Standard production supports the clearly labelled offline demo provider.
+      # Set false once a real external AI provider is configured.
+      ALLOW_DEMO_AI: ${ALLOW_DEMO_AI:-true}
+      MAIL_BACKEND: ${MAIL_BACKEND:-disabled}
+      PASSWORD_BREACH_CHECK: "true"
+      GRADIO_AUTH_MODE: application
+      # The deployment file also supplies one-off/DB credentials. The web
+      # runtime needs only its least-privilege DATABASE_URL from the base file.
+      POSTGRES_PASSWORD: ""
+      AUDITOR_DB_PASSWORD: ""
+      APP_DB_PASSWORD: ""
+      # This profile uses fresh keys in its dedicated deploy/.env.vps, not laptop paths.
+      APP_SECRET_KEY_FILE: ""
+      DATABASE_PASSWORD_FILE: ""
+      REDIS_PASSWORD_FILE: ""
+      BOOTSTRAP_ADMIN_PASSWORD: ""
+      VAULT_ADDR: ""
+      VAULT_TOKEN_FILE: ""
+      VAULT_NAMESPACE: ""
+      VAULT_ALLOW_INSECURE_HTTP: "false"
+      AWS_KMS_KEY_ID: ""
+      AWS_REGION: ""
+      GCP_KMS_KEY_NAME: ""
+      OIDC_PROXY_SECRET_FILE: ""
+      AUDIT_WORM_ENDPOINT: ""
+      AUDIT_WORM_TOKEN_FILE: ""
+      # Four browsers may share a classroom/router address. Preserve the HTTP
+      # burst allowance for loading modules, while bounding costly operations.
+      REQUEST_IP_MAX_CONCURRENT: "16"
+      REQUEST_IP_MAX_STREAMS: "4"
+      PASSWORD_MAX_CONCURRENT: "1"
+      AI_MAX_CONCURRENT: "1"
+      GRADIO_QUEUE_MAX_SIZE: "16"
+      GRADIO_CONCURRENCY_LIMIT: "2"
+      GRADIO_RETAINED_EVENTS: "64"
+      GRADIO_STATE_CAPACITY: "64"
+    mem_limit: 1g
+    cpus: 1.0
+
+  caddy:
+    image: ${CADDY_IMAGE:?set CADDY_IMAGE to a verified name@sha256 digest}
+    mem_limit: 192m
+    cpus: 0.25
