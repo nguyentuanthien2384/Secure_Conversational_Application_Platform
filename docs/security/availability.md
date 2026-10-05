@@ -59,7 +59,9 @@ Trong cấu hình Caddy production, chặn truy cập readiness từ Internet; D
 
 `GET /api/admin/availability` yêu cầu tài khoản admin và trả snapshot của worker: số yêu cầu/stream đang chạy, số lần từ chối, năng lực băm mật khẩu, readiness và các trần giao diện/AI. Bộ đếm reset khi tiến trình khởi động lại. Không coi snapshot của một worker là số liệu tổng cụm.
 
-Trong tab Quản trị, chọn làm mới để xem các slot yêu cầu/luồng/băm mật khẩu, số sự kiện giữ lại và lượt từ chối ghi nhận. Đây là số liệu tức thời khi lấy snapshot, gồm chính yêu cầu lấy số liệu; không phải biểu đồ lịch sử tải.
+Trong tab Quản trị, chọn làm mới để xem các slot yêu cầu/luồng/băm mật khẩu, số sự kiện giữ lại và lượt từ chối ghi nhận. Snapshot tài nguyên gồm chính yêu cầu lấy số liệu. Phần HTTP dùng cửa sổ 60 giây với vòng đệm cố định 60 ô: nhóm status, thường/SSE, histogram và trung bình thời gian ứng dụng phát header. SSE được đo ngay khi bắt đầu phản hồi, không chờ luồng đóng; yêu cầu hủy/lỗi trước header được đếm riêng. Trung bình gồm tất cả phản hồi có header, không phải latency riêng của phản hồi thành công hay thời gian truyền hết body.
+
+Cảnh báo tự hết khi cửa sổ trôi: ít nhất 5 phản hồi `429`/`503`; ít nhất 5 lỗi `5xx` với tỷ lệ từ 10%; ít nhất 5 yêu cầu chưa phát header; hoặc ít nhất 20 phản hồi và từ 20% mất hơn 1 giây đến header. Snapshot cũng cảnh báo khi ngân sách request/SSE/password đang đầy. Đây là dấu hiệu vận hành để điều tra, không tự kết luận DDoS. Chỉ admin có quyền xem; không giữ URL/IP/body/header/token cho thống kê này.
 
 Sự kiện `availability.overload` được gom mẫu với nhãn cố định; không chứa prompt, mật khẩu, token, IP hay đường dẫn yêu cầu. Nhật ký từ chối xác thực vô danh cũng được lấy mẫu để giảm lượng ghi audit khi có burst. Điều này giữ bằng chứng đại diện; số lần bị từ chối cần đối chiếu bộ đếm, không chỉ đếm dòng audit.
 
@@ -89,6 +91,34 @@ Turnstile hoặc một challenge tương đương là lựa chọn tương lai c
 Các giới hạn trong ứng dụng không ngăn bão lưu lượng làm đầy đường truyền hoặc cạn tài nguyên trước khi tới ASGI. Laptop local hiện chưa cần provisioning các dịch vụ upstream này.
 
 ## Kiểm thử và triển khai theo giai đoạn
+
+### Công cụ kiểm chứng local đã có
+
+Kiểm tra HTTP thật trên hai tiến trình ứng dụng tạm riêng, socket chỉ bind `127.0.0.1` ở cổng do hệ điều hành cấp:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.security_load_check
+```
+
+Công cụ không nhận URL mục tiêu, không đọc cấu hình/DB/secret thật và dùng provider AI giả lập. Kiểm tra baseline health; giữ bốn body chưa hoàn tất để xác nhận `503`, `Retry-After` và thu hồi slot sau ngắt kết nối; giữ provider slot thật để xác nhận API chat bận rồi phục hồi; chờ deadline body 30 giây trả `408`; xác minh DB/crypto/audit sau tải; vượt quota IP rồi thử header chuyển tiếp giả và phục hồi sau cửa sổ trôi. `--quick` bỏ bài chờ body timeout và báo rõ phần chưa kiểm chứng.
+
+Các trần thử nghiệm được hạ xuống (request 4, password/AI 1, quota IP 6/2 giây) để kiểm tra hành vi chặn mà không cần tải lớn. SQLite giữ writer transaction qua lời gọi chat nên kiểm tra AI dùng một reservation trong core, không giữ DB transaction, rồi gọi API thật. Đây không phải phép đo parallel chat throughput hay công suất cấu hình mặc định.
+
+Tối đa 160 request mỗi worker, năm kết nối tải cùng lúc (bốn body giữ slot + một probe), ngân sách công việc 100 giây và tối đa 14 giây dọn tiến trình khi lỗi. Guard bắt đầu trước khi dựng app/seed, lấy mẫu RSS worker mỗi 0,1 giây, ngừng worker tạm nếu vượt 1 GiB, 30 giây CPU hoặc thời gian còn lại; RSS không đọc được cũng không tiếp tục. Lấy mẫu có thể bỏ lỡ đỉnh RAM rất ngắn; đây không phải giới hạn bộ nhớ cứng của hệ điều hành. Parent cũng giới hạn thời gian chờ khởi động/I/O và thu hồi tiến trình khi lỗi.
+
+Báo cáo `reports/security-load-local/security-load.json` chỉ có nhãn cố định, số lượng/status, thời gian, CPU và RSS. p50/p95 tính riêng phản hồi thành công và phản hồi bị chặn, gồm kết nối + đọc phản hồi HTTP từ client; không trộn lỗi nhanh vào latency thành công. CPU % tính theo một lõi, RSS/CPU chỉ đo worker, không gồm client hay tổng RAM máy. Báo cáo không chứa token, khóa hoặc nội dung chat. Chưa thử slow header, SYN flood, DDoS Internet, tải nhiều worker hay phụ thuộc production thật.
+
+Diễn tập backup/restore SQLite ngoại tuyến, không mở cổng:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.security_recovery_drill
+```
+
+Công cụ xuất JSON với 33 bước kiểm tra và thời gian local, dùng SQLite online backup để giữ cả commit mới còn trong WAL. Xác nhận wrapped DEK/epoch/KEK metadata được giữ, giải mã với khóa đúng và từ chối khóa sai hoặc bản mã/metadata bị sửa; token logout và tài khoản inactive trước backup vẫn bị chặn sau restore; audit chain còn nguyên. DB mẫu và bản khôi phục được dọn trong thư mục tạm; KEK/JWT key giữ riêng trong RAM, không nhúng vào snapshot. Đây là diễn tập, không phải lệnh backup cho DB hiện có hoặc bằng chứng RTO/RPO production.
+
+Một snapshot cũ không chứa các thu hồi phiên/tài khoản xảy ra sau thời điểm backup. Trước phục hồi dữ liệu thật phải đối chiếu các thu hồi đó từ nguồn tin cậy hoặc thu hồi toàn bộ phiên phục hồi theo quy trình vận hành; không đưa bản khôi phục ra phục vụ chỉ vì giải mã và audit chain đạt. Vault/KMS/WORM, backup dài hạn và khôi phục sau mất máy vẫn cần diễn tập với hạ tầng thực tế.
+
+### Quy trình khi triển khai thực tế
 
 1. Chạy kiểm thử tự động và demo ngoại tuyến; xác nhận các giới hạn cấu hình hợp lệ, dữ liệu kiểm thử tách khỏi dữ liệu thật. Kiểm tra Compose bằng `config --quiet` với môi trường placeholder hoặc môi trường vận hành được giữ kín; không in bản Compose đã nội suy bí mật.
 2. Đo baseline ở local/staging: một tài khoản, nhiều tab vừa đủ, thao tác đăng nhập, chat và export bình thường. Ghi RAM đỉnh, độ trễ và số slot; không đưa prompt thật vào kết quả đo.

@@ -323,3 +323,56 @@ Nguồn nguyên tắc:
 [OWASP Denial of Service](https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html),
 [Uvicorn settings](https://www.uvicorn.org/settings/),
 [Docker static IP ngoài vùng cấp động](https://docs.docker.com/reference/cli/docker/network/connect/#network-implications-of-stopping-pausing-or-restarting-containers).
+
+## 7. Giám sát, HTTP local và diễn tập khôi phục — 05/10/2026
+
+Bước tiếp theo triển khai cho laptop chưa có tên miền. Không thay cấu hình,
+khóa hoặc DB đang dùng, không mở cổng LAN/Internet hoặc dùng AI trả phí.
+
+- **Giám sát admin:** vòng đệm cố định 60 ô thống kê status/kind và latency
+  tới header trong cửa sổ 60 giây; SSE không phải đợi đóng mới ghi nhận.
+  Lỗi/hủy trước header được đếm riêng. Cảnh báo theo ngưỡng cố định cho
+  `429`/`503`, lỗi `5xx`, chưa phản hồi, header chậm và ngân sách đang đầy,
+  tự hết khi cửa sổ trôi. Giao diện/API chỉ dành cho admin; nhãn không chứa
+  định danh, URL, IP, body hoặc header. Không có cảnh báo email/paging bên ngoài.
+- **HTTP thật có giới hạn:** `scripts.security_load_check` dựng hai worker
+  tạm trên loopback, AI giả lập và SQLite riêng. Kiểm chứng chặn/thu hồi slot
+  khi body chưa hoàn tất, deadline body trả `408`, API chat báo bận/phục hồi,
+  quota IP không bị đổi bằng header giả và DB/crypto/audit còn hoạt động.
+  Guard RSS/CPU/time chạy trước app build/seed; parent quản lý deadline và
+  dọn worker. Không có tùy chọn URL để chạy tải vào website khác.
+- **Backup/restore:** `scripts.security_recovery_drill` dùng online backup
+  khi commit mới còn trong SQLite WAL; xác nhận bản sao giữ commit đó và hai
+  epoch wrapped DEK cùng khóa tài khoản. Giải mã với khóa được giữ riêng,
+  từ chối khóa sai và các sửa đổi bản mã/AAD/KEK metadata. Token logout và
+  account inactive trước backup vẫn bị chặn sau restore; audit chain đạt.
+  Snapshot không chứa plaintext mẫu, KEK hoặc khóa JWT; dữ liệu được dọn.
+
+Các giới hạn load được hạ để gây quá tải nhẹ có kiểm soát. SQLite dùng writer
+transaction để bảo vệ quyết định xác thực qua thao tác chat, nên reservation
+AI được giữ trong core không kèm DB transaction rồi gọi API thật. Các số
+latency/RSS local này không thiết lập công suất parallel chat, SLA hoặc sức
+chịu DDoS production. Restore còn cần xử lý thu hồi xảy ra sau snapshot;
+không coi bằng chứng thu hồi trước backup là bảo đảm cho một snapshot cũ.
+Vault/KMS/WORM và phục hồi khi mất máy chưa được kiểm chứng ở bước này.
+
+### Bằng chứng kiểm chứng
+
+- **983 kiểm thử Python đạt**, gồm **36 trường hợp mới** cho giám sát, load
+  harness và phục hồi; báo cáo `reports/operations-security-pytest.xml`.
+  Load harness được kiểm tra lại 11/11 sau hoàn thiện cleanup; phép chạy fresh
+  process với cấu hình host giả chứng minh không mở DB/secret/proxy của host.
+- HTTP thật đạt **6/6 giai đoạn** trong khoảng 49,3 giây; body chưa hoàn tất
+  trả `408` sau **30,005 giây**, slot được thu hồi và chat/DB/audit phục hồi.
+  Báo cáo `reports/security-load-local/security-load.json` giữ latency thành
+  công riêng với phản hồi chặn, RSS/CPU worker và phạm vi fault injection.
+- Diễn tập khôi phục đạt **33/33 kiểm tra**; bằng chứng tổng hợp an toàn tại
+  `reports/security-recovery-drill.json`. Thời gian local không xác lập RTO/RPO.
+- Bộ kiểm chứng bảo mật chạy lại đạt **11/11**, trong
+  `reports/security-validation-operations/`. Ruff, `uv lock --check` và
+  whitespace đạt; Bandit không có phát hiện medium severity/confidence trở
+  lên với `-ll -ii`, trong `reports/operations-security-bandit.json`.
+- Không đổi dependency, không thực hiện pentest độc lập/Internet flood hoặc
+  kiểm chứng hạ tầng production. Báo cáo là dữ liệu local, được loại khỏi Git.
+
+Phạm vi, ngưỡng và lệnh chạy có trong [availability.md](docs/security/availability.md).

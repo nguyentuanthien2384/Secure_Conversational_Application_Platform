@@ -617,11 +617,25 @@ là ngân sách khởi điểm, phải điều chỉnh bằng đo tải trên m�
 giới hạn AI không thay thế hạn mức thanh toán của nhà cung cấp.
 
 Quản trị viên xem bộ đếm của worker tại `GET /api/admin/availability`.
+Tab Quản trị có thống kê HTTP cửa sổ 60 giây và cảnh báo khi quá tải, lỗi,
+phản hồi chậm hoặc ngân sách tài nguyên đang đầy. Các phép đo có nhãn cố định,
+không giữ URL/IP/body/token và không tự kết luận có tấn công DDoS.
 Các biến `REQUEST_*`, `AUTH_GLOBAL_MAX_ATTEMPTS`, `PASSWORD_MAX_CONCURRENT`,
 `AI_*`, `READINESS_*`, `GRADIO_QUEUE_MAX_SIZE`, `GRADIO_CONCURRENCY_LIMIT` cùng
 quy trình vận hành nằm trong [hướng dẫn chống quá tải](docs/security/availability.md).
 Máy local vẫn dùng hồ sơ development; trước khi mở Internet cần lớp chống
 DDoS/WAF ở biên, khóa truy cập origin và hoàn tất cấu hình production/high.
+
+Hai công cụ local dựng dữ liệu tạm riêng để kiểm chứng qua HTTP thật và
+diễn tập khôi phục, không dùng DB/secret hoặc AI trả phí của bạn:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.security_load_check
+.\.venv\Scripts\python.exe -m scripts.security_recovery_drill
+```
+
+Load check xuất `reports/security-load-local/security-load.json`; recovery
+drill xuất JSON ra stdout. Xem phạm vi và giới hạn phép đo trong hướng dẫn trên.
 
 Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Những nhóm đáng chú ý:
 

@@ -4498,7 +4498,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return list(db.scalars(select(User).order_by(User.created_at.desc()).limit(500)))
 
     def availability_snapshot():
-        return {
+        snapshot = {
             **availability_monitor.snapshot(),
             "requests": request_capacity.snapshot(),
             "streams": stream_capacity.snapshot(),
@@ -4510,6 +4510,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "gradio_retained_events": len(gradio_demo.scap_capacity.events),
             "ai_concurrency_limit": settings.ai_max_concurrent,
         }
+        for resource, code in (
+            ("requests", "request_capacity_full"),
+            ("streams", "stream_capacity_full"),
+            ("password_operations", "password_capacity_full"),
+        ):
+            budget = snapshot[resource]
+            if budget["active"] >= budget["limit"]:
+                snapshot["alerts"].append({
+                    "code": code, "severity": "medium", "count": budget["active"],
+                    "limit": budget["limit"],
+                })
+        return snapshot
 
     @app.get("/api/admin/availability")
     def availability_status(_: Annotated[User, Depends(admin_user)]):

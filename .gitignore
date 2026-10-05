@@ -214,6 +214,7 @@ reports/*.html
 reports/*.xml
 reports/security-validation/
 reports/security-validation-*/
+reports/security-load-local/
 reports/demo-evidence/
 reports/practice-lab/
 reports/practice-lab-*/

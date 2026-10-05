@@ -3035,6 +3035,20 @@ def build_ui(
                     "Audit lấy mẫu các lần từ chối vô danh lặp lại; "
                     "số dòng audit không thể hiện toàn bộ số lần bị chặn."
                 )
+                recent = availability.get("http_recent")
+                if recent:
+                    statuses = recent["status_classes"]
+                    stats_md += (
+                        f"\n\n**Quan sát HTTP gần đây ({recent['window_seconds']} giây)**\n\n"
+                        f"Phản hồi: **{recent['responses']}** · "
+                        f"Bị giới hạn/quá tải (429/503): **{recent['throttled_responses']}** · "
+                        f"Lỗi máy chủ (5xx): **{statuses['5xx']}** · "
+                        f"Ngắt trước phản hồi: **{statuses['unanswered']}**\n\n"
+                        f"Độ trễ đến header trung bình: **{recent['average_latency_ms']:.2f} ms** · "
+                        f"Phản hồi chậm hơn 1 giây: **{recent['slow_responses']}**. "
+                        "Đo đến header để luồng giao diện dài không làm sai độ trễ. "
+                        "Cửa sổ dùng ô 1 giây, chỉ quan sát tiến trình hiện tại."
+                    )
             alerts = _api(
                 token, "GET", "/api/admin/security-alerts", params={"window_minutes": "60"}
             )
@@ -3047,6 +3061,29 @@ def build_ui(
                 alerts_md = "**Cảnh báo an ninh (60 phút):**\n" + lines
             else:
                 alerts_md = "**Cảnh báo an ninh (60 phút):** 🟢 không có."
+            availability_labels = {
+                "http_overload": "Nhiều phản hồi bị giới hạn hoặc quá tải (429/503)",
+                "http_server_errors": "Tỷ lệ lỗi máy chủ tăng (5xx)",
+                "http_unanswered": "Nhiều yêu cầu ngắt trước khi có phản hồi",
+                "http_slow_headers": "Nhiều phản hồi mất hơn 1 giây đến header",
+                "request_capacity_full": "Các vị trí xử lý yêu cầu đang đầy",
+                "stream_capacity_full": "Các vị trí luồng giao diện đang đầy",
+                "password_capacity_full": "Các vị trí băm mật khẩu đang đầy",
+            }
+            observed_alerts = availability.get("alerts", []) if availability else []
+            if observed_alerts:
+                lines = "\n".join(
+                    f"- {'🔴 CAO' if a['severity'] == 'high' else '🟡 TRUNG BÌNH'} — "
+                    f"{availability_labels[a['code']]}: **{a['count']}**"
+                    for a in observed_alerts if a["code"] in availability_labels
+                )
+                alerts_md += (
+                    "\n\n**Cảnh báo vận hành (60 giây / tài nguyên hiện tại):**\n"
+                    + lines
+                    + "\n\nĐây là dấu hiệu cần rà soát, chưa kết luận có tấn công. "
+                    "Tài nguyên hiện tại tính cả yêu cầu đang lấy số liệu; "
+                    "cảnh báo HTTP tự hết khi cửa sổ quan sát trôi qua."
+                )
             users = _api(token, "GET", "/api/admin/users")
             table = [
                 [
