@@ -387,7 +387,7 @@ def test_health_endpoint_does_not_leak_environment_in_production(settings):
 
     from src.app.main import create_app
 
-    prod_like = replace(settings, environment="production")
+    prod_like = replace(settings, environment="production", allowed_hosts=("testserver",))
     with TestClient(create_app(prod_like)) as prod_client:
         body = prod_client.get("/api/health").json()
     assert body == {"status": "ok"}

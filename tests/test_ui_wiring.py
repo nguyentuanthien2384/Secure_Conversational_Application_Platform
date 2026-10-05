@@ -188,7 +188,7 @@ def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypa
                   if component.elem_id == "chat-notice")
     assert updates[notice._id] == gr.update(value="", visible=False)
     qr = next(component for component in runtime_demo.blocks.values()
-              if isinstance(component, gr.HTML) and component.label == "Quét bằng ứng dụng xác thực")
+              if isinstance(component, gr.Markdown) and component.label == "Quét bằng ứng dụng xác thực")
     assert updates[qr._id] == gr.update(value="", visible=False)
     mfa_activation, _ = _button_event(runtime_demo, "Kích hoạt")
     recovery = mfa_activation.outputs[5]
@@ -390,11 +390,14 @@ def test_totp_qr_is_inline_and_has_no_file_toolbar():
     qr_panels = [
         component
         for component in demo.blocks.values()
-        if isinstance(component, gr.HTML)
+        if isinstance(component, gr.Markdown)
         and component.label == "Quét bằng ứng dụng xác thực"
     ]
     assert len(qr_panels) == 1
     assert qr_panels[0].buttons == []
+    assert not any(isinstance(component, gr.HTML) for component in demo.blocks.values()), (
+        "Gradio HTML uses eval and cannot render under the enforced script policy"
+    )
     assert not any(
         isinstance(component, gr.Image)
         and component.label == "Quét bằng ứng dụng xác thực"

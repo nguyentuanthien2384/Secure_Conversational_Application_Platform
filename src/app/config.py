@@ -11,10 +11,12 @@ from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
 from dotenv import load_dotenv
 from sqlalchemy.engine import make_url
 
+from src.app.host_security import effective_allowed_hosts, normalize_allowed_hosts
+
 AVAILABILITY_ENV_LIMITS = {
     "REQUEST_MAX_CONCURRENT": (32, 1, 512),
     "REQUEST_MAX_STREAMS": (16, 1, 512),
-    "REQUEST_IP_MAX_CONCURRENT": (8, 1, 512),
+    "REQUEST_IP_MAX_CONCURRENT": (16, 1, 512),
     "REQUEST_IP_MAX_STREAMS": (2, 1, 512),
     "REQUEST_WINDOW_SECONDS": (60, 1, 3_600),
     "REQUEST_GLOBAL_MAX_ATTEMPTS": (600, 1, 100_000),
@@ -32,6 +34,9 @@ AVAILABILITY_ENV_LIMITS = {
     "GRADIO_RETAINED_EVENTS": (128, 1, 4_096),
     "GRADIO_RESULT_TTL_SECONDS": (120, 10, 600),
     "GRADIO_STATE_CAPACITY": (256, 1, 4_096),
+    "MAIL_MAX_PENDING": (32, 1, 1_024),
+    "MAIL_OUTBOX_MAX_FILES": (512, 1, 10_000),
+    "MAIL_OUTBOX_MAX_BYTES": (16_777_216, 65_536, 1_073_741_824),
 }
 
 
@@ -181,7 +186,7 @@ class Settings:
     # Finite per-worker admission budgets; Redis additionally shares quotas.
     request_max_concurrent: int = 32
     request_max_streams: int = 16
-    request_ip_max_concurrent: int = 8
+    request_ip_max_concurrent: int = 16
     request_ip_max_streams: int = 2
     request_window_seconds: int = 60
     request_global_max_attempts: int = 600
@@ -266,6 +271,9 @@ class Settings:
     mail_backend: str = "disabled"
     mail_outbox_dir: str = "mail_outbox"
     mail_from: str = "SCAP <no-reply@scap.local>"
+    mail_max_pending: int = 32
+    mail_outbox_max_files: int = 512
+    mail_outbox_max_bytes: int = 16_777_216
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""
@@ -308,6 +316,11 @@ class Settings:
             raise RuntimeError(
                 "APP_ENV không hợp lệ; chỉ chấp nhận development, test hoặc production."
             )
+        configured_hosts = _csv_env("ALLOWED_HOSTS")
+        try:
+            normalize_allowed_hosts(configured_hosts)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         security_profile = os.getenv("SECURITY_PROFILE", "standard").strip().lower()
         if security_profile not in {"standard", "high"}:
             raise RuntimeError("SECURITY_PROFILE chỉ chấp nhận standard hoặc high.")
@@ -354,11 +367,11 @@ class Settings:
                 )
             if not _csv_env("ALLOWED_ORIGINS"):
                 raise RuntimeError("ALLOWED_ORIGINS bắt buộc ở production.")
-            if not _csv_env("ALLOWED_HOSTS"):
+            if not configured_hosts:
                 raise RuntimeError(
                     "ALLOWED_HOSTS bắt buộc ở production (chống tấn công Host header)."
                 )
-            if "*" in _csv_env("ALLOWED_ORIGINS") or "*" in _csv_env("ALLOWED_HOSTS"):
+            if "*" in _csv_env("ALLOWED_ORIGINS"):
                 raise RuntimeError(
                     "Production không cho phép wildcard trong origin/host allowlist."
                 )
@@ -654,7 +667,7 @@ class Settings:
             mfa_max_attempts=int(os.getenv("MFA_MAX_ATTEMPTS", "5")),
             redis_url=redis_url,
             allowed_origins=_csv_env("ALLOWED_ORIGINS"),
-            allowed_hosts=_csv_env("ALLOWED_HOSTS"),
+            allowed_hosts=effective_allowed_hosts(configured_hosts, environment),
             max_sessions_per_user=int(os.getenv("MAX_SESSIONS_PER_USER", "100")),
             csp_allow_unsafe_eval=_bool_env("CSP_ALLOW_UNSAFE_EVAL", False),
             password_min_length=int(os.getenv("PASSWORD_MIN_LENGTH", "15")),

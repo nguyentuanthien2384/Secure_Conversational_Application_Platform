@@ -140,6 +140,12 @@ Authorization, Cookie, Set-Cookie và secret header của OIDC proxy trước kh
 log. Chính sách CSP report-only gửi vi phạm tới endpoint giới hạn dung lượng/tần
 suất; endpoint chỉ giữ tên directive, status và origin, chủ động bỏ URL path,
 query, đoạn script/DOM và nội dung người dùng trước khi chuyển SIEM.
+UI thực thi nonce cho script, không cấp nonce cho dữ liệu được chèn vào trang;
+CSS inline được giữ có chủ đích và không tạo báo cáo cho mỗi style hợp lệ.
+Gradio deep-link bị chặn để không xuất trạng thái ra plaintext. Middleware bỏ
+header origin thô mà thư viện tự tin; scheme/client đã được Uvicorn xác minh
+với peer Caddy và Host cụ thể tiếp tục là nguồn tin cậy. Compose cho phép thêm
+loopback để giao diện gọi REST nội bộ; danh sách Origin vẫn chỉ là origin public.
 
 ## IAM tối thiểu cho khóa
 

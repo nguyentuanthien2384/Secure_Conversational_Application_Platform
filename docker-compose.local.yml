@@ -32,8 +32,8 @@ services:
       # Nói cách khác: giữ production thì không demo được, nên overlay "local"
       # phải là development. Bản production thật vẫn nguyên ở docker-compose.yml.
       APP_ENV: development
-      # Cho phép truy cập qua localhost (TrustedHostMiddleware bỏ qua port).
-      ALLOWED_HOSTS: localhost,127.0.0.1
+      # Exact local hosts; the application validates ports and IPv6 syntax.
+      ALLOWED_HOSTS: localhost,127.0.0.1,::1
       ALLOWED_ORIGINS: http://localhost:8000,http://127.0.0.1:8000
       PUBLIC_BASE_URL: http://localhost:8000
       # HIBP cần gọi ra Internet; tắt để demo offline chạy nhanh, ổn định.

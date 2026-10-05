@@ -10,7 +10,7 @@ Các giá trị mặc định có thể cấu hình bằng biến môi trường
 
 - `REQUEST_MAX_CONCURRENT=32`: yêu cầu HTTP thông thường đang xử lý trong một worker.
 - `REQUEST_MAX_STREAMS=16`: luồng Gradio SSE đang mở, tách khỏi ngân sách HTTP thông thường.
-- `REQUEST_IP_MAX_CONCURRENT=8`, `REQUEST_IP_MAX_STREAMS=2`: giới hạn cùng lúc cho từng IP.
+- `REQUEST_IP_MAX_CONCURRENT=16`, `REQUEST_IP_MAX_STREAMS=2`: giới hạn cùng lúc cho từng IP. Trần 8 đã chặn cold load module Gradio trong trình duyệt local; 16 giữ giới hạn và cho phép tải giao diện. Nếu `.env` cũ đặt 8 rõ ràng, cần điều chỉnh biến đó; biến đã đặt luôn ưu tiên hơn default mới.
 - `REQUEST_WINDOW_SECONDS=60`, `REQUEST_GLOBAL_MAX_ATTEMPTS=600`, `REQUEST_IP_MAX_ATTEMPTS=300`: số yêu cầu trong cửa sổ thời gian.
 - `AUTH_GLOBAL_MAX_ATTEMPTS=120`: trần chung cho các POST vào `/api/auth/`, bổ sung cho giới hạn đăng nhập/MFA/khôi phục riêng.
 - `PASSWORD_MAX_CONCURRENT=2`: phép băm/xác minh Argon2 đồng thời, kể cả đăng nhập, đổi mật khẩu và mã khôi phục. Với tham số hiện tại, hai phép Argon2 sử dụng khoảng 128 MiB riêng cho vùng nhớ băm; còn phải dự phòng RAM cho ứng dụng và hệ điều hành.
@@ -61,7 +61,7 @@ Trong cấu hình Caddy production, chặn truy cập readiness từ Internet; D
 
 Trong tab Quản trị, chọn làm mới để xem các slot yêu cầu/luồng/băm mật khẩu, số sự kiện giữ lại và lượt từ chối ghi nhận. Snapshot tài nguyên gồm chính yêu cầu lấy số liệu. Phần HTTP dùng cửa sổ 60 giây với vòng đệm cố định 60 ô: nhóm status, thường/SSE, histogram và trung bình thời gian ứng dụng phát header. SSE được đo ngay khi bắt đầu phản hồi, không chờ luồng đóng; yêu cầu hủy/lỗi trước header được đếm riêng. Trung bình gồm tất cả phản hồi có header, không phải latency riêng của phản hồi thành công hay thời gian truyền hết body.
 
-Cảnh báo tự hết khi cửa sổ trôi: ít nhất 5 phản hồi `429`/`503`; ít nhất 5 lỗi `5xx` với tỷ lệ từ 10%; ít nhất 5 yêu cầu chưa phát header; hoặc ít nhất 20 phản hồi và từ 20% mất hơn 1 giây đến header. Snapshot cũng cảnh báo khi ngân sách request/SSE/password đang đầy. Đây là dấu hiệu vận hành để điều tra, không tự kết luận DDoS. Chỉ admin có quyền xem; không giữ URL/IP/body/header/token cho thống kê này.
+Cảnh báo tự hết khi cửa sổ trôi: ít nhất 5 phản hồi `429`/`503`; ít nhất 5 lỗi `5xx` với tỷ lệ từ 10%; ít nhất 5 yêu cầu chưa phát header; hoặc ít nhất 20 phản hồi và từ 20% mất hơn 1 giây đến header. Snapshot cũng cảnh báo khi ngân sách request/SSE/password/email đang đầy. Đây là dấu hiệu vận hành để điều tra, không tự kết luận DDoS. Chỉ admin có quyền xem; không giữ URL/IP/body/header/token cho thống kê này.
 
 Sự kiện `availability.overload` được gom mẫu với nhãn cố định; không chứa prompt, mật khẩu, token, IP hay đường dẫn yêu cầu. Nhật ký từ chối xác thực vô danh cũng được lấy mẫu để giảm lượng ghi audit khi có burst. Điều này giữ bằng chứng đại diện; số lần bị từ chối cần đối chiếu bộ đếm, không chỉ đếm dòng audit.
 
@@ -130,3 +130,30 @@ Một snapshot cũ không chứa các thu hồi phiên/tài khoản xảy ra sau
 Trước khi dùng dữ liệu quan trọng, thực hành restore trong môi trường cô lập: backup DB cùng wrapped-DEK/key metadata, giữ quyền truy cập KEK/Vault đúng phiên bản, đối chiếu checkpoint WORM và tính toàn vẹn audit. Xác nhận có thể đọc bản mã bằng khóa đúng, bản mã/metadata bị sửa bị từ chối và tài khoản/phiên bị thu hồi vẫn không truy cập được. Đo thời gian restore và lượng dữ liệu mất theo lịch backup; ghi RTO/RPO đã đo, không chỉ ghi mục tiêu.
 
 Không dùng `docker compose down -v`, reset dữ liệu demo hoặc sửa chuỗi audit để phục hồi hệ thống thật. Backup thiếu khóa/phụ thuộc WORM có thể không đủ để khôi phục ứng dụng; kiểm thử restore phải bao gồm các phụ thuộc đó.
+
+## Email và biên giao diện
+
+`MAIL_MAX_PENDING=32` giới hạn cả thư đang gửi và đang chờ trong mỗi worker; tối đa hai luồng gửi. Shutdown chờ tối đa 10 giây rồi hủy thư chưa chạy; tác vụ SMTP đang chạy vẫn kết thúc theo timeout từng thao tác 15 giây. Bộ đếm `mail` trong API quản trị không chứa địa chỉ/nội dung; cần theo dõi `failed`/`rejected` vì thư nền không thể báo lỗi lại cho request đã hoàn tất. Gửi reset khi hàng đợi đầy vẫn trả cùng `202` cho tài khoản có/không tồn tại, mã chưa gửi bị thu hồi đúng yêu cầu.
+
+Outbox chỉ dùng local/demo: tối đa 512 tệp, 16 MiB và 64 KiB mỗi thư. Không tự xóa thư cũ; khi đầy, chuyển thư cần giữ ra kho riêng rồi dọn theo quyết định của người vận hành. Không trỏ tới thư mục chứa tệp khác, symlink, junction hoặc hardlink. Quota được đồng bộ trong một tiến trình; không chia sẻ cùng outbox giữa nhiều worker. POSIX dùng quyền riêng tư; trên Windows cần ACL thư mục chỉ cho tài khoản vận hành. Production tiếp tục từ chối outbox.
+
+Host mặc định local chỉ là `127.0.0.1`, `localhost`, `::1`; muốn truy cập LAN phải khai báo host cụ thể. CSP chỉ cho script bootstrap đã xác minh dùng nonce mới và script asset cùng origin; CSS inline vẫn cần cho Gradio. Không tự cấp nonce cho HTML/dữ liệu người dùng. Adapter từ chối bootstrap/custom script không tương thích khi nâng thư viện. Báo cáo CSP giữ allowance CSS này để tránh burst báo cáo hợp lệ làm nghẽn giao diện. Deep-link lưu trạng thái plaintext bị chặn; header origin thô của thư viện bị bỏ, scope do server/proxy xác minh được giữ.
+
+## Sao lưu SQLite mã hóa và phục hồi offline
+
+Đây là công cụ cho **SQLite local tối đa 64 MiB**; không thay quy trình PostgreSQL/Vault/WORM production. Tạo thư mục riêng trên ổ mã hóa với ACL chỉ dành cho người vận hành. Thay các đường dẫn ví dụ dưới đây bằng DB đã xác nhận và tên đầu ra mới; công cụ không suy ra cấu hình từ `.env`:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.secure_backup backup --database "D:\SCAP-private\current.db" --output "D:\SCAP-private\copy.scapbak"
+.\.venv\Scripts\python.exe -m scripts.secure_backup restore --archive "D:\SCAP-private\copy.scapbak" --output "D:\SCAP-private\recovered.db"
+```
+
+Mật khẩu backup được nhập ẩn, tối thiểu 16 byte UTF-8, xác nhận khi tạo; không đưa vào argument/env/log. AES-256-GCM xác thực cả snapshot và header phiên bản/kích thước/KDF. Argon2id cố định 64 MiB, ba lượt; từ chối header/kích thước sai trước KDF. SQLite online backup giữ commit WAL; không sao chép riêng file `.db` đang chạy. Bước snapshot và validation có deadline riêng 30 giây. Tệp chỉ được xuất nguyên tử nếu chưa tồn tại, cần filesystem hỗ trợ hardlink; không có tùy chọn ghi đè. Điều này chưa bảo đảm directory entry tồn tại sau mất điện.
+
+DB chứa wrapped DEK/epoch/phiên bản khóa; công cụ **không xuất KEK, JWT key, `.env` hoặc trạng thái dịch vụ ngoài**. Cất khóa và mật khẩu backup riêng, bảo toàn các phiên bản khóa còn cần đọc. Plaintext snapshot tạm nằm trong thư mục đầu ra riêng rồi được dọn; Windows kế thừa ACL thư mục, không cam kết xóa an toàn trên SSD. Archive `.scapbak` được loại khỏi Git nhưng vẫn phải bảo vệ.
+
+Restore thu hồi toàn bộ phiên/JWT challenge, tiêu thụ recovery code/MFA code/prekey E2EE và xóa challenge passkey/E2EE. Token version nhảy ngẫu nhiên để tránh trùng phiên bản của challenge phát sau snapshot. TOTP tiêu thụ cửa sổ hiện tại, có thể cần chờ tối đa khoảng 60 giây để dùng mã mới. Audit chain, wrapped DEK và ciphertext được giữ nguyên. **Mọi tài khoản bị khóa mặc định** vì backup cũ không biết các thay đổi/thu hồi mới hơn.
+
+Giữ DB phục hồi offline, tắt `SEED_DEMO_DATA` và bootstrap tạo admin trước khi phục vụ. Đối chiếu từ nguồn mới hơn các khóa/xóa tài khoản, mật khẩu, MFA/seed, email khôi phục, passkey, thiết bị E2EE, membership/epoch và dữ liệu đã xóa. Chỉ tài khoản đã đối chiếu mới được kích hoạt bằng cách phục hồi vào một tệp mới khác với tùy chọn `--activate-reviewed-user USERNAME` (lặp lại cho từng tài khoản); tùy chọn này là quyết định của operator, không tự chứng minh review đã hoàn tất. Phát hành prekey/recovery code mới qua luồng hiện có sau review.
+
+Trước chuyển cấu hình sang DB mới, xác minh khóa đúng/sai, chain/checkpoint ngoài và các account/phiên đã thu hồi không truy cập được. Không đổi khóa/DB đang chạy chỉ để thử công cụ. Lịch sao lưu, bản sao ngoài máy, retention và diễn tập mất máy vẫn do người vận hành thiết lập; lần phát triển này chỉ dùng dữ liệu giả trong thư mục tạm.

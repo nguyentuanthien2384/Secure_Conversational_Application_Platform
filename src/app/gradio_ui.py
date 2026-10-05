@@ -1542,10 +1542,14 @@ def build_ui(
                                 with gr.Row():
                                     # QR được nhúng trực tiếp vào HTML để Gradio
                                     # không ghi PNG tạm ra máy chạy giao diện.
-                                    qr_html = gr.HTML(
+                                    # Only internally generated PNG-base64
+                                    # markup reaches this component; Markdown
+                                    # renders it without Gradio HTML's eval.
+                                    qr_html = gr.Markdown(
                                         label="Quét bằng ứng dụng xác thực",
                                         show_label=True,
-                                        min_height=QR_DISPLAY_PX,
+                                        sanitize_html=False,
+                                        buttons=[],
                                         container=True,
                                         padding=False,
                                         scale=1,

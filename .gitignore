@@ -236,3 +236,6 @@ tmp/pdfs/
 
 # Local security-mail outbox (development/demo only; contains one-time codes)
 mail_outbox/
+
+# Encrypted local backup archives still contain sensitive account metadata.
+*.scapbak

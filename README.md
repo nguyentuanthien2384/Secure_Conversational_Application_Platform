@@ -320,6 +320,15 @@ không bao giờ gọi AI phía server.
 `Permissions-Policy`, `Cache-Control: no-store`, HSTS ở production, và **CSP tách theo nhóm đường dẫn**:
 `/api/*` dùng `default-src 'none'`; `/docs`, `/redoc` nới đúng phần Swagger cần; UI Gradio bỏ
 `'unsafe-eval'` theo mặc định (bật lại có chủ đích bằng `CSP_ALLOW_UNSAFE_EVAL`).
+UI dùng nonce mới cho mỗi phản hồi và chỉ cấp cho bootstrap đã xác minh của Gradio;
+`script-src` không còn `unsafe-inline`, thuộc tính chạy JavaScript bị chặn. CSS inline
+vẫn được cho phép để giao diện hoạt động. Host local mặc định chỉ nhận loopback;
+header đổi origin của thư viện và chức năng deep-link lưu trạng thái đã bị vô hiệu hóa.
+
+Email có hàng đợi hữu hạn và outbox có trần tệp/dung lượng. Công cụ
+`python -m scripts.secure_backup` sao lưu SQLite mã hóa và phục hồi vào **tệp mới**,
+thu hồi phiên/mã một lần và khóa tài khoản mặc định. Xem quy trình và giới hạn trong
+[hướng dẫn vận hành](docs/security/availability.md#sao-lưu-sqlite-mã-hóa-và-phục-hồi-offline).
 
 ---
 
@@ -717,8 +726,9 @@ Secure_Conversational_Application_Platform/
 1. **Khóa audit vẫn nằm cùng tiến trình.** High profile đã đưa KEK hội thoại ra Vault/KMS,
    nhưng khóa ký JWT/audit dẫn xuất từ app secret vẫn nằm trong web process. Checkpoint ngoài
    WORM phát hiện rollback sau khi giao; full host compromise trước khi giao vẫn còn rủi ro.
-2. **CSP còn `'unsafe-inline'`.** Gradio sinh style/script inline. `'unsafe-eval'` đã bỏ được
-   (giai đoạn 1); chuyển sang nonce/hash cần tách frontend riêng (giai đoạn 2).
+2. **CSP còn cho phép CSS inline.** Script đã dùng nonce và chặn handler inline;
+   style runtime của Gradio cần allowance riêng. Adapter kiểm tra mẫu bootstrap
+   và từ chối phiên bản không tương thích; phải kiểm thử lại khi nâng Gradio.
 3. **IDS chữ ký là phòng thủ chiều sâu, không phải kiểm soát chính.** Truy vấn tham số hóa
    của SQLAlchemy là biện pháp chính chống SQL injection trong các luồng đã triển khai;
    engine signature phát hiện dấu hiệu nghi vấn và có thể bị né bằng mã hóa/obfuscation.

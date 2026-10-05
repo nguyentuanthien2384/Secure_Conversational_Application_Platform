@@ -17,7 +17,6 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.exceptions import RedisError
@@ -73,8 +72,11 @@ from src.app.e2ee import (
     verify_ed25519_signature,
 )
 from src.app.envelope import EnvelopeCryptoService, EnvelopeEncryptionError
+from src.app.gradio_boundary import GradioBoundaryMiddleware
 from src.app.gradio_capacity import attach_gradio_capacity
+from src.app.gradio_csp import attach_gradio_csp
 from src.app.gradio_ui import CUSTOM_CSS, THEME, build_ui
+from src.app.host_security import ExactHostMiddleware, effective_allowed_hosts
 from src.app.ids import (
     DECOY_PATHS,
     SCANNER_AGENTS,
@@ -94,7 +96,7 @@ from src.app.key_management import (
     LocalAesKeyProvider,
     VaultTransitKeyProvider,
 )
-from src.app.mailer import build_mailer
+from src.app.mailer import MailUnavailable, build_mailer
 from src.app.maintenance import SecurityMaintenance
 from src.app.models import (
     AuditEvent,
@@ -334,6 +336,7 @@ def _build_crypto_services(
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
+    allowed_hosts = effective_allowed_hosts(settings.allowed_hosts, settings.environment)
     for name, (_, minimum, maximum) in AVAILABILITY_ENV_LIMITS.items():
         value = getattr(settings, name.lower())
         if type(value) is not int or not minimum <= value <= maximum:
@@ -421,6 +424,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        mailer.start()
         # PostgreSQL always uses the one-shot owner migration service, including
         # the local Docker overlay. The runtime role intentionally has no DDL
         # permission, so asking it to run compatibility migrations on each
@@ -527,7 +531,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             await maintenance.stop()
-            mailer.flush()
+            await anyio.to_thread.run_sync(mailer.close)
             envelope_crypto_service.clear_cache()
             database.engine.dispose()
 
@@ -566,11 +570,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Reject requests whose Host header is not explicitly allowed. This blocks
     # Host-header injection and DNS-rebinding attacks. Enabled whenever
     # ALLOWED_HOSTS is configured (mandatory in production, see config.py).
-    if settings.allowed_hosts:
-        app.add_middleware(
-            TrustedHostMiddleware,
-            allowed_hosts=list(settings.allowed_hosts),
-        )
+    app.add_middleware(ExactHostMiddleware, allowed_hosts=allowed_hosts)
 
     if settings.allowed_origins:
         app.add_middleware(
@@ -583,6 +583,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):
+        request.state.scap_csp_nonce = secrets.token_urlsafe(24)
         supplied_request_id = request.headers.get("x-request-id", "")
         request_id = (
             supplied_request_id
@@ -789,12 +790,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # so the main origin no longer ships eval unconditionally. The UI deliberately avoids
             # gr.HTML for this reason: Gradio 6 compiles that component's markup with
             # new Function(), which this policy blocks — see _static_html in gradio_ui.py.
-            # 'unsafe-inline' remains
-            # pending a nonce/hash refactor (phase 2). object-src is locked to 'none'.
+            # The scoped Gradio template adapter nonces only its validated
+            # bootstrap scripts before rendering data into the page.
             script_eval = " 'unsafe-eval'" if settings.csp_allow_unsafe_eval else ""
             csp = (
                 "default-src 'self'; "
-                f"script-src 'self' 'unsafe-inline'{script_eval}; "
+                f"script-src 'self' 'nonce-{request.state.scap_csp_nonce}'{script_eval}; "
+                "script-src-attr 'none'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "font-src 'self' data:; "
                 "img-src 'self' data: blob:; "
@@ -804,9 +806,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         response.headers["Content-Security-Policy"] = csp
         if settings.csp_report_only and not path.startswith("/api"):
-            # Observe whether the bundled Gradio release can run without inline
-            # script before promoting this stricter policy to enforcement.
-            report_policy = csp.replace(" 'unsafe-inline'", "").replace(" 'unsafe-eval'", "")
+            # Report script violations while retaining the deliberate style
+            # compatibility allowance. Reporting every valid Gradio style
+            # creates a burst of requests that can starve the initial UI load.
+            report_policy = csp.replace(" 'unsafe-eval'", "")
             response.headers["Content-Security-Policy-Report-Only"] = (
                 report_policy + "; report-uri /api/security/csp-report"
             )
@@ -814,6 +817,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
 
+    app.add_middleware(GradioBoundaryMiddleware)
     app.add_middleware(RequestLimitsMiddleware)
     app.add_middleware(
         AdmissionMiddleware, settings=settings, monitor=availability_monitor,
@@ -900,6 +904,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code=503,
             content={"detail": "Hệ thống đang bận. Vui lòng thử lại sau."},
             headers={"Retry-After": "1", "Cache-Control": "no-store"},
+        )
+
+    @app.exception_handler(MailUnavailable)
+    async def mail_unavailable_handler(request: Request, exc: MailUnavailable):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Dịch vụ gửi thư đang bận hoặc tạm thời không khả dụng."},
+            headers={"Retry-After": "10", "Cache-Control": "no-store"},
         )
 
     @app.exception_handler(RedisError)
@@ -4509,11 +4521,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "gradio_state_capacity": settings.gradio_state_capacity,
             "gradio_retained_events": len(gradio_demo.scap_capacity.events),
             "ai_concurrency_limit": settings.ai_max_concurrent,
+            "mail": mailer.snapshot(),
         }
         for resource, code in (
             ("requests", "request_capacity_full"),
             ("streams", "stream_capacity_full"),
             ("password_operations", "password_capacity_full"),
+            ("mail", "mail_capacity_full"),
         ):
             budget = snapshot[resource]
             if budget["active"] >= budget["limit"]:
@@ -5118,6 +5132,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     for route in app.routes:
         if isinstance(route, Mount) and isinstance(route.app, FastAPI):
             attach_gradio_capacity(gradio_demo, route.app)
+            attach_gradio_csp(gradio_demo, route.app)
             route.app.add_exception_handler(
                 RequestValidationError, safe_request_validation_error
             )

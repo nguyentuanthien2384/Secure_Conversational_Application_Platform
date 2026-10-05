@@ -29,7 +29,7 @@ from src.app.account_security import describe_user_agent
 from src.app.audit import client_ip, client_user_agent, record_audit
 from src.app.config import Settings
 from src.app.db import utcnow
-from src.app.mailer import Mailer, mask_email, normalize_email
+from src.app.mailer import Mailer, MailUnavailable, mask_email, normalize_email
 from src.app.models import AccountEmail, AccountRecoveryCode, User, WebAuthnCredential
 from src.app.passkeys import PasskeyError, PasskeyService, clean_passkey_name, passkey_view
 from src.app.schemas import (
@@ -305,11 +305,39 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             ), user_id=user.id, purpose="password_reset", now=utcnow(),
             minutes=settings.password_reset_minutes,
         )
+        # Capture the specific row while the account lock still serializes
+        # issuance. A delivery failure must not consume a newer request's code.
+        db.flush()
+        issued_code_id = db.scalar(select(AccountRecoveryCode.id).where(
+            AccountRecoveryCode.user_id == user.id,
+            AccountRecoveryCode.purpose == "password_reset",
+            AccountRecoveryCode.consumed_at.is_(None),
+        ))
         db.commit()
-        send_code(
-            ctx.mailer, email.email, purpose="password_reset", username=user.username, code=code,
-            minutes=settings.password_reset_minutes,
-        )
+        try:
+            send_code(
+                ctx.mailer, email.email, purpose="password_reset", username=user.username, code=code,
+                minutes=settings.password_reset_minutes,
+            )
+        except MailUnavailable:
+            # A full mail queue must not turn this anonymous endpoint into an
+            # account-existence oracle. Burn the undelivered reset code, retain
+            # bounded metadata, and return the same accepted response.
+            db.execute(
+                update(AccountRecoveryCode)
+                .where(
+                    AccountRecoveryCode.id == issued_code_id,
+                    AccountRecoveryCode.consumed_at.is_(None),
+                )
+                .values(consumed_at=utcnow())
+                .execution_options(synchronize_session=False)
+            )
+            db.commit()
+            record_audit(
+                db, request, "auth.password_reset.request", actor_id=user.id, outcome="failure",
+                details={"reason": "mail_unavailable"},
+            )
+            return RESET_ACCEPTED
         record_audit(
             db, request, "auth.password_reset.request", actor_id=user.id, target_type="user",
             target_id=user.id, details={"email": mask_email(email.email)},

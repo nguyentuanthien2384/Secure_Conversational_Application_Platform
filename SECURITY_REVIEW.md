@@ -376,3 +376,81 @@ Vault/KMS/WORM và phục hồi khi mất máy chưa được kiểm chứng ở
   kiểm chứng hạ tầng production. Báo cáo là dữ liệu local, được loại khỏi Git.
 
 Phạm vi, ngưỡng và lệnh chạy có trong [availability.md](docs/security/availability.md).
+
+## 8. Hoàn thiện các thiếu sót còn xử lý được ở local — 05/10/2026
+
+Đã gia cố thêm các đường có tác động thực tế. Không đổi `.env`, khóa, DB/outbox
+đang dùng hoặc mở dịch vụ ra Internet; mọi kiểm chứng thao tác dùng dữ liệu giả.
+
+- **Email hữu hạn:** tối đa 32 thư đang chạy/chờ mỗi worker, hai luồng gửi;
+  shutdown chờ hữu hạn rồi hủy thư chưa chạy. Outbox có trần 512 tệp/16 MiB,
+  mỗi thư 64 KiB, ghi độc quyền và từ chối link/junction/hardlink. Không xóa
+  thư cũ để nhận thư mới. Snapshot quản trị giữ counter, không giữ địa chỉ/body.
+  Lỗi gửi đồng bộ có phản hồi chung; reset vô danh vẫn cùng `202` dù tài khoản
+  có/không tồn tại khi mail bận. Chỉ mã của request thất bại bị thu hồi, không
+  tiêu thụ mã mới hơn đã được một request khác phát hành.
+- **CSP thực thi cho script:** nonce ngẫu nhiên 192 bit mỗi phản hồi; chỉ mẫu
+  bootstrap Gradio đã kiểm tra trước nội suy được cấp nonce. Không sửa template
+  toàn cục, không tự cấp nonce cho script trong HTML đã render. Chặn handler
+  inline, bỏ `unsafe-inline` cho script; giữ CSS inline có chủ đích. Adapter
+  từ chối bootstrap/custom JS/head không tương thích thay vì nới policy.
+  QR 2FA dùng Markdown với PNG data URL nội bộ, không eval hoặc tệp cache.
+- **Biên local và thư viện:** Host chỉ nhận danh sách chính xác; local mặc định
+  loopback IPv4/IPv6, production bắt buộc cấu hình riêng. Raw header đổi origin
+  của Gradio bị bỏ sau kiểm tra kích thước/framing; scheme/client từ ASGI đã
+  được server/proxy xác minh vẫn giữ. Chặn deep-link xuất/đọc trạng thái UI ra
+  plaintext trước callback thư viện. Compose bổ sung Host loopback cho UI gọi
+  REST nội bộ, danh sách Origin trình duyệt vẫn giữ origin public.
+- **Backup mã hóa thật:** `scripts.secure_backup` online SQLite tối đa 64 MiB,
+  giữ WAL và wrapped key/epoch metadata, AES-256-GCM với header xác thực và
+  Argon2id hữu hạn. Mật khẩu nhập ẩn; không xuất `.env`/KEK/JWT. Chỉ xuất tệp
+  mới nguyên tử; từ chối ghi đè và đường dẫn liên kết. Restore thu hồi phiên,
+  challenge, recovery code và one-time prekey E2EE, đổi token version ngẫu nhiên
+  và khóa mọi tài khoản mặc định. Chỉ operator mới kích hoạt rõ ràng tài khoản
+  đã đối chiếu; không suy ra các thu hồi/thay đổi sau snapshot từ backup cũ.
+- **Kiểm chứng trình duyệt:** cold load với trần IP 8 bị chặn khi các module
+  Gradio tải cùng lúc. Đã điều chỉnh mặc định thành 16, giữ trần toàn worker 32,
+  không miễn quota/capacity cho static. Bỏ báo cáo vi phạm CSS hợp lệ để tránh
+  tự tạo burst request. Giao diện tải, đăng nhập và QR 352×352 hoạt động dưới
+  CSP mới trên demo tạm riêng; không có lỗi JavaScript mới ở lần tải thành công.
+
+### Giới hạn còn cần triển khai thực tế
+
+Windows cần ACL riêng cho outbox/thư mục backup và ổ mã hóa; chmod không thay
+ACL hoặc bảo đảm xóa an toàn trên SSD. Outbox quota là trong một tiến trình.
+Restore phải giữ offline, tắt demo seed/bootstrap và đối chiếu tài khoản,
+mật khẩu, MFA/seed, email, passkey, E2EE device/membership/epoch cùng dữ liệu đã
+xóa từ nguồn mới hơn; kiểm chứng khóa đúng phiên bản và checkpoint ngoài.
+Backup SQLite local không thay backup PostgreSQL/KMS/WORM hoặc lịch/offsite
+backup thật. Các thao tác này chưa được vận hành trên dữ liệu của người dùng.
+
+CDN/WAF/chống DDoS upstream, bot challenge và khóa origin cần tên miền/dịch vụ
+triển khai. Turnstile chưa tích hợp. Giám sát/paging ngoài, IAM/PKI/retention
+lock, client E2EE hoàn chỉnh đã audit và pentest độc lập vẫn là cổng triển khai;
+không tuyên bố đã hoàn thành các dịch vụ đó hoặc đạt bảo mật tuyệt đối.
+
+Hướng dẫn vận hành và lệnh backup/restore:
+[availability.md](docs/security/availability.md).
+Nguyên tắc tham chiếu: [OWASP CSP](https://cheatsheetseries.owasp.org/cheatsheets/Content_Security_Policy_Cheat_Sheet.html),
+[OWASP DoS](https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html),
+[cryptography AES-GCM](https://cryptography.io/en/latest/hazmat/primitives/aead/).
+
+### Bằng chứng kiểm chứng cuối
+
+- **1.109 kiểm thử Python đạt**, gồm 126 regression mới đạt; hai kiểm thử quyền
+  POSIX được bỏ qua trên Windows. Báo cáo: `reports/final-hardening-pytest.xml`.
+  Vòng cuối chạy trên cấu hình mặc định IP 16; 86 kiểm thử biên/config và 20
+  kiểm thử wiring giao diện cũng đã đạt riêng sau các điều chỉnh.
+- **21 kiểm thử JavaScript đạt** và bộ kiểm chứng bảo mật **11/11 đạt**, trong
+  `reports/security-validation-final/`. Demo ngoại tuyến đạt 11 kiểm tra.
+- Ruff, `uv lock --check` và whitespace đạt. Bandit không có phát hiện từ
+  medium severity/confidence trở lên với `-ll -ii`, gồm cả CLI backup mới;
+  báo cáo `reports/final-hardening-bandit.json`.
+- `pip-audit` môi trường `.venv`: **104 gói, 0 lỗ hổng đã biết** tại lần quét,
+  trong `reports/final-hardening-pip-audit.json`; không xác lập không có lỗ hổng
+  chưa công bố. Không thay dependency. Compose base/high/local đã kiểm tra
+  cấu hình hợp nhất với placeholder; base/local parse lại sau đổi trần IP 16.
+- Trình duyệt kiểm tra trên demo tạm riêng: tải đầu, đăng nhập và QR 2FA có ảnh
+  data URL 352×352 đã tải thành công; không có lỗi JavaScript mới. Các server,
+  tab và dữ liệu thử đã dọn. Không pentest độc lập, SMTP thật, DDoS Internet
+  hoặc vận hành backup trên DB thật.
