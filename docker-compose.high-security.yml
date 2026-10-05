@@ -75,6 +75,12 @@ services:
       - "no"
       - "--save"
       - ""
+      - "--maxmemory"
+      - "${REDIS_MAXMEMORY:-128mb}"
+      - "--maxmemory-policy"
+      - "noeviction"
+      - "--maxclients"
+      - "${REDIS_MAXCLIENTS:-256}"
     secrets:
       - internal_ca_cert
       - redis_server_cert

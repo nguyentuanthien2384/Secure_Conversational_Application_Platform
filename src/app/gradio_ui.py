@@ -21,6 +21,7 @@ import gradio as gr
 
 from src.app.account_security import DEVICE_COOKIE_NAME, DEVICE_TOKEN_HEADER
 from src.app.audit import sign_ui_client_context
+from src.app.gradio_capacity import install_gradio_capacity
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
 from src.app.ui_session import COOKIE_NAME, BrowserSessionStore, UISessionCapacityError
 
@@ -1157,8 +1158,15 @@ def build_ui(
     session_store: BrowserSessionStore | None = None,
     *,
     client_context_key: bytes | None = None,
+    queue_max_size: int = 32,
+    concurrency_limit: int = 4,
+    retained_events: int = 128,
+    result_ttl_seconds: int = 120,
+    state_capacity: int = 256,
 ) -> gr.Blocks:
     global _CLIENT_CONTEXT_KEY, _SESSION_STORE
+    if any(type(value) is not int or value < 1 for value in (queue_max_size, concurrency_limit)):
+        raise ValueError("Gradio queue and callback limits must be positive integers.")
     session_store = session_store if session_store is not None else BrowserSessionStore()
     _SESSION_STORE = session_store
     if client_context_key is not None:
@@ -3009,6 +3017,24 @@ def build_ui(
                 "**Tóm tắt phiên quan sát** · Các chỉ số được làm mới trực tiếp từ API quản trị. "
                 "Ưu tiên rà soát hai chỉ số cuối khi chuẩn bị trình diễn hoặc báo cáo."
             )
+            availability = stats.get("availability")
+            if availability:
+                requests = availability["requests"]
+                streams = availability["streams"]
+                password_ops = availability["password_operations"]
+                rejected = sum(availability["rejections"].values())
+                stats_md += (
+                    "\n\n**Tài nguyên xử lý hiện tại**\n\n"
+                    f"Yêu cầu: **{requests['active']}/{requests['limit']}** · "
+                    f"Luồng giao diện: **{streams['active']}/{streams['limit']}** · "
+                    f"Băm mật khẩu: **{password_ops['active']}/{password_ops['limit']}**\n\n"
+                    f"Sự kiện giao diện lưu giữ: **{availability['gradio_retained_events']}/"
+                    f"{availability['gradio_retained_event_limit']}** · "
+                    f"Lượt từ chối ghi nhận: **{rejected}**\n\n"
+                    "Số liệu của tiến trình hiện tại, đặt lại khi khởi động. "
+                    "Audit lấy mẫu các lần từ chối vô danh lặp lại; "
+                    "số dòng audit không thể hiện toàn bộ số lần bị chặn."
+                )
             alerts = _api(
                 token, "GET", "/api/admin/security-alerts", params={"window_minutes": "60"}
             )
@@ -3414,4 +3440,13 @@ def build_ui(
             _guard(unblock_ip, 2), [st_token, tb_sec_ip], [df_sec_block, tb_sec_ip]
         )
 
+    demo.queue(
+        max_size=queue_max_size,
+        default_concurrency_limit=concurrency_limit,
+        api_open=False,
+    )
+    install_gradio_capacity(
+        demo, retained_events=retained_events, result_ttl_seconds=result_ttl_seconds,
+        state_capacity=state_capacity,
+    )
     return demo

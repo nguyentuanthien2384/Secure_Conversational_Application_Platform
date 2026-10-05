@@ -11,6 +11,29 @@ from urllib.parse import parse_qsl, quote, urlparse, urlsplit, urlunsplit
 from dotenv import load_dotenv
 from sqlalchemy.engine import make_url
 
+AVAILABILITY_ENV_LIMITS = {
+    "REQUEST_MAX_CONCURRENT": (32, 1, 512),
+    "REQUEST_MAX_STREAMS": (16, 1, 512),
+    "REQUEST_IP_MAX_CONCURRENT": (8, 1, 512),
+    "REQUEST_IP_MAX_STREAMS": (2, 1, 512),
+    "REQUEST_WINDOW_SECONDS": (60, 1, 3_600),
+    "REQUEST_GLOBAL_MAX_ATTEMPTS": (600, 1, 100_000),
+    "REQUEST_IP_MAX_ATTEMPTS": (300, 1, 100_000),
+    "AUTH_GLOBAL_MAX_ATTEMPTS": (120, 1, 100_000),
+    "READINESS_MAX_ATTEMPTS": (12, 1, 10_000),
+    "READINESS_CACHE_SECONDS": (5, 1, 30),
+    "PASSWORD_MAX_CONCURRENT": (2, 1, 8),
+    "AI_MAX_CONCURRENT": (2, 1, 32),
+    "AI_GLOBAL_MAX_ATTEMPTS": (60, 1, 100_000),
+    "AI_DAILY_MAX_ATTEMPTS": (1_000, 1, 1_000_000),
+    "AI_MAX_OUTPUT_TOKENS": (1_024, 128, 8_192),
+    "GRADIO_QUEUE_MAX_SIZE": (32, 1, 1_024),
+    "GRADIO_CONCURRENCY_LIMIT": (4, 1, 32),
+    "GRADIO_RETAINED_EVENTS": (128, 1, 4_096),
+    "GRADIO_RESULT_TTL_SECONDS": (120, 10, 600),
+    "GRADIO_STATE_CAPACITY": (256, 1, 4_096),
+}
+
 
 def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -155,6 +178,27 @@ class Settings:
     allow_self_registration: bool = True
     message_window_seconds: int = 60
     message_max_attempts: int = 20
+    # Finite per-worker admission budgets; Redis additionally shares quotas.
+    request_max_concurrent: int = 32
+    request_max_streams: int = 16
+    request_ip_max_concurrent: int = 8
+    request_ip_max_streams: int = 2
+    request_window_seconds: int = 60
+    request_global_max_attempts: int = 600
+    request_ip_max_attempts: int = 300
+    auth_global_max_attempts: int = 120
+    readiness_max_attempts: int = 12
+    readiness_cache_seconds: int = 5
+    password_max_concurrent: int = 2
+    ai_max_concurrent: int = 2
+    ai_global_max_attempts: int = 60
+    ai_daily_max_attempts: int = 1_000
+    ai_max_output_tokens: int = 1_024
+    gradio_queue_max_size: int = 32
+    gradio_concurrency_limit: int = 4
+    gradio_retained_events: int = 128
+    gradio_result_ttl_seconds: int = 120
+    gradio_state_capacity: int = 256
     # Issuer xuất hiện HAI lần trong otpauth URI (trong label và trong query),
     # nên tên dài đẩy mật độ QR lên đáng kể. Giữ ngắn; đây chỉ là nhãn hiển thị
     # trong ứng dụng xác thực và có thể đổi bất cứ lúc nào qua MFA_ISSUER.
@@ -512,6 +556,15 @@ class Settings:
             if not minimum <= value <= maximum:
                 raise RuntimeError(f"{name} phải nằm trong khoảng {minimum} đến {maximum}.")
             numeric_limits[name] = value
+        availability_limits = {}
+        for name, (default, minimum, maximum) in AVAILABILITY_ENV_LIMITS.items():
+            try:
+                value = int(os.getenv(name, str(default)))
+            except ValueError as exc:
+                raise RuntimeError(f"{name} phải là số nguyên.") from exc
+            if not minimum <= value <= maximum:
+                raise RuntimeError(f"{name} phải nằm trong khoảng {minimum} đến {maximum}.")
+            availability_limits[name.lower()] = value
         if security_profile == "high":
             if numeric_limits["AUDIT_CHECKPOINT_INTERVAL"] != 1:
                 raise RuntimeError(
@@ -578,6 +631,7 @@ class Settings:
         ) or (f"http://localhost:{os.getenv('PORT', '8000')}",)
 
         return cls(
+            **availability_limits,
             environment=environment,
             database_url=database_url,
             secret_key=secret_key,

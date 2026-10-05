@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import unquote, urlsplit
 
+import anyio
 import gradio as gr
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status
@@ -19,8 +20,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import func, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from redis.exceptions import RedisError
+from sqlalchemy import func, or_, select, text, update
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as DatabasePoolTimeout
 from sqlalchemy.orm import Session
 from starlette.routing import Mount
 
@@ -46,8 +49,16 @@ from src.app.audit import (
 )
 from src.app.audit_chain import append_lock, derive_audit_key, seal_event, verify_chain
 from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
+from src.app.availability import (
+    AdmissionMiddleware,
+    AvailabilityMonitor,
+    BoundedPasswordService,
+    CapacityBudget,
+    CapacityExceeded,
+    ReadinessProbe,
+)
 from src.app.browser_security import browser_request_denial
-from src.app.config import Settings
+from src.app.config import AVAILABILITY_ENV_LIMITS, Settings
 from src.app.db import Database, utcnow
 from src.app.e2ee import (
     PROTOCOL_DOUBLE_RATCHET,
@@ -62,6 +73,7 @@ from src.app.e2ee import (
     verify_ed25519_signature,
 )
 from src.app.envelope import EnvelopeCryptoService, EnvelopeEncryptionError
+from src.app.gradio_capacity import attach_gradio_capacity
 from src.app.gradio_ui import CUSTOM_CSS, THEME, build_ui
 from src.app.ids import (
     DECOY_PATHS,
@@ -147,7 +159,6 @@ from src.app.schemas import (
 from src.app.security import (
     CryptoService,
     PasswordBreachCheckUnavailable,
-    PasswordService,
     PwnedPasswordChecker,
     RedisSlidingWindowRateLimiter,
     SlidingWindowRateLimiter,
@@ -155,7 +166,13 @@ from src.app.security import (
     TotpService,
     generate_recovery_code,
 )
-from src.app.services import AIProviderError, AIService, ChatService, DLPPolicyViolation
+from src.app.services import (
+    AIProviderBusy,
+    AIProviderError,
+    AIService,
+    ChatService,
+    DLPPolicyViolation,
+)
 from src.app.siem import configure_siem_logging, emit_security_event
 from src.app.ui_session import BrowserSessionStore, register_ui_session_routes
 
@@ -317,6 +334,10 @@ def _build_crypto_services(
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
+    for name, (_, minimum, maximum) in AVAILABILITY_ENV_LIMITS.items():
+        value = getattr(settings, name.lower())
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError(f"{name} must be an integer between {minimum} and {maximum}.")
     if any(
         value <= 0
         for value in (
@@ -332,8 +353,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
     ):
         raise ValueError("Security duration and rate-limit settings must be positive integers.")
-    database = Database(settings.database_url)
-    password_service = PasswordService()
+    database = Database(settings.database_url, runtime_limits=True)
+    password_service = BoundedPasswordService(settings.password_max_concurrent)
+    availability_monitor = AvailabilityMonitor()
+    request_capacity = CapacityBudget(settings.request_max_concurrent)
+    stream_capacity = CapacityBudget(settings.request_max_streams)
+    readiness_probe = ReadinessProbe(settings.readiness_cache_seconds)
     breach_checker = PwnedPasswordChecker(
         enabled=settings.password_breach_check,
         fail_closed=settings.security_profile == "high",
@@ -350,13 +375,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     refresh_limiter = limiter_type(*limiter_args)
     auth_audit_limiter = limiter_type(*limiter_args)
     recovery_limiter = limiter_type(*limiter_args)
+    admission_limiter = (
+        RedisSlidingWindowRateLimiter(settings.redis_url, key_prefix="scap:admission:")
+        if settings.redis_url else None
+    )
     device_tokens = DeviceTokenService(settings.secret_key, settings.device_token_days)
     mailer = build_mailer(settings)
     passkey_service = PasskeyService(
         settings.webauthn_rp_id, settings.webauthn_rp_name, settings.webauthn_origins
     )
     totp_service = TotpService()
-    chat_service = ChatService(envelope_crypto_service, AIService(settings))
+    ai_limiter = (
+        RedisSlidingWindowRateLimiter(settings.redis_url, key_prefix="scap:ai:")
+        if settings.redis_url else SlidingWindowRateLimiter()
+    )
+    chat_service = ChatService(envelope_crypto_service, AIService(settings, provider_limiter=ai_limiter))
     # Structured JSON security log on stdout for SIEM ingestion (Bài 7 §SIEM).
     configure_siem_logging(enabled=settings.siem_json_logs)
     # Application-layer IDS/IPS state (Bài 7 §7.3).
@@ -525,6 +558,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.passkeys = passkey_service
     app.state.audit_checkpoint_service = audit_checkpoint_service
     app.state.security_maintenance = maintenance
+    app.state.availability_monitor = availability_monitor
+    app.state.request_capacity = request_capacity
+    app.state.stream_capacity = stream_capacity
+    app.state.readiness_probe = readiness_probe
 
     # Reject requests whose Host header is not explicitly allowed. This blocks
     # Host-header injection and DNS-rebinding attacks. Enabled whenever
@@ -558,11 +595,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if origin_denial is not None:
             # Bound telemetry for unauthenticated browser denials without
             # persisting headers, URL paths, credentials, or request bodies.
-            source_allowed, _ = auth_audit_limiter.allow(
+            source_allowed, _ = await anyio.to_thread.run_sync(lambda: auth_audit_limiter.allow(
                 f"browser-origin:source:{client_ip(request)}", 10, 60
-            )
+            ))
             if source_allowed:
-                global_allowed, _ = auth_audit_limiter.allow("browser-origin:global", 100, 60)
+                global_allowed, _ = await anyio.to_thread.run_sync(
+                    lambda: auth_audit_limiter.allow("browser-origin:global", 100, 60)
+                )
                 if global_allowed:
                     emit_security_event(
                         "browser.origin.denied",
@@ -716,6 +755,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
 
         response = await call_next(request)
+        if response.status_code in {429, 503}:
+            response.headers.setdefault("Retry-After", "1")
+        if response.status_code == 503 and request.url.path.startswith("/gradio_api/"):
+            availability_monitor.reject("gradio_unavailable")
         response.headers.add_vary_header("Origin")
         response.headers.add_vary_header("Sec-Fetch-Site")
         response.headers["X-Request-ID"] = request_id
@@ -772,6 +815,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return response
 
     app.add_middleware(RequestLimitsMiddleware)
+    app.add_middleware(
+        AdmissionMiddleware, settings=settings, monitor=availability_monitor,
+        requests=request_capacity, streams=stream_capacity, shared_limiter=admission_limiter,
+    )
 
     @app.post("/api/security/csp-report", status_code=status.HTTP_204_NO_CONTENT)
     async def receive_csp_report(request: Request) -> Response:
@@ -779,11 +826,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # cannot require bearer auth. Bound both request size and per-source
         # volume, then retain only origins/directive names—not URL paths,
         # queries, script samples, DOM snippets, or user content.
-        allowed, _ = registration_limiter.allow(
+        allowed, _ = await anyio.to_thread.run_sync(lambda: registration_limiter.allow(
             f"csp-report:{client_ip(request)}",
             max_attempts=30,
             window_seconds=60,
-        )
+        ))
         if not allowed:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         body = bytearray()
@@ -844,6 +891,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "detail": "Đã xảy ra lỗi nội bộ. Hãy cung cấp request_id cho quản trị viên.",
                 "request_id": getattr(request.state, "request_id", None),
             },
+        )
+
+    @app.exception_handler(CapacityExceeded)
+    async def capacity_exceeded_handler(request: Request, exc: CapacityExceeded):
+        availability_monitor.reject("password_capacity")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Hệ thống đang bận. Vui lòng thử lại sau."},
+            headers={"Retry-After": "1", "Cache-Control": "no-store"},
+        )
+
+    @app.exception_handler(RedisError)
+    @app.exception_handler(OperationalError)
+    @app.exception_handler(DatabasePoolTimeout)
+    async def unavailable_security_dependency(request: Request, exc: Exception):
+        availability_monitor.reject("security_dependency_unavailable")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Dịch vụ tạm thời không khả dụng. Vui lòng thử lại sau."},
+            headers={"Retry-After": "3", "Cache-Control": "no-store"},
         )
 
     def get_db() -> Session:
@@ -1719,18 +1786,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return consumed.rowcount == 1
 
     @app.get("/api/health")
-    def health(db: Annotated[Session, Depends(get_db)]):
+    def health():
         # Deliberately minimal: an unauthenticated probe should confirm liveness
         # and nothing else. Leaking the environment name helps an attacker decide
         # whether guards such as DOCS_ENABLED or HSTS are active.
-        db.scalar(select(func.count()).select_from(User))
         payload = {"status": "ok"}
         if settings.environment != "production":
             payload["environment"] = settings.environment
         return payload
 
     @app.get("/api/ready")
-    def readiness(db: Annotated[Session, Depends(get_db)]):
+    def readiness():
         """Report whether this instance is safe to receive routed traffic.
 
         Liveness intentionally remains separate at ``/api/health``. In the high
@@ -1739,35 +1805,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         that the external WORM receiver remains reachable even while idle.
         """
 
-        db.scalar(select(func.count()).select_from(User))
-        if settings.security_profile == "high" and settings.audit_worm_endpoint:
-            if audit_checkpoint_service is None:
-                return JSONResponse(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    content={"status": "unavailable"},
-                    headers={"Retry-After": "30"},
-                )
+        def check_dependencies() -> bool:
             try:
-                verification = audit_checkpoint_service.ensure_latest_anchored(
-                    db,
-                    probe_external=True,
-                )
-            except AuditCheckpointError:
-                emit_security_event(
-                    "audit.checkpoint.readiness_failed",
-                    outcome="failure",
-                )
-                return JSONResponse(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    content={"status": "unavailable"},
-                    headers={"Retry-After": "30"},
-                )
-            if not verification.fully_anchored:
-                return JSONResponse(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    content={"status": "unavailable"},
-                    headers={"Retry-After": "30"},
-                )
+                with database.session_factory() as db:
+                    db.scalar(text("SELECT 1"))
+                    if settings.security_profile == "high":
+                        if audit_checkpoint_service is None or not settings.audit_worm_endpoint:
+                            return False
+                        verification = audit_checkpoint_service.ensure_latest_anchored(
+                            db, probe_external=True,
+                        )
+                        return verification.fully_anchored
+                return True
+            except (SQLAlchemyError, AuditCheckpointError):
+                availability_monitor.reject("readiness_dependency")
+                return False
+
+        if not readiness_probe.check(
+            check_dependencies, cache_success=settings.security_profile != "high",
+        ):
+            return JSONResponse(
+                status_code=503, content={"status": "unavailable"},
+                headers={"Retry-After": "30"},
+            )
         return {"status": "ready"}
 
     @app.post("/api/auth/register", response_model=UserResponse, status_code=201)
@@ -3527,6 +3587,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except AIProviderError as exc:
+            if isinstance(exc, AIProviderBusy):
+                availability_monitor.reject("ai_capacity_or_quota")
             # Lỗi phía nhà cung cấp AI, không phải lỗi của người dùng: 503 kèm
             # Retry-After. `str(exc)` đã là thông điệp chung chung an toàn;
             # log máy chủ chỉ giữ loại lỗi và model, không giữ thông điệp SDK.
@@ -3538,12 +3600,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 target_type="chat_session",
                 target_id=session_id,
                 outcome="failure",
-                details={"reason": "ai_provider_unavailable"},
+                details={"reason": "ai_provider_busy" if isinstance(exc, AIProviderBusy) else "ai_provider_unavailable"},
             )
             raise HTTPException(
                 status_code=503,
                 detail=str(exc),
-                headers={"Retry-After": "30"},
+                headers={"Retry-After": str(exc.retry_after) if isinstance(exc, AIProviderBusy) else "30"},
             ) from exc
         row.updated_at = utcnow()
         db.commit()
@@ -4435,6 +4497,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         return list(db.scalars(select(User).order_by(User.created_at.desc()).limit(500)))
 
+    def availability_snapshot():
+        return {
+            **availability_monitor.snapshot(),
+            "requests": request_capacity.snapshot(),
+            "streams": stream_capacity.snapshot(),
+            "password_operations": password_service.capacity.snapshot(),
+            "readiness": readiness_probe.capacity.snapshot(),
+            "gradio_queue_limit": settings.gradio_queue_max_size,
+            "gradio_retained_event_limit": settings.gradio_retained_events,
+            "gradio_state_capacity": settings.gradio_state_capacity,
+            "gradio_retained_events": len(gradio_demo.scap_capacity.events),
+            "ai_concurrency_limit": settings.ai_max_concurrent,
+        }
+
+    @app.get("/api/admin/availability")
+    def availability_status(_: Annotated[User, Depends(admin_user)]):
+        return availability_snapshot()
+
     @app.post("/api/admin/users", response_model=UserResponse, status_code=201)
     def admin_create_user(
         payload: AdminCreateUser,
@@ -4669,6 +4749,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "total_messages": total_messages,
             "recent_login_failures": recent_login_failures,
             "recent_auth_denials": recent_auth_denials,
+            "availability": availability_snapshot(),
         }
 
     @app.get("/api/admin/practice/catalog")
@@ -4965,7 +5046,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         device_cookie_days=settings.device_token_days,
     )
     gradio_demo = build_ui(
-        session_store=ui_session_store, client_context_key=ui_client_context_key
+        session_store=ui_session_store, client_context_key=ui_client_context_key,
+        queue_max_size=settings.gradio_queue_max_size,
+        concurrency_limit=settings.gradio_concurrency_limit,
+        retained_events=settings.gradio_retained_events,
+        result_ttl_seconds=settings.gradio_result_ttl_seconds,
+        state_capacity=settings.gradio_state_capacity,
     )
     gradio_auth_dependency = None
     if settings.gradio_auth_mode == "oidc":
@@ -5019,6 +5105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # privacy boundary to Gradio queue/run requests as to the REST API.
     for route in app.routes:
         if isinstance(route, Mount) and isinstance(route.app, FastAPI):
+            attach_gradio_capacity(gradio_demo, route.app)
             route.app.add_exception_handler(
                 RequestValidationError, safe_request_validation_error
             )

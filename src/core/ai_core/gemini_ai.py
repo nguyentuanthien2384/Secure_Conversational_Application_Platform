@@ -28,6 +28,8 @@ class GeminiClient:
         retry_attempts: Tổng số lần thử (kể cả lần đầu) khi gặp lỗi tạm thời
             408/429/5xx hoặc mạng. SDK mặc định chỉ thử một lần, nên một lỗi
             "model overloaded" thoáng qua cũng trả lỗi cho người dùng.
+        max_output_tokens: Trần token đầu ra cho mọi lần gọi từ client này.
+            ``extra_config`` có thể hạ nhưng không tăng giới hạn đã cấu hình.
 
     Raises:
         ValueError: Nếu không tìm thấy `api_key`.
@@ -40,6 +42,7 @@ class GeminiClient:
         *,
         timeout_seconds: float | None = None,
         retry_attempts: int = 1,
+        max_output_tokens: int | None = None,
     ):
         if api_key is None:
             api_key = os.getenv("GOOGLE_GENAI_API_KEY", "")
@@ -52,6 +55,11 @@ class GeminiClient:
             raise ValueError("timeout_seconds phải dương.")
         if retry_attempts < 1:
             raise ValueError("retry_attempts phải ít nhất là 1.")
+        if max_output_tokens is not None and (
+            type(max_output_tokens) is not int or max_output_tokens < 1
+        ):
+            raise ValueError("max_output_tokens phải là số nguyên dương.")
+        self.max_output_tokens = max_output_tokens
         http_options = types.HttpOptions(
             # HttpOptions.timeout tính bằng mili giây.
             timeout=int(timeout_seconds * 1000) if timeout_seconds is not None else None,
@@ -141,7 +149,20 @@ class GeminiClient:
         if extra_config:
             cfg_kwargs.update(extra_config)
 
-        generate_content_config = types.GenerateContentConfig(**cfg_kwargs) if cfg_kwargs else None
+        generate_content_config = (
+            types.GenerateContentConfig(**cfg_kwargs)
+            if cfg_kwargs or self.max_output_tokens is not None else None
+        )
+        if generate_content_config is not None and self.max_output_tokens is not None:
+            # Clamp the parsed field, after aliases/extra_config have been
+            # applied, so a caller cannot override the deployment's ceiling.
+            requested = generate_content_config.max_output_tokens
+            if requested is not None and requested < 1:
+                raise ValueError("max_output_tokens phải là số nguyên dương.")
+            generate_content_config.max_output_tokens = (
+                min(requested, self.max_output_tokens)
+                if requested is not None else self.max_output_tokens
+            )
 
         resp = self.client.models.generate_content(
             model=(model or self.model),
@@ -174,4 +195,3 @@ if __name__ == "__main__":
     #   export GOOGLE_GENAI_API_KEY="..."  # hoặc đặt trong .env rồi load trước đó
     client = GeminiClient(model="gemini-flash-lite-latest")
     print(client.generate("hello"))
-    

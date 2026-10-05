@@ -607,6 +607,22 @@ rồi mới gỡ khóa cũ khỏi danh sách.
 
 ## 12. Cấu hình qua biến môi trường
 
+Lớp bảo vệ quá tải dùng ngân sách hữu hạn trước khi đọc/parse body: mặc định
+32 yêu cầu xử lý và 16 luồng SSE trên mỗi worker, tối đa 8 yêu cầu và 2 luồng
+SSE từ cùng IP. Redis chia sẻ hạn mức theo IP/toàn hệ thống giữa các worker.
+Argon2 chỉ chạy 2 tác vụ đồng thời; Gradio chờ tối đa 32 sự kiện và không cho
+API đồng bộ bỏ qua hàng đợi. AI giới hạn 2 lời gọi đồng thời, 60 lời gọi/phút,
+1.000 lời gọi trong 24 giờ trượt và 1.024 output token/lời gọi. Các giá trị này
+là ngân sách khởi điểm, phải điều chỉnh bằng đo tải trên môi trường triển khai;
+giới hạn AI không thay thế hạn mức thanh toán của nhà cung cấp.
+
+Quản trị viên xem bộ đếm của worker tại `GET /api/admin/availability`.
+Các biến `REQUEST_*`, `AUTH_GLOBAL_MAX_ATTEMPTS`, `PASSWORD_MAX_CONCURRENT`,
+`AI_*`, `READINESS_*`, `GRADIO_QUEUE_MAX_SIZE`, `GRADIO_CONCURRENCY_LIMIT` cùng
+quy trình vận hành nằm trong [hướng dẫn chống quá tải](docs/security/availability.md).
+Máy local vẫn dùng hồ sơ development; trước khi mở Internet cần lớp chống
+DDoS/WAF ở biên, khóa truy cập origin và hoàn tất cấu hình production/high.
+
 Toàn bộ biến và giải thích nằm trong [.env.example](.env.example). Những nhóm đáng chú ý:
 
 | Nhóm | Biến tiêu biểu |

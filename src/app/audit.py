@@ -19,6 +19,10 @@ from src.app.siem import emit_security_event
 
 logger = logging.getLogger("secure_chat.audit")
 _METADATA_DLP = DLPScanner()
+_SAMPLED_ANONYMOUS_RATE_EVENTS = frozenset({
+    "auth.login", "auth.register", "auth.password_reset.request",
+    "auth.password_reset", "auth.passkey.login",
+})
 
 
 def safe_user_agent(value: str) -> str | None:
@@ -162,12 +166,25 @@ def record_audit(
     target_id: str | None = None,
     outcome: str = "success",
     details: dict[str, Any] | None = None,
-) -> AuditEvent:
+) -> AuditEvent | None:
     """Persist one audit entry, seal it into the hash chain, mirror it to the SIEM.
 
     Failure to log is itself a security event, so chain/SIEM problems are logged
     loudly but never turned into a 500 for the end user.
     """
+    # Repeated anonymous throttle denials must not amplify a cheap request
+    # into a DB commit, chain lock, SIEM line and WORM delivery each time.
+    # Sample only this narrow fixed set; account changes and credential
+    # failures, successes and authenticated audit events remain complete.
+    if (actor_id is None and event_type in _SAMPLED_ANONYMOUS_RATE_EVENTS
+        and outcome == "blocked" and details == {"reason": "rate_limit"}):
+        monitor = getattr(request.app.state, "availability_monitor", None)
+        if monitor is not None:
+            suppressed = monitor.sample_anonymous_audit(event_type)
+            if suppressed is None:
+                return None
+            details = {**details, "sample_window_seconds": 60,
+                       "suppressed_before_this_sample": suppressed}
     ip = client_ip(request)
     user_agent = safe_user_agent(client_user_agent(request))
     request_id = getattr(request.state, "request_id", None)

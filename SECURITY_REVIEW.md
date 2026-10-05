@@ -202,8 +202,9 @@ provision PostgreSQL/Redis với TLS, secret file/workload identity, Vault/KMS,
 OIDC proxy và kho WORM; tắt demo/docs, cấu hình allowlist và kiểm thử phục hồi.
 Compose thường nạp toàn bộ `.env` vào app, vì vậy credential DB quyền cao có
 thể xuất hiện trong web runtime; dùng high-security overlay đã loại `env_file`
-và staging secret tối thiểu. Production đang tin proxy từ mọi peer backend
-(`--forwarded-allow-ips=*`), nên cần giữ mạng backend và đường vào app cô lập.
+và staging secret tối thiểu. Ở lần rà soát 04/10, production còn tin proxy từ
+mọi peer backend (`--forwarded-allow-ips=*`); bản vá 05/10 bên dưới giới hạn
+nguồn được tin cậy về địa chỉ Caddy. Vẫn phải giữ mạng backend và đường vào app cô lập.
 Không đổi `.env` demo sang production khi các dịch vụ bắt buộc chưa tồn tại.
 
 Private E2EE hiện là server relay và kiểm tra biên, chưa có client Double
@@ -234,3 +235,91 @@ thay thế DAST có xác thực, kiểm thử tải, pentest hoặc xác minh h�
 Nguồn tham chiếu nguyên tắc: [OWASP Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html),
 [Cryptographic Storage](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html),
 [Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).
+
+## 6. Bảo vệ tính sẵn sàng và giới hạn tài nguyên — 05/10/2026
+
+Người dùng xác nhận dự án đang chạy trên máy cá nhân/local, chưa có tên miền.
+Bản nâng cấp này bảo vệ các đường xử lý của ứng dụng và chuẩn bị cấu hình
+triển khai; chưa mở cổng, dựng CDN/WAF hoặc thay đổi `.env` và dữ liệu thật.
+
+### Những phần đã triển khai
+
+1. **Từ chối sớm trước nghiệp vụ:** admission middleware giới hạn số yêu cầu
+   theo IP/toàn ứng dụng và trần riêng cho xác thực/readiness. Có giới hạn
+   request đang chạy theo worker và theo nguồn; SSE dùng ngân sách riêng.
+   Khi quá tải trả `429`/`503` cùng `Retry-After`, không tạo hàng đợi chờ vô hạn.
+   Slot được giữ đến cuối phản hồi và thu hồi khi lỗi hoặc client hủy kết nối.
+2. **Giới hạn tác vụ tốn RAM/chi phí:** Argon2 có tối đa hai tác vụ đồng thời
+   mặc định, áp dụng qua password service chung. AI có trần concurrency,
+   ngân sách theo phút/24 giờ và trần output token được áp dụng tại cấu hình
+   SDK thực tế; lỗi quota/provider không để lại một cuộc trao đổi chat dở dang.
+3. **Giao diện hữu hạn:** hàng đợi Gradio có trần, đường gọi trực tiếp không
+   được bỏ qua queue cho callback đã đưa vào queue. Event/result/state và
+   metadata có giới hạn dung lượng; giữ tác vụ đang chạy, dọn kết quả đã hoàn
+   tất khi tiêu thụ hoặc hết hạn. Adapter kiểm tra tương thích lúc startup;
+   cần chạy lại các regression này khi nâng phiên bản Gradio.
+4. **Phụ thuộc có thời gian chờ hữu hạn:** limiter local không đẩy khóa đang
+   sống ra để nhận khóa mới; Redis có timeout ba giây, không retry và pool
+   tối đa 16 kết nối cho mỗi limiter. Web runtime PostgreSQL dùng pool 5+5,
+   chờ pool/connect năm giây, statement 30 giây, lock năm giây. SQLite giữ
+   WAL, foreign key và busy timeout mười giây; tác vụ maintenance không bị
+   áp giới hạn SQL mới của web runtime. Lỗi phụ thuộc bảo mật trả lỗi an toàn.
+5. **Probe và giám sát ít tốn tài nguyên:** health không truy vấn DB/WORM;
+   readiness single-flight, standard cache thành công năm giây, high kiểm tra
+   WORM ngay không dùng success cache. Snapshot chỉ dành cho admin và hiển
+   thị trong tab Quản trị. Counter/nhãn không chứa credential hay prompt;
+   audit từ chối rate limit vô danh được lấy mẫu để giảm khuếch đại ghi DB,
+   còn thay đổi tài khoản và lỗi credential vẫn giữ audit đầy đủ.
+6. **Cấu hình server/edge:** Uvicorn có trần concurrency/backlog/keep-alive,
+   local không tin proxy header. Compose production chỉ tin địa chỉ Caddy
+   cố định ngoài dải IP cấp động, thay wildcard; readiness bị chặn ở Caddy,
+   healthcheck gọi trực tiếp trong container. Redis có trần RAM/client và `noeviction`, tránh âm thầm
+   xóa quota bảo mật khi đầy. Các biến mới được mô tả trong `.env.example`.
+
+### Phạm vi và giới hạn thực tế
+
+Concurrency/counter trong RAM thuộc từng worker; Redis chia sẻ quota theo
+thời gian giữa worker. Quota mất lịch sử khi local hoặc Redis không persistence
+khởi động lại. SDK AI có retry, nên quota ứng dụng không phải trần số request
+billable hay hạn mức tiền. Timeout từng thao tác không phải deadline tuyệt đối
+của cả request. TTL Gradio dọn theo lượt yêu cầu tiếp theo, không bảo đảm xóa
+mọi bản sao dữ liệu khỏi RAM đúng giây hết hạn.
+
+Các giá trị mặc định là mốc khởi đầu, chưa phải công suất đã đo của laptop.
+Chưa thực hiện flood/benchmark tải, pentest độc lập hoặc kiểm chứng hệ thống
+PostgreSQL/Redis/TLS/Vault/WORM production đang chạy. Chuỗi xử lý HTTP chậm
+trước ASGI và bão lưu lượng làm đầy đường truyền cần kiểm soát ở edge/mạng.
+Khi đưa lên Internet phải bổ sung upstream chống DDoS, WAF/bot challenge phù
+hợp, khóa truy cập trực tiếp origin, cảnh báo vận hành và diễn tập restore.
+Không có cam kết chống mọi tấn công; cấu hình local/demo hiện tại vẫn không
+tương đương profile production/high.
+
+Hướng dẫn giới hạn, chạy local và các bước vận hành:
+[docs/security/availability.md](docs/security/availability.md).
+
+### Bằng chứng kiểm chứng
+
+- **947 kiểm thử Python đạt**, gồm **81 regression mới** cho admission, limiter,
+  provider AI, hàng đợi/lưu giữ Gradio, cấu hình DB và giao diện quản trị.
+  Kiểm thử hủy/lỗi xác nhận slot được trả; kiểm thử thread churn bảo vệ state
+  đang dùng; driver-boundary test kiểm tra tham số PostgreSQL mà không kết nối
+  máy chủ thật. Bằng chứng: `reports/availability-pytest.xml`.
+- **21 kiểm thử JavaScript đạt**; bộ kiểm chứng bảo mật **11/11 đạt** sau khi
+  tích hợp, trong `reports/security-validation-availability/`.
+- Ruff, `uv lock --check` và kiểm tra whitespace đạt. Bandit không có phát hiện
+  từ mức medium severity/confidence trở lên với `-ll -ii`; báo cáo local:
+  `reports/availability-bandit.json`.
+- `pip-audit` môi trường `.venv`: **104 gói, 0 lỗ hổng đã biết** tại lần quét
+  này, trong `reports/availability-pip-audit.json`; không bao gồm lỗ hổng chưa
+  được công bố.
+- Compose local và high-security được parse thành công; cấu hình high xác nhận
+  proxy trust khớp IP Caddy, dải IP động tách khỏi địa chỉ đó và biến admission
+  còn hiệu lực. High dùng môi trường placeholder, không chạy container hoặc
+  đọc secret thật. Đây là kiểm chứng cấu hình, chưa kiểm chứng runtime TLS,
+  Caddy, Redis, PostgreSQL, Vault hay WORM.
+
+Nguồn nguyên tắc:
+[OWASP Unrestricted Resource Consumption](https://api-security.owasp.org/editions/2023/en/0xa4-unrestricted-resource-consumption/),
+[OWASP Denial of Service](https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html),
+[Uvicorn settings](https://www.uvicorn.org/settings/),
+[Docker static IP ngoài vùng cấp động](https://docs.docker.com/reference/cli/docker/network/connect/#network-implications-of-stopping-pausing-or-restarting-containers).

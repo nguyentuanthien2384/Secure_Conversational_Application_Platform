@@ -4,6 +4,7 @@ from collections.abc import Generator
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, create_engine, event, inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -16,16 +17,37 @@ class Base(DeclarativeBase):
 
 
 class Database:
-    def __init__(self, database_url: str):
+    def __init__(self, database_url: str, *, runtime_limits: bool = False):
+        """Create a database engine without connecting to PostgreSQL yet.
+
+        Web runtimes opt into finite PostgreSQL pool, connect and SQL waits.
+        Maintenance scripts retain their existing defaults, including for long
+        migrations. The 30-second statement ceiling accommodates full audit
+        history reads while still bounding stalled queries; lock waits are
+        capped independently at five seconds. It is not a request deadline.
+        """
         connect_args = (
             {"check_same_thread": False, "timeout": 10}
             if database_url.startswith("sqlite")
             else {}
         )
+        pool_limits = {}
+        if runtime_limits and make_url(database_url).get_backend_name() == "postgresql":
+            # SQLAlchemy merges connect_args after URL driver parameters, so
+            # runtime limits deliberately win URL timeout/options overrides.
+            # SSL mode, certificate paths, credentials and other URL parameters
+            # are passed through unchanged. No idle-transaction ceiling: an AI
+            # call can hold an otherwise legitimate transaction while waiting.
+            connect_args = {
+                "connect_timeout": 5,
+                "options": "-c statement_timeout=30000 -c lock_timeout=5000",
+            }
+            pool_limits = {"pool_size": 5, "max_overflow": 5, "pool_timeout": 5}
         self.engine = create_engine(
             database_url,
             pool_pre_ping=True,
             connect_args=connect_args,
+            **pool_limits,
         )
         if database_url.startswith("sqlite"):
             # SQLite does not enforce declared foreign keys unless each

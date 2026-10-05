@@ -76,7 +76,8 @@ services:
     # needing CHOWN/SETUID/SETGID and keeps cap_drop: ALL effective in production.
     user: redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    # Never evict active security quotas to admit new attacker identities.
+    command: ["redis-server", "--appendonly", "no", "--save", "", "--maxmemory", "${REDIS_MAXMEMORY:-128mb}", "--maxmemory-policy", "noeviction", "--maxclients", "${REDIS_MAXCLIENTS:-256}"]
     read_only: true
     tmpfs:
       - /data
@@ -128,7 +129,7 @@ services:
     # duy nhất của mạng edge, nên mới được phép chuyển tiếp thông tin client.
     # Caddy owns the sanitized request log. Uvicorn access logging is disabled
     # because the one-use export capability is necessarily carried in the path.
-    command: ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*", "--no-access-log"]
+    command: ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=${SCAP_CADDY_IPV4:-172.30.45.2}", "--no-access-log", "--limit-concurrency", "${UVICORN_LIMIT_CONCURRENCY:-64}", "--backlog", "${UVICORN_BACKLOG:-128}", "--timeout-keep-alive", "${UVICORN_KEEPALIVE_SECONDS:-5}", "--timeout-graceful-shutdown", "${UVICORN_SHUTDOWN_SECONDS:-20}", "--h11-max-incomplete-event-size", "16384"]
     env_file: .env
     environment:
       APP_ENV: production
@@ -140,6 +141,26 @@ services:
       DOCS_ENABLED: "false"
       PASSWORD_BREACH_CHECK: "true"
       SEED_DEMO_DATA: "false"
+      REQUEST_MAX_CONCURRENT: ${REQUEST_MAX_CONCURRENT:-32}
+      REQUEST_MAX_STREAMS: ${REQUEST_MAX_STREAMS:-16}
+      REQUEST_IP_MAX_CONCURRENT: ${REQUEST_IP_MAX_CONCURRENT:-8}
+      REQUEST_IP_MAX_STREAMS: ${REQUEST_IP_MAX_STREAMS:-2}
+      REQUEST_WINDOW_SECONDS: ${REQUEST_WINDOW_SECONDS:-60}
+      REQUEST_GLOBAL_MAX_ATTEMPTS: ${REQUEST_GLOBAL_MAX_ATTEMPTS:-600}
+      REQUEST_IP_MAX_ATTEMPTS: ${REQUEST_IP_MAX_ATTEMPTS:-300}
+      AUTH_GLOBAL_MAX_ATTEMPTS: ${AUTH_GLOBAL_MAX_ATTEMPTS:-120}
+      READINESS_MAX_ATTEMPTS: ${READINESS_MAX_ATTEMPTS:-12}
+      READINESS_CACHE_SECONDS: ${READINESS_CACHE_SECONDS:-5}
+      PASSWORD_MAX_CONCURRENT: ${PASSWORD_MAX_CONCURRENT:-2}
+      AI_MAX_CONCURRENT: ${AI_MAX_CONCURRENT:-2}
+      AI_GLOBAL_MAX_ATTEMPTS: ${AI_GLOBAL_MAX_ATTEMPTS:-60}
+      AI_DAILY_MAX_ATTEMPTS: ${AI_DAILY_MAX_ATTEMPTS:-1000}
+      AI_MAX_OUTPUT_TOKENS: ${AI_MAX_OUTPUT_TOKENS:-1024}
+      GRADIO_QUEUE_MAX_SIZE: ${GRADIO_QUEUE_MAX_SIZE:-32}
+      GRADIO_CONCURRENCY_LIMIT: ${GRADIO_CONCURRENCY_LIMIT:-4}
+      GRADIO_RETAINED_EVENTS: ${GRADIO_RETAINED_EVENTS:-128}
+      GRADIO_RESULT_TTL_SECONDS: ${GRADIO_RESULT_TTL_SECONDS:-120}
+      GRADIO_STATE_CAPACITY: ${GRADIO_STATE_CAPACITY:-256}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -200,7 +221,9 @@ services:
     stop_grace_period: 30s
     logging: *default-logging
     # Caddy chỉ ở mạng "edge"; nó không nhìn thấy Postgres hay Redis.
-    networks: [edge]
+    networks:
+      edge:
+        ipv4_address: ${SCAP_CADDY_IPV4:-172.30.45.2}
 
 volumes:
   postgres_data:
@@ -215,3 +238,8 @@ networks:
     internal: true
   edge:
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${SCAP_EDGE_SUBNET:-172.30.45.0/28}
+          # Static Caddy must stay outside the dynamic pool; app starts first.
+          ip_range: ${SCAP_EDGE_DYNAMIC_RANGE:-172.30.45.8/29}

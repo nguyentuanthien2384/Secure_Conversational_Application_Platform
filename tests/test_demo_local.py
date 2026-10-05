@@ -107,6 +107,10 @@ def test_ctrl_c_disposes_demo_and_removes_its_temporary_directory(monkeypatch, c
     def interrupt(server, *_args, **_kwargs):
         # An open browser event stream must not keep the demo alive forever.
         assert server.config.timeout_graceful_shutdown == 5
+        assert server.config.limit_concurrency == 64
+        assert server.config.backlog == 128
+        assert server.config.timeout_keep_alive == 5
+        assert server.config.proxy_headers is False
         raise KeyboardInterrupt
 
     monkeypatch.setattr("scripts.demo_local.demo_application", application)

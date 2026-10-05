@@ -52,4 +52,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 # Không tin các proxy header theo mặc định. Bản Compose production bật chúng
 # riêng sau Caddy, còn bản local được publish thẳng nên không thể bị giả IP qua
 # X-Forwarded-For.
-CMD ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers", "--no-access-log"]
+CMD ["/app/.venv/bin/uvicorn", "src.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers", "--no-access-log", "--limit-concurrency", "64", "--backlog", "128", "--timeout-keep-alive", "5", "--timeout-graceful-shutdown", "20", "--h11-max-incomplete-event-size", "16384"]

@@ -208,7 +208,10 @@ def main(argv: list[str] | None = None) -> int:
                 print("Ctrl+C để dừng. Lần chạy tiếp theo tạo dữ liệu mới; dữ liệu hiện có của bạn được giữ nguyên.")
                 config = uvicorn.Config(app, host="127.0.0.1", port=args.port,
                                         access_log=False, proxy_headers=False, log_level="warning",
-                                        timeout_graceful_shutdown=5)
+                                        timeout_graceful_shutdown=5,
+                                        limit_concurrency=64, backlog=128,
+                                        timeout_keep_alive=5,
+                                        h11_max_incomplete_event_size=16_384)
                 try:
                     uvicorn.Server(config).run(sockets=[listener])
                 except KeyboardInterrupt:

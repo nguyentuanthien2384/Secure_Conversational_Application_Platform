@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import ssl
 import struct
@@ -13,7 +14,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
-from collections import defaultdict, deque
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
@@ -488,23 +489,60 @@ class PwnedPasswordChecker:
 
 
 class SlidingWindowRateLimiter:
-    """Small in-memory limiter for a single teaching/demo instance."""
+    """Bounded in-memory limiter for one application process.
 
-    def __init__(self) -> None:
-        self._events: dict[str, deque[float]] = defaultdict(deque)
+    Expired keys are reclaimed, but active budgets are never evicted to make
+    room for rotating attacker identities. A full store denies new keys.
+    """
+
+    def __init__(
+        self, *, max_keys: int = 10_000, cleanup_interval_seconds: float = 60.0
+    ) -> None:
+        if max_keys <= 0 or not math.isfinite(cleanup_interval_seconds) or cleanup_interval_seconds <= 0:
+            raise ValueError("Rate limiter capacity and cleanup interval must be positive.")
+        self._max_keys = max_keys
+        self._cleanup_interval_seconds = cleanup_interval_seconds
+        self._events: dict[str, deque[float]] = {}
+        self._expires_at: dict[str, float] = {}
+        self._next_cleanup = 0.0
+        self._next_expiry = math.inf
         self._lock = threading.Lock()
 
+    def _cleanup(self, now: float) -> None:
+        for key in [key for key, expiry in self._expires_at.items() if expiry <= now]:
+            self._events.pop(key, None)
+            self._expires_at.pop(key, None)
+        self._next_expiry = min(self._expires_at.values(), default=math.inf)
+        self._next_cleanup = now + self._cleanup_interval_seconds
+
     def allow(self, key: str, max_attempts: int, window_seconds: int) -> tuple[bool, int]:
+        if max_attempts <= 0 or window_seconds <= 0:
+            raise ValueError("Rate limiter budget and window must be positive.")
         now = time.monotonic()
         cutoff = now - window_seconds
         with self._lock:
-            bucket = self._events[key]
-            while bucket and bucket[0] < cutoff:
+            if now >= self._next_cleanup:
+                self._cleanup(now)
+            bucket = self._events.get(key)
+            if bucket is None:
+                if len(self._events) >= self._max_keys and now >= self._next_expiry:
+                    self._cleanup(now)
+                if len(self._events) >= self._max_keys:
+                    return False, max(1, math.ceil(self._next_expiry - now))
+                bucket = deque()
+                self._events[key] = bucket
+            while bucket and bucket[0] <= cutoff:
                 bucket.popleft()
+            # A longer window cannot make an existing bucket eligible for
+            # eviction while its accepted requests are still in that window.
+            expiry = (bucket[-1] if bucket else now) + window_seconds
+            self._expires_at[key] = max(self._expires_at.get(key, 0.0), expiry)
+            self._next_expiry = min(self._next_expiry, self._expires_at[key])
             if len(bucket) >= max_attempts:
-                retry_after = max(1, int(window_seconds - (now - bucket[0])))
+                retry_after = max(1, math.ceil(window_seconds - (now - bucket[0])))
                 return False, retry_after
             bucket.append(now)
+            self._expires_at[key] = max(self._expires_at[key], now + window_seconds)
             return True, 0
 
     def refund(self, key: str) -> None:
@@ -518,10 +556,14 @@ class SlidingWindowRateLimiter:
             bucket = self._events.get(key)
             if bucket:
                 bucket.pop()
+                if not bucket:
+                    self._events.pop(key, None)
+                    self._expires_at.pop(key, None)
 
     def reset(self, key: str) -> None:
         with self._lock:
             self._events.pop(key, None)
+            self._expires_at.pop(key, None)
 
 
 class RedisSlidingWindowRateLimiter:
@@ -551,12 +593,36 @@ redis.call('EXPIRE', key, math.ceil(window) + 1)
 return {1, 0}
 """
 
-    def __init__(self, redis_url: str, *, key_prefix: str = "scap:rate-limit:") -> None:
+    def __init__(
+        self, redis_url: str, *, key_prefix: str = "scap:rate-limit:",
+        connect_timeout_seconds: float = 3.0, socket_timeout_seconds: float = 3.0,
+    ) -> None:
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in (connect_timeout_seconds, socket_timeout_seconds)
+        ):
+            raise ValueError("Redis limiter timeouts must be finite and positive.")
         try:
             import redis
+            from redis.backoff import NoBackoff
+            from redis.retry import Retry
         except ImportError as exc:  # pragma: no cover - exercised only in Redis deployments
             raise RuntimeError("Thiếu package redis cho REDIS_URL.") from exc
-        self._client = redis.Redis.from_url(redis_url, decode_responses=True)
+        connection_limits = {
+            "socket_connect_timeout": connect_timeout_seconds,
+            "socket_timeout": socket_timeout_seconds,
+            "retry_on_timeout": False,
+            "retry_on_error": [],
+            "retry": Retry(NoBackoff(), 0),
+        }
+        self._client = redis.Redis.from_url(
+            redis_url, decode_responses=True, max_connections=16, **connection_limits
+        )
+        # Redis URL query options normally override explicit kwargs. Apply
+        # these limits before the first connection so a URL cannot restore
+        # unbounded socket waits or retries, while retaining its TLS options.
+        self._client.connection_pool.connection_kwargs.update(connection_limits)
+        self._client.connection_pool.max_connections = 16
         try:
             self._client.ping()
         except redis.RedisError as exc:

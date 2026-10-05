@@ -50,6 +50,13 @@
 	}
 
 	# ── Chặn sớm các đường dẫn trinh sát của stack khác (WordPress/PHP/git) ──
+	# Readiness is for the container/orchestrator, never an Internet endpoint.
+	# Prevent public callers from consuming the dependency-probe budget.
+	@private_ready path /api/ready /api/ready/*
+	handle @private_ready {
+		respond 404
+	}
+
 	# Lọc ở biên rẻ hơn nhiều so với để request đi tới tầng ứng dụng.
 	@recon path_regexp recon ^/(wp-admin|wp-login\.php|phpmyadmin|xmlrpc\.php|\.env|\.git/|\.aws/|\.ssh/|config\.php|cgi-bin/)
 	handle @recon {
