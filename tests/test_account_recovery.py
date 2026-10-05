@@ -86,9 +86,10 @@ def test_mask_email_hides_the_local_part():
 
 
 def test_outbox_transport_writes_eml_files(tmp_path):
-    mailer = Mailer(OutboxTransport(tmp_path), "SCAP <no-reply@scap.local>", background=False)
+    directory = tmp_path / "outbox"
+    mailer = Mailer(OutboxTransport(directory), "SCAP <no-reply@scap.local>", background=False)
     mailer.send("a@example.com", "Chủ đề", "Nội dung", template="test")
-    files = list(tmp_path.glob("*.eml"))
+    files = list(directory.glob("*.eml"))
     assert len(files) == 1 and b"a@example.com" in files[0].read_bytes()
 
 

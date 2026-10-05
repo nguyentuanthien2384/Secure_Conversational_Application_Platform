@@ -14,9 +14,10 @@ it. This is a bounded local SQLite tool, not a PostgreSQL backup tool.
 The v1 framing stores fixed Argon2id parameters, salt, nonce, creation time and
 SQLite byte length in a fixed header authenticated as AES-GCM additional data.
 Untrusted headers and file sizes are rejected before allocating/deriving a key.
-Temporary plaintext snapshots use a private directory, then are removed. On
-Windows their ACL inherits the destination directory; chmod is not an ACL or
-secure-erasure guarantee. Use an operator-owned directory on encrypted storage.
+Temporary plaintext snapshots use a directory created with a private ACL/mode,
+then are removed. Windows grants only the current process user and SYSTEM.
+Use an operator-owned destination on encrypted storage; this is not secure
+erasure or protection against software running as that user/administrator.
 """
 
 from __future__ import annotations
@@ -26,14 +27,14 @@ import getpass
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import stat
 import struct
 import sys
-import tempfile
 import time
 import warnings
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -41,6 +42,8 @@ from typing import BinaryIO
 from argon2.low_level import Type, hash_secret_raw
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from src.app.private_storage import create_private_directory, create_private_file
 
 MAX_DATABASE_BYTES = 64 * 1024 * 1024
 BACKUP_DEADLINE_SECONDS = 30
@@ -125,11 +128,30 @@ def _open_input(path: Path) -> BinaryIO:
 
 
 def _write_new(path: Path, payload: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-    with os.fdopen(descriptor, "wb") as target:
+    with create_private_file(path) as target:
         target.write(payload)
         target.flush()
         os.fsync(target.fileno())
+
+
+@contextmanager
+def _private_temporary_directory(parent: Path, prefix: str):
+    """Create private storage before SQLite can create plaintext/sidecars."""
+    for _attempt in range(32):
+        directory = parent / (prefix + secrets.token_hex(16))
+        try:
+            create_private_directory(directory)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise BackupError("Could not reserve private temporary storage.")
+    try:
+        yield directory
+    finally:
+        # Only remove the new random child that this operation created. Never
+        # clean the input, output or a caller-supplied existing directory.
+        shutil.rmtree(directory)
 
 
 def _publish_new(temporary: Path, output: Path) -> None:
@@ -199,9 +221,7 @@ def backup_database(database: Path, output: Path, passphrase: str) -> dict[str, 
     _passphrase_bytes(passphrase)
     database = _checked_path(database, existing=True)
     output = _checked_path(output, existing=False)
-    with tempfile.TemporaryDirectory(prefix="scap-backup-", dir=output.parent) as temporary:
-        directory = Path(temporary)
-        directory.chmod(0o700)
+    with _private_temporary_directory(output.parent, "scap-backup-") as directory:
         snapshot = directory / "snapshot.db"
         _snapshot(database, snapshot)
         payload = snapshot.read_bytes()
@@ -323,9 +343,7 @@ def restore_database(
     archive = _checked_path(archive, existing=True)
     output = _checked_path(output, existing=False)
     payload, created = _decrypt_archive(archive, passphrase)
-    with tempfile.TemporaryDirectory(prefix="scap-restore-", dir=output.parent) as temporary:
-        directory = Path(temporary)
-        directory.chmod(0o700)
+    with _private_temporary_directory(output.parent, "scap-restore-") as directory:
         restored = directory / "restored.db"
         _write_new(restored, payload)
         counts = _revoke_restored_credentials(restored, reviewed_users)

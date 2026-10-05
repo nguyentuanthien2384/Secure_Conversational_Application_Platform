@@ -10,6 +10,24 @@ from email.message import EmailMessage
 import pytest
 
 from src.app.mailer import MAX_MESSAGE_BYTES, MailBusy, Mailer, MailUnavailable, OutboxTransport
+from src.app.private_storage import (
+    check_private_directory,
+    check_private_file,
+    create_private_directory,
+    create_private_file,
+)
+
+
+@pytest.fixture
+def private_outbox(tmp_path):
+    directory = tmp_path / "private-outbox"
+    create_private_directory(directory)
+    return directory
+
+
+def _retain(path, payload=b"retained secret email"):
+    with create_private_file(path) as target:
+        target.write(payload)
 
 
 class BlockingTransport:
@@ -201,9 +219,10 @@ def test_synchronous_transport_failure_surfaces_only_generic_error_and_releases_
         mailer.close(timeout=0)
 
 
-def test_synchronous_mailer_reports_outbox_full_without_deleting_existing_mail(tmp_path):
+def test_synchronous_mailer_reports_outbox_full_without_deleting_existing_mail(private_outbox):
+    tmp_path = private_outbox
     retained = tmp_path / "retained.eml"
-    retained.write_bytes(b"retained secret email")
+    _retain(retained)
     mailer = Mailer(
         OutboxTransport(tmp_path, max_files=1), "no-reply@scap.local", background=False,
     )
@@ -235,9 +254,10 @@ def test_oversized_and_invalid_mail_never_enters_queue():
     mailer.close(timeout=0)
 
 
-def test_existing_mail_is_preserved_when_outbox_file_budget_is_full(tmp_path):
+def test_existing_mail_is_preserved_when_outbox_file_budget_is_full(private_outbox):
+    tmp_path = private_outbox
     retained = tmp_path / "existing.eml"
-    retained.write_bytes(b"retained secret email")
+    _retain(retained)
     transport = OutboxTransport(tmp_path, max_files=2)
     transport.send(_message())
     with pytest.raises(MailBusy):
@@ -246,9 +266,10 @@ def test_existing_mail_is_preserved_when_outbox_file_budget_is_full(tmp_path):
     assert len(list(tmp_path.glob("*.eml"))) == 2
 
 
-def test_outbox_byte_budget_includes_existing_files(tmp_path):
+def test_outbox_byte_budget_includes_existing_files(private_outbox):
+    tmp_path = private_outbox
     retained = tmp_path / "existing.eml"
-    retained.write_bytes(b"retained secret email")
+    _retain(retained)
     incoming = _message()
     limit = retained.stat().st_size + len(bytes(incoming))
     transport = OutboxTransport(tmp_path, max_bytes=limit)
@@ -259,7 +280,8 @@ def test_outbox_byte_budget_includes_existing_files(tmp_path):
     assert sum(file.stat().st_size for file in tmp_path.iterdir()) == limit
 
 
-def test_empty_outbox_rejects_one_mail_larger_than_its_byte_budget(tmp_path):
+def test_empty_outbox_rejects_one_mail_larger_than_its_byte_budget(private_outbox):
+    tmp_path = private_outbox
     transport = OutboxTransport(tmp_path, max_bytes=1)
     with pytest.raises(MailBusy):
         transport.send(_message())
@@ -274,7 +296,8 @@ def test_outbox_rejects_oversized_message_without_creating_directory(tmp_path):
     assert not directory.exists()
 
 
-def test_outbox_instances_serialize_the_same_directory_quota(tmp_path):
+def test_outbox_instances_serialize_the_same_directory_quota(private_outbox):
+    tmp_path = private_outbox
     transports = [OutboxTransport(tmp_path, max_files=1) for _ in range(8)]
 
     def attempt(transport):
@@ -321,7 +344,7 @@ def test_outbox_unsafe_entry_never_modifies_link_target(tmp_path):
     target = tmp_path / "private-target"
     target.write_bytes(b"keep secret")
     directory = tmp_path / "outbox"
-    directory.mkdir(mode=0o700)
+    create_private_directory(directory)
     _symlink(target, directory / "existing.eml")
     with pytest.raises(MailUnavailable):
         OutboxTransport(directory).send(_message())
@@ -333,7 +356,7 @@ def test_outbox_hardlink_entry_is_rejected_without_modifying_target(tmp_path):
     target = tmp_path / "private-target"
     target.write_bytes(b"keep secret")
     directory = tmp_path / "outbox"
-    directory.mkdir(mode=0o700)
+    create_private_directory(directory)
     try:
         os.link(target, directory / "existing.eml")
     except (OSError, NotImplementedError):
@@ -344,7 +367,8 @@ def test_outbox_hardlink_entry_is_rejected_without_modifying_target(tmp_path):
     assert len(list(directory.iterdir())) == 1
 
 
-def test_outbox_exclusive_creation_does_not_overwrite_existing_mail(tmp_path, monkeypatch):
+def test_outbox_exclusive_creation_does_not_overwrite_existing_mail(private_outbox, monkeypatch):
+    tmp_path = private_outbox
     class FixedDate:
         @staticmethod
         def now(zone):
@@ -354,7 +378,7 @@ def test_outbox_exclusive_creation_does_not_overwrite_existing_mail(tmp_path, mo
             return "fixed-time"
 
     retained = tmp_path / ("fixed-time-" + "a" * 32 + ".eml")
-    retained.write_bytes(b"retained secret email")
+    _retain(retained)
     monkeypatch.setattr("src.app.mailer.datetime", FixedDate)
     monkeypatch.setattr("src.app.mailer.secrets.token_hex", lambda _: "a" * 32)
     with pytest.raises(FileExistsError):
@@ -379,3 +403,33 @@ def test_existing_world_readable_outbox_is_rejected_without_mutation(tmp_path):
         OutboxTransport(directory).send(_message())
     assert directory.stat().st_mode & 0o777 == 0o755
     assert list(directory.iterdir()) == []
+
+
+def test_outbox_creation_protects_directory_and_message_before_next_send(tmp_path):
+    directory = tmp_path / "new-outbox"
+    transport = OutboxTransport(directory)
+    transport.send(_message())
+    check_private_directory(directory)
+    retained = next(directory.iterdir())
+    check_private_file(retained)
+    before = retained.read_bytes()
+    transport.send(_message("Second private code"))
+    assert retained.read_bytes() == before
+    for message in directory.iterdir():
+        check_private_file(message)
+
+
+def test_outbox_checks_existing_message_privacy_without_rewriting(tmp_path):
+    directory = tmp_path / "new-outbox"
+    create_private_directory(directory)
+    unsafe = tmp_path / "public.eml"
+    unsafe.write_bytes(b"retained secret email")
+    if os.name != "nt":
+        unsafe.chmod(0o644)
+    # A move preserves the old file's security descriptor on this volume.
+    retained = directory / "public.eml"
+    unsafe.rename(retained)
+    with pytest.raises(MailUnavailable):
+        OutboxTransport(directory).send(_message())
+    assert retained.read_bytes() == b"retained secret email"
+    assert list(directory.iterdir()) == [retained]

@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from src.app.audit_chain import canonical_datetime
 from src.app.db import utcnow
 from src.app.models import AuditCheckpoint, AuditEvent
+from src.app.secret_files import SecretFileTooLarge, read_secret_text
 
 CHECKPOINT_NAMESPACE = uuid.UUID("995c6f15-89fb-47bb-b5b6-067562f076f1")
 EXTERNAL_FAILURE_RETRY_SECONDS = 30
@@ -150,10 +151,12 @@ class AuditCheckpointService:
         if self.token_file is None:
             return ""
         try:
-            token = self.token_file.read_text(encoding="utf-8").strip()
+            token = read_secret_text(self.token_file, max_bytes=4096).strip()
+        except SecretFileTooLarge as exc:
+            raise AuditCheckpointError("Audit WORM credential is invalid.") from exc
         except OSError as exc:
             raise AuditCheckpointError("Audit WORM credential is unavailable.") from exc
-        if not token or len(token) > 4096 or "\r" in token or "\n" in token:
+        if not token or len(token) > 4096 or any(char in token for char in ("\x00", "\r", "\n")):
             raise AuditCheckpointError("Audit WORM credential is invalid.")
         return token
 

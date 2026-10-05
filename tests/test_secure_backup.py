@@ -17,6 +17,7 @@ from scripts import secure_backup as backup
 from src.app.audit_chain import derive_audit_key, seal_event, verify_chain
 from src.app.db import Database
 from src.app.main import create_app
+from src.app.private_storage import PrivateStorageError, check_private_directory, check_private_file
 from src.app.models import (
     AccountRecoveryCode,
     AuditEvent,
@@ -349,6 +350,65 @@ def test_cancellation_cleans_private_plaintext_snapshot(sample_database, tmp_pat
     with pytest.raises(KeyboardInterrupt):
         backup.backup_database(sample_database, tmp_path / "cancelled.scapbak", _PASSWORD)
     assert not _temporary_files(tmp_path) and not (tmp_path / "cancelled.scapbak").exists()
+
+
+def test_backup_acl_is_applied_before_snapshot_and_preserved_on_publication(
+    sample_database, tmp_path, monkeypatch,
+):
+    snapshot = backup._snapshot
+    checked = []
+
+    def private_snapshot(source, destination):
+        check_private_directory(destination.parent)
+        assert not destination.exists()
+        snapshot(source, destination)
+        check_private_file(destination)
+        checked.append(destination)
+
+    monkeypatch.setattr(backup, "_snapshot", private_snapshot)
+    output = tmp_path / "private.scapbak"
+    backup.backup_database(sample_database, output, _PASSWORD)
+    assert len(checked) == 1 and not checked[0].exists()
+    check_private_file(output)
+    assert output.stat().st_nlink == 1
+    assert not _temporary_files(tmp_path)
+
+
+def test_restore_acl_is_applied_before_sqlite_opens_plaintext_and_retained(
+    archive, tmp_path, monkeypatch,
+):
+    revoke = backup._revoke_restored_credentials
+    checked = []
+
+    def private_revoke(path, reviewed_users):
+        check_private_directory(path.parent)
+        check_private_file(path)
+        checked.append(path)
+        return revoke(path, reviewed_users)
+
+    monkeypatch.setattr(backup, "_revoke_restored_credentials", private_revoke)
+    output = tmp_path / "private-restored.db"
+    backup.restore_database(archive, output, _PASSWORD)
+    assert len(checked) == 1 and not checked[0].exists()
+    check_private_file(output)
+    assert output.stat().st_nlink == 1
+    assert not _temporary_files(tmp_path)
+
+
+def test_backup_refuses_plaintext_creation_if_private_storage_is_unavailable(
+    sample_database, tmp_path, monkeypatch,
+):
+    before = sample_database.read_bytes()
+
+    def refused(_path):
+        raise PrivateStorageError("Private storage is unavailable.")
+
+    monkeypatch.setattr(backup, "create_private_directory", refused)
+    with pytest.raises(PrivateStorageError):
+        backup.backup_database(sample_database, tmp_path / "refused.scapbak", _PASSWORD)
+    assert sample_database.read_bytes() == before
+    assert not (tmp_path / "refused.scapbak").exists()
+    assert not _temporary_files(tmp_path)
 
 
 @pytest.mark.parametrize("passphrase", ["", "short", "a" * 1025])

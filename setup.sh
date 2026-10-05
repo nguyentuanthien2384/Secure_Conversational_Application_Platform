@@ -45,46 +45,22 @@ fi
 command -v uv >/dev/null 2>&1 || die "Không cài được uv. Xem https://docs.astral.sh/uv/getting-started/installation/"
 ok "uv $(uv --version | awk '{print $2}')"
 
-# ---------- 3. File .env ----------
-step "3/5 Kiểm tra cấu hình .env"
-if [ -f .env ]; then
-  ok ".env đã tồn tại — giữ nguyên"
-else
-  cp .env.example .env
-  warn "Đã tạo .env từ .env.example — đang sinh secrets ngẫu nhiên..."
-  SECRETS="$(python3 scripts/generate_secrets.py 2>/dev/null || uv run --no-project python scripts/generate_secrets.py)"
-  APP_SECRET="$(echo "$SECRETS" | grep '^APP_SECRET_KEY=' | cut -d= -f2-)"
-  MASTER_KEY="$(echo "$SECRETS" | grep '^MASTER_ENCRYPTION_KEY=' | cut -d= -f2-)"
-  python3 - "$APP_SECRET" "$MASTER_KEY" <<'PYEOF'
-import sys, pathlib
-app_secret, master_key = sys.argv[1], sys.argv[2]
-p = pathlib.Path(".env"); out = []
-for line in p.read_text(encoding="utf-8").splitlines():
-    if line.startswith("APP_SECRET_KEY="):
-        line = "APP_SECRET_KEY=" + app_secret
-    elif line.startswith("MASTER_ENCRYPTION_KEY="):
-        line = "MASTER_ENCRYPTION_KEY=" + master_key
-    elif line.startswith("SEED_DEMO_DATA="):
-        line = "SEED_DEMO_DATA=true"
-    out.append(line)
-if not any(l.startswith("SEED_DEMO_DATA=") for l in out):
-    out.append("SEED_DEMO_DATA=true")
-p.write_text("\n".join(out) + "\n", encoding="utf-8")
-PYEOF
-  ok "Đã sinh APP_SECRET_KEY và MASTER_ENCRYPTION_KEY"
-fi
-
-# ---------- 4. Cài dependency ----------
-step "4/5 Cài dependency (uv sync --group dev)"
+# ---------- 3. Cài dependency ----------
+step "3/5 Cài dependency (uv sync --group dev)"
 uv sync --group dev
 ok "Môi trường ảo .venv đã sẵn sàng"
+
+# ---------- 4. Cấu hình và storage private ----------
+step "4/5 Kiểm tra cấu hình và kho lưu trữ private"
+uv run python -m scripts.local_storage init
+ok "Cấu hình local sẵn sàng; secrets không đi qua tham số lệnh"
 
 # ---------- 5. Test + scan (tùy chọn) ----------
 if [ "$RUN_TESTS" -eq 1 ]; then
   step "5/5 Kiểm thử và quét bảo mật"
-  uv run pytest --cov=src.app --cov-report=term-missing || warn "Có test thất bại — xem log ở trên"
-  uv run ruff check src tests scripts || warn "Ruff báo lỗi lint"
-  uv run bandit -q -r src/app -ll -ii || warn "Bandit báo cảnh báo"
+  uv run pytest --cov=src.app --cov-report=term-missing
+  uv run ruff check src tests scripts
+  uv run bandit -q -r src/app -ll -ii
 else
   step "5/5 Bỏ qua test (thêm --test nếu muốn chạy)"
 fi

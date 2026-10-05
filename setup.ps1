@@ -38,43 +38,27 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 }
 Ok ((uv --version) -join "")
 
-# ---------- 3. .env ----------
-Step "3/5 Kiem tra cau hinh .env"
-if (Test-Path ".env") {
-    Ok ".env da ton tai - giu nguyen"
-} else {
-    Copy-Item ".env.example" ".env"
-    Warn "Da tao .env - dang sinh secrets ngau nhien..."
-    $bytes1 = New-Object byte[] 48
-    $bytes2 = New-Object byte[] 32
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $rng.GetBytes($bytes1); $rng.GetBytes($bytes2)
-    $appSecret = [Convert]::ToBase64String($bytes1).Replace('+','-').Replace('/','_').TrimEnd('=')
-    $masterKey = [Convert]::ToBase64String($bytes2).Replace('+','-').Replace('/','_')
-    $lines = Get-Content ".env"
-    $out = foreach ($line in $lines) {
-        if     ($line -like "APP_SECRET_KEY=*")        { "APP_SECRET_KEY=$appSecret" }
-        elseif ($line -like "MASTER_ENCRYPTION_KEY=*") { "MASTER_ENCRYPTION_KEY=$masterKey" }
-        elseif ($line -like "SEED_DEMO_DATA=*")        { "SEED_DEMO_DATA=true" }
-        else                                           { $line }
-    }
-    if (-not ($out -like "SEED_DEMO_DATA=*")) { $out += "SEED_DEMO_DATA=true" }
-    $out | Set-Content ".env" -Encoding UTF8
-    Ok "Da sinh APP_SECRET_KEY va MASTER_ENCRYPTION_KEY"
-}
-
-# ---------- 4. Dependency ----------
-Step "4/5 Cai dependency (uv sync --group dev)"
+# ---------- 3. Dependency ----------
+Step "3/5 Cai dependency (uv sync --group dev)"
 uv sync --group dev
 if ($LASTEXITCODE -ne 0) { Die "uv sync that bai - kiem tra ket noi Internet" }
 Ok "Moi truong ao .venv da san sang"
+
+# ---------- 4. Private local storage ----------
+Step "4/5 Kiem tra cau hinh va kho luu tru private"
+uv run python -m scripts.local_storage init
+if ($LASTEXITCODE -ne 0) { Die "Khong the tao cau hinh an toan - xem huong dan o tren" }
+Ok "Cau hinh local san sang; secrets khong di qua tham so lenh"
 
 # ---------- 5. Test ----------
 if ($Test) {
     Step "5/5 Kiem thu va quet bao mat"
     uv run pytest --cov=src.app --cov-report=term-missing
+    if ($LASTEXITCODE -ne 0) { Die "Kiem thu that bai" }
     uv run ruff check src tests scripts
+    if ($LASTEXITCODE -ne 0) { Die "Ruff bao loi" }
     uv run bandit -q -r src/app -ll -ii
+    if ($LASTEXITCODE -ne 0) { Die "Bandit bao canh bao" }
 } else {
     Step "5/5 Bo qua test (them -Test neu muon chay)"
 }

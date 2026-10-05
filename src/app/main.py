@@ -7,7 +7,6 @@ import uuid
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Annotated
 from urllib.parse import unquote, urlsplit
 
@@ -158,6 +157,7 @@ from src.app.schemas import (
     UserRoleUpdate,
     UserStatusUpdate,
 )
+from src.app.secret_files import SecretFileTooLarge, read_secret_text
 from src.app.security import (
     CryptoService,
     PasswordBreachCheckUnavailable,
@@ -5082,10 +5082,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     gradio_auth_dependency = None
     if settings.gradio_auth_mode == "oidc":
         try:
-            proxy_secret = Path(settings.oidc_proxy_secret_file).read_text(encoding="utf-8").strip()
+            proxy_secret = read_secret_text(settings.oidc_proxy_secret_file, max_bytes=4096).strip()
+        except SecretFileTooLarge as exc:
+            raise RuntimeError("Bí mật reverse proxy OIDC phải dài 32-4096 ký tự.") from exc
         except OSError as exc:
             raise RuntimeError("Không đọc được bí mật xác thực reverse proxy OIDC.") from exc
-        if len(proxy_secret) < 32 or len(proxy_secret) > 4096:
+        if len(proxy_secret) < 32 or len(proxy_secret) > 4096 or any(
+            char in proxy_secret for char in ("\x00", "\r", "\n")
+        ):
             raise RuntimeError("Bí mật reverse proxy OIDC phải dài 32-4096 ký tự.")
 
         def verified_proxy_identity(request: Request) -> str | None:

@@ -33,6 +33,13 @@ from email.utils import formataddr, make_msgid, parseaddr
 from pathlib import Path
 from typing import Protocol
 
+from .private_storage import (
+    PrivateStorageError,
+    check_private_file,
+    create_private_file,
+    prepare_private_directory,
+)
+
 logger = logging.getLogger("secure_chat.mail")
 
 MAIL_BACKENDS = ("disabled", "outbox", "smtp")
@@ -101,20 +108,14 @@ class OutboxTransport:
         self.max_files = _positive_limit(max_files, "max_files")
         self.max_bytes = _positive_limit(max_bytes, "max_bytes")
 
-    @staticmethod
-    def _reject_links(path: Path) -> None:
-        for component in (*reversed(path.parents), path):
-            if component.is_symlink() or (
-                hasattr(component, "is_junction") and component.is_junction()
-            ):
-                raise MailUnavailable("The demo outbox directory is unsafe.")
-
     def _prepare_directory(self) -> None:
-        self._reject_links(self.directory)
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._reject_links(self.directory)
-        if os.name != "nt" and self.directory.stat().st_mode & 0o077:
-            raise MailUnavailable("The demo outbox directory must be private.")
+        try:
+            prepare_private_directory(self.directory)
+        except PrivateStorageError as exc:
+            raise MailUnavailable(
+                "The demo outbox must use a private, unlinked directory. "
+                "Create a new directory with scripts.local_storage mkdir."
+            ) from exc
 
     def _check_quota(self, incoming_bytes: int) -> None:
         count = total = 0
@@ -125,6 +126,12 @@ class OutboxTransport:
                 metadata = os.stat(entry.path, follow_symlinks=False)
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     raise MailUnavailable("The demo outbox contains an unsafe entry.")
+                # Windows traversal permissions do not protect pre-existing
+                # children with their own broad ACL. Validate retained mail too.
+                try:
+                    check_private_file(Path(entry.path))
+                except PrivateStorageError as exc:
+                    raise MailUnavailable("The demo outbox contains a non-private entry.") from exc
                 count += 1
                 total += metadata.st_size
                 if count >= self.max_files or total + incoming_bytes > self.max_bytes:
@@ -141,11 +148,13 @@ class OutboxTransport:
             self._check_quota(len(payload))
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             path = self.directory / f"{stamp}-{secrets.token_hex(16)}.eml"
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(path, flags, 0o600)
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(payload)
+            try:
+                # The ACL/mode is applied by the create operation, before any
+                # reset/verification code is written to disk.
+                with create_private_file(path) as output:
+                    output.write(payload)
+            except PrivateStorageError as exc:
+                raise MailUnavailable("The demo outbox cannot securely create mail.") from exc
 
 
 class SmtpTransport:

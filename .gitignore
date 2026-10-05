@@ -237,5 +237,8 @@ tmp/pdfs/
 # Local security-mail outbox (development/demo only; contains one-time codes)
 mail_outbox/
 
+# Fresh local setup: private SQLite data, sidecars and recovery mail.
+local_data/
+
 # Encrypted local backup archives still contain sensitive account metadata.
 *.scapbak

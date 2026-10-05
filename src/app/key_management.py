@@ -28,6 +28,8 @@ from urllib.parse import quote, urlparse
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from src.app.secret_files import SecretFileTooLarge, read_secret_text
+
 _SAFE_VAULT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
@@ -275,10 +277,12 @@ class VaultTransitKeyProvider:
 
     def _token(self) -> str:
         try:
-            token = self._token_file.read_text(encoding="utf-8").strip()
+            token = read_secret_text(self._token_file, max_bytes=4096).strip()
+        except SecretFileTooLarge as exc:
+            raise KeyProviderError("Vault workload token is invalid.") from exc
         except OSError as exc:
             raise KeyProviderError("Vault workload token is unavailable.") from exc
-        if not token or len(token) > 4096 or "\n" in token or "\r" in token:
+        if not token or len(token) > 4096 or any(char in token for char in ("\x00", "\n", "\r")):
             raise KeyProviderError("Vault workload token is invalid.")
         return token
 

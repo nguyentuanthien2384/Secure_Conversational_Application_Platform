@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from sqlalchemy.engine import make_url
 
 from src.app.host_security import effective_allowed_hosts, normalize_allowed_hosts
+from src.app.secret_files import SecretFileTooLarge, read_secret_text
 
 AVAILABILITY_ENV_LIMITS = {
     "REQUEST_MAX_CONCURRENT": (32, 1, 512),
@@ -66,9 +67,9 @@ def _read_secret_file(file_env: str) -> str | None:
         return None
     path = Path(path_value)
     try:
-        if path.stat().st_size > 16_384:
-            raise RuntimeError(f"{file_env} vượt quá giới hạn 16 KiB.")
-        value = path.read_text(encoding="utf-8")
+        value = read_secret_text(path)
+    except SecretFileTooLarge as exc:
+        raise RuntimeError(f"{file_env} vượt quá giới hạn 16 KiB.") from exc
     except OSError as exc:
         raise RuntimeError(f"Không thể đọc secret file được chỉ định bởi {file_env}.") from exc
     value = value.removesuffix("\n").removesuffix("\r")
