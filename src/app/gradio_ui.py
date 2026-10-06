@@ -72,7 +72,7 @@ CUSTOM_CSS = """
 /* ==========================================================================
    SCAP — bảng điều khiển bảo mật
    Nguyên tắc: workspace dùng toàn bộ chiều rộng khả dụng, mật độ cao, dữ liệu
-   mật mã luôn dùng monospace. Màu nhấn CHỈ dùng để báo trạng thái, không trang trí.
+   mật mã luôn dùng monospace. Màu emerald dẫn hướng thao tác và trạng thái.
    ========================================================================== */
 
 :root {
@@ -519,8 +519,52 @@ footer { display: none !important; }
   background: #1e3a5f !important;
   color: #dbeafe !important;
 }
-#session-list input[type="radio"] { display: none !important; }
+#session-list input[type="radio"] {
+  /* Keep native keyboard focus and Space-key activation available. */
+  position: absolute; opacity: 0; width: 1px; height: 1px;
+}
+#session-list label:focus-within {
+  outline: 2px solid var(--scap-ok-fg); outline-offset: 2px;
+}
 #session-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Shared surfaces and clear hierarchy across all eight workspace tabs. */
+#workspace-tabs > .tab-wrapper {
+  padding: 6px; margin-bottom: 12px;
+  border: 1px solid var(--scap-line); border-radius: 12px;
+  background: var(--background-fill-primary);
+}
+#workspace-tabs > .tab-wrapper .tab-nav button {
+  border-radius: 8px; min-height: 44px;
+}
+#workspace-tabs > .tab-wrapper .tab-nav button.selected {
+  background: var(--scap-ok-bg) !important;
+}
+#workspace-tabs .gr-accordion > button { align-items: center; }
+#workspace-tabs > .tabitem { padding: 16px 0 !important; }
+#chat-sidebar { border-top: 3px solid #10b981; }
+#chat-main { min-width: 0 !important; }
+#chat-history {
+  border: 1px solid var(--scap-line); border-radius: 14px;
+  background: var(--background-fill-primary);
+}
+.chat-welcome { max-width: 430px; margin: auto; padding: 24px; text-align: center; }
+.chat-welcome .welcome-symbol {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 48px; height: 48px; border-radius: 14px;
+  color: var(--scap-ok-fg); background: var(--scap-ok-bg);
+  font-size: 25px; margin-bottom: 12px;
+}
+.chat-welcome h3 { margin: 0 0 10px; font-size: 22px; color: var(--scap-ink); }
+.chat-welcome p { margin: 0; line-height: 1.7; color: var(--scap-muted); }
+.tab-intro { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--scap-line); }
+.tab-intro h3 { margin: 0 0 6px; color: var(--scap-ink); font-size: 22px; }
+.tab-intro p { margin: 0; color: var(--scap-muted); line-height: 1.6; }
+.auth-caption { margin: 0; color: var(--scap-muted); font-size: 14px; }
+#chat-composer { align-items: end; }
+#chat-composer textarea { font-size: 16px !important; line-height: 1.6; }
+#chat-composer button { min-height: 46px; }
+.mono-df { max-width: 100%; min-width: 0 !important; }
 
 /* ── Khối trạng thái ───────────────────────────────────────────────────── */
 #chat-notice, #sec-verdict, #sec-ids-verdict {
@@ -560,6 +604,13 @@ footer { display: none !important; }
 @media (min-width: 1024px) {
   #chat-row { flex-wrap: nowrap !important; }
 }
+@media (max-width: 1023px) {
+  #chat-row { flex-direction: column !important; }
+  #chat-sidebar, #chat-main {
+    width: 100% !important; min-width: 0 !important;
+  }
+  #session-list { max-height: 180px; }
+}
 @media (max-width: 999px) {
   .gradio-container > .main {
     padding: 12px var(--scap-page-gutter) 32px !important;
@@ -578,17 +629,26 @@ footer { display: none !important; }
   #topbar > .topbar-timer { justify-self: end; }
   #topbar > .topbar-extend,
   #topbar > .topbar-logout { width: 100% !important; }
+  #topbar button { width: 100% !important; }
 }
 /* Dưới 900px: thẻ bám sát mép trên để ô nhập đầu tiên luôn nằm trên nếp gấp
    màn hình điện thoại. */
 @media (max-width: 900px) {
-  #auth-wrap { margin-top: 3vh; }
+  #auth-wrap { margin-top: max(40px, 3vh); }
   #auth-card { padding: 24px 20px 20px !important; }
+}
+@media (max-width: 640px) {
+  #workspace-tabs > .tabitem { padding: 10px 0 !important; }
+  #workspace-tabs button, #app-sec .section-card button { min-height: 44px; }
+  #chat-composer { flex-wrap: nowrap !important; }
+  #chat-composer button { min-width: 72px !important; }
+  .chat-welcome { padding: 18px; }
+  .chat-welcome h3 { font-size: 20px; }
 }
 
 /* Sàn chất lượng: focus thấy được bằng bàn phím, tôn trọng reduced-motion. */
 :where(button, input, textarea, select, [tabindex]):focus-visible {
-  outline: 2px solid var(--scap-ok-bd);
+  outline: 2px solid var(--scap-ok-fg);
   outline-offset: 2px;
 }
 @media (prefers-reduced-motion: reduce) {
@@ -1067,13 +1127,12 @@ def _security_activity_snapshot(token):
 
 
 # ─────────────────── mảnh HTML tĩnh của trang đăng nhập ───────────────────
-# Trang đăng nhập chỉ giữ đúng hai việc: đăng nhập và tạo tài khoản. Dấu nhận
-# diện dưới đây là thứ duy nhất còn lại — đủ để người dùng biết mình đang gõ
-# mật khẩu vào đâu, không kèm bất kỳ nội dung giới thiệu nào.
+# Nhận diện ngắn cho các luồng đăng nhập, đăng ký và khôi phục tài khoản.
 AUTH_BRAND_HTML = (
     '<div class="auth-brand">'
     '<span class="auth-medallion" role="img" aria-label="Khiên bảo mật SCAP"></span>'
     '<span class="mark-word">SCAP</span>'
+    '<p class="auth-caption">Không gian trò chuyện &amp; quản lý bảo mật</p>'
     "</div>"
 )
 
@@ -1089,6 +1148,16 @@ APP_WORDMARK_HTML = (
     '<span class="app-kicker">Security console</span>'
     '<span class="app-name">SCAP · Secure Workspace</span>'
     "</div>"
+)
+
+CHAT_WELCOME_HTML = (
+    '<div class="chat-welcome">'
+    '<span class="welcome-symbol" aria-hidden="true">✦</span>'
+    '<h3>Bắt đầu một cuộc trò chuyện</h3>'
+    '<p>Chọn một hội thoại hoặc bấm <strong>+ Hội thoại mới</strong>. '
+    'Sau đó nhập câu hỏi và nhấn <strong>Gửi</strong>. '
+    'Chọn chế độ bảo mật trong phần thiết lập khi tạo hội thoại mới.</p>'
+    '</div>'
 )
 
 
@@ -1377,7 +1446,9 @@ def build_ui(
                 # ---------- TRÒ CHUYỆN ----------
                 with gr.Tab("Trò chuyện"):
                     with gr.Row(elem_id="chat-row"):
-                        with gr.Column(scale=1, min_width=330, elem_classes="section-card"):
+                        with gr.Column(
+                            scale=1, min_width=300, elem_id="chat-sidebar", elem_classes="section-card"
+                        ):
                             gr.Markdown("#### Phiên hội thoại", elem_id="side-title")
                             # Danh sách chọn được bằng một cú bấm (thay cho Dropdown).
                             # gr.Radio giữ nguyên API choices/value nên mọi handler cũ
@@ -1391,34 +1462,39 @@ def build_ui(
                                 elem_id="session-list",
                                 container=False,
                             )
+                            with gr.Accordion("Thiết lập hội thoại mới", open=False):
+                                tb_new_title = gr.Textbox(
+                                    label="Tiêu đề (không bắt buộc)",
+                                    max_lines=1,
+                                    placeholder="Ví dụ: Ôn tập bảo mật ứng dụng",
+                                )
+                                dd_new_security = gr.Dropdown(
+                                    choices=[
+                                        ("Secure — mã hóa phía máy chủ", "secure"),
+                                        ("Confidential — DLP/xác nhận nghiêm ngặt", "confidential"),
+                                    ],
+                                    value="secure",
+                                    label="Chế độ bảo mật",
+                                )
+                                dd_new_class = gr.Dropdown(
+                                    choices=[
+                                        ("Public", "public"),
+                                        ("Internal", "internal"),
+                                        ("Confidential", "confidential"),
+                                        ("Highly confidential", "highly_confidential"),
+                                    ],
+                                    value="internal",
+                                    label="Phân loại dữ liệu",
+                                )
+                                gr.Markdown(
+                                    "Mặc định: **Secure / Internal**. Các thiết lập này áp dụng "
+                                    "khi bạn bấm **+ Hội thoại mới**; không đổi hội thoại đang chọn."
+                                )
                             with gr.Row():
                                 btn_create = gr.Button(
                                     "+ Hội thoại mới", variant="primary", size="sm", scale=3
                                 )
-                                btn_refresh = gr.Button("↻", size="sm", scale=1, min_width=44)
-                            tb_new_title = gr.Textbox(
-                                show_label=False,
-                                max_lines=1,
-                                placeholder="Tiêu đề cho hội thoại mới…",
-                            )
-                            dd_new_security = gr.Dropdown(
-                                choices=[
-                                    ("Secure — mã hóa phía máy chủ", "secure"),
-                                    ("Confidential — DLP/xác nhận nghiêm ngặt", "confidential"),
-                                ],
-                                value="secure",
-                                label="Chế độ bảo mật",
-                            )
-                            dd_new_class = gr.Dropdown(
-                                choices=[
-                                    ("Public", "public"),
-                                    ("Internal", "internal"),
-                                    ("Confidential", "confidential"),
-                                    ("Highly confidential", "highly_confidential"),
-                                ],
-                                value="internal",
-                                label="Phân loại dữ liệu",
-                            )
+                                btn_refresh = gr.Button("Làm mới", size="sm", scale=1, min_width=85)
                             with gr.Accordion("Quản lý hội thoại đang chọn", open=False):
                                 tb_rename = gr.Textbox(label="Đổi tên", max_lines=1)
                                 btn_rename = gr.Button("Lưu tên mới", size="sm")
@@ -1437,10 +1513,12 @@ def build_ui(
                             file_export = gr.DownloadButton(
                                 label="Tải tệp JSON", visible=False, size="sm"
                             )
-                        with gr.Column(scale=3, min_width=600):
+                        with gr.Column(scale=3, min_width=360, elem_id="chat-main"):
                             chatbot = gr.Chatbot(
                                 label="Nội dung",
                                 height=CHAT_HISTORY_HEIGHT,
+                                elem_id="chat-history",
+                                placeholder=CHAT_WELCOME_HTML,
                                 avatar_images=AVATARS,
                                 buttons=["copy", "copy_all"],
                                 # Chat/provider output is untrusted.  Keep it as
@@ -1451,9 +1529,9 @@ def build_ui(
                                 allow_tags=False,
                                 allow_file_downloads=False,
                             )
-                            with gr.Row():
+                            with gr.Row(elem_id="chat-composer"):
                                 tb_msg = gr.Textbox(
-                                    show_label=False,
+                                    label="Tin nhắn",
                                     placeholder="Nhập tin nhắn — Enter để gửi…",
                                     max_lines=3,
                                     max_length=4000,
@@ -1475,7 +1553,7 @@ def build_ui(
                             )
                             with gr.Row():
                                 tb_search = gr.Textbox(
-                                    show_label=False,
+                                    label="Tìm trong hội thoại",
                                     placeholder="Tìm trong hội thoại này…",
                                     max_lines=1,
                                     scale=4,
@@ -1485,6 +1563,10 @@ def build_ui(
 
                 # ---------- DỮ LIỆU MÃ HÓA ----------
                 with gr.Tab("Dữ liệu mã hóa"):
+                    _static_html(
+                        '<div class="tab-intro"><h3>Dữ liệu mã hóa</h3>'
+                        '<p>Chọn hội thoại để xem bản mã, nonce và phiên bản khóa lưu trên máy chủ.</p></div>'
+                    )
                     with gr.Row():
                         dd_cipher = gr.Dropdown(
                             label="Hội thoại", choices=[], interactive=True, scale=3
@@ -1506,6 +1588,11 @@ def build_ui(
 
                 # ---------- TÌM KIẾM ----------
                 with gr.Tab("Tìm kiếm"):
+                    _static_html(
+                        '<div class="tab-intro"><h3>Tìm lại nội dung</h3>'
+                        '<p>Tra cứu trong các hội thoại thuộc tài khoản của bạn. '
+                        'Chọn một từ khóa cụ thể để thu hẹp kết quả.</p></div>'
+                    )
                     with gr.Row():
                         tb_gq = gr.Textbox(
                             label="Từ khóa (trên mọi hội thoại của bạn)", max_lines=1, scale=4
@@ -1519,6 +1606,11 @@ def build_ui(
 
                 # ---------- TÀI KHOẢN ----------
                 with gr.Tab("Tài khoản"):
+                    _static_html(
+                        '<div class="tab-intro"><h3>Bảo vệ tài khoản của bạn</h3>'
+                        '<p>Quản lý mật khẩu, xác thực hai lớp, passkey, email khôi phục '
+                        'và các thiết bị đã đăng nhập.</p></div>'
+                    )
                     md_profile = gr.Markdown("")
                     chk_consent = gr.Checkbox(
                         label="Cho phép gửi nội dung (đã lọc thông tin nhạy cảm) tới AI bên ngoài"
@@ -1717,6 +1809,11 @@ def build_ui(
 
                 # ---------- NHẬT KÝ ----------
                 with gr.Tab("Nhật ký kiểm toán", visible=False) as mod_tab:
+                    _static_html(
+                        '<div class="tab-intro"><h3>Nhật ký kiểm toán</h3>'
+                        '<p>Chọn số dòng và tải nhật ký để xem sự kiện, kết quả và thời điểm. '
+                        'Audit ID dùng để đối chiếu bằng chứng trong hồ sơ sự cố.</p></div>'
+                    )
                     with gr.Row():
                         sl_audit = gr.Slider(10, 500, value=100, step=10, label="Số dòng", scale=3)
                         btn_audit = gr.Button("Tải nhật ký", size="sm", scale=1)

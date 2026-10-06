@@ -1,229 +1,132 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+# Keep source code, tests, documentation, UI assets, Docker configuration,
+# .python-version, pyproject.toml and uv.lock in Git for reproducible setup.
 
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-.pytest-tmp*/
-cover/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
-
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
-
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
-
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
-
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
-
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.envrc
-.venv
-env/
+# Python environments and installed dependencies
+.venv/
 venv/
+env/
 ENV/
 env.bak/
 venv.bak/
+.Python
+__pypackages__/
+.pdm-python
+.pixi/
+node_modules/
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# Python bytecode, build output and package caches
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+.pdm-build/
+.pybuilder/
+wheels/
+share/python-wheels/
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
+# Test, coverage and static-analysis output
+.pytest_cache/
+.pytest-tmp*/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+cover/
+nosetests.xml
+*.cover
+*.py.cover
+.ruff_cache/
 .mypy_cache/
 .dmypy.json
 dmypy.json
-
-# Pyre type checker
 .pyre/
-
-# pytype static type analyzer
 .pytype/
-
-# Cython debug symbols
+.cache/
+.uv-cache/
 cython_debug/
 
-# IDE & Editors
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS files
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Cursor
-.cursorignore
-.cursorindexingignore
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-
-# Environment & Secrets (Keep .env.example tracked)
+# Runtime environment and secrets; retain safe configuration templates
 .env
 .env.*
+*.env
+.envrc
 !.env.example
+!.env.*.example
+!*.env.example
+/secrets/
+/certs/
+/deploy/secrets/
+/deploy/certs/
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+.pypirc
 
-# Local databases, logs, and dynamic reports
+# Private local data, mail containing one-time codes and database sidecars
+local_data/
+mail_outbox/
 *.db
-*.sqlite
-*.sqlite3
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+/backups/
+*.scapbak
+dump.rdb
+appendonly.aof
+appendonlydir/
+
+# Generated logs, scans, lab captures, screenshots and scratch files
 *.log
 logs/
-reports/*.json
-reports/*.html
-reports/*.xml
-reports/security-validation/
-reports/security-validation-*/
-reports/security-load-local/
-reports/demo-evidence/
-reports/practice-lab/
-reports/practice-lab-*/
-# Local document-rendering scratch space; source PDFs live outside the repo.
-tmp/pdfs/
+*.pid
+/reports/*
+!/reports/README.md
+# Exact artifact paths generated by .github/workflows/security.yml
+/reports-bandit.json
+/reports-pip-audit.json
+/requirements-audit.txt
+/sbom-source.cdx.json
+/sbom-image.cdx.json
+/SHA256SUMS
+/supply-chain/
+/tmp/
+/temp/
+/gradio_cached_examples/
+.gradio/
+.webassets-cache/
+celerybeat-schedule
+celerybeat.pid
 
-# Large binary / model / data archive files
+# Downloaded archives, container exports, datasets and model weights
+/downloads/
 *.tar
 *.tar.gz
+*.tgz
 *.zip
 *.7z
 *.pkl
@@ -234,11 +137,23 @@ tmp/pdfs/
 *.onnx
 *.bin
 
-# Local security-mail outbox (development/demo only; contains one-time codes)
-mail_outbox/
+# Generated documentation / notebook state
+docs/_build/
+/site/
+.ipynb_checkpoints/
 
-# Fresh local setup: private SQLite data, sidecars and recovery mail.
-local_data/
+# Local editor settings, temporary edits and OS metadata
+.idea/
+.vscode/
+.spyderproject
+.spyproject
+.ropeproject
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Encrypted local backup archives still contain sensitive account metadata.
-*.scapbak
+# Lockfiles and source UI/documentation images are intentionally not ignored.
+# A .gitignore rule does not remove files that Git already tracks.
