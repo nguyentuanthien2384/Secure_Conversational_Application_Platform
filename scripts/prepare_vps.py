@@ -15,8 +15,10 @@ import secrets
 import stat
 import sys
 from datetime import datetime, timedelta, timezone
+from email.utils import parseaddr
 from pathlib import Path
 
+from src.app.mailer import normalize_email
 from src.app.private_storage import (
     PrivateStorageError,
     check_private_file,
@@ -55,6 +57,17 @@ _EMPTY = (
     "OIDC_PROXY_SECRET_FILE", "AUDIT_WORM_TOKEN_FILE",
 )
 _IMAGES = ("BASE_IMAGE", "POSTGRES_IMAGE", "REDIS_IMAGE", "CADDY_IMAGE")
+# Public, non-secret edge settings. A missing SCAP_EDGE_MODE means "direct" so
+# configurations created before shared-proxy support keep their behaviour.
+_EDGE_MODES = ("direct", "shared-proxy")
+_EDGE_DEFAULTS = {
+    "SCAP_EDGE_MODE": "direct",
+    "SCAP_SHARED_EDGE_NETWORK": "vps-shared-edge",
+    "SCAP_SHARED_SITES_VOLUME": "vps-shared-sites",
+    "SCAP_FRONT_PROXY_IPV4": "172.30.47.2",
+    "SCAP_SHARED_CADDY_IPV4": "172.30.47.3",
+}
+_DOCKER_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}")
 _PASSWORDS = ("POSTGRES_PASSWORD", "APP_DB_PASSWORD", "AUDITOR_DB_PASSWORD")
 _LIMITS = {
     "REQUEST_MAX_CONCURRENT": (16, 64), "REQUEST_MAX_STREAMS": (4, 16),
@@ -193,6 +206,67 @@ def initialize(project: str | Path, *, domain: str = "", email: str = "") -> str
     return "created"
 
 
+def configure(project: str | Path, *, domain: str = "", email: str = "",
+              images: dict[str, str] | None = None, edge_mode: str = "") -> list[str]:
+    """Fill public deployment fields in the existing private file; secrets stay unchanged."""
+    target = _project(project) / "deploy" / ".env.vps"
+    lines, values = _read(target, private=True)
+    replacements = {}
+    if edge_mode:
+        if edge_mode not in _EDGE_MODES:
+            raise PreparationError(f"SCAP_EDGE_MODE: use {' or '.join(_EDGE_MODES)}.")
+        replacements["SCAP_EDGE_MODE"] = edge_mode
+        # Older files predate these keys; add the documented defaults once.
+        missing = [key for key in _EDGE_DEFAULTS if key not in values]
+        if missing:
+            lines = [*lines, "# Edge settings added by prepare_vps configure.",
+                     *(f"{key}={_EDGE_DEFAULTS[key]}" for key in missing)]
+            values = {**values, **{key: _EDGE_DEFAULTS[key] for key in missing}}
+    if domain:
+        if not _domain(domain):
+            raise PreparationError("PUBLIC_DOMAIN: use a real lower-case DNS hostname.")
+        origin = f"https://{domain}"
+        replacements.update({
+            "PUBLIC_DOMAIN": domain, "PUBLIC_BASE_URL": origin, "ALLOWED_ORIGINS": origin,
+            "ALLOWED_HOSTS": f"{domain},127.0.0.1,localhost,::1",
+            "WEBAUTHN_RP_ID": domain, "WEBAUTHN_ORIGINS": origin,
+        })
+    if email:
+        if not _email(email):
+            raise PreparationError("CADDY_EMAIL: use an email address on a real domain.")
+        replacements["CADDY_EMAIL"] = email
+    for key, value in (images or {}).items():
+        if key not in _IMAGES or not _IMAGE.fullmatch(value):
+            raise PreparationError(f"{key}: use one of {', '.join(_IMAGES)} with name@sha256:<64 hex>.")
+        replacements[key] = value
+    if not replacements:
+        raise PreparationError("Nothing to configure; pass a domain, email, image or edge mode.")
+    if not replacements.keys() <= values.keys():
+        raise PreparationError("Deployment configuration is missing template fields; recreate it with init.")
+    output = []
+    for line in lines:
+        match = _ASSIGNMENT.fullmatch(line)
+        output.append(f"{match[1]}={replacements[match[1]]}"
+                      if match and match[1] in replacements else line)
+    # Stage a NEW private file, then atomically swap it in so a crash never
+    # leaves a truncated configuration or a copy with inherited permissions.
+    staged = target.with_name(".env.vps.new")
+    try:
+        stream = create_private_file(staged)
+    except FileExistsError as exc:
+        raise PreparationError("A previous update left deploy/.env.vps.new; review and remove it.") from exc
+    try:
+        with stream:
+            stream.write(("\n".join(output) + "\n").encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, target)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    return sorted(replacements)
+
+
 def check(project: str | Path) -> list[str]:
     """Return bounded field-level issues without loading dotenv or echoing values."""
     _, values = _read(_project(project) / "deploy" / ".env.vps", private=True)
@@ -269,6 +343,29 @@ def check(project: str | Path) -> list[str]:
             raise ValueError
     except ValueError:
         issues.append("SCAP_EDGE_SUBNET/SCAP_EDGE_DYNAMIC_RANGE/SCAP_CADDY_IPV4: invalid proxy network.")
+    edge_mode = values.get("SCAP_EDGE_MODE", "direct")
+    if edge_mode not in _EDGE_MODES:
+        issues.append(f"SCAP_EDGE_MODE: use {' or '.join(_EDGE_MODES)}.")
+    elif edge_mode == "shared-proxy":
+        for key in ("SCAP_SHARED_EDGE_NETWORK", "SCAP_SHARED_SITES_VOLUME"):
+            if not _DOCKER_NAME.fullmatch(values.get(key, "")):
+                issues.append(f"{key}: a Docker network/volume name is required.")
+        try:
+            # SCAP trusts forwarded client addresses from exactly one front proxy.
+            front = ipaddress.ip_address(values.get("SCAP_FRONT_PROXY_IPV4", ""))
+            shared = ipaddress.ip_address(values.get("SCAP_SHARED_CADDY_IPV4", ""))
+            own_edge = ipaddress.ip_network(values.get("SCAP_EDGE_SUBNET", ""))
+            if (front.version != 4 or shared.version != 4 or front == shared
+                    or not front.is_private or not shared.is_private
+                    or front in own_edge or shared in own_edge):
+                raise ValueError
+        except ValueError:
+            issues.append("SCAP_FRONT_PROXY_IPV4/SCAP_SHARED_CADDY_IPV4: use two distinct private "
+                          "IPv4 addresses outside SCAP_EDGE_SUBNET.")
+    # The app builds its mailer at startup even when mail is disabled, so an
+    # address it rejects (e.g. no-reply@localhost) stops the web process.
+    if "MAIL_FROM" in values and normalize_email(parseaddr(values["MAIL_FROM"])[1]) is None:
+        issues.append("MAIL_FROM: use a sender with a dotted domain, e.g. 'SCAP <no-reply@scap.local>'.")
     backend = values.get("MAIL_BACKEND")
     if backend not in {"disabled", "smtp"}:
         issues.append("MAIL_BACKEND: use disabled or smtp.")
@@ -299,6 +396,12 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--project", type=Path, default=Path.cwd())
     init.add_argument("--domain", default="")
     init.add_argument("--email", default="")
+    update = commands.add_parser("configure", help="Set domain, email or pinned images; keep secrets.")
+    update.add_argument("--project", type=Path, default=Path.cwd())
+    update.add_argument("--domain", default="")
+    update.add_argument("--email", default="")
+    update.add_argument("--image", action="append", default=[], metavar="KEY=NAME@sha256:DIGEST")
+    update.add_argument("--edge-mode", choices=_EDGE_MODES, default="")
     verify = commands.add_parser("check", help="Check readiness without printing secrets or starting services.")
     verify.add_argument("--project", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
@@ -307,6 +410,12 @@ def main(argv: list[str] | None = None) -> int:
             status = initialize(args.project, domain=args.domain, email=args.email)
             print(f"Deployment configuration {status}: deploy/.env.vps; local keys and data preserved.")
             print("For a NEW PostgreSQL deployment only. Run check before any server startup.")
+            return 0
+        if args.command == "configure":
+            images = dict(item.split("=", 1) if "=" in item else (item, "") for item in args.image)
+            changed = configure(args.project, domain=args.domain, email=args.email, images=images,
+                                edge_mode=args.edge_mode)
+            print(f"Updated deploy/.env.vps: {', '.join(changed)}; secrets unchanged.")
             return 0
         issues = check(args.project)
         if issues:

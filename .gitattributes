@@ -1,0 +1,8 @@
+# Files executed or mounted inside Linux containers/VPS must keep LF endings,
+# even when core.autocrlf=true on Windows checkouts.
+*.sh text eol=lf
+*.sql text eol=lf
+*.yml text eol=lf
+Caddyfile text eol=lf
+Dockerfile text eol=lf
+deploy/*.example text eol=lf

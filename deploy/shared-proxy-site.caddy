@@ -1,0 +1,15 @@
+# SCAP site on the VPS front proxy (another app's Caddy that owns ports 80/443).
+# deploy/remote-deploy.sh fills the placeholders, validates the result, writes it
+# to the shared sites volume as scap.caddy and reloads the front proxy.
+# Edit this template in the SCAP repository, not the copy on the VPS.
+__PUBLIC_DOMAIN__ {
+	tls {
+		protocols tls1.3
+	}
+	reverse_proxy __SCAP_CADDY__:80 {
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+		}
+	}
+}

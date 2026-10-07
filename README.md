@@ -255,11 +255,13 @@ Hồ sơ demo **VPS Linux 1 CPU/3 GB, khoảng 3–4 người dùng** có overla
 
 ```powershell
 uv run --frozen python -m scripts.prepare_vps init --project .
-# Hoàn tất domain, email và image digest trong deploy/.env.vps.
-uv run --frozen python -m scripts.prepare_vps check --project .
+.\deploy\deploy.ps1 setup-server -Server root@IP_VPS          # một lần: Docker, user deploy, UFW
+.\deploy\deploy.ps1 configure -Domain demo.tenmien.vn -Email ban@tenmien.vn
+.\deploy\deploy.ps1 deploy -Server deploy@IP_VPS              # build, upload qua SSH, compose up
+.\deploy\deploy.ps1 admin -Server deploy@IP_VPS               # tạo tài khoản quản trị
 ```
 
-`init` tạo `deploy/.env.vps` mới, không ghi đè `.env` local. Đọc [VPS_DEMO_DEPLOYMENT.md](docs/VPS_DEMO_DEPLOYMENT.md) cho build, chuyển gói qua SSH, tạo admin, SMTP và kiểm tra HTTPS.
+`init` tạo `deploy/.env.vps` mới, không ghi đè `.env` local; `configure` điền domain/email và ghim digest image mà không đổi khóa. VPS đã có ứng dụng khác giữ cổng 80/443 (ví dụ JobFind trên VPS 123HOST) thì thêm `-EdgeMode shared-proxy` để Caddy của ứng dụng đó chuyển tên miền SCAP vào; `deploy.ps1 backup` sao lưu PostgreSQL và tải bản sao về máy. Đọc [VPS_DEMO_DEPLOYMENT.md](docs/VPS_DEMO_DEPLOYMENT.md) cho chuẩn bị DNS/VPS (ví dụ 123host), các bước thủ công tương đương, SMTP và kiểm tra HTTPS.
 
 ### High-security
 
@@ -397,7 +399,7 @@ Secure_Conversational_Application_Platform/
 ├── scripts/                  # Demo, kiểm chứng, migration, backup và deploy
 ├── tests/                    # Python và JavaScript tests
 ├── docs/                     # Kịch bản demo, runbook, phạm vi bảo mật
-├── deploy/vps.env.example    # Mẫu cấu hình VPS công khai
+├── deploy/                   # Mẫu cấu hình VPS công khai và script deploy qua SSH
 ├── reports/README.md         # Hướng dẫn sinh báo cáo
 ├── .github/workflows/        # CI và quét bảo mật
 ├── .env.example              # Mẫu biến môi trường, không chứa khóa thật

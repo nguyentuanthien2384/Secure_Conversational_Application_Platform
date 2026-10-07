@@ -14,6 +14,8 @@ tests
 docs
 deploy/.env*
 deploy/*.tar
+deploy/out
+backups
 # Runtime secrets and local user data must never enter a build context.
 local_data
 mail_outbox

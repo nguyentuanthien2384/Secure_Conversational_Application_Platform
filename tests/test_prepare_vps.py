@@ -38,15 +38,18 @@ def replace(project, **changes):
     path.write_text("\n".join(output) + "\n", encoding="utf-8")
 
 
+PINNED = {name: f"{image}@sha256:" + character * 64
+          for name, image, character in (
+              ("BASE_IMAGE", "python:3.12-slim", "a"),
+              ("POSTGRES_IMAGE", "postgres:17-alpine", "b"),
+              ("REDIS_IMAGE", "redis:7.4-alpine", "c"),
+              ("CADDY_IMAGE", "caddy:2.10-alpine", "d"),
+          )}
+
+
 def ready(project):
     vps.initialize(project, domain="chat.scap-demo.vn", email="admin@scap-demo.vn")
-    replace(project, **{name: f"{image}@sha256:" + character * 64
-                        for name, image, character in (
-                            ("BASE_IMAGE", "python:3.12-slim", "a"),
-                            ("POSTGRES_IMAGE", "postgres:17-alpine", "b"),
-                            ("REDIS_IMAGE", "redis:7.4-alpine", "c"),
-                            ("CADDY_IMAGE", "caddy:2.10-alpine", "d"),
-                        )})
+    replace(project, **PINNED)
 
 
 def test_init_protects_separate_keys_and_preserves_local_files(project):
@@ -101,6 +104,7 @@ def test_completed_configuration_passes_without_starting_services(project):
 
 def test_generated_profile_satisfies_application_production_guards(project, monkeypatch):
     from src.app import config as application_config
+    from src.app.mailer import build_mailer
 
     ready(project)
     monkeypatch.setattr(application_config, "load_dotenv", lambda: None)
@@ -112,6 +116,8 @@ def test_generated_profile_satisfies_application_production_guards(project, monk
     assert settings.allow_demo_ai
     assert settings.mail_backend == "disabled"
     assert settings.webauthn_rp_id == "chat.scap-demo.vn"
+    # The web process builds its mailer at startup even with mail disabled.
+    assert build_mailer(settings).sender == "SCAP <no-reply@scap.local>"
 
 
 @pytest.mark.parametrize("domain", ["localhost", "192.0.2.1", "*.scap-demo.vn", "SCAP.vn",
@@ -140,6 +146,7 @@ def test_invalid_or_placeholder_domains_never_create_secrets(project, domain):
     ({"SCAP_CADDY_IPV4": "172.30.45.9"}, "SCAP_EDGE_SUBNET"),
     ({"SECURITY_TXT_EXPIRES": "2000-01-01T00:00:00Z"}, "SECURITY_TXT_EXPIRES"),
     ({"SMTP_PASSWORD_FILE": "/unmounted/key"}, "SMTP_PASSWORD_FILE"),
+    ({"MAIL_FROM": "'SCAP <no-reply@localhost>'"}, "MAIL_FROM"),
 ])
 def test_unsafe_configuration_reports_fields_without_values(project, changes, field):
     ready(project)
@@ -191,6 +198,103 @@ def test_broad_permissions_rejected_on_posix(project):
     ready(project)
     (project / "deploy/.env.vps").chmod(0o644)
     assert vps.main(["check", "--project", str(project)]) == 1
+
+
+def test_configure_completes_pending_profile_and_keeps_secrets(project):
+    vps.initialize(project)
+    secrets_before = {key: values(project)[key]
+                      for key in (*vps._PASSWORDS, "APP_SECRET_KEY", "MASTER_ENCRYPTION_KEY")}
+    changed = vps.configure(project, domain="chat.scap-demo.vn", email="admin@scap-demo.vn",
+                            images=PINNED)
+    assert "PUBLIC_DOMAIN" in changed and "CADDY_IMAGE" in changed
+    check_private_file(project / "deploy/.env.vps")
+    config = values(project)
+    assert config["ALLOWED_HOSTS"] == "chat.scap-demo.vn,127.0.0.1,localhost,::1"
+    assert config["WEBAUTHN_ORIGINS"] == "https://chat.scap-demo.vn"
+    assert {key: config[key] for key in secrets_before} == secrets_before
+    assert not (project / "deploy/.env.vps.new").exists()
+    assert vps.check(project) == []
+
+
+def test_configure_changes_only_requested_fields(project):
+    ready(project)
+    vps.configure(project, email="ops@scap-demo.vn")
+    config = values(project)
+    assert config["CADDY_EMAIL"] == "ops@scap-demo.vn"
+    assert config["PUBLIC_DOMAIN"] == "chat.scap-demo.vn"
+    assert vps.check(project) == []
+
+
+@pytest.mark.parametrize("kwargs,field", [
+    ({"domain": "demo.example.org"}, "PUBLIC_DOMAIN"),
+    ({"email": "root@localhost"}, "CADDY_EMAIL"),
+    ({"images": {"BASE_IMAGE": "python:3.12-slim"}}, "BASE_IMAGE"),
+    ({"images": {"APP_SECRET_KEY": "x@sha256:" + "a" * 64}}, "APP_SECRET_KEY"),
+    ({}, "Nothing to configure"),
+])
+def test_configure_rejects_invalid_values_without_writing(project, kwargs, field):
+    vps.initialize(project)
+    original = (project / "deploy/.env.vps").read_bytes()
+    with pytest.raises(vps.PreparationError, match=field):
+        vps.configure(project, **kwargs)
+    assert (project / "deploy/.env.vps").read_bytes() == original
+
+
+def test_configure_requires_existing_private_configuration(project):
+    assert vps.main(["configure", "--project", str(project), "--domain", "chat.scap-demo.vn"]) == 1
+    assert not (project / "deploy/.env.vps").exists()
+
+
+def test_configure_cli_reports_field_names_only(project, capsys):
+    vps.initialize(project)
+    arguments = ["configure", "--project", str(project), "--domain", "chat.scap-demo.vn",
+                 "--email", "admin@scap-demo.vn"]
+    arguments += [part for key, value in PINNED.items() for part in ("--image", f"{key}={value}")]
+    assert vps.main(arguments) == 0
+    output = capsys.readouterr().out
+    assert "PUBLIC_DOMAIN" in output and "@sha256:" not in output
+    assert vps.main(["check", "--project", str(project)]) == 0
+
+
+def test_configure_shared_proxy_upgrades_older_configuration(project):
+    ready(project)
+    path = project / "deploy/.env.vps"
+    # Files created before shared-proxy support have no edge keys at all.
+    lines = [line for line in vps._read(path, private=True)[0]
+             if not line.startswith(tuple(vps._EDGE_DEFAULTS))]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert vps.check(project) == []
+    secrets_before = {key: values(project)[key] for key in (*vps._PASSWORDS, "MASTER_ENCRYPTION_KEY")}
+    assert "SCAP_EDGE_MODE" in vps.configure(project, edge_mode="shared-proxy")
+    config = values(project)
+    assert config["SCAP_EDGE_MODE"] == "shared-proxy"
+    assert config["SCAP_FRONT_PROXY_IPV4"] == "172.30.47.2"
+    assert {key: config[key] for key in secrets_before} == secrets_before
+    assert vps.check(project) == []
+    vps.configure(project, edge_mode="direct")
+    assert sum(line.startswith("SCAP_EDGE_MODE=")
+               for line in vps._read(path, private=True)[0]) == 1
+
+
+@pytest.mark.parametrize("changes,field", [
+    ({"SCAP_EDGE_MODE": "public"}, "SCAP_EDGE_MODE"),
+    ({"SCAP_SHARED_EDGE_NETWORK": "bad name"}, "SCAP_SHARED_EDGE_NETWORK"),
+    ({"SCAP_SHARED_SITES_VOLUME": ""}, "SCAP_SHARED_SITES_VOLUME"),
+    ({"SCAP_FRONT_PROXY_IPV4": "172.30.47.3"}, "SCAP_FRONT_PROXY_IPV4"),
+    ({"SCAP_FRONT_PROXY_IPV4": "172.30.45.5"}, "SCAP_FRONT_PROXY_IPV4"),
+    ({"SCAP_FRONT_PROXY_IPV4": "8.8.8.8"}, "SCAP_FRONT_PROXY_IPV4"),
+])
+def test_shared_proxy_trusts_one_private_front_address(project, changes, field):
+    ready(project)
+    vps.configure(project, edge_mode="shared-proxy")
+    replace(project, **changes)
+    assert any(field in issue for issue in vps.check(project))
+
+
+def test_configure_rejects_unknown_edge_mode(project):
+    vps.initialize(project)
+    with pytest.raises(vps.PreparationError, match="SCAP_EDGE_MODE"):
+        vps.configure(project, edge_mode="public")
 
 
 def test_symlink_configuration_is_not_followed(project, tmp_path):

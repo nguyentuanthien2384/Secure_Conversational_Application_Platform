@@ -1,0 +1,28 @@
+# SCAP on a VPS whose ports 80/443 already belong to another app's Caddy (e.g. JobFind).
+# Use with docker-compose.yml + docker-compose.vps-demo.yml when SCAP_EDGE_MODE=shared-proxy;
+# deploy/vps-compose.sh selects it automatically. See docs/VPS_DEMO_DEPLOYMENT.md.
+#
+# Internet ─HTTPS─► front Caddy (other app, SCAP_FRONT_PROXY_IPV4) ─HTTP, vps-shared-edge─►
+#   SCAP Caddy (filters, headers, body limit) ─edge─► app ─backend─► db / redis
+#
+# The front proxy owns the network and the sites volume; SCAP only joins them.
+services:
+  caddy:
+    # No published ports: only the front proxy can reach SCAP's Caddy.
+    ports: !reset []
+    environment:
+      SCAP_FRONT_PROXY_IPV4: ${SCAP_FRONT_PROXY_IPV4:?set SCAP_FRONT_PROXY_IPV4 for shared-proxy mode}
+    volumes: !override
+      - ./Caddyfile.shared-proxy:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge:
+        ipv4_address: ${SCAP_CADDY_IPV4:-172.30.45.2}
+      shared-edge:
+        ipv4_address: ${SCAP_SHARED_CADDY_IPV4:?set SCAP_SHARED_CADDY_IPV4 for shared-proxy mode}
+
+networks:
+  shared-edge:
+    external: true
+    name: ${SCAP_SHARED_EDGE_NETWORK:?set SCAP_SHARED_EDGE_NETWORK for shared-proxy mode}

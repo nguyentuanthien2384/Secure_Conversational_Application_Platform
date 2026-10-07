@@ -14,7 +14,7 @@ DOCKER = shutil.which("docker")
 pytestmark = pytest.mark.skipif(DOCKER is None, reason="Docker Compose CLI is unavailable")
 
 
-def resolved_compose(tmp_path: Path, *, overlay="vps-demo", overrides=None):
+def resolved_compose(tmp_path: Path, *, overlay="vps-demo", extra=(), overrides=None):
     """Validate merge behavior with synthetic credentials; never read local .env."""
     app_env = tmp_path / "app.env"
     app_env.write_text(
@@ -59,7 +59,9 @@ def resolved_compose(tmp_path: Path, *, overlay="vps-demo", overrides=None):
         [
             DOCKER, "compose", "--project-name", "scap-vps-config-test",
             "--env-file", str(compose_env), "-f", str(ROOT / "docker-compose.yml"),
-            "-f", str(ROOT / f"docker-compose.{overlay}.yml"), "config", "--format", "json",
+            "-f", str(ROOT / f"docker-compose.{overlay}.yml"),
+            *[part for name in extra for part in ("-f", str(ROOT / f"docker-compose.{name}.yml"))],
+            "config", "--format", "json",
         ],
         cwd=ROOT, env=process_env, capture_output=True, text=True, timeout=30, check=False,
     )
@@ -167,3 +169,31 @@ def test_local_overlay_still_uses_loopback_and_development_guards(tmp_path):
     for name in ("app", "migrate"):
         assert services[name]["build"]["args"]["REQUIRE_BASE_IMAGE_DIGEST"] == "false"
     assert "caddy" not in services
+
+
+SHARED_EDGE = {
+    "SCAP_SHARED_EDGE_NETWORK": "vps-shared-edge",
+    "SCAP_FRONT_PROXY_IPV4": "172.30.47.2",
+    "SCAP_SHARED_CADDY_IPV4": "172.30.47.3",
+}
+
+
+def test_shared_proxy_overlay_hands_ports_to_front_proxy(tmp_path):
+    resolved = resolved_compose(tmp_path, extra=("shared-proxy",), overrides=SHARED_EDGE)
+    services = resolved["services"]
+    caddy = services["caddy"]
+    assert not caddy.get("ports")
+    assert caddy["networks"]["shared-edge"]["ipv4_address"] == "172.30.47.3"
+    assert caddy["networks"]["edge"]["ipv4_address"] == "172.30.45.2"
+    assert caddy["environment"]["SCAP_FRONT_PROXY_IPV4"] == "172.30.47.2"
+    mounts = {volume["target"]: volume for volume in caddy["volumes"]}
+    assert mounts["/etc/caddy/Caddyfile"]["source"].endswith("Caddyfile.shared-proxy")
+    assert mounts["/etc/caddy/Caddyfile"]["read_only"]
+    assert {"/data", "/config"} <= mounts.keys()
+    network = resolved["networks"]["shared-edge"]
+    assert network["external"] and network["name"] == "vps-shared-edge"
+    # Only Caddy joins the shared network; the app keeps trusting SCAP's Caddy alone.
+    for name in ("app", "migrate", "db", "redis"):
+        assert "shared-edge" not in services[name].get("networks", {})
+        assert not services[name].get("ports")
+    assert "--forwarded-allow-ips=172.30.45.2" in services["app"]["command"]

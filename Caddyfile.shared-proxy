@@ -1,0 +1,107 @@
+# SCAP's Caddy behind a front proxy that already owns ports 80/443 on the VPS
+# (docker-compose.shared-proxy.yml). The front proxy terminates TLS 1.3 for
+# PUBLIC_DOMAIN using deploy/shared-proxy-site.caddy and forwards plain HTTP over
+# the private vps-shared-edge network. Every application-facing rule below must
+# stay identical to Caddyfile; tests/test_shared_proxy.py checks that.
+{
+	email {$CADDY_EMAIL}
+	# The front proxy obtains and renews the certificate; this server is HTTP only.
+	auto_https off
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 60s
+			idle 2m
+		}
+		max_header_size 32KB
+		# Trust X-Forwarded-For/-Proto from exactly one address: the front proxy.
+		# Anything else on the shared network is treated as an ordinary client.
+		trusted_proxies static {$SCAP_FRONT_PROXY_IPV4}/32
+		trusted_proxies_strict
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+http://{$PUBLIC_DOMAIN} {
+	encode zstd gzip
+
+	request_body {
+		max_size 1MB
+	}
+
+	handle /.well-known/security.txt {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `Contact: mailto:{$CADDY_EMAIL}
+		Preferred-Languages: vi, en
+		Canonical: https://{$PUBLIC_DOMAIN}/.well-known/security.txt
+		Policy: https://{$PUBLIC_DOMAIN}/security-policy
+		Expires: {$SECURITY_TXT_EXPIRES}
+		` 200
+	}
+
+	handle /security-policy {
+		header Content-Type "text/plain; charset=utf-8"
+		respond `Vulnerability Disclosure Policy
+
+		Only test systems you own or are explicitly authorized to assess.
+		Do not access, alter, retain, or disclose other users' data.
+		Avoid denial-of-service, social engineering, and destructive testing.
+		Report findings to {$CADDY_EMAIL} with reproducible steps and impact.
+		We will acknowledge a valid report and coordinate remediation in good faith.
+		` 200
+	}
+
+	@private_ready path /api/ready /api/ready/*
+	handle @private_ready {
+		respond 404
+	}
+
+	@recon path_regexp recon ^/(wp-admin|wp-login\.php|phpmyadmin|xmlrpc\.php|\.env|\.git/|\.aws/|\.ssh/|config\.php|cgi-bin/)
+	handle @recon {
+		respond 404
+	}
+
+	@bad_method not method GET POST PATCH DELETE HEAD OPTIONS
+	handle @bad_method {
+		respond 405
+	}
+
+	@export_download path /api/exports/*
+	log_skip @export_download
+
+	reverse_proxy app:8000 {
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+		}
+		# {client_ip} is the browser address vouched for by the front proxy.
+		# Uvicorn takes the right-most untrusted X-Forwarded-For entry, so pass
+		# only that address; appending the front proxy would make every user
+		# share one rate-limit and audit identity.
+		header_up X-Forwarded-For {client_ip}
+		header_up X-Real-IP {client_ip}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		-Server
+		-X-Powered-By
+	}
+
+	log {
+		output stdout
+		format filter {
+			request>headers>Authorization delete
+			request>headers>Cookie delete
+			request>headers>X-Scap-Proxy-Secret delete
+			response>headers>Set-Cookie delete
+			wrap json
+		}
+	}
+}

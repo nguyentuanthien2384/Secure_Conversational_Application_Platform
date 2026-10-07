@@ -16,6 +16,153 @@ Các file được dùng:
 Chuẩn bị này chưa mua dịch vụ, mở cổng hoặc khởi động ứng dụng trên server.
 SQLite, tài khoản mẫu và dữ liệu local hiện tại không được chuyển sang VPS.
 
+## Cách nhanh: deploy bằng `deploy/deploy.ps1`
+
+Script chạy trên Windows và tự động hóa các mục 1–4 bên dưới: build image trên
+máy cá nhân, gửi qua SSH, chạy Docker Compose trên VPS. Cần Docker Desktop
+(Linux containers) đang chạy, `.venv` đã cài bằng `setup.ps1` và VPS Ubuntu
+22.04/24.04 x86_64 (kể cả bản *minimal* của 123HOST).
+
+### Hai chế độ biên
+
+| `SCAP_EDGE_MODE` | Khi nào dùng | Ai giữ cổng 80/443 |
+| --- | --- | --- |
+| `direct` (mặc định) | VPS riêng cho SCAP | Caddy của SCAP |
+| `shared-proxy` | VPS đã chạy ứng dụng khác bằng Docker + Caddy, ví dụ VPS 123HOST đang chạy JobFind | Caddy của ứng dụng kia |
+
+Ở chế độ `shared-proxy`:
+
+```
+Internet ─HTTPS, TLS 1.3─► Caddy JobFind :443 ─┬─ 61-14-233-122.sslip.io ───► JobFind
+                                                └─ scap.61-14-233-122.sslip.io
+                                                     │ HTTP, mạng vps-shared-edge (172.30.47.0/28)
+                                                     ▼
+                                                Caddy SCAP 172.30.47.3: lọc đường dẫn, header, giới hạn body
+                                                     ▼ mạng edge của SCAP
+                                                app ─► mạng backend nội bộ ─► PostgreSQL, Redis
+```
+
+- Caddy SCAP ([Caddyfile.shared-proxy](../Caddyfile.shared-proxy)) giữ nguyên mọi
+  luật của [Caddyfile](../Caddyfile) (test `tests/test_shared_proxy.py` so từng
+  dòng), chỉ tin `X-Forwarded-For` từ đúng `172.30.47.2` (Caddy JobFind) và chỉ
+  chuyển IP người dùng cho app. Nhờ vậy giới hạn theo IP và audit vẫn tính riêng
+  từng người, client không giả được IP bằng header.
+- SCAP không vào mạng nội bộ của JobFind; hai bên không thấy CSDL của nhau.
+- Đánh đổi: Caddy JobFind giữ chứng chỉ HTTPS của SCAP và thấy nội dung đã giải
+  mã TLS. Chấp nhận được cho demo; dữ liệu thật nên chạy `direct` trên VPS riêng.
+
+### Triển khai lên VPS 123HOST đang chạy JobFind (`61.14.233.122`)
+
+VPS này dùng **cổng SSH 2018**, đăng nhập `root` bằng mật khẩu xem/đặt lại ở trang
+quản lý VPS (khác mật khẩu tài khoản 123HOST). Docker và swap đã có sẵn.
+
+**Bước 1 — cập nhật JobFind (một lần).** Commit và push thay đổi trong
+`D:\job_find\deploy` (`Caddyfile`, `docker-compose.yml`, `README.md`): Caddy của
+JobFind tham gia mạng `vps-shared-edge`, mount volume `vps-shared-sites` và
+`import sites/*.caddy`. Trên VPS (JobFind gián đoạn vài giây, không build lại React):
+
+```bash
+cd /root/DALN_JobFind && git pull && cd deploy
+docker compose up -d web
+```
+
+**Bước 2 — chuẩn bị VPS cho SCAP (một lần).**
+
+```powershell
+$env:SCAP_VPS_PORT = "2018"
+.\deploy\deploy.ps1 setup-server -Server root@61.14.233.122
+```
+
+Lệnh tạo SSH key nếu máy chưa có rồi chạy [server-setup.sh](../deploy/server-setup.sh):
+cập nhật OS không hỏi lại (giữ `sshd_config` cổng 2018 của 123HOST), bỏ qua
+Docker/swap đã có, tạo user `deploy` đăng nhập bằng key (thuộc nhóm `docker`,
+tương đương root trên host), cài `cron`, giữ UFW mở 2018/80/443 và báo cổng
+80/443 đang do container JobFind giữ. Script không dừng dịch vụ hay container nào.
+
+**Bước 3 — cấu hình.** `scap.61-14-233-122.sslip.io` tự phân giải về IP VPS, không
+cần tạo bản ghi DNS. Email hiển thị công khai trong `/.well-known/security.txt`.
+
+```powershell
+.\deploy\deploy.ps1 configure -Domain scap.61-14-233-122.sslip.io -Email <email-cua-ban> -EdgeMode shared-proxy
+```
+
+Lệnh ghi domain/email/chế độ biên vào `deploy/.env.vps`, ghim digest SHA-256 của
+4 image nền, giữ nguyên khóa bí mật và chạy `check`.
+
+**Bước 4 — deploy và tạo admin.**
+
+```powershell
+$env:SCAP_VPS = "deploy@61.14.233.122"
+$env:SCAP_VPS_PORT = "2018"
+.\deploy\deploy.ps1 deploy
+.\deploy\deploy.ps1 admin -AdminUser operator
+```
+
+`deploy` build image `linux/amd64`, upload image nén (khoảng 360 MB), gói cấu hình,
+script vận hành và `deploy/.env.vps`. Trên VPS, [remote-deploy.sh](../deploy/remote-deploy.sh)
+kiểm tra cấu hình, nạp image, chạy `migrate → app → caddy`, rồi ở chế độ
+`shared-proxy`:
+
+1. kiểm tra mạng, volume và dòng `import` của Caddy JobFind đã sẵn sàng;
+2. kiểm tra cú pháp site SCAP ([shared-proxy-site.caddy](../deploy/shared-proxy-site.caddy))
+   bằng Caddy **trước khi** chạm vào JobFind;
+3. ghi `scap.caddy` vào volume và `caddy reload` Caddy JobFind (không khởi động
+   lại; reload lỗi thì gỡ file ra để JobFind giữ nguyên);
+4. chờ `https://scap.61-14-233-122.sslip.io/api/health`. Caddy JobFind tự xin chứng
+   chỉ Let's Encrypt cho tên miền SCAP.
+
+Nếu chỉ sửa `.env.vps` hoặc Caddyfile, thêm `-SkipBuild` để không upload lại image.
+
+### VPS riêng (`direct`)
+
+Trên trang quản lý VPS: cài Ubuntu 22.04/24.04 LTS; nếu có tường lửa phía nhà cung
+cấp, mở cổng SSH, 80 và 443. Tạo bản ghi `A` của tên miền trỏ về IP VPS, hoặc dùng
+tạm `<IP-nối-bằng-gạch>.sslip.io`. Gói hosting (cPanel) không dùng được cho Docker.
+
+```powershell
+.\deploy\deploy.ps1 setup-server -Server root@IP_VPS
+.\deploy\deploy.ps1 configure -Domain demo.tenmiencuaban.vn -Email ban@tenmiencuaban.vn
+.\deploy\deploy.ps1 deploy -Server deploy@IP_VPS
+.\deploy\deploy.ps1 admin -Server deploy@IP_VPS
+```
+
+Nếu `setup-server` báo cổng 80/443 do dịch vụ trên host giữ (ví dụ Caddy của addon
+FlashVPS), tắt nó bằng `systemctl disable --now caddy` trước khi deploy.
+
+### Vận hành
+
+| Việc | Trên Windows | Trên VPS (user `deploy`, thư mục `~/scap-vps`) |
+| --- | --- | --- |
+| Cập nhật code | `deploy.ps1 deploy` | |
+| Chỉ đổi cấu hình | `deploy.ps1 deploy -SkipBuild` | |
+| Trạng thái, RAM, ổ đĩa | `deploy.ps1 status` | `./vps-compose.sh ps` |
+| Xem log | `deploy.ps1 logs -Follow` | `./vps-compose.sh logs --tail 80 app caddy` |
+| Sao lưu ngay, tải về máy | `deploy.ps1 backup` → `backups\vps\<thời-điểm>` | `bash backup.sh` |
+| Sao lưu tự động | | cron 03:00 hằng ngày, giữ 14 bản (deploy tự cài) |
+| Khôi phục | | `bash restore.sh backups/<thời-điểm>`, thêm `--force` nếu DB đã có dữ liệu |
+| Dừng, giữ dữ liệu | | `./vps-compose.sh down`. **Không bao giờ** thêm `-v` |
+
+[backup.sh](../deploy/backup.sh) tạo `pg_dump` kèm SHA-256;
+[restore.sh](../deploy/restore.sh) kiểm tra checksum và từ chối ghi đè DB đã có
+người dùng nếu thiếu `--force`. Nội dung tin nhắn trong bản dump được mã hóa bằng
+khóa trong `deploy/.env.vps`, nên **giữ file đó trên máy cá nhân cùng bản sao lưu**
+và không để nó trong `backups/`. **Không xóa hoặc tạo lại `deploy/.env.vps`.**
+
+### Sự cố thường gặp
+
+| Hiện tượng | Cách xử lý |
+| --- | --- |
+| `ssh: connect to host … port 22: Connection refused` | VPS 123HOST dùng cổng 2018: `$env:SCAP_VPS_PORT = "2018"` |
+| `Permission denied (publickey,password)` khi `setup-server` | Dùng mật khẩu root ở trang quản lý VPS hoặc đặt lại tại đó |
+| `Chua co mang Docker vps-shared-edge` hoặc `chua co dong 'import sites/*.caddy'` | Chưa làm Bước 1 (cập nhật JobFind) |
+| `port is already allocated` khi deploy `direct` | VPS đã có ứng dụng khác giữ 80/443: `configure -EdgeMode shared-proxy` |
+| `MAIL_FROM: use a sender with a dotted domain` | File `.env.vps` tạo từ mẫu cũ: sửa thành `MAIL_FROM='SCAP <no-reply@scap.local>'` |
+| `Chua truy cap duoc https://…` sau deploy | Xem `deploy.ps1 logs`; chế độ `shared-proxy` xem thêm log Caddy JobFind: `docker compose logs --tail 50 web` trong `/root/DALN_JobFind/deploy` |
+| `curl` trên Windows 10 báo `SEC_E_UNSUPPORTED_FUNCTION` | Windows 10 không có TLS 1.3 mà SCAP yêu cầu; mở bằng Chrome/Edge/Firefox |
+| PowerShell chặn script | `powershell -ExecutionPolicy Bypass -File deploy\deploy.ps1 <lệnh> …` |
+
+Các mục bên dưới mô tả chi tiết từng bước khi muốn làm thủ công ở chế độ `direct`.
+
 ## 1. Chuẩn bị ngay trên máy cá nhân
 
 Tại thư mục dự án, dùng PowerShell:
@@ -135,8 +282,9 @@ chưa được cấp quyền Docker):
 ```bash
 cd ~/scap-vps
 set -e
-umask 077
-tar -xf scap-deploy.tar
+# Postgres/Caddy đọc file bind-mount bằng user khác, nên cấu hình công khai cần
+# quyền đọc 644; chỉ thư mục deploy và .env.vps được giữ riêng tư.
+(umask 022 && tar -xf scap-deploy.tar --no-same-owner)
 chmod 700 deploy
 chmod 600 deploy/.env.vps
 python3 -m scripts.prepare_vps check --project .
@@ -176,7 +324,8 @@ bật MFA cho tài khoản quản trị, giữ recovery code ở nơi riêng.
 - Đặt lịch backup PostgreSQL mã hóa ra nơi ngoài VPS; giữ riêng `.env.vps`, các
   phiên bản khóa mã hóa cần thiết và quyền truy cập bản backup. Diễn tập restore
   vào môi trường cô lập, đối chiếu audit và thu hồi tài khoản/phiên sau snapshot.
-  `scripts.secure_backup` hiện chỉ dùng cho SQLite, **không backup PostgreSQL**.
+  `scripts.secure_backup` chỉ dùng cho SQLite; PostgreSQL trên VPS dùng
+  `deploy/backup.sh` và `deploy/restore.sh` (mục Vận hành).
 - Khi nâng cấp, backup trước, giữ nguyên file bí mật, tên project `scap-vps-demo` và
   volume; thay image sau khi thử bản mới. Không chạy `docker compose down -v`,
   seed/reset database hoặc sinh lại khóa để xử lý lỗi triển khai.

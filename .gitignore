@@ -70,6 +70,7 @@ cython_debug/
 /secrets/
 /certs/
 /deploy/secrets/
+/deploy/out/
 /deploy/certs/
 *.key
 *.pem
