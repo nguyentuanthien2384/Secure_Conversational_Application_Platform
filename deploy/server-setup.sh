@@ -106,13 +106,11 @@ echo "==> Cong 80/443"
 listeners=$(ss -Hltnp '( sport = :80 or sport = :443 )' 2>/dev/null || true)
 if [ -z "$listeners" ]; then
   echo "  Dang trong: dung SCAP_EDGE_MODE=direct (Caddy cua SCAP giu 80/443)."
-elif printf '%s
-' "$listeners" | grep -q docker-proxy; then
+elif printf '%s\n' "$listeners" | grep -q docker-proxy; then
   echo "  Do container Docker khac giu (vd JobFind): dung SCAP_EDGE_MODE=shared-proxy."
 else
   echo "  [!] Dich vu tren host dang giu cong 80/443:"
-  printf '%s
-' "$listeners" | awk '{print "      " $4 "  " $6}'
+  printf '%s\n' "$listeners" | awk '{print "      " $4 "  " $6}'
   echo "      Neu la addon khong dung (vd Caddy cua FlashVPS): systemctl disable --now caddy"
 fi
 

@@ -12,6 +12,7 @@ Các giá trị mặc định có thể cấu hình bằng biến môi trường
 - `REQUEST_MAX_STREAMS=16`: luồng Gradio SSE đang mở, tách khỏi ngân sách HTTP thông thường.
 - `REQUEST_IP_MAX_CONCURRENT=16`, `REQUEST_IP_MAX_STREAMS=2`: giới hạn cùng lúc cho từng IP. Trần 8 đã chặn cold load module Gradio trong trình duyệt local; 16 giữ giới hạn và cho phép tải giao diện. Nếu `.env` cũ đặt 8 rõ ràng, cần điều chỉnh biến đó; biến đã đặt luôn ưu tiên hơn default mới.
 - `REQUEST_WINDOW_SECONDS=60`, `REQUEST_GLOBAL_MAX_ATTEMPTS=600`, `REQUEST_IP_MAX_ATTEMPTS=300`: số yêu cầu trong cửa sổ thời gian.
+- `REQUEST_GLOBAL_MAX_ASSET_ATTEMPTS=30000`, `REQUEST_IP_MAX_ASSET_ATTEMPTS=3000`: hạn mức riêng cho tệp giao diện đóng gói của Gradio (`GET`/`HEAD` `/assets/…`, `/static/…`). Một lần tải trang cần khoảng 110 tệp; nếu tính chung với hạn mức trên, hai–ba lần tải lại đã làm mọi thao tác giao diện nhận 429 và giao diện bị treo. Các tệp này vẫn chiếm vị trí xử lý đồng thời như yêu cầu thường.
 - `AUTH_GLOBAL_MAX_ATTEMPTS=120`: trần chung cho các POST vào `/api/auth/`, bổ sung cho giới hạn đăng nhập/MFA/khôi phục riêng.
 - `PASSWORD_MAX_CONCURRENT=2`: phép băm/xác minh Argon2 đồng thời, kể cả đăng nhập, đổi mật khẩu và mã khôi phục. Với tham số hiện tại, hai phép Argon2 sử dụng khoảng 128 MiB riêng cho vùng nhớ băm; còn phải dự phòng RAM cho ứng dụng và hệ điều hành.
 - `AI_MAX_CONCURRENT=2`: lời gọi AI bên ngoài đang chạy trong một tiến trình.

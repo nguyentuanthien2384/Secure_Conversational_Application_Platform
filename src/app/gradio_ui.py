@@ -37,6 +37,16 @@ _SESSION_STORE: BrowserSessionStore | None = None
 # tokens never enter this DOM component, cookies readable by JS, or storage.
 SESSION_CLEAR_MARKUP = '<span data-scap-session-clear="1"></span>'
 
+# Đồng hồ phiên. Trước đây gr.Timer gọi máy chủ MỖI GIÂY và trả về ~110 output:
+# mỗi giây 2 request (queue/join + SSE) ăn vào hạn mức REQUEST_IP_MAX_ATTEMPTS và
+# frontend phải cập nhật trạng thái của cả trăm component, khiến chuyển tab bị
+# đứng/treo. Giờ trình duyệt tự đếm từng giây (session_bridge.js); máy chủ chỉ
+# đồng bộ lại sau mỗi SESSION_TICK_SECONDS, nhắc trước khi hết hạn và tự đăng
+# xuất đúng lúc hết hạn (khoảng tick được rút ngắn khi gần hết hạn).
+SESSION_TICK_SECONDS = 10
+# Ngưỡng nhắc trước khi phiên hết hạn (giây).
+WARN_BEFORE_EXPIRY = 120
+
 # Vùng lịch sử co theo chiều cao màn hình để ô soạn và nút Gửi luôn ở gần nội
 # dung. Giới hạn dưới vẫn đủ đọc hội thoại; giới hạn trên tránh khoảng trắng lớn
 # đẩy trình soạn thảo xuống dưới nếp gấp trên laptop.
@@ -470,18 +480,42 @@ footer { display: none !important; }
 .dashboard-panel p:first-child { margin-top: 0; }
 .dashboard-panel p:last-child { margin-bottom: 0; }
 .dashboard-section-title { margin: 20px 0 8px !important; color: var(--scap-ink); font-size: 16px !important; font-weight: 700; }
-.dashboard-table { border: 1px solid var(--scap-line); border-radius: 10px; overflow: hidden; }
-.dashboard-table table { border-collapse: collapse; }
-.dashboard-table th { background: rgba(148,163,184,.12) !important; }
+.dashboard-table .scap-table th { background: rgba(148,163,184,.16) !important; }
 
-/* ── Bảng dữ liệu: mọi thứ liên quan mật mã đều monospace ──────────────── */
-.mono-df table {
+/* ── Bảng dữ liệu chỉ đọc (HTML dựng sẵn ở máy chủ, xem _table_html) ───── */
+.scap-table-block { width: 100%; min-width: 0 !important; max-width: 100%; }
+.scap-table-scroll {
+  max-height: 560px; overflow: auto;
+  border: 1px solid var(--scap-line); border-radius: 10px;
+  background: var(--background-fill-primary);
+}
+.scap-table-block table.scap-table {
+  width: 100%; margin: 0 !important; border: 0 !important;
+  border-collapse: separate; border-spacing: 0;
+  font-size: 14px; line-height: 1.45;
+}
+.scap-table th, .scap-table td {
+  padding: 8px 12px !important; border: 0 !important;
+  border-bottom: 1px solid var(--scap-line) !important;
+  text-align: left; vertical-align: top; overflow-wrap: anywhere;
+}
+.scap-table th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--background-fill-secondary) !important;
+  color: var(--scap-ink); font-weight: 650; white-space: nowrap;
+}
+.scap-table tbody tr:nth-child(even) td { background: rgba(148,163,184,.06); }
+.scap-table tbody tr:last-child td { border-bottom: 0 !important; }
+.scap-table td.scap-table-empty { color: var(--scap-muted); text-align: center; font-style: italic; }
+.scap-table-nowrap .scap-table td { white-space: nowrap; overflow-wrap: normal; }
+
+/* Mọi thứ liên quan mật mã đều monospace. */
+.mono-df .scap-table {
   font-family: var(--font-mono);
   font-size: 13.5px;
   font-variant-numeric: tabular-nums;
 }
-.mono-df th { font-size: 12.5px !important; text-transform: uppercase; letter-spacing: .05em; }
-.mono-df td { white-space: nowrap; }
+.mono-df .scap-table th { font-size: 12.5px; text-transform: uppercase; letter-spacing: .05em; }
 
 /* ── Danh sách hội thoại ───────────────────────────────────────────────── */
 #side-title h4 {
@@ -801,6 +835,24 @@ def _api(token, method, path, body=None, *, params=None):
     return data
 
 
+def _countdown_markup(left: int) -> str:
+    """Đồng hồ phiên trên thanh trạng thái.
+
+    ``data-scap-countdown`` là số giây còn lại tại thời điểm máy chủ dựng; từ đó
+    session_bridge.js tự đếm lùi từng giây mà không cần gọi lại máy chủ. Chỉ chứa
+    số nguyên và biểu tượng cố định, nên an toàn khi tắt sanitize.
+    """
+    left = max(0, int(left))
+    hours, rem = divmod(left, 3600)
+    minutes, seconds = divmod(rem, 60)
+    shown = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+    icon = "⚠️" if left <= WARN_BEFORE_EXPIRY else "⏳"
+    return (
+        f'<span data-scap-countdown="{left}" data-scap-warn-at="{WARN_BEFORE_EXPIRY}">'
+        f"<span data-scap-countdown-icon>{icon}</span> <strong>{shown}</strong></span>"
+    )
+
+
 def _fmt(iso: str | None) -> str:
     if not iso:
         return "—"
@@ -868,6 +920,68 @@ def _safe_markdown_text(value) -> str:
     for char in "`*_{}[]()#+-.!|~":
         text = text.replace(char, "\\" + char)
     return html.escape(text, quote=True)
+
+
+# ─────────────────────────── bảng chỉ đọc ───────────────────────────
+# gr.Dataframe của Gradio 6 tính lại mô hình hàng (TanStack table) qua chuỗi
+# reactive cho từng ô. Đo trên Chrome: bảng audit 100 dòng × 7 cột chặn luồng
+# chính ~10 giây mỗi lần cập nhật — đó là hiện tượng "bấm sang tab là treo".
+# Mọi bảng ở đây chỉ để đọc, nên máy chủ dựng sẵn HTML (escape từng ô) và
+# gr.Markdown chỉ việc hiển thị: không eval, không reactive theo ô.
+CIPHER_HEADERS = ("#", "Vai trò", "Ciphertext (base64, rút gọn)", "Nonce", "Key ver.", "Thời điểm")
+SEARCH_HEADERS = ("Hội thoại", "Vai trò", "Nội dung", "Thời điểm")
+DEVICE_HEADERS = (
+    "", "Thiết bị / trình duyệt", "IP", "Đăng nhập lúc", "Hoạt động gần nhất",
+    "Hết hạn nếu không hoạt động", "Giới hạn phiên tối đa",
+)
+PASSKEY_HEADERS = ("Tên", "Tạo lúc", "Dùng gần nhất", "Đồng bộ đám mây")
+ACTIVITY_HEADERS = ("Thời gian", "Sự kiện", "Kết quả", "IP", "Thiết bị")
+USER_HEADERS = ("Tên", "Vai trò", "Trạng thái", "2FA", "Ngày tạo")
+AUDIT_HEADERS = ("#", "Sự kiện", "Kết quả", "Actor", "Đối tượng", "IP", "Thời điểm")
+INCIDENT_HEADERS = ("Mã", "Tiêu đề", "Giai đoạn", "Mức độ", "Trạng thái", "Phiên bản", "Bằng chứng")
+DETECTION_HEADERS = ("Luật", "MITRE", "Mức", "Mô tả", "Nguồn", "Đường dẫn", "Dấu hiệu")
+ANOMALY_HEADERS = ("Mã", "Mức", "Đối tượng", "Số lần", "Diễn giải")
+BLOCKLIST_HEADERS = ("Địa chỉ IP", "Còn bị chặn (giây)")
+
+
+def _table_cell(value) -> str:
+    """Một ô bảng: dữ liệu từ API/người dùng luôn là văn bản trơ."""
+    text = "" if value is None else str(value)
+    # Gộp xuống một dòng: dòng trống sẽ kết thúc khối HTML và phần còn lại bị
+    # Markdown diễn giải.
+    text = " ".join(text.split())
+    for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)):
+        text = text.replace(chr(codepoint), f"\\u{codepoint:04X}")
+    return html.escape(text, quote=True)
+
+
+def _table_html(headers, rows) -> str:
+    head = "".join(f"<th>{_table_cell(header)}</th>" for header in headers)
+    if rows:
+        body = "".join(
+            "<tr>" + "".join(f"<td>{_table_cell(cell)}</td>" for cell in row) + "</tr>"
+            for row in rows
+        )
+    else:
+        body = (
+            f'<tr><td class="scap-table-empty" colspan="{len(headers)}">'
+            "Chưa có dữ liệu.</td></tr>"
+        )
+    return (
+        '<div class="scap-table-scroll"><table class="scap-table">'
+        f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+def _data_table(headers, *, elem_id=None, elem_classes=()) -> gr.Markdown:
+    """Bảng chỉ đọc; handler trả về _table_html(headers, rows) cho output này."""
+    return gr.Markdown(
+        _table_html(headers, []),
+        elem_id=elem_id,
+        elem_classes=["scap-table-block", *elem_classes],
+        # Ô bảng là dữ liệu: không để KaTeX diễn giải chuỗi kiểu $$...$$.
+        latex_delimiters=[],
+    )
 
 
 def _practice_lesson_markdown(lesson) -> str:
@@ -967,6 +1081,7 @@ def _devices_snapshot(token):
         ]
         for row in rows
     ]
+    table = _table_html(DEVICE_HEADERS, table)
     revoke = [
         (f"{(row.get('ip_address') or '—')} · {_fmt(row['issued_at'])}", row["id"])
         for row in rows
@@ -1052,6 +1167,7 @@ def _passkeys_snapshot(token):
         ]
         for row in rows
     ]
+    table = _table_html(PASSKEY_HEADERS, table)
     choices = [(f"{row['name']} · {_fmt(row['created_at'])}", row["id"]) for row in rows]
     return table, choices
 
@@ -1079,7 +1195,7 @@ _SEVERITY_MARKS = {"critical": "🔴", "warning": "🟠", "info": "🟢"}
 
 
 def _security_activity_snapshot(token):
-    """Return (summary markdown, table rows, alerts) like an account security page."""
+    """Return (summary markdown, table markup, alerts) like an account security page."""
     data = _api(token, "GET", "/api/auth/security-activity", params={"limit": 30})
     rows = [
         [
@@ -1123,7 +1239,7 @@ def _security_activity_snapshot(token):
     lines.extend(f"⚠️ {alert}" for alert in alerts)
     if not alerts:
         lines.append("✅ Không có dấu hiệu bất thường kể từ lần đăng nhập trước.")
-    return "\n\n".join(lines), rows, alerts
+    return "\n\n".join(lines), _table_html(ACTIVITY_HEADERS, rows), alerts
 
 
 # ─────────────────── mảnh HTML tĩnh của trang đăng nhập ───────────────────
@@ -1267,8 +1383,11 @@ def build_ui(
         )
         st_passkey = gr.State({})
         # Đã hiện cảnh báo "sắp hết phiên" chưa — để chỉ nhắc một lần cho mỗi
-        # phiên thay vì mỗi giây một lần trong suốt hai phút cuối.
+        # phiên thay vì ở mọi lần tick trong suốt hai phút cuối.
         st_warned = gr.State(False)
+        # Mốc hết hạn của phiên vừa hết hạn. tick() chỉ đổi giá trị này; sự kiện
+        # change của nó mới dọn toàn bộ giao diện, nên tick định kỳ luôn nhẹ.
+        st_expired = gr.State(0.0)
 
         # ============ XÁC THỰC ============
         # Một thẻ duy nhất: dấu nhận diện, hai tab (đăng nhập / tạo tài khoản),
@@ -1432,7 +1551,11 @@ def build_ui(
             with gr.Row(elem_id="topbar"):
                 _static_html(APP_WORDMARK_HTML, elem_classes="topbar-brand")
                 md_banner = gr.Markdown("", elem_classes=["md", "topbar-user"])
-                md_countdown = gr.Markdown("", elem_classes=["md", "topbar-timer"])
+                # Markup do _countdown_markup() dựng từ số nguyên; giữ nguyên
+                # thuộc tính data-* cho bộ đếm phía trình duyệt.
+                md_countdown = gr.Markdown(
+                    "", sanitize_html=False, elem_classes=["md", "topbar-timer"]
+                )
                 btn_extend = gr.Button(
                     "Gia hạn phiên", size="sm", elem_classes=["topbar-action", "topbar-extend"]
                 )
@@ -1440,7 +1563,7 @@ def build_ui(
                     "Đăng xuất", size="sm", elem_id="btn-logout",
                     elem_classes=["topbar-action", "topbar-logout"]
                 )
-            timer = gr.Timer(1, active=False)
+            timer = gr.Timer(SESSION_TICK_SECONDS, active=False)
 
             with gr.Tabs(elem_id="workspace-tabs"):
                 # ---------- TRÒ CHUYỆN ----------
@@ -1572,18 +1695,8 @@ def build_ui(
                             label="Hội thoại", choices=[], interactive=True, scale=3
                         )
                         btn_cipher = gr.Button("Tải bản mã", scale=1)
-                    df_cipher = gr.Dataframe(
-                        headers=[
-                            "#",
-                            "Vai trò",
-                            "Ciphertext (base64, rút gọn)",
-                            "Nonce",
-                            "Key ver.",
-                            "Thời điểm",
-                        ],
-                        interactive=False,
-                        wrap=True,
-                        elem_classes="mono-df",
+                    df_cipher = _data_table(
+                        CIPHER_HEADERS, elem_id="cipher-table", elem_classes=["mono-df"]
                     )
 
                 # ---------- TÌM KIẾM ----------
@@ -1598,11 +1711,7 @@ def build_ui(
                             label="Từ khóa (trên mọi hội thoại của bạn)", max_lines=1, scale=4
                         )
                         btn_gsearch = gr.Button("Tìm kiếm", variant="primary", scale=1)
-                    df_gsearch = gr.Dataframe(
-                        headers=["Hội thoại", "Vai trò", "Nội dung", "Thời điểm"],
-                        interactive=False,
-                        wrap=True,
-                    )
+                    df_gsearch = _data_table(SEARCH_HEADERS, elem_id="global-search-table")
 
                 # ---------- TÀI KHOẢN ----------
                 with gr.Tab("Tài khoản"):
@@ -1666,19 +1775,7 @@ def build_ui(
                                 tb_dis_code = gr.Textbox(label="Mã TOTP / khôi phục", max_length=32)
                             btn_disable = gr.Button("Tắt 2FA", variant="stop", size="sm")
                     with gr.Accordion("Thiết bị đang đăng nhập", open=True):
-                        df_devices = gr.Dataframe(
-                            headers=[
-                                "",
-                                "Thiết bị / trình duyệt",
-                                "IP",
-                                "Đăng nhập lúc",
-                                "Hoạt động gần nhất",
-                                "Hết hạn nếu không hoạt động",
-                                "Giới hạn phiên tối đa",
-                            ],
-                            interactive=False,
-                            wrap=True,
-                        )
+                        df_devices = _data_table(DEVICE_HEADERS, elem_id="devices-table")
                         gr.Markdown(
                             "Làm mới danh sách hoặc gia hạn token không kéo dài thời hạn không hoạt động. "
                             "Các mốc trong bảng được kiểm tra ở máy chủ."
@@ -1722,11 +1819,7 @@ def build_ui(
                             "hoặc PIN của thiết bị. Khóa riêng không bao giờ rời thiết bị và passkey "
                             "chỉ dùng được trên đúng trang này, nên kẻ lừa đảo không thể đánh cắp."
                         )
-                        df_passkeys = gr.Dataframe(
-                            headers=["Tên", "Tạo lúc", "Dùng gần nhất", "Đồng bộ đám mây"],
-                            interactive=False,
-                            wrap=True,
-                        )
+                        df_passkeys = _data_table(PASSKEY_HEADERS, elem_id="passkeys-table")
                         with gr.Row():
                             tb_passkey_name = gr.Textbox(
                                 label="Tên passkey (tuỳ chọn)", max_length=64, max_lines=1,
@@ -1747,11 +1840,7 @@ def build_ui(
                             )
                     with gr.Accordion("Hoạt động bảo mật gần đây", open=True):
                         md_activity = gr.Markdown(ACTIVITY_PLACEHOLDER)
-                        df_activity = gr.Dataframe(
-                            headers=["Thời gian", "Sự kiện", "Kết quả", "IP", "Thiết bị"],
-                            interactive=False,
-                            wrap=True,
-                        )
+                        df_activity = _data_table(ACTIVITY_HEADERS, elem_id="activity-table")
                         gr.Markdown(
                             "Gồm cả các lần người khác thử đăng nhập vào tài khoản của bạn. "
                             "Thao tác của quản trị viên được ghi nhận nhưng ẩn địa chỉ của họ."
@@ -1777,11 +1866,8 @@ def build_ui(
                     md_stats = gr.Markdown("*Đang chờ nạp dữ liệu vận hành.*", elem_classes="dashboard-panel")
                     md_alerts = gr.Markdown("*Đang chờ nạp cảnh báo.*", elem_classes="dashboard-panel")
                     gr.Markdown("#### Danh mục tài khoản", elem_classes="dashboard-section-title")
-                    df_users = gr.Dataframe(
-                        headers=["Tên", "Vai trò", "Trạng thái", "2FA", "Ngày tạo"],
-                        interactive=False,
-                        wrap=True,
-                        elem_classes="dashboard-table",
+                    df_users = _data_table(
+                        USER_HEADERS, elem_id="users-table", elem_classes=["dashboard-table"]
                     )
                     with gr.Row():
                         dd_user_pick = gr.Dropdown(label="Người dùng", choices=[], scale=2)
@@ -1817,21 +1903,11 @@ def build_ui(
                     with gr.Row():
                         sl_audit = gr.Slider(10, 500, value=100, step=10, label="Số dòng", scale=3)
                         btn_audit = gr.Button("Tải nhật ký", size="sm", scale=1)
-                    df_audit = gr.Dataframe(
-                        headers=[
-                            "#",
-                            "Sự kiện",
-                            "Kết quả",
-                            "Actor",
-                            "Đối tượng",
-                            "IP",
-                            "Thời điểm",
-                        ],
-                        interactive=False,
-                        # Giữ nguyên audit ID/IP; bảng tự cuộn ngang khi màn hình
-                        # hẹp thay vì bẻ đôi định danh khiến dữ liệu khó đọc.
-                        wrap=False,
-                        elem_classes="mono-df",
+                    # Giữ nguyên audit ID/IP trên một dòng; bảng tự cuộn ngang khi
+                    # màn hình hẹp thay vì bẻ đôi định danh khiến dữ liệu khó đọc.
+                    df_audit = _data_table(
+                        AUDIT_HEADERS, elem_id="audit-table",
+                        elem_classes=["mono-df", "scap-table-nowrap"],
                     )
 
                 # ---------- THỰC HÀNH ANM ----------
@@ -1871,10 +1947,7 @@ def build_ui(
                         )
                     with gr.Accordion("Hồ sơ sự cố", open=True):
                         btn_incident_refresh = gr.Button("Làm mới sự cố", size="sm")
-                        df_incidents = gr.Dataframe(
-                            headers=["Mã", "Tiêu đề", "Giai đoạn", "Mức độ", "Trạng thái", "Phiên bản", "Bằng chứng"],
-                            interactive=False, wrap=True, elem_id="practice-incidents",
-                        )
+                        df_incidents = _data_table(INCIDENT_HEADERS, elem_id="practice-incidents")
                         dd_incident = gr.Dropdown(label="Sự cố cần xem", choices=[], elem_id="practice-incident")
                         md_incident_detail = gr.Markdown("", elem_id="practice-incident-detail")
                         # Only the identifier and revision are retained;
@@ -1952,10 +2025,8 @@ def build_ui(
                         )
 
                     with gr.Accordion("2 · IDS — mẫu tấn công đã phát hiện", open=True):
-                        df_sec_det = gr.Dataframe(
-                            headers=["Luật", "MITRE", "Mức", "Mô tả", "Nguồn", "Đường dẫn", "Dấu hiệu"],
-                            interactive=False,
-                            wrap=True,
+                        df_sec_det = _data_table(
+                            DETECTION_HEADERS, elem_id="sec-detections-table",
                             elem_classes=["mono-df", "dashboard-table"],
                         )
 
@@ -1965,11 +2036,8 @@ def build_ui(
                                 5, 720, value=60, step=5, label="Cửa sổ thời gian (phút)", scale=3
                             )
                             btn_sec_anom = gr.Button("Phân tích", size="sm", scale=1)
-                        df_sec_anom = gr.Dataframe(
-                            headers=["Mã", "Mức", "Đối tượng", "Số lần", "Diễn giải"],
-                            interactive=False,
-                            wrap=True,
-                            elem_classes="mono-df",
+                        df_sec_anom = _data_table(
+                            ANOMALY_HEADERS, elem_id="sec-anomalies-table", elem_classes=["mono-df"]
                         )
 
                     with gr.Accordion("4 · Purple Team — kiểm chứng luật phát hiện", open=False):
@@ -1987,11 +2055,8 @@ def build_ui(
 
                     with gr.Accordion("5 · IPS — nguồn đang bị chặn", open=True):
                         gr.Markdown("*Xem và gỡ chặn cần vai trò admin.*")
-                        df_sec_block = gr.Dataframe(
-                            headers=["Địa chỉ IP", "Còn bị chặn (giây)"],
-                            interactive=False,
-                            wrap=True,
-                            elem_classes="mono-df",
+                        df_sec_block = _data_table(
+                            BLOCKLIST_HEADERS, elem_id="sec-blocklist-table", elem_classes=["mono-df"]
                         )
                         with gr.Row():
                             tb_sec_ip = gr.Textbox(label="IP cần gỡ chặn", max_lines=1, scale=3)
@@ -2053,9 +2118,9 @@ def build_ui(
             (md_chat_notice, gr.update(value="", visible=False)),
             (btn_consent_send, gr.update(visible=False)),
             (tb_search, ""),
-            (df_cipher, []),
+            (df_cipher, _table_html(CIPHER_HEADERS, [])),
             (tb_gq, ""),
-            (df_gsearch, []),
+            (df_gsearch, _table_html(SEARCH_HEADERS, [])),
             (tb_pw_cur, ""),
             (tb_pw_new, ""),
             (grp_mfa_setup, gr.update(visible=False)),
@@ -2066,13 +2131,13 @@ def build_ui(
             (tb_dis_pw, ""),
             (tb_dis_code, ""),
             (md_activity, ACTIVITY_PLACEHOLDER),
-            (df_activity, []),
+            (df_activity, _table_html(ACTIVITY_HEADERS, [])),
             (passkey_bridge, ""),
             (tb_passkey_result, ""),
             (st_passkey, {}),
             (md_passkey_hint, gr.update(value="", visible=False)),
             (btn_passkey_create, gr.update(visible=False)),
-            (df_passkeys, []),
+            (df_passkeys, _table_html(PASSKEY_HEADERS, [])),
             (dd_passkey_remove, gr.update(choices=[], value=None)),
             (tb_passkey_name, ""),
             (tb_acct_pw, ""),
@@ -2089,28 +2154,28 @@ def build_ui(
             (md_metric_denials, md_metric_denials.value),
             (md_stats, md_stats.value),
             (md_alerts, md_alerts.value),
-            (df_users, []),
+            (df_users, _table_html(USER_HEADERS, [])),
             (dd_user_pick, gr.update(choices=[], value=None)),
             (dd_role_new, "user"),
             (tb_cu_name, ""),
             (tb_cu_pw, ""),
             (dd_cu_role, "user"),
             (sl_audit, 100),
-            (df_audit, []),
+            (df_audit, _table_html(AUDIT_HEADERS, [])),
             (md_sec_detections, md_sec_detections.value),
             (md_sec_anomalies, md_sec_anomalies.value),
             (md_sec_blocks, md_sec_blocks.value),
             (md_sec_verdict, md_sec_verdict.value),
-            (df_sec_det, []),
+            (df_sec_det, _table_html(DETECTION_HEADERS, [])),
             (sl_sec_win, 60),
-            (df_sec_anom, []),
+            (df_sec_anom, _table_html(ANOMALY_HEADERS, [])),
             (md_sec_ids_verdict, md_sec_ids_verdict.value),
-            (df_sec_block, []),
+            (df_sec_block, _table_html(BLOCKLIST_HEADERS, [])),
             (tb_sec_ip, ""),
             (dd_practice_lesson, gr.update(choices=[], value=None)),
             (md_practice_guide, ""),
             (md_practice_stages, ""),
-            (df_incidents, []),
+            (df_incidents, _table_html(INCIDENT_HEADERS, [])),
             (dd_incident, gr.update(choices=[], value=None)),
             (md_incident_detail, ""),
             (st_incident_revision, None),
@@ -2121,8 +2186,8 @@ def build_ui(
             (dd_incident_severity, "medium"),
             (tb_incident_evidence, ""),
         ]
-        # _alive() cập nhật đúng hai output cuối, giữ nguyên mọi ô đang nhập.
-        RESET_OUTS = STAGE1 + STAGE2 + [item[0] for item in EXTRA_RESET] + [
+        # Hai output cuối là đồng hồ và cờ cảnh báo của phiên.
+        RESET_OUTS =STAGE1 + STAGE2 + [item[0] for item in EXTRA_RESET] + [
             md_countdown, st_warned,
         ]
 
@@ -2153,7 +2218,7 @@ def build_ui(
                 "",
                 gr.update(visible=False),
                 gr.update(visible=False),
-                [],
+                _table_html(DEVICE_HEADERS, []),  # df_devices
                 gr.update(choices=[], value=None),
                 gr.Timer(active=False),
                 gr.update(visible=False),  # practice_tab
@@ -2254,7 +2319,8 @@ def build_ui(
                 gr.update(visible=mfa_on),
                 devices,
                 gr.update(choices=revoke, value=None),
-                gr.Timer(active=True),
+                # Đặt lại cả chu kỳ: tick có thể đã rút ngắn nó ở phiên trước.
+                gr.Timer(value=SESSION_TICK_SECONDS, active=True),
                 gr.update(visible=(role in ("moderator", "admin"))),
             )
 
@@ -2500,53 +2566,57 @@ def build_ui(
 
         btn_logout.click(_guard(do_logout, len(RESET_OUTS)), [st_token], RESET_OUTS)
 
-        # Ngưỡng nhắc trước khi phiên hết hạn (giây).
-        WARN_BEFORE_EXPIRY = 120
-
-        def _alive(countdown_markdown, warned):
-            """Giữ nguyên mọi output trừ đồng hồ và cờ cảnh báo.
-
-            gr.skip() để đồng hồ chạy mỗi giây không ghi đè state của người dùng
-            (ô đang gõ, hội thoại đang chọn…).
-            """
-            return tuple(gr.skip() for _ in range(len(RESET_OUTS) - 2)) + (
-                countdown_markdown,
-                warned,
-            )
-
         def tick(exp, warned):
-            """Chạy mỗi giây: đếm ngược, nhắc trước, và tự đăng xuất khi hết hạn.
+            """Đồng bộ đồng hồ, nhắc trước, và báo hết hạn để tự đăng xuất.
 
-            Trước đây hàm này chỉ đổi dòng chữ thành "token đã hết hạn" rồi thôi:
-            giao diện vẫn hiện đầy đủ, mọi nút vẫn bấm được, và người dùng chỉ
-            biết mình đã mất phiên khi một thao tác trả về 401. Tệ hơn, dữ liệu
-            hội thoại đã giải mã vẫn nằm trong state của trình duyệt sau khi
-            phiên đã chết. Bây giờ hết hạn là dọn sạch state và quay về màn đăng
-            nhập, đúng như khi bấm Đăng xuất.
+            Chạy theo gr.Timer (mỗi SESSION_TICK_SECONDS) và ngay khi st_exp đổi
+            (đăng nhập, khôi phục, gia hạn) để đồng hồ hiện ngay. Chỉ có 4 output
+            nhỏ; trình duyệt tự đếm từng giây giữa hai lần tick.
+
+            Hết hạn không chỉ đổi dòng chữ: dữ liệu hội thoại đã giải mã không
+            được nằm lại trong state của trình duyệt sau khi phiên đã chết. tick
+            ghi mốc hết hạn vào st_expired; expire_session() (sự kiện change của
+            nó) dọn sạch state và quay về màn đăng nhập như khi bấm Đăng xuất.
             """
             if not exp:
-                return _alive("", False)
+                return "", False, gr.skip(), gr.skip()
             left = int(exp - time.time())
             if left <= 0:
-                gr.Warning("Phiên đã hết hạn — vui lòng đăng nhập lại.")
-                # A newer token in another tab may still be valid. Clear only
-                # this tab; expired cookie records are pruned by the store.
-                result = list(_reset_tuple())
-                result[RESET_OUTS.index(resume_ticket)] = ""
-                return tuple(result)
+                return "", False, gr.Timer(active=False), exp
             if left <= WARN_BEFORE_EXPIRY and not warned:
                 gr.Warning(
                     f"Phiên sẽ hết hạn sau {left} giây. "
                     "Bấm “Gia hạn phiên” để tiếp tục làm việc."
                 )
                 warned = True
-            hours, rem = divmod(left, 3600)
-            minutes, seconds = divmod(rem, 60)
-            shown = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
-            icon = "⚠️" if left <= WARN_BEFORE_EXPIRY else "⏳"
-            return _alive(f"{icon} **{shown}**", warned)
+            # Gần hết hạn thì hẹn tick kế tiếp đúng lúc hết hạn thay vì trễ tới
+            # một chu kỳ. Giá trị không đổi thì frontend không đặt lại Timer.
+            interval = min(SESSION_TICK_SECONDS, left)
+            return _countdown_markup(left), warned, gr.Timer(value=interval, active=True), gr.skip()
 
-        timer.tick(tick, [st_exp, st_warned], RESET_OUTS, show_progress="hidden")
+        gr.on(
+            triggers=[timer.tick, st_exp.change],
+            fn=tick,
+            inputs=[st_exp, st_warned],
+            outputs=[md_countdown, st_warned, timer, st_expired],
+            show_progress="hidden",
+            trigger_mode="always_last",
+            api_name=False,
+        )
+
+        def expire_session(expired_at):
+            if not expired_at:
+                return tuple(gr.skip() for _ in RESET_OUTS)
+            gr.Warning("Phiên đã hết hạn — vui lòng đăng nhập lại.")
+            # A newer token in another tab may still be valid. Clear only
+            # this tab; expired cookie records are pruned by the store.
+            result = list(_reset_tuple())
+            result[RESET_OUTS.index(resume_ticket)] = ""
+            return tuple(result)
+
+        st_expired.change(
+            expire_session, [st_expired], RESET_OUTS, show_progress="hidden", api_name=False,
+        )
 
         def extend_session(token):
             """Xin token mới trước khi token hiện tại hết hạn (sliding session).
@@ -2805,7 +2875,7 @@ def build_ui(
             rows = _api(token, "GET", f"/api/sessions/{session_id}/ciphertexts")
             if not rows:
                 gr.Info("Hội thoại này chưa có tin nhắn nào.")
-            return [
+            return _table_html(CIPHER_HEADERS, [
                 [
                     row["id"],
                     row["role"],
@@ -2815,7 +2885,7 @@ def build_ui(
                     _fmt(row["created_at"]),
                 ]
                 for row in rows
-            ]
+            ])
 
         btn_cipher.click(_guard(load_cipher, 1), [st_token, dd_cipher], [df_cipher])
 
@@ -2830,7 +2900,7 @@ def build_ui(
                 f"Tìm thấy {len(rows)} tin nhắn "
                 f"trong {len({r['session_id'] for r in rows})} hội thoại."
             )
-            return [
+            return _table_html(SEARCH_HEADERS, [
                 [
                     row["session_title"],
                     ("Bạn" if row["role"] == "user" else "Trợ lý"),
@@ -2838,7 +2908,7 @@ def build_ui(
                     _fmt(row["created_at"]),
                 ]
                 for row in rows
-            ]
+            ])
 
         btn_gsearch.click(_guard(global_search, 1), [st_token, tb_gq], [df_gsearch])
         tb_gq.submit(_guard(global_search, 1), [st_token, tb_gq], [df_gsearch])
@@ -3186,7 +3256,7 @@ def build_ui(
                     "cảnh báo HTTP tự hết khi cửa sổ quan sát trôi qua."
                 )
             users = _api(token, "GET", "/api/admin/users")
-            table = [
+            table = _table_html(USER_HEADERS, [
                 [
                     u["username"],
                     u["role"],
@@ -3195,7 +3265,7 @@ def build_ui(
                     _fmt(u["created_at"]),
                 ]
                 for u in users
-            ]
+            ])
             choices = [(f"{u['username']} ({u['role']})", u["id"]) for u in users]
             return (*metrics, stats_md, alerts_md, table, gr.update(choices=choices, value=None))
 
@@ -3270,7 +3340,7 @@ def build_ui(
         # ---- nhật ký ----
         def load_audit(token, limit):
             rows = _api(token, "GET", "/api/admin/audit", params={"limit": str(int(limit))})
-            return [
+            return _table_html(AUDIT_HEADERS, [
                 [
                     row["id"],
                     row["event_type"],
@@ -3285,7 +3355,7 @@ def build_ui(
                     _fmt(row["created_at"]),
                 ]
                 for row in rows
-            ]
+            ])
 
         btn_audit.click(_guard(load_audit, 1), [st_token, sl_audit], [df_audit])
         mod_tab.select(_guard(load_audit, 1), [st_token, sl_audit], [df_audit])
@@ -3329,10 +3399,10 @@ def build_ui(
 
         def incident_list(token, selected=None):
             rows = _api(token, "GET", "/api/admin/incidents", params={"limit": "50"})
-            table = [
+            table = _table_html(INCIDENT_HEADERS, [
                 [row["id"], row["title"], row["stage"], row["severity"], row["status"], row["version"], row["evidence_count"]]
                 for row in rows
-            ]
+            ])
             choices = [(f"{row['title']} · {row['status']}", row["id"]) for row in rows]
             if selected not in {row["id"] for row in rows}:
                 selected = None
@@ -3462,7 +3532,7 @@ def build_ui(
                 "được ghi vào nhật ký."
             )
 
-        def load_detections(token):
+        def detection_rows(token):
             rows = _api(token, "GET", "/api/admin/ids/detections", params={"limit": "100"})
             return [
                 [
@@ -3477,7 +3547,7 @@ def build_ui(
                 for r in (rows or [])
             ]
 
-        def load_anomalies(token, window):
+        def anomaly_rows(token, window):
             rows = _api(
                 token,
                 "GET",
@@ -3523,7 +3593,10 @@ def build_ui(
                 f"Kịch bản chưa phát hiện: {misses or 'không xác định'}."
             )
 
-        def load_blocklist(token):
+        def load_anomalies(token, window):
+            return _table_html(ANOMALY_HEADERS, anomaly_rows(token, window))
+
+        def blocklist_rows(token):
             rows = _api(token, "GET", "/api/admin/ids/blocklist")
             return [[r.get("source_ip", ""), r.get("seconds_remaining", "")] for r in (rows or [])]
 
@@ -3534,7 +3607,7 @@ def build_ui(
                 return gr.skip(), gr.skip()
             _api(token, "DELETE", f"/api/admin/ids/blocklist/{ip}")
             gr.Info(f"Đã gỡ chặn {ip}.")
-            return load_blocklist(token), ""
+            return _table_html(BLOCKLIST_HEADERS, blocklist_rows(token)), ""
 
         def refresh_security(token, window):
             """Nạp cả bốn khối. Mỗi khối bọc riêng để thiếu quyền ở một khối
@@ -3550,15 +3623,20 @@ def build_ui(
             verdict = safe(
                 lambda: verify_chain_ui(token), "**Không thể xác minh chuỗi.**"
             )
-            det = safe(lambda: load_detections(token), [])
-            anom = safe(lambda: load_anomalies(token, window), [])
-            block = safe(lambda: load_blocklist(token), [])
+            det = safe(lambda: detection_rows(token), [])
+            anom = safe(lambda: anomaly_rows(token, window), [])
+            block = safe(lambda: blocklist_rows(token), [])
             metrics = (
                 f"**Dấu hiệu IDS**\n\n## {len(det)}\n\nTrong bộ nhớ hiện tại",
                 f"**Bất thường**\n\n## {len(anom)}\n\nCửa sổ {int(window)} phút",
                 f"**Nguồn bị chặn**\n\n## {len(block)}\n\nĐang hiệu lực",
             )
-            return (*metrics, verdict, det, anom, block)
+            return (
+                *metrics, verdict,
+                _table_html(DETECTION_HEADERS, det),
+                _table_html(ANOMALY_HEADERS, anom),
+                _table_html(BLOCKLIST_HEADERS, block),
+            )
 
         SEC_OUTS = [
             md_sec_detections,

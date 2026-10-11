@@ -480,11 +480,11 @@ def test_ui_activity_snapshot_flags_suspicious_events(monkeypatch):
         }
 
     monkeypatch.setattr(gradio_ui, "_api", fake_api)
-    summary, rows, alerts = gradio_ui._security_activity_snapshot("token")
+    summary, table, alerts = gradio_ui._security_activity_snapshot("token")
     assert "192.0.2.1" in summary and "Chrome · Windows" in summary
     assert len(alerts) == 3
     assert "ĐÚNG mật khẩu" in alerts[0]
-    assert rows == [[
+    assert table == gradio_ui._table_html(gradio_ui.ACTIVITY_HEADERS, [[
         "02/10/2026 07:00", "🟠 Đăng nhập từ thiết bị mới", "Thành công", "203.0.113.5",
         "Safari · iOS",
-    ]]
+    ]])

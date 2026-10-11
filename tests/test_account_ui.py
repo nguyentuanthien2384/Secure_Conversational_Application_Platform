@@ -100,7 +100,9 @@ def test_passkey_registration_publishes_options_then_verifies_the_matching_resul
     )
     verify = next(call for call in api.calls if call[2].endswith("/registration/verify"))
     assert verify[3] == {"challenge_id": "k" * 36, "credential": {"id": "c"}, "name": "Laptop"}
-    assert outputs[5] == [["Laptop", "02/10/2026 07:00", "—", "Có"]]
+    assert outputs[5] == gradio_ui._table_html(
+        gradio_ui.PASSKEY_HEADERS, [["Laptop", "02/10/2026 07:00", "—", "Có"]]
+    )
     assert outputs[4] == ""  # the hidden result box is cleared
 
 

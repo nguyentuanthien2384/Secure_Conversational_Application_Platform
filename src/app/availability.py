@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 import time
 import uuid
@@ -251,6 +252,23 @@ class ReadinessProbe:
             self.capacity.release()
 
 
+# Gradio serves its compiled frontend from package-owned, read-only folders.
+# One page load fetches ~110 of these files; counting them against the
+# per-IP request quota let two or three reloads exhaust it, after which every
+# UI event got 429 and the workspace froze. They keep their own quota and
+# still occupy normal concurrency slots.
+_FRONTEND_ASSET_PATH = re.compile(r"/(?:assets|static)/[A-Za-z0-9_-][A-Za-z0-9._/-]{0,255}\Z")
+
+
+def _frontend_asset(scope: Scope) -> bool:
+    path = scope.get("path", "")
+    return (
+        scope.get("method") in {"GET", "HEAD"}
+        and _FRONTEND_ASSET_PATH.match(path) is not None
+        and "/." not in path
+    )
+
+
 class AdmissionMiddleware:
     """Reject before buffering JSON, opening DB sessions or invoking the UI.
 
@@ -319,10 +337,16 @@ class AdmissionMiddleware:
             return
         settings = self.settings
         ip = client_ip(Request(scope))
-        limits = [
-            (f"ip:{ip}", settings.request_ip_max_attempts),
-            ("global", settings.request_global_max_attempts),
-        ]
+        if _frontend_asset(scope):
+            limits = [
+                (f"asset-ip:{ip}", settings.request_ip_max_asset_attempts),
+                ("asset-global", settings.request_global_max_asset_attempts),
+            ]
+        else:
+            limits = [
+                (f"ip:{ip}", settings.request_ip_max_attempts),
+                ("global", settings.request_global_max_attempts),
+            ]
         if scope.get("method") == "POST" and path.startswith("/api/auth/"):
             limits.append(("auth-global", settings.auth_global_max_attempts))
         if path.rstrip("/") == "/api/ready":

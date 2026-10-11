@@ -65,6 +65,10 @@ def _event_for(demo, target, event="click"):
     return demo.fns[dependency["id"]], dependency
 
 
+def _is_table(component):
+    return isinstance(component, gr.Markdown) and "scap-table-block" in (component.elem_classes or [])
+
+
 def _button_event(demo, label):
     button = next(component for component in demo.blocks.values()
                   if isinstance(component, gr.Button) and component.value == label)
@@ -150,8 +154,14 @@ def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypa
     if reason == "expiry":
         timer = next(component for component in runtime_demo.blocks.values()
                      if isinstance(component, gr.Timer))
-        callback, dependency = _event_for(runtime_demo, timer, "tick")
-        result = callback.fn(999, True)
+        tick, tick_dependency = _event_for(runtime_demo, timer, "tick")
+        # The periodic tick only records the expiry; the state's change event
+        # performs the full reset, so routine ticks stay small.
+        _, _, timer_update, expired_at = tick.fn(999, True)
+        assert expired_at == 999 and timer_update.active is False
+        expired_state = runtime_demo.blocks[tick_dependency["outputs"][-1]]
+        callback, dependency = _event_for(runtime_demo, expired_state, "change")
+        result = callback.fn(expired_at)
         assert calls == []
     else:
         label, args, expected_endpoint = {
@@ -173,13 +183,17 @@ def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypa
     # A simulated prior browser view has another user's data in every textbox,
     # table and download control. Each must receive an actual value replacement.
     for component in runtime_demo.blocks.values():
-        if isinstance(component, (gr.Textbox, gr.Dataframe, gr.Chatbot, gr.DownloadButton)):
-            assert component._id in updates, f"Reset omitted {component.label}"
+        table = _is_table(component)
+        if table or isinstance(component, (gr.Textbox, gr.Chatbot, gr.DownloadButton)):
+            assert component._id in updates, f"Reset omitted {component.label or component.elem_id}"
             update = updates[component._id]
             value = update.get("value", "previous-account-data") if isinstance(update, dict) else update
             if isinstance(component, gr.DownloadButton):
                 assert value is None and update["visible"] is False
-            elif isinstance(component, (gr.Dataframe, gr.Chatbot)):
+            elif table:
+                assert value == component.value, f"Retained rows in {component.elem_id}"
+                assert "scap-table-empty" in value
+            elif isinstance(component, gr.Chatbot):
                 assert value == []
             else:
                 assert value == "", f"Retained text in {component.label}"
@@ -210,18 +224,64 @@ def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypa
     assert updates[password._id]["type"] == "password"
 
 
-def test_live_countdown_preserves_work_and_only_updates_final_two_outputs(runtime_demo, monkeypatch):
+def test_session_clock_tick_only_touches_the_clock(runtime_demo, monkeypatch):
+    """A tick that returned every workspace output made tab switches freeze."""
     from src.app import gradio_ui
 
     monkeypatch.setattr(gradio_ui.time, "time", lambda: 1000)
+    monkeypatch.setattr(gr, "Warning", lambda *args, **kwargs: None)
     timer = next(component for component in runtime_demo.blocks.values()
                  if isinstance(component, gr.Timer))
+    assert timer.value == gradio_ui.SESSION_TICK_SECONDS > 1
     callback, dependency = _event_for(runtime_demo, timer, "tick")
-    result = callback.fn(1600, False)
-    assert len(result) == len(dependency["outputs"])
-    assert all(value == gr.skip() for value in result[:-2])
-    assert "10:00" in result[-2]
-    assert result[-1] is False
+    # Sign-in, restore and renewal change the expiry: show the clock at once.
+    expiry_state = runtime_demo.blocks[dependency["inputs"][0]]
+    assert isinstance(expiry_state, gr.State)
+    assert (expiry_state._id, "change") in dependency["targets"]
+    assert len(dependency["outputs"]) == 4
+
+    countdown, warned, timer_update, expired = callback.fn(1600, False)
+    assert 'data-scap-countdown="600"' in countdown and "10:00" in countdown
+    assert warned is False and expired == gr.skip()
+    assert timer_update.value == gradio_ui.SESSION_TICK_SECONDS and timer_update.active is True
+
+    # Near the deadline the next tick lands exactly on it, not up to a cycle late.
+    countdown, warned, timer_update, expired = callback.fn(1005, False)
+    assert "0:05" in countdown and warned is True
+    assert timer_update.value == 5 and expired == gr.skip()
+
+    assert callback.fn(0, False)[:2] == ("", False)
+
+
+def test_countdown_markup_is_numeric_only():
+    from src.app import gradio_ui
+
+    assert "1:02:05" in gradio_ui._countdown_markup(3725)
+    assert "⏳" in gradio_ui._countdown_markup(121)
+    assert "⚠️" in gradio_ui._countdown_markup(120)
+    assert 'data-scap-countdown="0"' in gradio_ui._countdown_markup(-5)
+
+
+def test_tables_render_untrusted_values_as_inert_text():
+    from src.app import gradio_ui
+
+    markup = gradio_ui._table_html(
+        ("Tên", "Nội dung"),
+        [['<img src=x onerror=alert(1)>', "a\n\n# heading $$x$$"], [None, "‮evil"]],
+    )
+    assert "<img" not in markup and "&lt;img src=x onerror=alert(1)&gt;" in markup
+    # A blank line would end the HTML block and let Markdown interpret the rest.
+    assert "\n" not in markup and "a # heading $$x$$" in markup
+    assert "‮" not in markup and "\\u202E" in markup
+    empty = gradio_ui._table_html(("A", "B"), [])
+    assert 'colspan="2"' in empty and "scap-table-empty" in empty
+
+
+def test_read_only_tables_do_not_use_the_slow_dataframe(runtime_demo):
+    assert not any(isinstance(component, gr.Dataframe) for component in runtime_demo.blocks.values())
+    tables = [component for component in runtime_demo.blocks.values() if _is_table(component)]
+    assert len(tables) == 11
+    assert all(table.latex_delimiters == [] for table in tables)
 
 
 def test_logout_still_clears_local_state_when_server_cannot_confirm(runtime_demo, monkeypatch):
@@ -237,9 +297,8 @@ def test_logout_still_clears_local_state_when_server_cannot_confirm(runtime_demo
     assert len(result) == len(dependency["outputs"])
     assert result[0] == ""
     search_table = next(component for component in runtime_demo.blocks.values()
-                        if isinstance(component, gr.Dataframe)
-                        and component.headers == ["Hội thoại", "Vai trò", "Nội dung", "Thời điểm"])
-    assert result[dependency["outputs"].index(search_table._id)] == []
+                        if component.elem_id == "global-search-table")
+    assert result[dependency["outputs"].index(search_table._id)] == search_table.value
 
 
 def test_load_workspace_returns_one_value_per_stage2_component():
@@ -286,7 +345,11 @@ def test_workspace_keeps_one_full_width_responsive_shell():
     assert '"extend logout"' in source
     assert 'elem_classes=["topbar-action", "topbar-extend"]' in source
     assert 'elem_classes=["topbar-action", "topbar-logout"]' in source
-    assert "wrap=False" in source
+    # Audit IDs/IPs stay on one line; the table scrolls horizontally instead.
+    audit_table = next(component for component in demo.blocks.values()
+                       if component.elem_id == "audit-table")
+    assert "scap-table-nowrap" in audit_table.elem_classes
+    assert ".scap-table-nowrap .scap-table td { white-space: nowrap;" in source
 
 
 def test_chat_history_uses_viewport_bounded_height():
@@ -317,8 +380,7 @@ def test_audit_table_refreshes_when_the_row_limit_changes():
     audit_tables = [
         component
         for component in demo.blocks.values()
-        if isinstance(component, gr.Dataframe)
-        and component.headers == ["#", "Sự kiện", "Kết quả", "Actor", "Đối tượng", "IP", "Thời điểm"]
+        if component.elem_id == "audit-table"
     ]
 
     assert len(sliders) == 1

@@ -263,7 +263,8 @@ def test_old_tab_expiry_does_not_clear_a_newer_browser_session(ui, monkeypatch):
     renewed = _invoke(ui.demo, "extend_session", state[0])
     cookie = _remember(ui, renewed)
     monkeypatch.setattr(gradio_ui.time, "time", lambda: state[1] + 1)
-    result = _invoke(ui.demo, "tick", state[1], False, cookie=cookie)
+    expired_at = _invoke(ui.demo, "tick", state[1], False, cookie=cookie)[-1]
+    result = _invoke(ui.demo, "expire_session", expired_at, cookie=cookie)
     _assert_logged_out(result)
     assert gradio_ui.SESSION_CLEAR_MARKUP not in result
     assert ui.store.restore(cookie) == renewed[:2]

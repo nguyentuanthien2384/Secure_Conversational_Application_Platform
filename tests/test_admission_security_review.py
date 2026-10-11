@@ -72,6 +72,37 @@ def test_same_peer_cannot_rotate_forwarded_headers_to_evade_admission(settings):
     asyncio.run(scenario())
 
 
+def test_frontend_assets_do_not_spend_the_ui_request_quota(settings):
+    """One Gradio page load is ~110 package files; they once starved UI events."""
+    configured = replace(settings, request_ip_max_attempts=2, request_ip_max_asset_attempts=3)
+    middleware = middleware_for(configured, accept)
+
+    async def scenario():
+        for path in ("/assets/index-abc.js", "/static/js/iframeResizer.min.js", "/assets/Blocks-x.css"):
+            assert (await exercise(middleware, scope_for(path)))[0] == 204
+        # The asset quota itself is still finite.
+        assert await exercise(middleware, scope_for("/assets/index-abc.js")) == (429, [])
+        assert (await exercise(middleware, scope_for("/gradio_api/queue/join", method="POST")))[0] == 204
+        assert (await exercise(middleware, scope_for("/api/sessions")))[0] == 204
+        assert await exercise(middleware, scope_for("/api/sessions")) == (429, [])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("path, method", [
+    ("/assets/index.js", "POST"), ("/assets/../api/sessions", "GET"), ("/assets/.hidden", "GET"),
+    ("/assetsx/index.js", "GET"), ("/api/assets/index.js", "GET"), ("/gradio_api/queue/data", "GET"),
+])
+def test_only_packaged_frontend_reads_use_the_asset_quota(settings, path, method):
+    middleware = middleware_for(replace(settings, request_ip_max_attempts=1), accept)
+
+    async def scenario():
+        assert (await exercise(middleware, scope_for("/api/sessions")))[0] == 204
+        assert await exercise(middleware, scope_for(path, method=method)) == (429, [])
+
+    asyncio.run(scenario())
+
+
 def test_shared_global_budget_cannot_be_reset_by_switching_workers(settings):
     shared = SlidingWindowRateLimiter()
     configured = replace(settings, request_global_max_attempts=2)
@@ -315,6 +346,7 @@ def test_only_anonymous_rate_denials_are_sampled_while_credential_failure_is_dur
 @pytest.mark.parametrize("name, value", [
     ("request_max_concurrent", 0), ("request_max_streams", -1),
     ("request_global_max_attempts", True), ("request_ip_max_attempts", 1.5),
+    ("request_ip_max_asset_attempts", 0), ("request_global_max_asset_attempts", 1.5),
     ("password_max_concurrent", 0), ("gradio_queue_max_size", 0),
 ])
 def test_availability_configuration_cannot_disable_limits(settings, name, value):

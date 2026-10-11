@@ -22,6 +22,8 @@ AVAILABILITY_ENV_LIMITS = {
     "REQUEST_WINDOW_SECONDS": (60, 1, 3_600),
     "REQUEST_GLOBAL_MAX_ATTEMPTS": (600, 1, 100_000),
     "REQUEST_IP_MAX_ATTEMPTS": (300, 1, 100_000),
+    "REQUEST_GLOBAL_MAX_ASSET_ATTEMPTS": (30_000, 1, 1_000_000),
+    "REQUEST_IP_MAX_ASSET_ATTEMPTS": (3_000, 1, 1_000_000),
     "AUTH_GLOBAL_MAX_ATTEMPTS": (120, 1, 100_000),
     "READINESS_MAX_ATTEMPTS": (12, 1, 10_000),
     "READINESS_CACHE_SECONDS": (5, 1, 30),
@@ -192,6 +194,10 @@ class Settings:
     request_window_seconds: int = 60
     request_global_max_attempts: int = 600
     request_ip_max_attempts: int = 300
+    # Gradio's packaged frontend files (~110 per page load) use a separate
+    # quota, so loading the page cannot starve the UI's own API events.
+    request_global_max_asset_attempts: int = 30_000
+    request_ip_max_asset_attempts: int = 3_000
     auth_global_max_attempts: int = 120
     readiness_max_attempts: int = 12
     readiness_cache_seconds: int = 5

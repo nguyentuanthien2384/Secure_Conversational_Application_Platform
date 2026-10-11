@@ -123,13 +123,13 @@ def test_session_end_clears_practice_data_and_revision(demo, monkeypatch, reason
         callback = _callback(demo, "do_logout")
         result = callback.fn("old-token")
     else:
-        callback = _callback(demo, "tick")
-        result = callback.fn(999, True)
+        callback = _callback(demo, "expire_session")
+        result = callback.fn(999)
     updates = dict(zip([item._id for item in callback.outputs], result, strict=True))
     fields = _fields(demo)
     for key in ("practice-guide", "practice-stages", "practice-incident-detail", "practice-incident-title", "practice-incident-evidence"):
         assert updates[fields[key]._id] == ""
-    assert updates[fields["practice-incidents"]._id] == []
+    assert updates[fields["practice-incidents"]._id] == gradio_ui._table_html(gradio_ui.INCIDENT_HEADERS, [])
     for key in ("practice-lesson", "practice-incident"):
         assert updates[fields[key]._id] == gr.update(choices=[], value=None)
     update = _callback(demo, "update_incident")
@@ -151,7 +151,10 @@ def test_incident_refresh_clears_selection_and_loaded_revision(demo, monkeypatch
     callback = _callback(demo, "refresh_incidents")
     result = callback.fn("analyst-token")
     assert calls == [(("analyst-token", "GET", "/api/admin/incidents"), {"params": {"limit": "50"}})]
-    assert result[0][0] == ["incident-1", "Xác minh đăng nhập", "initial_access", "high", "new", 1, 1]
+    assert result[0] == gradio_ui._table_html(
+        gradio_ui.INCIDENT_HEADERS,
+        [["incident-1", "Xác minh đăng nhập", "initial_access", "high", "new", 1, 1]],
+    )
     assert result[1]["value"] is None
     assert result[2:] == ("", None, "investigating", "")
     assert len(result) == len(callback.outputs)
