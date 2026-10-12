@@ -255,8 +255,11 @@ class ReadinessProbe:
 # Gradio serves its compiled frontend from package-owned, read-only folders.
 # One page load fetches ~110 of these files; counting them against the
 # per-IP request quota let two or three reloads exhaust it, after which every
-# UI event got 429 and the workspace froze. They keep their own quota and
-# still occupy normal concurrency slots.
+# UI event got 429 and the workspace froze. They keep their own quota and the
+# global concurrency budget, but not a per-source slot: over HTTP/2 a browser
+# requests them all at once, and two page loads behind one NAT then hit
+# REQUEST_IP_MAX_CONCURRENT and left the UI on "Loading...". Caddy already
+# queues them through a few upstream connections (Caddyfile @frontend_assets).
 _FRONTEND_ASSET_PATH = re.compile(r"/(?:assets|static)/[A-Za-z0-9_-][A-Za-z0-9._/-]{0,255}\Z")
 
 
@@ -337,7 +340,8 @@ class AdmissionMiddleware:
             return
         settings = self.settings
         ip = client_ip(Request(scope))
-        if _frontend_asset(scope):
+        asset = _frontend_asset(scope)
+        if asset:
             limits = [
                 (f"asset-ip:{ip}", settings.request_ip_max_asset_attempts),
                 ("asset-global", settings.request_global_max_asset_attempts),
@@ -360,17 +364,18 @@ class AdmissionMiddleware:
         if not budget.acquire():
             await self._reject(scope, receive, send, 503, "request_capacity", 1)
             return
-        source_key = (ip, streaming)
-        source_maximum = settings.request_ip_max_streams if streaming else settings.request_ip_max_concurrent
-        with self._source_lock:
-            source_active = self._sources.get(source_key, 0)
-            source_allowed = source_active < source_maximum
-            if source_allowed:
-                self._sources[source_key] = source_active + 1
-        if not source_allowed:
-            budget.release()
-            await self._reject(scope, receive, send, 503, "request_source_capacity", 1)
-            return
+        source_key = None if asset else (ip, streaming)
+        if source_key is not None:
+            source_maximum = settings.request_ip_max_streams if streaming else settings.request_ip_max_concurrent
+            with self._source_lock:
+                source_active = self._sources.get(source_key, 0)
+                source_allowed = source_active < source_maximum
+                if source_allowed:
+                    self._sources[source_key] = source_active + 1
+            if not source_allowed:
+                budget.release()
+                await self._reject(scope, receive, send, 503, "request_source_capacity", 1)
+                return
         try:
             # Liveness must not depend on Redis availability. It still obeys
             # local size/rate/capacity limits and never performs DB work.
@@ -396,12 +401,13 @@ class AdmissionMiddleware:
                     return
             await self.app(scope, receive, send)
         finally:
-            with self._source_lock:
-                remaining = self._sources[source_key] - 1
-                if remaining:
-                    self._sources[source_key] = remaining
-                else:
-                    self._sources.pop(source_key)
+            if source_key is not None:
+                with self._source_lock:
+                    remaining = self._sources[source_key] - 1
+                    if remaining:
+                        self._sources[source_key] = remaining
+                    else:
+                        self._sources.pop(source_key)
             budget.release()
 
     async def _reject(

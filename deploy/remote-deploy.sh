@@ -90,6 +90,10 @@ if ! compose up -d --no-build --remove-orphans; then
   fi
   die "Khoi dong that bai; xem log o tren."
 fi
+# Caddyfile được bind-mount theo từng file: git pull/tar ghi file mới (inode mới) nên
+# container đang chạy vẫn thấy bản cũ. Tạo lại Caddy của SCAP (vài giây) để luôn dùng
+# bản vừa cập nhật; dữ liệu và chứng chỉ nằm trong volume nên không mất.
+compose up -d --no-deps --force-recreate caddy
 compose ps
 
 if [ "$EDGE_MODE" = shared-proxy ]; then

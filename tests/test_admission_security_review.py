@@ -89,6 +89,37 @@ def test_frontend_assets_do_not_spend_the_ui_request_quota(settings):
     asyncio.run(scenario())
 
 
+def test_frontend_assets_skip_per_source_slots_but_keep_the_global_budget(settings):
+    """Over HTTP/2 a page requests its ~110 assets at once; per-IP slots stay for UI calls."""
+    gate = asyncio.Event()
+
+    async def hold(scope, receive, send):
+        await gate.wait()
+        await accept(scope, receive, send)
+
+    monitor = AvailabilityMonitor()
+    middleware = AdmissionMiddleware(
+        hold, settings=replace(settings, request_ip_max_concurrent=1), monitor=monitor,
+        requests=CapacityBudget(4), streams=CapacityBudget(1),
+    )
+
+    async def scenario():
+        held = [asyncio.create_task(exercise(middleware, scope_for(path)))
+                for path in ("/assets/a0.js", "/assets/a1.js", "/api/sessions")]
+        await asyncio.sleep(0)
+        # Two assets in flight did not use the IP's single UI slot; the UI call did,
+        # so a second UI call is shed per source while global capacity remains.
+        assert await exercise(middleware, scope_for("/api/me")) == (503, [])
+        held.append(asyncio.create_task(exercise(middleware, scope_for("/assets/b.js"))))
+        await asyncio.sleep(0)
+        # Assets still spend the global budget: 4 in flight, the next one is shed.
+        assert await exercise(middleware, scope_for("/assets/c.js")) == (503, [])
+        gate.set()
+        assert [(await task)[0] for task in held] == [204, 204, 204, 204]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("path, method", [
     ("/assets/index.js", "POST"), ("/assets/../api/sessions", "GET"), ("/assets/.hidden", "GET"),
     ("/assetsx/index.js", "GET"), ("/api/assets/index.js", "GET"), ("/gradio_api/queue/data", "GET"),

@@ -101,7 +101,7 @@ Hướng dẫn từng bước: [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md). Kịch b�
 - **`demo.mod` — moderator:** thêm nhật ký kiểm toán, thực hành ANM và giám sát IDS/bất thường.
 - **`demo.boss` — admin:** thêm dashboard, quản lý tài khoản, xác minh audit và danh sách chặn.
 
-Launcher còn nạp 8 tài khoản `lab.*` và hội thoại mẫu. Tài khoản/mật khẩu này là dữ liệu công khai dành cho học tập; production từ chối `SEED_DEMO_DATA=true`.
+Launcher còn nạp 8 tài khoản `lab.*` và hội thoại mẫu. Tài khoản/mật khẩu này là dữ liệu công khai dành cho học tập; production từ chối `SEED_DEMO_DATA=true`. Trên VPS, [scripts/seed_vps_accounts.py](scripts/seed_vps_accounts.py) tạo lại đúng các tài khoản này với mật khẩu riêng nhập ẩn (xem [hướng dẫn VPS](docs/VPS_DEMO_DEPLOYMENT.md)).
 
 **Luồng trải nghiệm đề xuất:**
 

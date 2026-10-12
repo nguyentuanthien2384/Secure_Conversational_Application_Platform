@@ -95,6 +95,13 @@ trên máy Windows (`D:\btl\scap\deploy\.env.vps`) và **không** có trên GitH
 2. Bên Local mở `D:\btl\scap\deploy`. Nếu không thấy `.env.vps`, bật *Show hidden files*.
 3. Bên VPS mở `/root/scap/deploy`, rồi kéo file `.env.vps` từ Local sang.
 
+Không kéo thả được trong Termius thì dùng terminal PowerShell của VS Code (dấu nhắc
+`PS D:\btl\scap>`), nhập mật khẩu root khi được hỏi:
+
+```powershell
+scp -P 2018 deploy/.env.vps root@61.14.233.122:/root/scap/deploy/.env.vps
+```
+
 Quay lại terminal của Termius, khóa quyền file, điền email (hiển thị công khai trong
 `/.well-known/security.txt`) và kiểm tra:
 
@@ -137,6 +144,22 @@ bash deploy/vps-compose.sh run --rm --no-deps app /app/.venv/bin/python scripts/
 
 Mở `https://scap.thiennt.id.vn`, đăng nhập rồi bật MFA. Kiểm tra lại
 `https://thiennt.id.vn` vẫn là JobFind.
+
+**Dùng lại các tài khoản quen thuộc khi chạy local** (thay hoặc thêm cho bước 6): một
+lệnh tạo `demo.user`, `demo.mod`, `demo.boss` (admin) và 8 tài khoản `lab.*` cùng hội
+thoại mẫu đã mã hóa, với **một mật khẩu riêng** nhập ẩn hai lần (15–128 ký tự).
+Mật khẩu công khai trong README bị từ chối vì website ai cũng truy cập được.
+Tài khoản đã tồn tại không bị đổi; chạy lại không tạo trùng.
+
+```bash
+cd /root/scap
+bash deploy/vps-compose.sh run --rm --no-deps app /app/.venv/bin/python scripts/seed_vps_accounts.py
+```
+
+Thêm `--with-sample-alerts` nếu muốn dashboard IDS có sẵn các cảnh báo tấn công giả
+lập. Mặc định không thêm, vì smart lockout đọc bảng audit nên các lần đăng nhập sai
+giả lập có thể tạm khóa `demo.user`/`lab.alice` với IP thật của bạn. Đăng nhập
+`demo.boss` và bật MFA ngay, vì đây là tài khoản admin.
 
 **Cập nhật code sau này:** trên Windows commit và push lên GitHub (VS Code →
 *Source Control* → *Commit* → *Sync*), rồi trong Termius:
@@ -209,6 +232,7 @@ trong `backups/`. **Không xóa hoặc tạo lại `deploy/.env.vps`.**
 | `port is already allocated` khi deploy `direct` | VPS đã có ứng dụng khác giữ 80/443: `configure -EdgeMode shared-proxy` |
 | `MAIL_FROM: use a sender with a dotted domain` | File `.env.vps` tạo từ mẫu cũ: sửa thành `MAIL_FROM='SCAP <no-reply@scap.local>'` |
 | `Chua truy cap duoc https://…` sau deploy | Xem `deploy.ps1 logs`; chế độ `shared-proxy` xem thêm log Caddy JobFind: `docker compose logs --tail 50 web` trong `/root/DALN_JobFind/deploy` |
+| Trang chỉ hiện `Loading...` mãi, console trình duyệt báo 503 cho `/assets/*.js` | Bản trước 12/10: qua HTTP/2 Gradio tải ~110 file cùng lúc và vượt giới hạn đồng thời theo IP. Đã sửa (Caddyfile `@frontend_assets`, file tĩnh không chiếm slot theo IP): push code rồi `bash deploy/update.sh` |
 | `curl` trên Windows 10 báo `SEC_E_UNSUPPORTED_FUNCTION` | Windows 10 không có TLS 1.3 mà SCAP yêu cầu; mở bằng Chrome/Edge/Firefox |
 | PowerShell chặn script | `powershell -ExecutionPolicy Bypass -File deploy\deploy.ps1 <lệnh> …` |
 

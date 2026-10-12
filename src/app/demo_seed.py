@@ -15,7 +15,7 @@ from random import SystemRandom
 
 from sqlalchemy import select
 
-from src.app.audit_chain import derive_audit_key, seal_event
+from src.app.audit_chain import append_lock, derive_audit_key, seal_event
 from src.app.db import Database, utcnow
 from src.app.models import AuditEvent, ChatSession, SecureMessage, User
 from src.app.security import CryptoService, PasswordService
@@ -238,6 +238,8 @@ def seed_demo_data(
     reset: bool = False,
     refresh_telemetry: bool = False,
     audit_key: bytes | None | object = _AUDIT_KEY_FROM_ENV,
+    passphrase: str = DEMO_PASSPHRASE,
+    sample_alerts: bool = True,
     log=print,
 ) -> None:
     """Nạp dữ liệu demo, có thể làm mới telemetry hiển thị trên dashboard.
@@ -251,6 +253,11 @@ def seed_demo_data(
     Truyền ``audit_key`` để dùng cùng khóa với cấu hình của ứng dụng mà không
     đọc lại .env. ``None`` tắt niêm phong; bỏ qua tham số giữ hành vi cũ là đọc
     khóa từ môi trường. Dữ liệu và telemetry đều là mẫu tổng hợp cho local lab.
+
+    ``passphrase`` thay mật khẩu công khai khi tạo tài khoản trên máy chủ thật
+    (scripts/seed_vps_accounts.py) và không bao giờ được in ra. ``sample_alerts``
+    tắt các sự kiện audit giả lập: smart lockout đọc chính bảng audit, nên các lần
+    đăng nhập sai mẫu có thể khóa tài khoản demo với người dùng thật.
     """
     if audit_key is _AUDIT_KEY_FROM_ENV:
         audit_key = _seed_audit_key()
@@ -287,7 +294,7 @@ def seed_demo_data(
                 continue
             user = User(
                 username=username,
-                password_hash=password_service.hash(DEMO_PASSPHRASE),
+                password_hash=password_service.hash(passphrase),
                 role=role,
                 ai_data_consent=False,
                 created_at=utcnow() - timedelta(days=_DEMO_RANDOM.randint(7, 30)),
@@ -352,7 +359,7 @@ def seed_demo_data(
         # Khi cần trình diễn lại sau hơn 60 phút, chỉ làm mới cụm tín hiệu
         # vừa xảy ra. Không thêm lại lịch sử 7 ngày để số liệu không phình to
         # mỗi lần khởi động ứng dụng local.
-        if created_any or reset or refresh_telemetry:
+        if sample_alerts and (created_any or reset or refresh_telemetry):
 
             def audit(minutes_ago, event, outcome, actor, ip, details, target=None):
                 return AuditEvent(
@@ -464,15 +471,21 @@ def seed_demo_data(
                 db.add_all(events)
                 db.commit()
             else:
-                for event in events:
-                    seal_event(db, event, audit_key)
-                    db.add(event)
-                    # seal_event đọc hash của bản ghi cuối cùng trong DB, nên phải
-                    # flush từng bản ghi để bản kế tiếp nối vào đúng mắt xích.
-                    db.flush()
-                db.commit()
+                # Cùng khóa với ứng dụng: chạy khi web đang hoạt động vẫn không
+                # tạo hai mắt xích trỏ về cùng một bản ghi trước.
+                with append_lock(db):
+                    for event in events:
+                        seal_event(db, event, audit_key)
+                        db.add(event)
+                        # seal_event đọc hash của bản ghi cuối cùng trong DB, nên phải
+                        # flush từng bản ghi để bản kế tiếp nối vào đúng mắt xích.
+                        db.flush()
+                    db.commit()
             mode = "làm mới cảnh báo trong 60 phút" if refresh_telemetry and not (created_any or reset) else "tạo dữ liệu"
             sealing = "đã niêm phong" if audit_key is not None else "không niêm phong"
             log(f"[audit] Đã ghi {len(events)} sự kiện kiểm toán mô phỏng ({mode}, {sealing}).")
 
-    log("[seed] Dữ liệu mẫu sẵn sàng — mật khẩu chung: " + DEMO_PASSPHRASE)
+    if passphrase == DEMO_PASSPHRASE:
+        log("[seed] Dữ liệu mẫu sẵn sàng — mật khẩu chung: " + DEMO_PASSPHRASE)
+    else:
+        log("[seed] Dữ liệu mẫu sẵn sàng — mật khẩu: mật khẩu riêng vừa nhập (không hiển thị).")

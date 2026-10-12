@@ -34,10 +34,24 @@ def test_shared_proxy_site_keeps_every_public_rule():
     tls = expected.index("tls {")
     assert expected[tls:tls + 3] == ["tls {", "protocols tls1.3", "}"]
     del expected[tls:tls + 3]
-    real_ip = expected.index("header_up X-Real-IP {remote_host}")
-    expected[real_ip:real_ip + 1] = ["header_up X-Forwarded-For {client_ip}",
-                                     "header_up X-Real-IP {client_ip}"]
+    while "header_up X-Real-IP {remote_host}" in expected:
+        real_ip = expected.index("header_up X-Real-IP {remote_host}")
+        expected[real_ip:real_ip + 1] = ["header_up X-Forwarded-For {client_ip}",
+                                         "header_up X-Real-IP {client_ip}"]
     assert _shared_site() == expected
+
+
+def test_frontend_assets_queue_at_the_edge_below_per_ip_concurrency():
+    # HTTP/2 lets one page load request ~110 Gradio files at once; the app
+    # answers 503 above REQUEST_IP_MAX_CONCURRENT, which left the UI on "Loading...".
+    from scripts.prepare_vps import _LIMITS
+
+    for name in ("Caddyfile", "Caddyfile.shared-proxy"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assets = text.split("handle @frontend_assets {", 1)[1].split("\n\t}\n", 1)[0]
+        assert "path /assets/* /static/*" in text
+        bound = int(re.search(r"max_conns_per_host (\d+)", assets)[1])
+        assert 1 <= bound < _LIMITS["REQUEST_IP_MAX_CONCURRENT"][0], name
 
 
 def test_shared_proxy_trusts_only_the_front_proxy_address():

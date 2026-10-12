@@ -66,6 +66,26 @@ http://{$PUBLIC_DOMAIN} {
 		respond 405
 	}
 
+	# Gradio tải ~110 file /assets cùng lúc. Qua HTTP/2 trình duyệt gửi cả loạt
+	# một lần, và app trả 503 khi một IP vượt REQUEST_IP_MAX_CONCURRENT (trang
+	# kẹt "Loading..."). Cho file tĩnh xếp hàng ở biên qua tối đa 8 kết nối tới
+	# app: Caddy chờ thay vì từ chối, giới hạn đồng thời của app giữ nguyên.
+	@frontend_assets {
+		method GET HEAD
+		path /assets/* /static/*
+	}
+	handle @frontend_assets {
+		reverse_proxy app:8000 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+				max_conns_per_host 8
+			}
+			header_up X-Forwarded-For {client_ip}
+			header_up X-Real-IP {client_ip}
+		}
+	}
+
 	@export_download path /api/exports/*
 	log_skip @export_download
 
