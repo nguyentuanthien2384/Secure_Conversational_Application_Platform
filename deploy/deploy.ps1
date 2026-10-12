@@ -105,6 +105,22 @@ function Assert-Docker {
     if ($os -ne "linux") { Die "Docker Desktop dang o Windows containers - chuyen sang Linux containers." }
 }
 
+# Let's Encrypt chi cap chung chi khi ten mien da tro ve VPS; xin som se that bai va
+# co the bi gioi han so lan thu. Tra ve loi (rong neu DNS dung) de configure chi canh bao.
+function Test-Dns([string]$Name) {
+    $records = @(Resolve-DnsName -Name $Name -Type A -DnsOnly -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Type -eq "A" } | ForEach-Object { $_.IPAddress })
+    if (-not $records) {
+        return "$Name chua co ban ghi A. Tao ban ghi A tro ve IP VPS (iNET: Quan ly ten mien > DNS), doi vai phut roi chay: ipconfig /flushdns"
+    }
+    $hostPart = if ($Server) { $Server.Split("@")[-1] } else { "" }
+    if ($hostPart -match '^\d{1,3}(\.\d{1,3}){3}$' -and $records -notcontains $hostPart) {
+        return "$Name dang tro ve $($records -join ', '), khong phai VPS $hostPart."
+    }
+    Ok "DNS: $Name -> $($records -join ', ')"
+    return ""
+}
+
 # File chay tren Linux ma co CRLF se hong (bash, init script cua Postgres).
 function Assert-LineEndings([string[]]$Paths) {
     foreach ($path in $Paths) {
@@ -180,7 +196,8 @@ try {
             if ($LASTEXITCODE -ne 0) { Die "Cau hinh van con thieu - xem danh sach o tren." }
             $publicDomain = Get-Setting "PUBLIC_DOMAIN"
             Ok "Cau hinh hop le cho https://$publicDomain (che do bien: $(Get-Setting 'SCAP_EDGE_MODE'))"
-            Write-Host "  Nho tao ban ghi DNS A: $publicDomain -> IP cua VPS truoc khi deploy."
+            $dnsProblem = Test-Dns $publicDomain
+            if ($dnsProblem) { Warn "$dnsProblem Can xong truoc khi deploy." }
         }
 
         "deploy" {
@@ -195,6 +212,8 @@ try {
             Step "Kiem tra deploy/.env.vps"
             & $Python -m scripts.prepare_vps check --project .
             if ($LASTEXITCODE -ne 0) { Die "Chua du cau hinh - chay: .\deploy\deploy.ps1 configure -Domain ... -Email ..." }
+            $dnsProblem = Test-Dns (Get-Setting "PUBLIC_DOMAIN")
+            if ($dnsProblem) { Die $dnsProblem }
 
             New-Item -ItemType Directory -Force $OutDir | Out-Null
             $uploads = $RemoteScripts + @("deploy/out/scap-deploy.tar")

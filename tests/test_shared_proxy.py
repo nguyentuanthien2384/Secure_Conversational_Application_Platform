@@ -79,5 +79,5 @@ def test_deploy_bundle_ships_every_bind_mount_and_script():
         assert (ROOT / item).exists(), item
     # Files executed or mounted on Linux must keep LF line endings.
     for item in [*scripts, "Caddyfile.shared-proxy", "docker-compose.shared-proxy.yml",
-                 "deploy/shared-proxy-site.caddy", "deploy/server-setup.sh"]:
+                 "deploy/shared-proxy-site.caddy", "deploy/server-setup.sh", "deploy/update.sh"]:
         assert b"\r" not in (ROOT / item).read_bytes(), item

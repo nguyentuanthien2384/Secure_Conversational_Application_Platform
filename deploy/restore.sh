@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Khôi phục PostgreSQL của SCAP từ một bản của backup.sh (chạy trong ~/scap-vps):
-#   bash restore.sh backups/20261007T030000Z           # chỉ khi DB chưa có người dùng
-#   bash restore.sh backups/20261007T030000Z --force   # ghi đè DB đang có dữ liệu
+# Khôi phục PostgreSQL của SCAP từ một bản của backup.sh. Đường dẫn tính từ gốc
+# repo git (hoặc ~/scap-vps với gói upload):
+#   bash deploy/restore.sh backups/20261007T030000Z           # chỉ khi DB chưa có người dùng
+#   bash deploy/restore.sh backups/20261007T030000Z --force   # ghi đè DB đang có dữ liệu
 # Cần đúng deploy/.env.vps đã dùng lúc sao lưu. Sau khi khôi phục, mọi phiên đăng
 # nhập/token sinh ra sau thời điểm sao lưu không còn; đối chiếu audit trước khi dùng.
 # $POSTGRES_* trong các lệnh db_exec được mở rộng bên trong container db.
 # shellcheck disable=SC2016
 set -euo pipefail
 
-cd "$(dirname "$0")"
+here=$(cd "$(dirname "$0")" && pwd)
+if [ "$(basename "$here")" = deploy ] && [ -f "$here/../docker-compose.yml" ]; then
+  cd "$here/.."   # repo git: backups/ nằm ở gốc repo (đã .gitignore)
+else
+  cd "$here"
+fi
 die() { echo "  [X] $*" >&2; exit 1; }
-compose() { bash ./vps-compose.sh "$@"; }
+compose() { bash "$here/vps-compose.sh" "$@"; }
 db_exec() { compose exec -T db sh -c "PGPASSWORD=\"\$POSTGRES_PASSWORD\" exec $1"; }
 
-[ $# -ge 1 ] && [ $# -le 2 ] || die "Cach dung: bash restore.sh backups/<thoi-diem> [--force]"
+[ $# -ge 1 ] && [ $# -le 2 ] || die "Cach dung: bash deploy/restore.sh backups/<thoi-diem> [--force]"
 dir=${1%/}
 force=${2:-}
 [ -z "$force" ] || [ "$force" = --force ] || die "Tham so thu hai chi co the la --force."

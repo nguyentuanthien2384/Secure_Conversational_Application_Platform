@@ -16,12 +16,12 @@ Các file được dùng:
 Chuẩn bị này chưa mua dịch vụ, mở cổng hoặc khởi động ứng dụng trên server.
 SQLite, tài khoản mẫu và dữ liệu local hiện tại không được chuyển sang VPS.
 
-## Cách nhanh: deploy bằng `deploy/deploy.ps1`
+## Cách nhanh: deploy bằng Termius hoặc `deploy/deploy.ps1`
 
-Script chạy trên Windows và tự động hóa các mục 1–4 bên dưới: build image trên
-máy cá nhân, gửi qua SSH, chạy Docker Compose trên VPS. Cần Docker Desktop
-(Linux containers) đang chạy, `.venv` đã cài bằng `setup.ps1` và VPS Ubuntu
-22.04/24.04 x86_64 (kể cả bản *minimal* của 123HOST).
+Có hai cách: làm hoàn toàn trong **Termius** (VPS tự `git clone` và build, giống
+JobFind), hoặc chạy `deploy.ps1` trên Windows (build trên máy cá nhân rồi gửi qua SSH;
+cần Docker Desktop và `.venv` từ `setup.ps1`). VPS: Ubuntu 22.04/24.04 x86_64, kể cả
+bản *minimal* của 123HOST.
 
 ### Hai chế độ biên
 
@@ -30,18 +30,22 @@ máy cá nhân, gửi qua SSH, chạy Docker Compose trên VPS. Cần Docker Des
 | `direct` (mặc định) | VPS riêng cho SCAP | Caddy của SCAP |
 | `shared-proxy` | VPS đã chạy ứng dụng khác bằng Docker + Caddy, ví dụ VPS 123HOST đang chạy JobFind | Caddy của ứng dụng kia |
 
-Ở chế độ `shared-proxy`:
+Ở chế độ `shared-proxy` (VPS 123HOST hiện tại):
 
 ```
-Internet ─HTTPS, TLS 1.3─► Caddy JobFind :443 ─┬─ 61-14-233-122.sslip.io ───► JobFind
-                                                └─ scap.61-14-233-122.sslip.io
-                                                     │ HTTP, mạng vps-shared-edge (172.30.47.0/28)
-                                                     ▼
-                                                Caddy SCAP 172.30.47.3: lọc đường dẫn, header, giới hạn body
-                                                     ▼ mạng edge của SCAP
-                                                app ─► mạng backend nội bộ ─► PostgreSQL, Redis
+Internet ─HTTPS─► Caddy JobFind :443 ─┬─ thiennt.id.vn ──────► JobFind
+                                       └─ scap.thiennt.id.vn (TLS 1.3)
+                                            │ HTTP, mạng vps-shared-edge (172.30.47.0/28)
+                                            ▼
+                                       Caddy SCAP 172.30.47.3: lọc đường dẫn, header, giới hạn body
+                                            ▼ mạng edge của SCAP
+                                       app ─► mạng backend nội bộ ─► PostgreSQL, Redis
 ```
 
+- Mỗi ứng dụng cần **hostname riêng** dưới cùng tên miền (`scap.thiennt.id.vn`),
+  không dùng đường dẫn kiểu `thiennt.id.vn/scap`: SCAP chạy giao diện ở `/` và API
+  ở `/api/*` (trùng JobFind), cookie phiên `path=/`, passkey gắn với hostname. Chung
+  một origin thì mã JavaScript của JobFind đọc được dữ liệu phiên SCAP.
 - Caddy SCAP ([Caddyfile.shared-proxy](../Caddyfile.shared-proxy)) giữ nguyên mọi
   luật của [Caddyfile](../Caddyfile) (test `tests/test_shared_proxy.py` so từng
   dòng), chỉ tin `X-Forwarded-For` từ đúng `172.30.47.2` (Caddy JobFind) và chỉ
@@ -51,67 +55,109 @@ Internet ─HTTPS, TLS 1.3─► Caddy JobFind :443 ─┬─ 61-14-233-122.ssli
 - Đánh đổi: Caddy JobFind giữ chứng chỉ HTTPS của SCAP và thấy nội dung đã giải
   mã TLS. Chấp nhận được cho demo; dữ liệu thật nên chạy `direct` trên VPS riêng.
 
-### Triển khai lên VPS 123HOST đang chạy JobFind (`61.14.233.122`)
+### Triển khai `scap.thiennt.id.vn` lên VPS 123HOST đang chạy JobFind (Termius)
 
-VPS này dùng **cổng SSH 2018**, đăng nhập `root` bằng mật khẩu xem/đặt lại ở trang
-quản lý VPS (khác mật khẩu tài khoản 123HOST). Docker và swap đã có sẵn.
+Cách làm giống JobFind: VPS tự lấy code từ GitHub (repo công khai), tự build và chạy.
+Mọi lệnh dưới đây gõ trong **Termius**, phiên `root@vps-nnbpg`, trừ bước DNS.
 
-**Bước 1 — cập nhật JobFind (một lần).** Commit và push thay đổi trong
-`D:\job_find\deploy` (`Caddyfile`, `docker-compose.yml`, `README.md`): Caddy của
-JobFind tham gia mạng `vps-shared-edge`, mount volume `vps-shared-sites` và
-`import sites/*.caddy`. Trên VPS (JobFind gián đoạn vài giây, không build lại React):
+| Mục | Giá trị |
+| --- | --- |
+| VPS | `61.14.233.122`, **cổng SSH 2018**, Ubuntu 22.04 minimal, Docker đã có |
+| JobFind | `https://thiennt.id.vn`, thư mục `/root/DALN_JobFind/deploy` |
+| SCAP | `https://scap.thiennt.id.vn`, thư mục `/root/scap` |
+| DNS | iNET (`ns1–3.inet.vn`) |
+
+**Bước 1 — DNS ở iNET.** Đăng nhập trang quản lý tên miền iNET → `thiennt.id.vn` →
+*Quản lý DNS* → thêm bản ghi: loại `A`, tên/host `scap`, giá trị `61.14.233.122`, TTL
+mặc định. Không sửa các bản ghi `@`/`www` của JobFind. Kiểm tra (gõ được cả trong
+Termius lẫn cmd của Windows): `nslookup scap.thiennt.id.vn` phải ra `61.14.233.122`.
+
+**Bước 2 — kiểm tra JobFind có mạng dùng chung.**
 
 ```bash
-cd /root/DALN_JobFind && git pull && cd deploy
-docker compose up -d web
+docker network inspect vps-shared-edge --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
 ```
 
-**Bước 2 — chuẩn bị VPS cho SCAP (một lần).**
+Kết quả có dòng `jobfind-web-1 172.30.47.2/28` là xong. Nếu báo `No such network`,
+cập nhật JobFind rồi kiểm tra lại: `cd /root/DALN_JobFind/deploy && sh scripts/update.sh`.
+
+**Bước 3 — lấy code SCAP về VPS (một lần).**
+
+```bash
+git --version && python3 --version && docker compose version
+cd /root && git clone https://github.com/nguyentuanthien2384/Secure_Conversational_Application_Platform.git scap
+```
+
+**Bước 4 — đưa `deploy/.env.vps` lên VPS (một lần).** File này chứa khóa bí mật, chỉ có
+trên máy Windows (`D:\btl\scap\deploy\.env.vps`) và **không** có trên GitHub.
+
+1. Termius → mục **SFTP** ở thanh bên trái → một bên chọn **Local**, bên kia chọn host VPS.
+2. Bên Local mở `D:\btl\scap\deploy`. Nếu không thấy `.env.vps`, bật *Show hidden files*.
+3. Bên VPS mở `/root/scap/deploy`, rồi kéo file `.env.vps` từ Local sang.
+
+Quay lại terminal của Termius, khóa quyền file, điền email (hiển thị công khai trong
+`/.well-known/security.txt`) và kiểm tra:
+
+```bash
+cd /root/scap
+chmod 600 deploy/.env.vps
+python3 -m scripts.prepare_vps configure --project . --email <email-cua-ban>
+python3 -m scripts.prepare_vps check --project .
+```
+
+`check` báo `Configuration checks passed` là được. Từ đây bản trên VPS là bản dùng để
+chạy; bản trên Windows giữ cùng các khóa bí mật, đừng xóa vì đó là bản sao lưu khóa.
+
+**Bước 5 — deploy.**
+
+```bash
+cd /root/scap && bash deploy/update.sh
+```
+
+[update.sh](../deploy/update.sh) sao lưu CSDL (nếu SCAP đang chạy), `git pull`, kiểm
+tra cấu hình, build image (lần đầu vài phút; JobFind vẫn chạy bình thường) rồi gọi
+[remote-deploy.sh](../deploy/remote-deploy.sh):
+
+1. chạy `migrate → app → caddy` của SCAP;
+2. kiểm tra mạng, volume và dòng `import` của Caddy JobFind đã sẵn sàng;
+3. kiểm tra cú pháp site SCAP ([shared-proxy-site.caddy](../deploy/shared-proxy-site.caddy))
+   bằng Caddy **trước khi** chạm vào JobFind;
+4. ghi `scap.caddy` vào volume và `caddy reload` Caddy JobFind (không khởi động
+   lại; reload lỗi thì gỡ file ra để JobFind giữ nguyên);
+5. chờ `https://scap.thiennt.id.vn/api/health`; Caddy JobFind tự xin chứng chỉ
+   Let's Encrypt cho `scap.thiennt.id.vn`;
+6. cài cron sao lưu PostgreSQL lúc 03:00 hằng ngày.
+
+**Bước 6 — tạo tài khoản quản trị** (nhập mật khẩu 15–128 ký tự hai lần, không hiển thị):
+
+```bash
+cd /root/scap
+bash deploy/vps-compose.sh run --rm --no-deps app /app/.venv/bin/python scripts/create_admin.py --username operator
+```
+
+Mở `https://scap.thiennt.id.vn`, đăng nhập rồi bật MFA. Kiểm tra lại
+`https://thiennt.id.vn` vẫn là JobFind.
+
+**Cập nhật code sau này:** trên Windows commit và push lên GitHub (VS Code →
+*Source Control* → *Commit* → *Sync*), rồi trong Termius:
+`cd /root/scap && bash deploy/update.sh`.
+
+#### Cách khác: deploy từ Windows bằng `deploy.ps1`
+
+Không cần push code; build trên máy cá nhân rồi upload qua SSH (chạy trong PowerShell
+của VS Code, dấu nhắc `PS D:\btl\scap>`; SCAP nằm ở `/home/deploy/scap-vps`, user `deploy`):
 
 ```powershell
 $env:SCAP_VPS_PORT = "2018"
-.\deploy\deploy.ps1 setup-server -Server root@61.14.233.122
-```
-
-Lệnh tạo SSH key nếu máy chưa có rồi chạy [server-setup.sh](../deploy/server-setup.sh):
-cập nhật OS không hỏi lại (giữ `sshd_config` cổng 2018 của 123HOST), bỏ qua
-Docker/swap đã có, tạo user `deploy` đăng nhập bằng key (thuộc nhóm `docker`,
-tương đương root trên host), cài `cron`, giữ UFW mở 2018/80/443 và báo cổng
-80/443 đang do container JobFind giữ. Script không dừng dịch vụ hay container nào.
-
-**Bước 3 — cấu hình.** `scap.61-14-233-122.sslip.io` tự phân giải về IP VPS, không
-cần tạo bản ghi DNS. Email hiển thị công khai trong `/.well-known/security.txt`.
-
-```powershell
-.\deploy\deploy.ps1 configure -Domain scap.61-14-233-122.sslip.io -Email <email-cua-ban> -EdgeMode shared-proxy
-```
-
-Lệnh ghi domain/email/chế độ biên vào `deploy/.env.vps`, ghim digest SHA-256 của
-4 image nền, giữ nguyên khóa bí mật và chạy `check`.
-
-**Bước 4 — deploy và tạo admin.**
-
-```powershell
+.\deploy\deploy.ps1 setup-server -Server root@61.14.233.122   # một lần, hỏi mật khẩu root
+.\deploy\deploy.ps1 configure -Email <email-cua-ban>
 $env:SCAP_VPS = "deploy@61.14.233.122"
-$env:SCAP_VPS_PORT = "2018"
 .\deploy\deploy.ps1 deploy
 .\deploy\deploy.ps1 admin -AdminUser operator
 ```
 
-`deploy` build image `linux/amd64`, upload image nén (khoảng 360 MB), gói cấu hình,
-script vận hành và `deploy/.env.vps`. Trên VPS, [remote-deploy.sh](../deploy/remote-deploy.sh)
-kiểm tra cấu hình, nạp image, chạy `migrate → app → caddy`, rồi ở chế độ
-`shared-proxy`:
-
-1. kiểm tra mạng, volume và dòng `import` của Caddy JobFind đã sẵn sàng;
-2. kiểm tra cú pháp site SCAP ([shared-proxy-site.caddy](../deploy/shared-proxy-site.caddy))
-   bằng Caddy **trước khi** chạm vào JobFind;
-3. ghi `scap.caddy` vào volume và `caddy reload` Caddy JobFind (không khởi động
-   lại; reload lỗi thì gỡ file ra để JobFind giữ nguyên);
-4. chờ `https://scap.61-14-233-122.sslip.io/api/health`. Caddy JobFind tự xin chứng
-   chỉ Let's Encrypt cho tên miền SCAP.
-
-Nếu chỉ sửa `.env.vps` hoặc Caddyfile, thêm `-SkipBuild` để không upload lại image.
+Chọn **một** trong hai cách cho mỗi VPS: hai cách dùng chung tên project Docker
+`scap-vps-demo` và volume dữ liệu, nhưng thư mục cấu hình khác nhau.
 
 ### VPS riêng (`direct`)
 
@@ -131,22 +177,23 @@ FlashVPS), tắt nó bằng `systemctl disable --now caddy` trước khi deploy.
 
 ### Vận hành
 
-| Việc | Trên Windows | Trên VPS (user `deploy`, thư mục `~/scap-vps`) |
+| Việc | Termius (trong `/root/scap`) | Nếu deploy bằng `deploy.ps1` (Windows) |
 | --- | --- | --- |
-| Cập nhật code | `deploy.ps1 deploy` | |
-| Chỉ đổi cấu hình | `deploy.ps1 deploy -SkipBuild` | |
-| Trạng thái, RAM, ổ đĩa | `deploy.ps1 status` | `./vps-compose.sh ps` |
-| Xem log | `deploy.ps1 logs -Follow` | `./vps-compose.sh logs --tail 80 app caddy` |
-| Sao lưu ngay, tải về máy | `deploy.ps1 backup` → `backups\vps\<thời-điểm>` | `bash backup.sh` |
-| Sao lưu tự động | | cron 03:00 hằng ngày, giữ 14 bản (deploy tự cài) |
-| Khôi phục | | `bash restore.sh backups/<thời-điểm>`, thêm `--force` nếu DB đã có dữ liệu |
-| Dừng, giữ dữ liệu | | `./vps-compose.sh down`. **Không bao giờ** thêm `-v` |
+| Cập nhật code (sau khi push) | `bash deploy/update.sh` | `deploy.ps1 deploy` |
+| Áp dụng thay đổi `.env.vps` | `bash deploy/remote-deploy.sh` | `deploy.ps1 deploy -SkipBuild` |
+| Trạng thái | `bash deploy/vps-compose.sh ps` | `deploy.ps1 status` |
+| Xem log | `bash deploy/vps-compose.sh logs --tail 80 app caddy` | `deploy.ps1 logs -Follow` |
+| Sao lưu ngay | `bash deploy/backup.sh` → `backups/<thời-điểm>` | `deploy.ps1 backup` (tải về `backups\vps`) |
+| Sao lưu tự động | cron 03:00 hằng ngày, giữ 14 bản (`crontab -l`) | như bên trái |
+| Khôi phục | `bash deploy/restore.sh backups/<thời-điểm>`, thêm `--force` nếu DB đã có dữ liệu | chạy trên VPS trong `~/scap-vps` |
+| Dừng, giữ dữ liệu | `bash deploy/vps-compose.sh down`. **Không bao giờ** thêm `-v` | như bên trái |
 
+Nên định kỳ tải thư mục `/root/scap/backups/` về máy bằng SFTP của Termius.
 [backup.sh](../deploy/backup.sh) tạo `pg_dump` kèm SHA-256;
 [restore.sh](../deploy/restore.sh) kiểm tra checksum và từ chối ghi đè DB đã có
 người dùng nếu thiếu `--force`. Nội dung tin nhắn trong bản dump được mã hóa bằng
-khóa trong `deploy/.env.vps`, nên **giữ file đó trên máy cá nhân cùng bản sao lưu**
-và không để nó trong `backups/`. **Không xóa hoặc tạo lại `deploy/.env.vps`.**
+khóa trong `deploy/.env.vps`, nên **giữ file đó cùng bản sao lưu** và không để nó
+trong `backups/`. **Không xóa hoặc tạo lại `deploy/.env.vps`.**
 
 ### Sự cố thường gặp
 
@@ -154,7 +201,11 @@ và không để nó trong `backups/`. **Không xóa hoặc tạo lại `deploy/
 | --- | --- |
 | `ssh: connect to host … port 22: Connection refused` | VPS 123HOST dùng cổng 2018: `$env:SCAP_VPS_PORT = "2018"` |
 | `Permission denied (publickey,password)` khi `setup-server` | Dùng mật khẩu root ở trang quản lý VPS hoặc đặt lại tại đó |
-| `Chua co mang Docker vps-shared-edge` hoặc `chua co dong 'import sites/*.caddy'` | Chưa làm Bước 1 (cập nhật JobFind) |
+| `Chua co mang Docker vps-shared-edge` hoặc `chua co dong 'import sites/*.caddy'` | JobFind trên VPS chưa có phần dùng chung: Bước 2 (`sh scripts/update.sh`) |
+| `cd: D:\btl\scap: No such file or directory` trong Termius | Lệnh `deploy.ps1` chạy trên Windows; trong Termius dùng `cd /root/scap && bash deploy/update.sh` |
+| `Chua co deploy/.env.vps` khi chạy `update.sh` | Bước 4: kéo file `.env.vps` vào `/root/scap/deploy/` bằng SFTP của Termius |
+| `configuration missing, unsafe or inaccessible` | `chmod 600 /root/scap/deploy/.env.vps` rồi chạy lại |
+| `... chua co ban ghi A` hoặc `dang tro ve ..., khong phai VPS` | Bước 1: bản ghi `A` `scap` → `61.14.233.122` ở iNET, đợi vài phút, `ipconfig /flushdns` |
 | `port is already allocated` khi deploy `direct` | VPS đã có ứng dụng khác giữ 80/443: `configure -EdgeMode shared-proxy` |
 | `MAIL_FROM: use a sender with a dotted domain` | File `.env.vps` tạo từ mẫu cũ: sửa thành `MAIL_FROM='SCAP <no-reply@scap.local>'` |
 | `Chua truy cap duoc https://…` sau deploy | Xem `deploy.ps1 logs`; chế độ `shared-proxy` xem thêm log Caddy JobFind: `docker compose logs --tail 50 web` trong `/root/DALN_JobFind/deploy` |

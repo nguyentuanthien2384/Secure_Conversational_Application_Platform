@@ -1,20 +1,31 @@
 #!/usr/bin/env bash
-# Chạy trên VPS trong ~/scap-vps; deploy/deploy.ps1 tải file này lên cùng các
-# script vận hành, gói cấu hình (scap-deploy.tar), image ứng dụng
-# (scap-image.tar.gz, tùy chọn) và deploy/.env.vps rồi gọi nó.
+# Khởi động/cập nhật SCAP trên VPS. Hai cách gọi:
+#  - Repo git (Termius): deploy/update.sh build image rồi gọi file này.
+#  - Gói upload: deploy/deploy.ps1 tải lên ~/scap-vps cùng scap-deploy.tar,
+#    scap-image.tar.gz (tùy chọn) và deploy/.env.vps rồi gọi file này.
 # Không tạo lại khóa, không xóa volume dữ liệu, không đụng image/container khác.
 set -euo pipefail
 
-cd "$(dirname "$0")"
+HERE=$(cd "$(dirname "$0")" && pwd)
+if [ "$(basename "$HERE")" = deploy ] && [ -f "$HERE/../docker-compose.yml" ]; then
+  ROOT=$(dirname "$HERE")
+else
+  ROOT=$HERE
+fi
+cd "$ROOT"
 ENV_FILE=deploy/.env.vps
 
-compose() { bash ./vps-compose.sh "$@"; }
+compose() { bash "$HERE/vps-compose.sh" "$@"; }
 die() { echo "  [X] $*" >&2; exit 1; }
 setting() { { grep -m1 "^$1=" "$ENV_FILE" || true; } | cut -d= -f2-; }
 
 [ -f "$ENV_FILE" ] || die "Thieu $ENV_FILE tren VPS."
 chmod 700 deploy
 chmod 600 "$ENV_FILE"
+# scp từ Windows không giữ bit thực thi; repo git thì để nguyên để git pull không vướng.
+if [ ! -d .git ]; then
+  chmod u+x remote-deploy.sh vps-compose.sh backup.sh restore.sh
+fi
 
 if [ -f scap-deploy.tar ]; then
   echo "==> Giai nen cau hinh"
@@ -28,7 +39,7 @@ fi
 
 if python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
   PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.prepare_vps check --project . \
-    || die "Cau hinh chua dat; sua deploy/.env.vps tren may ca nhan roi deploy lai."
+    || die "Cau hinh chua dat; sua deploy/.env.vps theo danh sach tren roi chay lai."
 else
   echo "  [!] VPS khong co Python >= 3.10; bo qua kiem tra cau hinh phia server." >&2
 fi
@@ -42,7 +53,7 @@ if [ -f scap-image.tar.gz ]; then
   rm -f scap-image.tar.gz
 fi
 docker image inspect "$APP_IMAGE" >/dev/null 2>&1 \
-  || die "VPS chua co image $APP_IMAGE; chay deploy khong kem -SkipBuild."
+  || die "VPS chua co image $APP_IMAGE; chay bash deploy/update.sh (hoac deploy.ps1 deploy khong kem -SkipBuild)."
 image_arch=$(docker image inspect --format '{{.Architecture}}' "$APP_IMAGE")
 host_arch=$(uname -m)
 case "$host_arch" in x86_64) host_arch=amd64 ;; aarch64) host_arch=arm64 ;; esac
@@ -115,15 +126,15 @@ if [ "$healthy" -eq 1 ]; then
   echo "  [OK] https://$DOMAIN dang hoat dong."
 else
   echo "  [!] Chua truy cap duoc https://$DOMAIN. Kiem tra ban ghi DNS A tro ve IP VPS," >&2
-  echo "      cong 80/443 va log Caddy: deploy.ps1 logs" >&2
+  echo "      va log: bash $HERE/vps-compose.sh logs --tail 80 caddy app" >&2
 fi
 
 # Sao lưu PostgreSQL hằng ngày lúc 03:00 (giờ VPS) bằng crontab của tài khoản này.
 if command -v crontab >/dev/null; then
-  entry="0 3 * * * bash $PWD/backup.sh >> $PWD/backup.log 2>&1"
-  { crontab -l 2>/dev/null | grep -vF "$PWD/backup.sh" || true; echo "$entry"; } | crontab -
+  entry="0 3 * * * bash $HERE/backup.sh >> $ROOT/backup.log 2>&1"
+  { crontab -l 2>/dev/null | grep -vF "$HERE/backup.sh" || true; echo "$entry"; } | crontab -
 else
-  echo "  [!] VPS chua co cron nen chua bat sao luu tu dong; chay lai setup-server." >&2
+  echo "  [!] VPS chua co cron nen chua bat sao luu tu dong: apt-get install -y cron roi chay lai." >&2
 fi
 
 # Chỉ xóa image ứng dụng SCAP cũ vừa bị thay; không prune image của dự án khác.
