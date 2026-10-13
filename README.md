@@ -48,7 +48,6 @@ Từ đăng nhập, phân quyền và kiểm soát dữ liệu đến mã hóa, 
 - **Bảo vệ dữ liệu:** AES-256-GCM, DEK riêng từng hội thoại, AAD ràng buộc từng tin nhắn, adapter Local/Vault Transit/AWS KMS/GCP KMS.
 - **Kiểm soát AI:** Gemini hoặc AI demo, đồng thuận gửi dữ liệu ra bên ngoài, DLP với chính sách cho phép/che/xác nhận/chặn/chỉ xử lý local.
 - **Giám sát:** IDS/IPS chữ ký và tương quan bất thường, audit HMAC chain, checkpoint ngoài hệ thống, sự kiện JSON cho SIEM, dashboard ngân sách tài nguyên.
-- **Học và thực hành:** 11 bài ANM, báo cáo kiểm chứng và PCAP tổng hợp, hồ sơ sự cố gắn với audit thực cùng lịch sử xử lý.
 - **Triển khai:** demo tạm trên laptop, local có dữ liệu lâu dài, Docker với PostgreSQL/Redis/Caddy, hồ sơ VPS nhỏ và high-security.
 
 Repository có **server relay ciphertext cho Private E2EE**. Client Double Ratchet/MLS hoàn chỉnh và kiểm toán độc lập còn là yêu cầu riêng; xem [giới hạn](#gioi-han) trước khi dùng cho dữ liệu nhạy cảm.
@@ -98,7 +97,7 @@ Hướng dẫn từng bước: [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md). Kịch b�
 **Mật khẩu mẫu dùng chung:** `Phenikaa-Vault#2026-Lab`.
 
 - **`demo.user` — user:** trò chuyện, bản mã, tìm kiếm và quản lý bảo mật tài khoản.
-- **`demo.mod` — moderator:** thêm nhật ký kiểm toán, thực hành ANM và giám sát IDS/bất thường.
+- **`demo.mod` — moderator:** thêm nhật ký kiểm toán và giám sát IDS/bất thường.
 - **`demo.boss` — admin:** thêm dashboard, quản lý tài khoản, xác minh audit và danh sách chặn.
 
 Launcher còn nạp 8 tài khoản `lab.*` và hội thoại mẫu. Tài khoản/mật khẩu này là dữ liệu công khai dành cho học tập; production từ chối `SEED_DEMO_DATA=true`. Trên VPS, [scripts/seed_vps_accounts.py](scripts/seed_vps_accounts.py) tạo lại đúng các tài khoản này với mật khẩu riêng nhập ẩn (xem [hướng dẫn VPS](docs/VPS_DEMO_DEPLOYMENT.md)).
@@ -109,16 +108,15 @@ Launcher còn nạp 8 tài khoản `lab.*` và hội thoại mẫu. Tài khoản
 2. Gửi một câu hỏi; phản hồi có nhãn **DEMO AI** khi không dùng provider thật.
 3. Thử email mẫu để quan sát DLP, rồi mở **Dữ liệu mã hóa** để xem ciphertext/nonce/key version.
 4. Vào **Tài khoản** để xem thiết bị, hoạt động bảo mật, thiết lập TOTP hoặc passkey.
-5. Đăng nhập `demo.mod`/`demo.boss` để xem audit, cảnh báo, hồ sơ sự cố và các bài ANM.
+5. Đăng nhập `demo.mod`/`demo.boss` để xem audit và cảnh báo.
 
 Sự kiện seed là **mô phỏng**, không phải bằng chứng có tấn công thật. AI demo minh họa nội dung sau DLP; kiểm chứng nhánh provider thật, consent và lọc phản hồi dùng runner/test riêng:
 
 ```powershell
 uv run --frozen python -m scripts.validate_security
-uv run --frozen python -m scripts.practice_lab --output-dir reports/practice-lab
 ```
 
-Các kết quả sinh ra trong `reports/` được bỏ qua khi commit. Đọc [SECURITY_AUTOMATION.md](docs/SECURITY_AUTOMATION.md) và [PRACTICAL_ANM.md](docs/PRACTICAL_ANM.md) để hiểu phạm vi kiểm chứng.
+Các kết quả sinh ra trong `reports/` được bỏ qua khi commit. Đọc [SECURITY_AUTOMATION.md](docs/SECURITY_AUTOMATION.md) để hiểu phạm vi kiểm chứng.
 
 <a id="giao-dien"></a>
 ## Giao diện và trải nghiệm sử dụng
@@ -139,7 +137,6 @@ Trang xác thực có ba luồng **Đăng nhập**, **Tạo tài khoản**, **Qu
 - **Tài khoản:** đổi mật khẩu; TOTP/QR/recovery code; đồng thuận AI; thiết bị; email khôi phục; passkey; hoạt động bảo mật.
 - **Quản trị — admin:** thống kê người dùng/hội thoại, dashboard khả dụng, tạo tài khoản, đổi vai trò và khóa/mở khóa/xóa tài khoản.
 - **Nhật ký kiểm toán — moderator/admin:** giới thiệu phạm vi và xem các sự kiện audit gần nhất.
-- **Thực hành ANM — moderator/admin:** chọn bài thực hành, đọc hướng dẫn và quản lý hồ sơ sự cố/bằng chứng/lịch sử xử lý.
 - **Bảo mật — moderator/admin:** IDS và tương quan bất thường; admin có thêm xác minh chuỗi audit, kiểm chứng phát hiện và gỡ chặn nguồn.
 
 Trên màn hình hẹp, thanh bên/chat xếp theo chiều dọc; nút mobile có vùng bấm tối thiểu 44px, nhãn nhập/tìm kiếm rõ và trạng thái focus hỗ trợ chọn hội thoại bằng bàn phím. Các tab có giới thiệu giúp người mới biết nội dung và thao tác cần thực hiện.
@@ -154,7 +151,7 @@ Quyền ở giao diện được kiểm tra lại tại API. Admin vẫn chỉ �
 ### Vai trò
 
 - **User:** dùng hội thoại và quản lý tài khoản cá nhân.
-- **Moderator:** quyền user cùng audit, IDS/bất thường, bài ANM và hồ sơ sự cố.
+- **Moderator:** quyền user cùng audit và IDS/bất thường.
 - **Admin:** quyền moderator cùng quản trị tài khoản, dashboard và các thao tác bảo mật đặc quyền.
 
 ### Ba ranh giới dữ liệu
@@ -201,7 +198,7 @@ FastAPI và Gradio chạy trong **một tiến trình**, Gradio mount tại `/`.
 - **DLP/AI:** kiểm tra prompt/context và phản hồi provider, xử lý mã hóa nhiều lớp, che hoặc chặn dữ liệu theo policy; consent có phiên bản, giảm ngữ cảnh gửi ra ngoài; timeout/retry và ngân sách lời gọi AI.
 - **Ranh giới HTTP/UI:** TrustedHost/CORS, kiểm tra Origin, giới hạn body/URI/header/JSON, CSP nonce, dữ liệu chat dạng inert text, ký IP/UA của trình duyệt giữa UI và API.
 - **Khả dụng:** hạn mức HTTP/SSE trước khi parse body, Redis cho quota dùng chung, giới hạn Argon2/AI/Gradio/mail, dashboard ngân sách từng worker và cảnh báo HTTP.
-- **IDS/audit:** chữ ký SQLi/XSS/traversal/scanner và tương quan audit; HMAC hash chain, checkpoint có ký tới WORM/SIEM; hồ sơ sự cố dùng bằng chứng audit đã kiểm chứng.
+- **IDS/audit:** chữ ký SQLi/XSS/traversal/scanner và tương quan audit; HMAC hash chain, checkpoint có ký tới WORM/SIEM.
 - **Production/high profile:** guard fail-closed; PostgreSQL có vai trò runtime quyền tối thiểu, KMS/OIDC/WORM và TLS nội bộ có xác minh CA trong hồ sơ high.
 
 </details>
@@ -279,7 +276,6 @@ Trong development, schema đầy đủ có tại `/docs`, `/redoc` và `/openapi
 - **Hội thoại:** `/api/sessions`, `/api/sessions/{id}`; dưới mỗi hội thoại có `messages`, `ciphertexts`, `security`, `export`, `export-ticket`; tìm kiếm `/api/search/messages`.
 - **Private E2EE:** `/api/e2ee/devices`, `/api/e2ee/users/{username}/prekey-bundle`, `/api/sessions/{id}/e2ee/members` và `/api/sessions/{id}/e2ee/envelopes`.
 - **Quản trị/giám sát, prefix `/api/admin`:** `users`, `stats`, `availability`, `audit`, `audit/verify`, `audit/checkpoint`, `ids/*`, `security-alerts`, `security/maintenance`.
-- **Thực hành/sự cố:** `/api/admin/practice/catalog`, `/api/admin/incidents` và `/api/admin/incidents/{id}`.
 - **Tình trạng:** `/api/health` là liveness tối giản; `/api/ready` kiểm tra DB và checkpoint WORM mới nhất trong high profile.
 
 Gửi access token bằng header `Authorization: Bearer <token>`. API export stream trực tiếp; vé tải dùng một lần, có hạn 60 giây và gắn phiên đăng nhập. Không chia sẻ token hoặc đường dẫn vé tải.
@@ -446,7 +442,7 @@ Sau khi clone, tạo lại môi trường bằng `uv sync --frozen --group dev` 
 
 - **Chạy và trình bày:** [Hướng dẫn local](HUONG_DAN_CHAY.md), [Docker](HUONG_DAN_DOCKER.md), [kịch bản demo](docs/DEMO_SCRIPT.md), [phân tích dự án](docs/PHAN_TICH_DU_AN.md).
 - **Triển khai/vận hành:** [VPS demo](docs/VPS_DEMO_DEPLOYMENT.md), [high-security](docs/HIGH_SECURITY_DEPLOYMENT.md), [availability/private storage/backup](docs/security/availability.md), [xử lý sự cố](docs/INCIDENT_RESPONSE_HIGH_SECURITY.md), [supply chain](docs/supply-chain/README.md).
-- **Tài khoản và ứng dụng:** [bảo vệ tài khoản](docs/ACCOUNT_PROTECTION.md), [bảo mật nâng cao](docs/ADVANCED_SECURITY.md), [bảo mật và tự động hóa](docs/SECURITY_AUTOMATION.md), [thực hành ANM](docs/PRACTICAL_ANM.md).
+- **Tài khoản và ứng dụng:** [bảo vệ tài khoản](docs/ACCOUNT_PROTECTION.md), [bảo mật nâng cao](docs/ADVANCED_SECURITY.md), [bảo mật và tự động hóa](docs/SECURITY_AUTOMATION.md).
 - **Ranh giới và quản trị dữ liệu:** [E2EE client contract](docs/E2EE_CLIENT_CONTRACT.md), [data inventory/DPIA baseline](docs/PRIVACY_DATA_INVENTORY.md), [truy vết yêu cầu](docs/SECURITY_REQUIREMENTS_TRACEABILITY.md), [security governance](docs/SECURITY_GOVERNANCE.md).
 - **Đánh giá/chính sách:** [SECURITY.md](SECURITY.md), [SECURITY_REVIEW.md](SECURITY_REVIEW.md), [cách sinh báo cáo](reports/README.md).
 

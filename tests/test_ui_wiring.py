@@ -420,7 +420,7 @@ def test_every_guarded_handler_skips_exactly_its_outputs(runtime_demo):
         name = getattr(cells["fn"], "__name__", "?")
         assert cells["n_outputs"] == outputs or cells["n_outputs"] <= 1 >= outputs, (name, outputs)
         checked.append(name)
-    assert {"set_role", "delete_user", "create_user", "update_incident"} <= set(checked)
+    assert {"set_role", "delete_user", "create_user"} <= set(checked)
 
 
 def test_refused_admin_action_keeps_the_admin_panel_usable(runtime_demo, monkeypatch):
@@ -545,7 +545,7 @@ def test_tables_render_untrusted_values_as_inert_text():
 def test_read_only_tables_do_not_use_the_slow_dataframe(runtime_demo):
     assert not any(isinstance(component, gr.Dataframe) for component in runtime_demo.blocks.values())
     tables = [component for component in runtime_demo.blocks.values() if _is_table(component)]
-    assert len(tables) == 11
+    assert len(tables) == 10
     assert all(table.latex_delimiters == [] for table in tables)
 
 
