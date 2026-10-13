@@ -172,6 +172,28 @@ def test_login_sessions_can_be_listed_revoked_and_revoked_globally(client: TestC
     assert client.get("/api/auth/me", headers=auth(first_token)).status_code == 401
 
 
+def test_unusable_tokens_carry_the_invalid_token_challenge_but_step_up_failures_do_not(
+    client: TestClient,
+):
+    """Clients sign a tab out only on RFC 6750 invalid_token, never on a wrong password."""
+    token = register_and_login(client, "challenge-user")
+    wrong_password = client.post(
+        "/api/auth/step-up", headers=auth(token), json={"password": "not the password"}
+    )
+    assert wrong_password.status_code == 401
+    assert "invalid_token" not in wrong_password.headers.get("www-authenticate", "")
+    assert client.get("/api/auth/me", headers=auth(token)).status_code == 200
+
+    malformed = client.get("/api/auth/me", headers=auth("not-a-jwt"))
+    assert malformed.status_code == 401
+    assert malformed.headers["www-authenticate"] == 'Bearer error="invalid_token"'
+
+    assert client.post("/api/auth/logout", headers=auth(token)).status_code == 204
+    revoked = client.get("/api/sessions", headers=auth(token))
+    assert revoked.status_code == 401
+    assert revoked.headers["www-authenticate"] == 'Bearer error="invalid_token"'
+
+
 def test_existing_account_is_persistently_locked_after_failed_logins(client: TestClient, app):
     register_and_login(client, "lockout-user")
     for _ in range(5):

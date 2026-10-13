@@ -198,10 +198,16 @@ def test_self_registration_can_be_disabled(settings: Settings):
     assert response.status_code == 403
 
 
-def test_lean_api_excludes_the_removed_agent_surface(client: TestClient):
+def test_lean_api_excludes_the_removed_agent_surface(app):
     """Giữ phạm vi app ở chat bảo mật; không vô tình đưa Agent API trở lại."""
-    paths = client.get("/openapi.json").json()["paths"]
+    paths = app.openapi()["paths"]
     assert not any(path.startswith("/api/agent") for path in paths)
+
+
+def test_api_schema_and_docs_are_not_published_when_docs_are_disabled(client: TestClient):
+    """Production (DOCS_ENABLED=false) must not hand out the full route map, admin routes included."""
+    for path in ("/openapi.json", "/docs", "/redoc"):
+        assert client.get(path).status_code == 404, path
 
 
 def test_password_policy_enforces_length(client: TestClient):

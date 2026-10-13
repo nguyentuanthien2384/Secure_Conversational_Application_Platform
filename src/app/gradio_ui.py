@@ -8,10 +8,13 @@ trò chuyện, bản mã, tìm kiếm toàn cục, tài khoản, thiết bị, q
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import json
 import os
+import re
 import secrets
+import threading
 import time
 from datetime import datetime
 from functools import wraps
@@ -611,6 +614,13 @@ footer { display: none !important; }
   background: var(--scap-warn-bg);
 }
 #chat-notice p { margin: 0; font-size: 15px; color: var(--scap-warn-fg); }
+#export-link a.scap-export-link {
+  display: block; text-align: center; padding: 7px 12px; border-radius: 8px;
+  border: 1px solid var(--button-secondary-border-color, #d0d7de);
+  background: var(--button-secondary-background-fill, #f6f8fa);
+  color: var(--button-secondary-text-color, inherit); font-weight: 600; text-decoration: none;
+}
+#export-link a.scap-export-link:hover { filter: brightness(0.97); }
 #sec-verdict, #sec-ids-verdict {
   border: 1px solid var(--scap-warn-bd);
   background: var(--scap-warn-bg);
@@ -794,9 +804,77 @@ def _browser_context_headers() -> dict[str, str]:
     return forwarded
 
 
+# Tab tokens the API has refused as unusable (revoked on another device, account
+# locked or deleted, session expired on the server). Only digests are kept; the
+# session clock sends such a tab back to sign-in at its next tick.
+_ENDED_TOKENS: dict[str, None] = {}
+_ENDED_TOKENS_LOCK = threading.Lock()
+_ENDED_TOKENS_MAX = 10_000
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _mark_session_ended(token: str) -> None:
+    with _ENDED_TOKENS_LOCK:
+        _ENDED_TOKENS[_token_digest(token)] = None
+        while len(_ENDED_TOKENS) > _ENDED_TOKENS_MAX:
+            del _ENDED_TOKENS[next(iter(_ENDED_TOKENS))]
+
+
+def _take_session_ended(token: str) -> bool:
+    digest = _token_digest(token)
+    with _ENDED_TOKENS_LOCK:
+        if digest not in _ENDED_TOKENS:
+            return False
+        del _ENDED_TOKENS[digest]
+        return True
+
+
+# Tên trường trong lỗi 422 của API -> nhãn trên giao diện.
+_VALIDATION_FIELDS = {
+    "username": "Tên đăng nhập", "password": "Mật khẩu", "current_password": "Mật khẩu hiện tại",
+    "new_password": "Mật khẩu mới", "title": "Tiêu đề", "content": "Nội dung", "email": "Email",
+    "identifier": "Tên đăng nhập hoặc email", "code": "Mã xác thực", "name": "Tên",
+    "role": "Vai trò", "query": "Từ khóa", "q": "Từ khóa", "security_mode": "Chế độ bảo mật",
+    "data_classification": "Phân loại dữ liệu",
+}
+
+
+def _validation_text(items) -> str:
+    """Vietnamese text for FastAPI 422 items ``{type, loc, msg}``.
+
+    Pydantic's own wording is English; our validators already speak Vietnamese
+    but arrive prefixed with "Value error, ". Input values are never echoed.
+    """
+    messages = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        loc = [part for part in item.get("loc") or []
+               if isinstance(part, str) and part not in {"body", "query", "path", "header"}]
+        label = _VALIDATION_FIELDS.get(loc[-1], loc[-1]) if loc else "Dữ liệu"
+        kind, msg = str(item.get("type") or ""), str(item.get("msg") or "")
+        number = re.search(r"\d+", msg)
+        if kind == "value_error":
+            text = msg.removeprefix("Value error, ")
+        elif kind == "string_too_short" and number:
+            text = f"{label} phải có ít nhất {number.group()} ký tự."
+        elif kind == "string_too_long" and number:
+            text = f"{label} chỉ được tối đa {number.group()} ký tự."
+        elif kind == "missing":
+            text = f"Thiếu {label[:1].lower() + label[1:]}."
+        else:
+            text = f"{label} không hợp lệ."
+        messages.append(text)
+    return " ".join(dict.fromkeys(messages)) or "Dữ liệu không hợp lệ."
+
+
 def _api(token, method, path, body=None, *, params=None):
     import httpx
 
+    tab_token = token
     headers = {"Content-Type": "application/json", **_browser_context_headers()}
     if token and _SESSION_STORE is not None:
         token = _SESSION_STORE.current_token(token)
@@ -823,15 +901,26 @@ def _api(token, method, path, body=None, *, params=None):
     if resp.status_code >= 400:
         detail = data.get("detail") if isinstance(data, dict) else None
         if isinstance(detail, list):
-            detail = " · ".join(item.get("msg", str(item)) for item in detail)
+            detail = _validation_text(detail)
         elif isinstance(detail, dict):
             detail = detail.get("message") or detail.get("code") or "Yêu cầu bị từ chối."
         message = detail or f"HTTP {resp.status_code}"
+        # Only the RFC 6750 invalid_token challenge ends the tab's session; a
+        # 401 for a wrong step-up password or 2FA code must not sign out.
+        if (
+            resp.status_code == 401
+            and tab_token
+            and 'error="invalid_token"' in resp.headers.get("WWW-Authenticate", "")
+        ):
+            _mark_session_ended(tab_token)
         if resp.status_code in (429, 503):
             retry = resp.headers.get("Retry-After")
             if retry:
                 message += f" Thử lại sau {retry} giây."
-        raise gr.Error(message)
+        error = gr.Error(message)
+        # Callers that expect a permission boundary (403) can render it quietly.
+        error.status_code = resp.status_code
+        raise error
     return data
 
 
@@ -862,6 +951,11 @@ def _fmt(iso: str | None) -> str:
         return iso
 
 
+def _error_text(err: gr.Error) -> str:
+    """Nội dung lỗi để hiển thị: ``str(gr.Error)`` là ``repr`` nên bị bọc dấu nháy."""
+    return err.message if isinstance(getattr(err, "message", None), str) else str(err)
+
+
 def _guard(fn, n_outputs):
     """Chạy handler; nếu API trả lỗi (gr.Error) thì hiển thị toast cảnh báo
     thay vì để Gradio gắn nhãn "Error" kẹt trên các component output."""
@@ -871,7 +965,7 @@ def _guard(fn, n_outputs):
         try:
             return fn(*args, **kwargs)
         except gr.Error as err:
-            gr.Warning(str(err))
+            gr.Warning(_error_text(err))
             if n_outputs <= 1:
                 return gr.skip()
             return tuple(gr.skip() for _ in range(n_outputs))
@@ -1356,6 +1450,11 @@ def build_ui(
     _SESSION_STORE = session_store
     if client_context_key is not None:
         _CLIENT_CONTEXT_KEY = client_context_key
+    if AVATARS is not None:
+        # Serve the public avatar file in place. Copied into the cache it was swept
+        # by delete_cache below a minute later, after which every chat reply showed
+        # a broken image (403 "File not allowed"). Only this one file is exposed.
+        gr.set_static_paths([str(_ASSISTANT_AVATAR)])
     # Gradio 6 applies theme and CSS when the UI is mounted/launched.  Supplying
     # them to Blocks itself is deprecated and emits a warning on every startup.
     with gr.Blocks(
@@ -1633,12 +1732,19 @@ def build_ui(
                                 with gr.Row():
                                     btn_export = gr.Button("Xuất JSON", size="sm")
                                     btn_delete = gr.Button("Xóa", variant="stop", size="sm")
-                            file_export = gr.DownloadButton(
-                                label="Tải tệp JSON", visible=False, size="sm"
+                            # A plain same-origin link: the browser redeems the one-time
+                            # ticket itself. gr.DownloadButton fetched the URL server-side
+                            # into Gradio's cache, spending the ticket and storing the
+                            # plaintext export (or failing Gradio's SSRF check outright).
+                            file_export = gr.Markdown(
+                                "", visible=False, sanitize_html=False, elem_id="export-link"
                             )
                         with gr.Column(scale=3, min_width=360, elem_id="chat-main"):
                             chatbot = gr.Chatbot(
                                 label="Nội dung",
+                                # The floating label badge covered the first
+                                # visible message whenever the history scrolled.
+                                show_label=False,
                                 height=CHAT_HISTORY_HEIGHT,
                                 elem_id="chat-history",
                                 placeholder=CHAT_WELCOME_HTML,
@@ -1766,7 +1872,6 @@ def build_ui(
                                         btn_activate = gr.Button(
                                             "Kích hoạt", variant="primary", size="sm"
                                         )
-                        md_recovery = gr.Markdown("", visible=False)
                         with gr.Group(visible=False) as grp_mfa_manage:
                             with gr.Row():
                                 tb_dis_pw = gr.Textbox(
@@ -2113,7 +2218,7 @@ def build_ui(
             (tb_rename, ""),
             (tb_export_password, ""),
             (tb_export_code, ""),
-            (file_export, gr.update(value=None, visible=False)),
+            (file_export, gr.update(value="", visible=False)),
             (tb_msg, ""),
             (md_chat_notice, gr.update(value="", visible=False)),
             (btn_consent_send, gr.update(visible=False)),
@@ -2127,7 +2232,6 @@ def build_ui(
             (qr_html, gr.update(value="", visible=False)),
             (tb_secret, ""),
             (tb_activate, ""),
-            (md_recovery, gr.update(value="", visible=False)),
             (tb_dis_pw, ""),
             (tb_dis_code, ""),
             (md_activity, ACTIVITY_PLACEHOLDER),
@@ -2345,10 +2449,22 @@ def build_ui(
                 show_progress="hidden",
             )
 
+        def _signed_out_on_load(request):
+            """Signed-out layout for a page load with nothing to restore.
+
+            Leave the login inputs alone: browsers and password managers fill them
+            while this load event runs, and clearing li_pass made the next click
+            answer "Vui lòng nhập đầy đủ…" although the form looked filled in.
+            """
+            result = list(_reset_tuple(request)[:len(STAGE1)])
+            for component in (li_pass, tb_mfa_code):
+                result[STAGE1.index(component)] = gr.skip()
+            return tuple(result)
+
         def restore_session(request: gr.Request = None):
             saved = session_store.restore(_cookie(request))
             if saved is None:
-                return _reset_tuple(request)[:len(STAGE1)]
+                return _signed_out_on_load(request)
             token, expires_at = saved
             try:
                 # Revalidate with the real auth service on every page load.
@@ -2356,7 +2472,7 @@ def build_ui(
                 # sessions, without rotating tokens or extending their expiry.
                 _api(token, "GET", "/api/auth/me")
             except gr.Error:
-                return _reset_tuple(request)[:len(STAGE1)]
+                return _signed_out_on_load(request)
             return (
                 token, expires_at, "", gr.update(visible=False), gr.update(visible=True),
                 gr.update(visible=False), "", "", gr.update(visible=True),
@@ -2566,7 +2682,7 @@ def build_ui(
 
         btn_logout.click(_guard(do_logout, len(RESET_OUTS)), [st_token], RESET_OUTS)
 
-        def tick(exp, warned):
+        def tick(exp, warned, token=None):
             """Đồng bộ đồng hồ, nhắc trước, và báo hết hạn để tự đăng xuất.
 
             Chạy theo gr.Timer (mỗi SESSION_TICK_SECONDS) và ngay khi st_exp đổi
@@ -2577,9 +2693,13 @@ def build_ui(
             được nằm lại trong state của trình duyệt sau khi phiên đã chết. tick
             ghi mốc hết hạn vào st_expired; expire_session() (sự kiện change của
             nó) dọn sạch state và quay về màn đăng nhập như khi bấm Đăng xuất.
+            Phiên bị máy chủ từ chối (thu hồi ở thiết bị khác, tài khoản bị khóa
+            hoặc xóa) được ghi mốc âm để expire_session báo đúng lý do.
             """
             if not exp:
                 return "", False, gr.skip(), gr.skip()
+            if token and _take_session_ended(token):
+                return "", False, gr.Timer(active=False), -time.time()
             left = int(exp - time.time())
             if left <= 0:
                 return "", False, gr.Timer(active=False), exp
@@ -2597,7 +2717,7 @@ def build_ui(
         gr.on(
             triggers=[timer.tick, st_exp.change],
             fn=tick,
-            inputs=[st_exp, st_warned],
+            inputs=[st_exp, st_warned, st_token],
             outputs=[md_countdown, st_warned, timer, st_expired],
             show_progress="hidden",
             trigger_mode="always_last",
@@ -2607,7 +2727,13 @@ def build_ui(
         def expire_session(expired_at):
             if not expired_at:
                 return tuple(gr.skip() for _ in RESET_OUTS)
-            gr.Warning("Phiên đã hết hạn — vui lòng đăng nhập lại.")
+            if expired_at < 0:
+                gr.Warning(
+                    "Phiên đăng nhập này không còn hiệu lực (đã bị thu hồi, tài khoản bị khóa "
+                    "hoặc bị xóa) — vui lòng đăng nhập lại."
+                )
+            else:
+                gr.Warning("Phiên đã hết hạn — vui lòng đăng nhập lại.")
             # A newer token in another tab may still be valid. Clear only
             # this tab; expired cookie records are pruned by the store.
             result = list(_reset_tuple())
@@ -2649,17 +2775,21 @@ def build_ui(
             _guard(refresh_sessions, 3), [st_token, dd_session], [dd_session, dd_cipher, chatbot]
         )
 
-        def pick_session(token, session_id):
-            """Bấm một hàng trong danh sách: nạp hội thoại và điền sẵn tên hiện tại."""
-            history = _chat_history(token, session_id)
-            title = ""
+        def _session_title(token, session_id):
             if session_id:
                 for label, value in _session_choices(token):
                     if value == session_id:
-                        title = label.lstrip("🔒🛡️🔐 ").strip()
-                        break
-            # Ẩn thông báo của lượt trước khi chuyển sang hội thoại khác.
-            return history, title, gr.update(value="", visible=False), gr.update(visible=False)
+                        return label.lstrip("🔒🛡️🔐 ").strip()
+            return ""
+
+        # Thông báo consent/DLP thuộc về lượt gửi trước; giữ lại khi đã sang
+        # hội thoại khác sẽ gắn nhầm cảnh báo vào hội thoại đang xem.
+        NOTICE_HIDDEN = (gr.update(value="", visible=False), gr.update(visible=False))
+
+        def pick_session(token, session_id):
+            """Bấm một hàng trong danh sách: nạp hội thoại và điền sẵn tên hiện tại."""
+            history = _chat_history(token, session_id)
+            return history, _session_title(token, session_id), *NOTICE_HIDDEN
 
         dd_session.input(
             _guard(pick_session, 4),
@@ -2680,12 +2810,14 @@ def build_ui(
             )
             gr.Info("Đã tạo hội thoại.")
             dd1, dd2, history = refresh_sessions(token, created["id"])
-            return dd1, dd2, history, ""
+            # Ô "Đổi tên" phải theo hội thoại vừa chọn, nếu không bấm "Lưu tên
+            # mới" sẽ chép tên hội thoại cũ sang hội thoại mới.
+            return dd1, dd2, history, "", _session_title(token, created["id"]), *NOTICE_HIDDEN
 
         btn_create.click(
-            _guard(create_session, 4),
+            _guard(create_session, 7),
             [st_token, tb_new_title, dd_new_security, dd_new_class],
-            [dd_session, dd_cipher, chatbot, tb_new_title],
+            [dd_session, dd_cipher, chatbot, tb_new_title, tb_rename, md_chat_notice, btn_consent_send],
         )
 
         def rename_session(token, session_id, title):
@@ -2706,13 +2838,15 @@ def build_ui(
         def delete_session(token, session_id):
             if not session_id:
                 gr.Warning("Chọn một hội thoại trước.")
-                return gr.skip(), gr.skip(), gr.skip()
+                return tuple(gr.skip() for _ in range(6))
             _api(token, "DELETE", f"/api/sessions/{session_id}")
             gr.Info("Đã xóa hội thoại và toàn bộ bản mã của nó.")
-            return refresh_sessions(token)
+            dd1, dd2, history = refresh_sessions(token)
+            return dd1, dd2, history, _session_title(token, dd1["value"]), *NOTICE_HIDDEN
 
         btn_delete.click(
-            _guard(delete_session, 3), [st_token, dd_session], [dd_session, dd_cipher, chatbot]
+            _guard(delete_session, 6), [st_token, dd_session],
+            [dd_session, dd_cipher, chatbot, tb_rename, md_chat_notice, btn_consent_send],
         )
 
         def export_session(token, session_id, password, code):
@@ -2739,11 +2873,14 @@ def build_ui(
                     "POST",
                     f"/api/sessions/{session_id}/export-ticket",
                 )
-            download_url = grant["download_url"]
-            if download_url.startswith("/"):
-                download_url = PUBLIC_BASE_URL + download_url
+            # Relative URL: works behind any proxy/host. The ticket is server-issued;
+            # escape it anyway because this Markdown does not sanitize HTML.
+            link = (
+                f'<a class="scap-export-link" href="{html.escape(grant["download_url"], quote=True)}"'
+                ' download rel="noopener">⬇ Tải tệp JSON (hết hạn sau 60 giây)</a>'
+            )
             gr.Info("Vé tải có hiệu lực 60 giây và chỉ dùng được một lần.")
-            return gr.update(value=download_url, visible=True), "", ""
+            return gr.update(value=link, visible=True), "", ""
 
         btn_export.click(
             _guard(export_session, 3),
@@ -2965,60 +3102,41 @@ def build_ui(
 
         btn_enroll.click(_guard(mfa_enroll, 3), [st_token], [grp_mfa_setup, qr_html, tb_secret])
 
-        def mfa_activate(token, code):
+        # The API revokes every session when 2FA is turned on or off, this one
+        # included (tests/test_mfa.py). Staying in the workspace with that dead
+        # token made every later action fail and F5 sign the user out, so both
+        # handlers sign out like a password change and ask for a fresh login.
+        def mfa_activate(token, code, request: gr.Request = None):
             data = _api(token, "POST", "/api/auth/mfa/activate", {"code": (code or "").strip()})
             codes = data.get("recovery_codes", [])
-            recovery = "#### Mã khôi phục — lưu ở nơi an toàn, mỗi mã dùng một lần\n" + " · ".join(
-                f"`{c}`" for c in codes
+            gr.Info(
+                "Lưu các mã khôi phục sau ở nơi an toàn, mỗi mã chỉ dùng một lần: "
+                + " · ".join(codes),
+                duration=None,
+                title="Mã khôi phục 2FA",
             )
-            gr.Info("2FA đã được kích hoạt.")
-            return (
-                gr.update(visible=False),
-                gr.update(visible=True),
-                gr.update(visible=False),
-                gr.update(value="", visible=False),
-                "",
-                gr.update(value=recovery, visible=True),
-                "**2FA đang bật.**",
-                "",
+            gr.Info(
+                "2FA đã được kích hoạt — mọi phiên bị thu hồi, mời đăng nhập lại "
+                "bằng mật khẩu và mã 6 số."
             )
+            return _reset_tuple(request)
 
         btn_activate.click(
-            _guard(mfa_activate, 8),
-            [st_token, tb_activate],
-            [
-                grp_mfa_enroll,
-                grp_mfa_manage,
-                grp_mfa_setup,
-                qr_html,
-                tb_secret,
-                md_recovery,
-                md_mfa_state,
-                tb_activate,
-            ],
+            _guard(mfa_activate, len(RESET_OUTS)), [st_token, tb_activate], RESET_OUTS,
         )
 
-        def mfa_disable(token, password, code):
+        def mfa_disable(token, password, code, request: gr.Request = None):
             _api(
                 token,
                 "POST",
                 "/api/auth/mfa/disable",
                 {"password": password, "code": (code or "").strip()},
             )
-            gr.Info("Đã tắt xác thực hai lớp.")
-            return (
-                gr.update(visible=True),
-                gr.update(visible=False),
-                gr.update(value="", visible=False),
-                "**2FA đang tắt** — nên bật để bảo vệ tài khoản.",
-                "",
-                "",
-            )
+            gr.Info("Đã tắt xác thực hai lớp — mọi phiên bị thu hồi, mời đăng nhập lại.")
+            return _reset_tuple(request)
 
         btn_disable.click(
-            _guard(mfa_disable, 6),
-            [st_token, tb_dis_pw, tb_dis_code],
-            [grp_mfa_enroll, grp_mfa_manage, md_recovery, md_mfa_state, tb_dis_pw, tb_dis_code],
+            _guard(mfa_disable, len(RESET_OUTS)), [st_token, tb_dis_pw, tb_dis_code], RESET_OUTS,
         )
 
         # ---- email khôi phục ----
@@ -3176,7 +3294,7 @@ def build_ui(
         btn_logout_all.click(_guard(logout_all, len(RESET_OUTS)), [st_token], RESET_OUTS)
 
         # ---- quản trị ----
-        def refresh_admin(token):
+        def refresh_admin(token, keep=None):
             stats = _api(token, "GET", "/api/admin/stats")
             metrics = (
                 f"**Người dùng**\n\n## {stats['total_users']}\n\nĐang hoạt động {stats['active_users']}",
@@ -3267,7 +3385,10 @@ def build_ui(
                 for u in users
             ])
             choices = [(f"{u['username']} ({u['role']})", u["id"]) for u in users]
-            return (*metrics, stats_md, alerts_md, table, gr.update(choices=choices, value=None))
+            # Keep the account the admin is working on (e.g. lock, then unlock);
+            # clearing it made the next button answer "Chọn một người dùng trước.".
+            selected = keep if keep in {u["id"] for u in users} else None
+            return (*metrics, stats_md, alerts_md, table, gr.update(choices=choices, value=selected))
 
         ADMIN_OUTS = [
             md_metric_users,
@@ -3288,9 +3409,9 @@ def build_ui(
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
             _api(token, "PATCH", f"/api/admin/users/{user_id}/role", {"role": role})
             gr.Info(f"Đã đổi vai trò thành {role}.")
-            return refresh_admin(token)
+            return refresh_admin(token, keep=user_id)
 
-        btn_set_role.click(_guard(set_role, 4), [st_token, dd_user_pick, dd_role_new], ADMIN_OUTS)
+        btn_set_role.click(_guard(set_role, len(ADMIN_OUTS)), [st_token, dd_user_pick, dd_role_new], ADMIN_OUTS)
 
         def set_status(token, user_id, active):
             if not user_id:
@@ -3298,15 +3419,15 @@ def build_ui(
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
             _api(token, "PATCH", f"/api/admin/users/{user_id}/status", {"is_active": active})
             gr.Info("Đã mở khóa tài khoản." if active else "Đã khóa tài khoản.")
-            return refresh_admin(token)
+            return refresh_admin(token, keep=user_id)
 
         btn_lock.click(
-            _guard(lambda tk, uid: set_status(tk, uid, False), 4),
+            _guard(lambda tk, uid: set_status(tk, uid, False), len(ADMIN_OUTS)),
             [st_token, dd_user_pick],
             ADMIN_OUTS,
         )
         btn_unlock.click(
-            _guard(lambda tk, uid: set_status(tk, uid, True), 4),
+            _guard(lambda tk, uid: set_status(tk, uid, True), len(ADMIN_OUTS)),
             [st_token, dd_user_pick],
             ADMIN_OUTS,
         )
@@ -3319,20 +3440,27 @@ def build_ui(
             gr.Info("Đã xóa tài khoản cùng toàn bộ dữ liệu của người đó.")
             return refresh_admin(token)
 
-        btn_del_user.click(_guard(delete_user, 4), [st_token, dd_user_pick], ADMIN_OUTS)
+        btn_del_user.click(_guard(delete_user, len(ADMIN_OUTS)), [st_token, dd_user_pick], ADMIN_OUTS)
 
         def create_user(token, username, password, role):
+            username = (username or "").strip()
+            if not 3 <= len(username) <= 32:
+                gr.Warning("Tên đăng nhập phải từ 3 đến 32 ký tự.")
+                return tuple(gr.skip() for _ in range(len(ADMIN_OUTS) + 2))
+            if len(password or "") < PASSWORD_MIN:
+                gr.Warning(f"Mật khẩu phải có ít nhất {PASSWORD_MIN} ký tự.")
+                return tuple(gr.skip() for _ in range(len(ADMIN_OUTS) + 2))
             _api(
                 token,
                 "POST",
                 "/api/admin/users",
-                {"username": (username or "").strip(), "password": password, "role": role},
+                {"username": username, "password": password, "role": role},
             )
             gr.Info("Đã tạo tài khoản mới.")
             return refresh_admin(token) + ("", "")
 
         btn_cu.click(
-            _guard(create_user, 6),
+            _guard(create_user, len(ADMIN_OUTS) + 2),
             [st_token, tb_cu_name, tb_cu_pw, dd_cu_role],
             ADMIN_OUTS + [tb_cu_name, tb_cu_pw],
         )
@@ -3494,7 +3622,9 @@ def build_ui(
             try:
                 data = _api(token, "GET", "/api/admin/audit/verify")
             except gr.Error as err:
-                return f"**Không thể xác minh chuỗi:** {err}"
+                if getattr(err, "status_code", None) == 403:
+                    return "**Không thể xác minh chuỗi:** chức năng này cần vai trò admin."
+                return f"**Không thể xác minh chuỗi:** {_error_text(err)}"
             total = data.get("total_events", 0)
             verified = data.get("verified_events", 0)
             unsealed = data.get("unsealed_events", 0)
@@ -3571,7 +3701,9 @@ def build_ui(
             try:
                 data = _api(token, "POST", "/api/admin/ids/verify-detection")
             except gr.Error as err:
-                return f"**Không thể chạy kiểm chứng:** {err}"
+                if getattr(err, "status_code", None) == 403:
+                    return "**Không thể chạy kiểm chứng:** chức năng này cần vai trò admin."
+                return f"**Không thể chạy kiểm chứng:** {_error_text(err)}"
             total = data.get("total_scenarios", 0)
             detected = data.get("detected_scenarios", 0)
             missed = data.get("missed_scenarios", 0)
@@ -3613,11 +3745,15 @@ def build_ui(
             """Nạp cả bốn khối. Mỗi khối bọc riêng để thiếu quyền ở một khối
             không làm trắng toàn bộ màn hình (moderator không có quyền admin)."""
 
-            def safe(fn, fallback):
+            def safe(fn, fallback, *, admin_only=False):
                 try:
                     return fn()
                 except gr.Error as err:
-                    gr.Warning(str(err))
+                    # Moderators lack the admin-only blocklist by design and the
+                    # section says so; refreshing must not look like a fault.
+                    if admin_only and getattr(err, "status_code", None) == 403:
+                        return None
+                    gr.Warning(_error_text(err))
                     return fallback
 
             verdict = safe(
@@ -3625,17 +3761,21 @@ def build_ui(
             )
             det = safe(lambda: detection_rows(token), [])
             anom = safe(lambda: anomaly_rows(token, window), [])
-            block = safe(lambda: blocklist_rows(token), [])
+            block = safe(lambda: blocklist_rows(token), [], admin_only=True)
+            blocked = (
+                f"**Nguồn bị chặn**\n\n## {len(block)}\n\nĐang hiệu lực" if block is not None
+                else "**Nguồn bị chặn**\n\n## —\n\nCần vai trò admin"
+            )
             metrics = (
                 f"**Dấu hiệu IDS**\n\n## {len(det)}\n\nTrong bộ nhớ hiện tại",
                 f"**Bất thường**\n\n## {len(anom)}\n\nCửa sổ {int(window)} phút",
-                f"**Nguồn bị chặn**\n\n## {len(block)}\n\nĐang hiệu lực",
+                blocked,
             )
             return (
                 *metrics, verdict,
                 _table_html(DETECTION_HEADERS, det),
                 _table_html(ANOMALY_HEADERS, anom),
-                _table_html(BLOCKLIST_HEADERS, block),
+                _table_html(BLOCKLIST_HEADERS, block or []),
             )
 
         SEC_OUTS = [
@@ -3656,6 +3796,12 @@ def build_ui(
             _guard(unblock_ip, 2), [st_token, tb_sec_ip], [df_sec_block, tb_sec_ip]
         )
 
+    # The page triggers events by fn_index. Nothing needs Gradio's public API
+    # catalogue (/gradio_api/info, "Use via API"), which listed every handler —
+    # login, reset, admin actions — as a ready-made map for bots.
+    for fn in demo.fns.values():
+        fn.api_visibility = "private"
+    demo.config = demo.get_config_file()
     demo.queue(
         max_size=queue_max_size,
         default_concurrency_limit=concurrency_limit,

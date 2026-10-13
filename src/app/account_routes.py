@@ -106,8 +106,10 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
 
     def require_mail() -> None:
         if not ctx.mailer.enabled:
+            # 501, không phải 503: email bị tắt theo cấu hình, thử lại không giúp gì.
+            # 503 khiến middleware thêm Retry-After và giao diện hiện "Thử lại sau 1 giây".
             raise HTTPException(
-                status_code=503, detail="Hệ thống chưa được cấu hình để gửi email."
+                status_code=501, detail="Hệ thống chưa được cấu hình để gửi email."
             )
 
     def notify_user(db: Session, request: Request, user: User, kind: str, **kwargs) -> None:

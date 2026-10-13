@@ -49,7 +49,9 @@ def test_total_request_ceiling_applies_before_connecting_including_slow_bodies(s
 def test_remaining_deadline_limits_io_and_rejects_recovery_waits():
     server = LocalServer.__new__(LocalServer)
     server.deadline = time.monotonic() + .1
-    assert 0 < server.timeout(7) <= .1
+    # Windows' monotonic clock may not tick between the two reads; the float
+    # subtraction then yields 0.1 plus rounding error.
+    assert 0 < server.timeout(7) <= .1 + 1e-9
     with pytest.raises(RuntimeError, match="Recovery exceeds"):
         server.pause(2.1)
     server.deadline = time.monotonic() - 1

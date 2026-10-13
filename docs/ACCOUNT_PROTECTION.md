@@ -134,7 +134,8 @@ dùng `eval`, không bao giờ thấy bearer token, và chỉ trả kết quả 
   email, thêm/xóa passkey, token bị dùng lại. Thư không chứa mật khẩu hay token.
 - `MAIL_BACKEND=smtp` dùng TLS bắt buộc (STARTTLS hoặc SSL) và xác minh chứng chỉ;
   `outbox` ghi file `.eml` cho demo (production từ chối); `disabled` khiến các chức năng
-  email trả 503.
+  email trả 501 (không hỗ trợ trên máy chủ này, không kèm `Retry-After`), nên giao diện
+  không gợi ý "thử lại sau".
 
 ## 8. Phát hiện dùng lại token đã xoay (RFC 9700 §4.14.2)
 

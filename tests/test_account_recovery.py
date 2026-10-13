@@ -169,17 +169,21 @@ def test_old_address_is_told_when_the_recovery_email_changes(client: TestClient,
     assert any("Email khôi phục" in item["Subject"] for item in mail.to("new@example.com"))
 
 
-def test_email_features_answer_503_when_mail_is_disabled(client: TestClient):
-    token = register_and_login(client, "mail-off")
-    assert client.post(
-        "/api/auth/email", headers=auth(token), json={"email": "x@example.com"}
-    ).status_code == 503
-    assert client.post(
-        "/api/auth/password-reset/request", json={"identifier": "mail-off"}
-    ).status_code == 503
-
-
 # ───────────────────────── password reset ─────────────────────────
+
+
+def test_disabled_mail_is_reported_as_unsupported_without_a_retry_hint(client: TestClient):
+    """MAIL_BACKEND=disabled is configuration, not overload: a 503 made the UI say
+    "Thử lại sau 1 giây" for a feature that never comes back on its own."""
+    token = register_and_login(client, "no-mail-user")
+    responses = [
+        client.post("/api/auth/password-reset/request", json={"identifier": "no-mail-user"}),
+        client.post("/api/auth/email", headers=auth(token), json={"email": "someone@example.com"}),
+    ]
+    for response in responses:
+        assert response.status_code == 501
+        assert "Retry-After" not in response.headers
+        assert response.json()["detail"] == "Hệ thống chưa được cấu hình để gửi email."
 
 
 def test_reset_request_does_not_reveal_whether_an_account_exists(client: TestClient, mail):

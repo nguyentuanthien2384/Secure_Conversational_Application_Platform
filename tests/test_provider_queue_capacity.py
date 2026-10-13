@@ -226,9 +226,8 @@ def test_gradio_shows_retry_after_when_api_provider_is_busy(monkeypatch) -> None
         2,
     )
     assert callback() == (gr.skip(), gr.skip())
-    assert len(warnings) == 1
-    assert AI_BUSY_MESSAGE in warnings[0]
-    assert "Thử lại sau 1 giây." in warnings[0]
+    # Exact text: str(gr.Error) is a repr and used to wrap every toast in quotes.
+    assert warnings == [f"{AI_BUSY_MESSAGE} Thử lại sau 1 giây."]
 
 
 def test_gradio_waiting_queue_rejects_overflow_then_accepts_after_removal() -> None:

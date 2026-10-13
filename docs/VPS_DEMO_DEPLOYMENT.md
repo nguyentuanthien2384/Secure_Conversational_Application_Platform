@@ -233,6 +233,8 @@ trong `backups/`. **Không xóa hoặc tạo lại `deploy/.env.vps`.**
 | `MAIL_FROM: use a sender with a dotted domain` | File `.env.vps` tạo từ mẫu cũ: sửa thành `MAIL_FROM='SCAP <no-reply@scap.local>'` |
 | `Chua truy cap duoc https://…` sau deploy | Xem `deploy.ps1 logs`; chế độ `shared-proxy` xem thêm log Caddy JobFind: `docker compose logs --tail 50 web` trong `/root/DALN_JobFind/deploy` |
 | Trang chỉ hiện `Loading...` mãi, console trình duyệt báo 503 cho `/assets/*.js` | Bản trước 12/10: qua HTTP/2 Gradio tải ~110 file cùng lúc và vượt giới hạn đồng thời theo IP. Đã sửa (Caddyfile `@frontend_assets`, file tĩnh không chiếm slot theo IP): push code rồi `bash deploy/update.sh` |
+| "Thử đăng nhập quá nhiều lần" / "Thử tạo tài khoản quá nhiều lần. Thử lại sau … giây" khi cả lớp dùng chung Wi-Fi | Giới hạn chống dò mật khẩu tính theo IP: 5 lần đăng nhập sai/5 phút, 5 lần đăng ký/giờ. Đợi hết thời gian, hoặc nới cho buổi demo trong `deploy/.env.vps` (ví dụ `REGISTRATION_MAX_ATTEMPTS=30`, `LOGIN_MAX_ATTEMPTS=10`) rồi `bash deploy/remote-deploy.sh` |
+| "Hệ thống chưa được cấu hình để gửi email" ở Quên mật khẩu / Email khôi phục | Đúng thiết kế khi `MAIL_BACKEND=disabled`: tự khôi phục mật khẩu và email khôi phục cần SMTP (`MAIL_BACKEND`, `SMTP_*` trong `.env.vps`) |
 | `curl` trên Windows 10 báo `SEC_E_UNSUPPORTED_FUNCTION` | Windows 10 không có TLS 1.3 mà SCAP yêu cầu; mở bằng Chrome/Edge/Firefox |
 | PowerShell chặn script | `powershell -ExecutionPolicy Bypass -File deploy\deploy.ps1 <lệnh> …` |
 

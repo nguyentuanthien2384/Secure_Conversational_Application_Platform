@@ -103,6 +103,17 @@ def _assert_logged_out(result):
     assert result[4] == gr.update(visible=False)
 
 
+def test_page_load_without_a_session_keeps_what_the_browser_filled_in(ui):
+    """The load event used to clear li_pass ~1 s after the page appeared, wiping
+    passwords that Chrome or a password manager had just autofilled."""
+    result = _invoke(ui.demo, "restore_session")
+    _assert_logged_out(result)
+    outputs = _callback(ui.demo, "restore_session").outputs
+    labels = [getattr(component, "elem_id", None) for component in outputs]
+    for elem_id in ("li-pass", "tb-mfa"):
+        assert result[labels.index(elem_id)] == gr.skip(), elem_id
+
+
 def test_reload_restores_real_account_and_history_without_extending_expiry(ui):
     state = _login(ui)
     response = ui.client.post("/api/sessions", headers=_headers(state[0]),

@@ -181,6 +181,10 @@ from src.app.ui_session import BrowserSessionStore, register_ui_session_routes
 logger = logging.getLogger("secure_chat")
 
 bearer = HTTPBearer(auto_error=False)
+# RFC 6750 §3.1: a revoked, expired or otherwise unusable access token is
+# "invalid_token". Clients end the session on it, unlike other 401s such as a
+# wrong step-up password or 2FA code on a still-valid session.
+INVALID_TOKEN_CHALLENGE = {"WWW-Authenticate": 'Bearer error="invalid_token"'}
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 CSP_DIRECTIVE_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 DISABLED_GRADIO_UPLOAD_PATHS = frozenset(
@@ -541,6 +545,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="Đồ án Bảo mật ứng dụng và hệ thống: chatbot đa người dùng, AES-GCM, RBAC và audit log.",
         docs_url="/docs" if settings.docs_enabled else None,
         redoc_url="/redoc" if settings.docs_enabled else None,
+        # The schema lists every route, admin ones included; production hides
+        # it together with the docs pages (README "production tắt theo cấu hình").
+        openapi_url="/openapi.json" if settings.docs_enabled else None,
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -1270,7 +1277,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except jwt.PyJWTError as exc:
             audit_access_denial(db, request, "invalid_token")
             raise HTTPException(
-                status_code=401, detail="Token không hợp lệ hoặc đã hết hạn."
+                status_code=401, detail="Token không hợp lệ hoặc đã hết hạn.",
+                headers=INVALID_TOKEN_CHALLENGE,
             ) from exc
         user = db.get(User, payload.get("sub"))
         auth_session = db.get(AuthSession, payload.get("jti"))
@@ -1293,7 +1301,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ):
                 detect_rotated_token_reuse(db, request, user, auth_session, revoked)
             audit_access_denial(db, request, "inactive_session")
-            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+            raise HTTPException(
+                status_code=401, detail="Tài khoản không hợp lệ.", headers=INVALID_TOKEN_CHALLENGE
+            )
 
         # Polling and token rotation cannot keep an abandoned login alive.
         # Logout also leaves activity untouched; its endpoint must still revoke
@@ -1309,10 +1319,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # refresh/revocation. Never overwrite a concurrent revocation or
             # revive a session which expired while waiting for the lock.
             if lock_user_row(db, user) is None or payload.get("ver") != user.token_version:
-                raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+                raise HTTPException(
+                    status_code=401, detail="Tài khoản không hợp lệ.",
+                    headers=INVALID_TOKEN_CHALLENGE,
+                )
             auth_session = lock_auth_session_row(db, str(payload["jti"]), user.id)
             if auth_session is None or db.get(RevokedToken, str(payload["jti"])) is not None:
-                raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
+                raise HTTPException(
+                    status_code=401, detail="Phiên đăng nhập không hợp lệ.",
+                    headers=INVALID_TOKEN_CHALLENGE,
+                )
             now = utcnow()
             reason = auth_session_expiry_reason(auth_session, now)
             if reason is not None:
@@ -1320,6 +1336,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(
                     status_code=401,
                     detail="Phiên đăng nhập đã hết hạn; vui lòng đăng nhập lại.",
+                    headers=INVALID_TOKEN_CHALLENGE,
                 )
             if not metadata_path:
                 # max also preserves monotonicity if a worker's clock moves back.
@@ -1861,7 +1878,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(
                 status_code=429,
-                detail="Too many account creation attempts. Please try again later.",
+                detail="Thử tạo tài khoản quá nhiều lần.",
                 headers={"Retry-After": str(retry_after)},
             )
         if not settings.allow_self_registration:
@@ -2764,11 +2781,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details={"reason": "invalid_current_password"},
             )
             raise HTTPException(
-                status_code=401, detail="Unable to change password with the supplied credentials."
+                status_code=401, detail="Mật khẩu hiện tại không đúng."
             )
         if payload.current_password == payload.new_password:
             raise HTTPException(
-                status_code=422, detail="New password must differ from the current password."
+                status_code=422, detail="Mật khẩu mới phải khác mật khẩu hiện tại."
             )
         if password_is_compromised(
             payload.new_password,
@@ -2885,7 +2902,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
         auth_session = db.get(AuthSession, session_jti)
         if auth_session is None or auth_session.user_id != user.id:
-            raise HTTPException(status_code=404, detail="Login session was not found.")
+            raise HTTPException(status_code=404, detail="Không tìm thấy phiên đăng nhập.")
         family_id = auth_session.session_family_id or auth_session.jti
         revoked = revoke_auth_session_family(
             db,
@@ -2894,7 +2911,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             reason="session_revoke",
         )
         if revoked == 0:
-            raise HTTPException(status_code=404, detail="Login session was not found.")
+            raise HTTPException(status_code=404, detail="Không tìm thấy phiên đăng nhập.")
         db.commit()
         record_audit(
             db,
@@ -4607,9 +4624,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         require_recent_step_up(credentials, admin, db)
         target = db.get(User, user_id)
         if target is None:
-            raise HTTPException(status_code=404, detail="User not found.")
+            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
         if lock_user_row(db, target, require_active=False) is None:
-            raise HTTPException(status_code=404, detail="User not found.")
+            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
         if target.id == admin.id:
             raise HTTPException(status_code=400, detail="Admin không thể tự xóa chính mình.")
         if target.role == "admin":
@@ -4665,7 +4682,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         require_recent_step_up(credentials, admin, db)
         target = db.get(User, user_id)
         if target is None:
-            raise HTTPException(status_code=404, detail="User not found.")
+            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
         if target.id == admin.id:
             raise HTTPException(
                 status_code=400, detail="Admin không thể tự đổi role của chính mình."
@@ -4698,12 +4715,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         require_recent_step_up(credentials, admin, db)
         target = db.get(User, user_id)
         if target is None:
-            raise HTTPException(status_code=404, detail="User account was not found.")
+            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
         if lock_user_row(db, target, require_active=False) is None:
-            raise HTTPException(status_code=404, detail="User account was not found.")
+            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
         if target.id == admin.id and not payload.is_active:
             raise HTTPException(
-                status_code=400, detail="The active administrator cannot lock itself."
+                status_code=400, detail="Admin không thể tự khóa chính mình."
             )
         revoked_memberships = 0
         advanced_sessions = 0
@@ -5129,6 +5146,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         show_error=False,
         max_file_size=settings.gradio_max_file_size,
         enable_monitoring=False,
+        # Gradio's inner FastAPI app would otherwise answer /openapi.json (and
+        # /docs) itself once the SCAP schema is switched off above.
+        app_kwargs={"openapi_url": None, "docs_url": None, "redoc_url": None},
     )
 
     # Mounted FastAPI apps keep their own exception handlers. Apply the same

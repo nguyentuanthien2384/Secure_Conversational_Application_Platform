@@ -140,7 +140,53 @@ def test_login_completion_is_acknowledged_even_without_a_session_ticket(runtime_
     assert "private-token" not in full_result
 
 
-@pytest.mark.parametrize("reason", ["logout", "logout_all", "password_change", "expiry"])
+def test_admin_actions_keep_the_selected_account_selected(runtime_demo, monkeypatch):
+    """Lock then unlock used to answer "Chọn một người dùng trước." because every
+    action reloaded the user list with the selection cleared."""
+    from src.app import gradio_ui
+
+    users = [{"id": f"user-{i}", "username": f"lab.{i}", "role": "user", "is_active": True,
+              "mfa_enabled": False, "created_at": "2026-10-12T07:00:00+00:00"} for i in range(3)]
+    stats = {"total_users": 3, "active_users": 3, "total_sessions": 0, "total_messages": 0,
+             "recent_login_failures": 0, "recent_auth_denials": 0, "availability": None}
+
+    def fake_api(token, method, path, *args, **kwargs):
+        return {"/api/admin/stats": stats, "/api/admin/users": users}.get(path, [])
+
+    monkeypatch.setattr(gradio_ui, "_api", fake_api)
+    monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
+    for label in ("Khóa", "Mở khóa"):
+        callback, dependency = _button_event(runtime_demo, label)
+        result = callback.fn("token", "user-1")
+        assert result[-1]["value"] == "user-1", label
+    callback, _ = _button_event(runtime_demo, "Đổi vai trò")
+    assert callback.fn("token", "user-2", "moderator")[-1]["value"] == "user-2"
+    callback, _ = _button_event(runtime_demo, "Xóa tài khoản")
+    users.pop(1)
+    assert callback.fn("token", "user-1")[-1]["value"] is None
+
+
+def test_mfa_activation_keeps_recovery_codes_on_screen_and_requires_a_fresh_login(runtime_demo, monkeypatch):
+    """Activation revokes the token in use; the UI must not keep working with it."""
+    from src.app import gradio_ui
+
+    codes = [f"code{i:02d}-recovery" for i in range(10)]
+    calls, notices = [], []
+    monkeypatch.setattr(gradio_ui, "_api",
+                        lambda *args: calls.append(args) or {"recovery_codes": codes})
+    monkeypatch.setattr(gr, "Info", lambda message, **kwargs: notices.append((message, kwargs)))
+    callback, dependency = _button_event(runtime_demo, "Kích hoạt")
+    result = callback.fn("previous-token", "123456")
+    assert calls[0][2] == "/api/auth/mfa/activate"
+    updates = dict(zip(dependency["outputs"], result, strict=True))
+    token_state = next(component for component in runtime_demo.blocks.values()
+                       if component._id == dependency["outputs"][0])
+    assert updates[token_state._id] == ""
+    sticky = [message for message, kwargs in notices if kwargs.get("duration", 10) is None]
+    assert len(sticky) == 1 and all(code in sticky[0] for code in codes)
+
+
+@pytest.mark.parametrize("reason", ["logout", "logout_all", "password_change", "expiry", "revoked"])
 def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypatch, reason):
     """Run the registered callbacks, including wrappers and actual output wiring."""
     from src.app import gradio_ui
@@ -151,14 +197,20 @@ def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypa
     monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
     monkeypatch.setattr(gr, "Warning", lambda *args, **kwargs: None)
     logout, logout_dependency = _button_event(runtime_demo, "Đăng xuất")
-    if reason == "expiry":
+    if reason in ("expiry", "revoked"):
         timer = next(component for component in runtime_demo.blocks.values()
                      if isinstance(component, gr.Timer))
         tick, tick_dependency = _event_for(runtime_demo, timer, "tick")
         # The periodic tick only records the expiry; the state's change event
         # performs the full reset, so routine ticks stay small.
-        _, _, timer_update, expired_at = tick.fn(999, True)
-        assert expired_at == 999 and timer_update.active is False
+        if reason == "expiry":
+            _, _, timer_update, expired_at = tick.fn(999, True)
+            assert expired_at == 999 and timer_update.active is False
+        else:
+            # The API refused this tab's token (revoked elsewhere, locked, deleted).
+            gradio_ui._mark_session_ended("previous-token")
+            _, _, timer_update, expired_at = tick.fn(1600, True, "previous-token")
+            assert expired_at == -1000 and timer_update.active is False
         expired_state = runtime_demo.blocks[tick_dependency["outputs"][-1]]
         callback, dependency = _event_for(runtime_demo, expired_state, "change")
         result = callback.fn(expired_at)
@@ -204,9 +256,10 @@ def test_session_end_handlers_clear_previous_account_data(runtime_demo, monkeypa
     qr = next(component for component in runtime_demo.blocks.values()
               if isinstance(component, gr.Markdown) and component.label == "Quét bằng ứng dụng xác thực")
     assert updates[qr._id] == gr.update(value="", visible=False)
-    mfa_activation, _ = _button_event(runtime_demo, "Kích hoạt")
-    recovery = mfa_activation.outputs[5]
-    assert updates[recovery._id] == gr.update(value="", visible=False)
+    # 2FA activation and deactivation revoke the session, so they reuse this reset.
+    for label in ("Kích hoạt", "Tắt 2FA"):
+        _, mfa_dependency = _button_event(runtime_demo, label)
+        assert mfa_dependency["outputs"] == logout_dependency["outputs"]
     # Previously fetched dashboard/log/security values are outputs of refresh
     # events: they must all belong to the reset, even while their tabs are hidden.
     for label in ("Làm mới dashboard", "Tải nhật ký", "Làm mới toàn bộ",
@@ -251,6 +304,218 @@ def test_session_clock_tick_only_touches_the_clock(runtime_demo, monkeypatch):
     assert timer_update.value == 5 and expired == gr.skip()
 
     assert callback.fn(0, False)[:2] == ("", False)
+
+
+def test_only_an_invalid_token_challenge_sends_the_tab_back_to_sign_in(runtime_demo, monkeypatch):
+    """A 401 for a wrong step-up password keeps the session; a revoked token ends it."""
+    import httpx
+
+    from src.app import gradio_ui
+
+    challenge = {"WWW-Authenticate": 'Bearer error="invalid_token"'}
+    responses = {
+        "/api/auth/step-up": httpx.Response(401, json={"detail": "Không xác thực được yêu cầu."}),
+        "/api/auth/sessions": httpx.Response(401, json={"detail": "Tài khoản không hợp lệ."}, headers=challenge),
+        "/api/auth/password-reset/request": httpx.Response(401, json={"detail": "x"}, headers=challenge),
+    }
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda request: responses[request.url.path]), **kwargs))
+    monkeypatch.setattr(gradio_ui, "_SESSION_STORE", None)
+    monkeypatch.setattr(gradio_ui.time, "time", lambda: 1000)
+    warnings = []
+    monkeypatch.setattr(gr, "Warning", lambda message, *args, **kwargs: warnings.append(message))
+    timer = next(component for component in runtime_demo.blocks.values()
+                 if isinstance(component, gr.Timer))
+    tick, dependency = _event_for(runtime_demo, timer, "tick")
+    _, logout_dependency = _button_event(runtime_demo, "Đăng xuất")
+    assert dependency["inputs"][2] == logout_dependency["inputs"][0], "tick must read the tab token"
+
+    with pytest.raises(gr.Error):
+        gradio_ui._api("tab-token", "POST", "/api/auth/step-up", {"password": "wrong"})
+    with pytest.raises(gr.Error):  # no tab token: nothing to end
+        gradio_ui._api(None, "POST", "/api/auth/password-reset/request", {"identifier": "abc"})
+    assert tick.fn(1600, False, "tab-token")[-1] == gr.skip()
+
+    with pytest.raises(gr.Error):
+        gradio_ui._api("tab-token", "GET", "/api/auth/sessions")
+    assert tick.fn(1600, False, "another-tab")[-1] == gr.skip()
+    assert tick.fn(0, False, "tab-token")[-1] == gr.skip(), "a signed-out tab has nothing to end"
+    _, _, timer_update, expired_at = tick.fn(1600, False, "tab-token")
+    assert expired_at == -1000 and timer_update.active is False
+    assert tick.fn(1600, False, "tab-token")[-1] == gr.skip(), "the marker is consumed once"
+
+    expired_state = runtime_demo.blocks[dependency["outputs"][-1]]
+    callback, _ = _event_for(runtime_demo, expired_state, "change")
+    callback.fn(expired_at)
+    assert "không còn hiệu lực" in warnings[-1]
+    callback.fn(999)
+    assert "hết hạn" in warnings[-1]
+
+
+def test_ended_token_markers_are_bounded_digests(monkeypatch):
+    from src.app import gradio_ui
+
+    monkeypatch.setattr(gradio_ui, "_ENDED_TOKENS", {})
+    monkeypatch.setattr(gradio_ui, "_ENDED_TOKENS_MAX", 3)
+    for index in range(5):
+        gradio_ui._mark_session_ended(f"token-{index}")
+    assert len(gradio_ui._ENDED_TOKENS) == 3
+    assert not any("token-" in key for key in gradio_ui._ENDED_TOKENS)
+    assert not gradio_ui._take_session_ended("token-0")
+    assert gradio_ui._take_session_ended("token-4")
+
+
+@pytest.mark.parametrize("action", ["create", "delete"])
+def test_switching_conversation_programmatically_clears_notices_and_rename(runtime_demo, monkeypatch, action):
+    """A DLP/consent notice belongs to the previous send; the rename box to the previous title."""
+    from src.app import gradio_ui
+
+    sessions = [{"id": "new", "title": "Hồ sơ mật", "security_mode": "confidential"},
+                {"id": "old", "title": "Ôn tập", "security_mode": "secure"}]
+
+    def api(token, method, path, body=None, **kwargs):
+        if (method, path) == ("POST", "/api/sessions"):
+            return {"id": "new", "title": body["title"]}
+        if (method, path) == ("GET", "/api/sessions"):
+            return sessions if action == "create" else sessions[1:]
+        if path.endswith("/messages"):
+            return []
+        if method == "GET":
+            return next(item for item in sessions if path.endswith(item["id"]))
+        return {}
+
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
+    if action == "create":
+        callback, dependency = _button_event(runtime_demo, "+ Hội thoại mới")
+        result = callback.fn("token", "Hồ sơ mật", "confidential", "internal")
+        expected_title = "Hồ sơ mật"
+    else:
+        callback, dependency = _button_event(runtime_demo, "Xóa")
+        result = callback.fn("token", "new")
+        expected_title = "Ôn tập"
+    outputs = {runtime_demo.blocks[item].elem_id or getattr(runtime_demo.blocks[item], "label", None)
+               or runtime_demo.blocks[item].value: value
+               for item, value in zip(dependency["outputs"], result, strict=True)}
+    assert outputs["chat-notice"] == gr.update(value="", visible=False)
+    assert outputs["Đồng ý và gửi"] == gr.update(visible=False)
+    assert outputs["Đổi tên"] == expected_title
+
+
+def test_every_guarded_handler_skips_exactly_its_outputs(runtime_demo):
+    """A failed API call returns one gr.skip() per output.
+
+    Admin actions once skipped 4 of 8 outputs: refusing to lock oneself raised
+    "didn't return enough output values" and left the user picker stuck.
+    """
+    checked = []
+    for dependency in runtime_demo.config["dependencies"]:
+        wrapper = runtime_demo.fns[dependency["id"]].fn
+        code = getattr(wrapper, "__code__", None)
+        if code is None or code.co_name != "wrapper" or "n_outputs" not in code.co_freevars:
+            continue
+        cells = dict(zip(code.co_freevars, (cell.cell_contents for cell in wrapper.__closure__)))
+        outputs = len(dependency["outputs"])
+        name = getattr(cells["fn"], "__name__", "?")
+        assert cells["n_outputs"] == outputs or cells["n_outputs"] <= 1 >= outputs, (name, outputs)
+        checked.append(name)
+    assert {"set_role", "delete_user", "create_user", "update_incident"} <= set(checked)
+
+
+def test_refused_admin_action_keeps_the_admin_panel_usable(runtime_demo, monkeypatch):
+    from src.app import gradio_ui
+
+    def refuse(*args, **kwargs):
+        raise gr.Error("Admin không thể tự khóa chính mình.")
+
+    monkeypatch.setattr(gradio_ui, "_api", refuse)
+    monkeypatch.setattr(gr, "Warning", lambda *args, **kwargs: None)
+    for label, args in (("Khóa", ("token", "self")), ("Mở khóa", ("token", "self")),
+                        ("Đổi vai trò", ("token", "self", "user")), ("Xóa tài khoản", ("token", "self")),
+                        ("Tạo", ("token", "taken", "Long-enough-password-1", "user"))):
+        callback, dependency = _button_event(runtime_demo, label)
+        result = callback.fn(*args)
+        assert len(result) == len(dependency["outputs"]), label
+        assert all(value == gr.skip() for value in result), label
+
+
+def test_validation_errors_reach_the_user_in_vietnamese(monkeypatch):
+    import httpx
+
+    from src.app import gradio_ui
+
+    items = [
+        {"type": "string_too_short", "loc": ["body", "username"], "msg": "String should have at least 3 characters"},
+        {"type": "string_too_long", "loc": ["body", "title"], "msg": "String should have at most 120 characters"},
+        {"type": "missing", "loc": ["body", "password"], "msg": "Field required"},
+        {"type": "value_error", "loc": ["body", "data_classification"],
+         "msg": "Value error, Dữ liệu nhạy cảm phải dùng chế độ confidential."},
+        {"type": "literal_error", "loc": ["body", "role"], "msg": "Input should be 'user' or 'admin'"},
+    ]
+    expected = ("Tên đăng nhập phải có ít nhất 3 ký tự. Tiêu đề chỉ được tối đa 120 ký tự. Thiếu mật khẩu. "
+                "Dữ liệu nhạy cảm phải dùng chế độ confidential. Vai trò không hợp lệ.")
+    assert gradio_ui._validation_text(items) == expected
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(422, json={"detail": items})), **kwargs))
+    monkeypatch.setattr(gradio_ui, "_SESSION_STORE", None)
+    with pytest.raises(gr.Error) as raised:
+        gradio_ui._api("token", "POST", "/api/admin/users", {"username": "ab"})
+    assert gradio_ui._error_text(raised.value) == expected
+
+
+def test_admin_create_form_checks_lengths_before_calling_the_api(runtime_demo, monkeypatch):
+    from src.app import gradio_ui
+
+    calls, warnings = [], []
+    monkeypatch.setattr(gradio_ui, "_api", lambda *args, **kwargs: calls.append(args) or {})
+    monkeypatch.setattr(gr, "Warning", lambda message, *args, **kwargs: warnings.append(message))
+    callback, dependency = _button_event(runtime_demo, "Tạo")
+    for username, password, expected in (("ab", "Long-enough-password-1", "Tên đăng nhập"),
+                                         ("qa.admin", "short", "Mật khẩu")):
+        result = callback.fn("token", username, password, "user")
+        assert len(result) == len(dependency["outputs"]) and all(value == gr.skip() for value in result)
+        assert warnings[-1].startswith(expected)
+    assert calls == []
+
+
+def test_moderator_security_refresh_marks_the_admin_only_blocklist_without_a_warning(
+    runtime_demo, monkeypatch,
+):
+    from src.app import gradio_ui
+
+    def api(token, method, path, body=None, **kwargs):
+        if path in ("/api/admin/ids/blocklist", "/api/admin/ids/verify-detection", "/api/admin/audit/verify"):
+            error = gr.Error("Không đủ quyền truy cập.")
+            error.status_code = 403
+            raise error
+        return []
+
+    warnings = []
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    monkeypatch.setattr(gr, "Warning", lambda message, *args, **kwargs: warnings.append(message))
+    callback, dependency = _button_event(runtime_demo, "Làm mới toàn bộ")
+    result = callback.fn("moderator-token", 60)
+    assert warnings == []
+    assert "Cần vai trò admin" in result[2]
+    assert "cần vai trò admin" in result[3], "chain verdict for a moderator"
+    blocklist = runtime_demo.blocks[dependency["outputs"][-1]]
+    assert result[-1] == gradio_ui._table_html(gradio_ui.BLOCKLIST_HEADERS, [])
+    assert blocklist.elem_id == "sec-blocklist-table"
+
+    verify, _ = _button_event(runtime_demo, "Chạy kiểm chứng Hit/Miss")
+    verdict = verify.fn("moderator-token")
+    assert "cần vai trò admin" in verdict and "'" not in verdict
+
+
+def test_gradio_does_not_publish_an_api_catalogue_of_the_ui_handlers(runtime_demo):
+    from fastapi.testclient import TestClient
+
+    assert {dependency["api_visibility"] for dependency in runtime_demo.config["dependencies"]} == {"private"}
+    with TestClient(runtime_demo.app) as client:
+        info = client.get("/gradio_api/info").json()
+    assert info["named_endpoints"] == {} and info["unnamed_endpoints"] == {}
 
 
 def test_countdown_markup_is_numeric_only():
@@ -321,6 +586,17 @@ def test_assistant_avatar_asset_is_shipped():
     asset = UI_SOURCE.parent / "ui_assets" / "assistant.png"
     assert asset.is_file(), "Thiếu src/app/ui_assets/assistant.png"
     assert asset.stat().st_size > 200
+
+
+def test_assistant_avatar_is_static_so_the_cache_sweep_cannot_break_it(runtime_demo):
+    """delete_cache=(60, 60) removed the cached avatar a minute after start-up and
+    every later chat reply showed a broken image (403 "File not allowed")."""
+    from src.app.gradio_ui import _ASSISTANT_AVATAR
+
+    chatbot = next(component for component in runtime_demo.blocks.values()
+                   if isinstance(component, gr.Chatbot))
+    served = chatbot.avatar_images[1]["path"]
+    assert Path(served).resolve() == _ASSISTANT_AVATAR.resolve()
 
 
 def test_session_labels_carry_the_lock_marker():
@@ -414,24 +690,25 @@ def test_ai_consent_notice_is_inline_and_can_retry_the_composer():
     assert 'gr.Warning("Đã che dữ liệu nhạy cảm' not in source
 
 
-def test_export_download_button_never_caches_the_plaintext_response(monkeypatch):
-    """The browser must redeem the stream ticket; Gradio must not prefetch it."""
+def test_export_is_a_same_origin_link_the_browser_redeems(runtime_demo, monkeypatch):
+    """Gradio 6 copies a DownloadButton URL into its cache through an SSRF-checked
+    server-side download: on the VPS that spent the one-use ticket and stored the
+    plaintext export; locally the check failed and the button never appeared."""
+    from src.app import gradio_ui
+
     source = UI_SOURCE.read_text(encoding="utf-8")
-    assert "file_export = gr.DownloadButton(" in source
+    assert "file_export = gr.DownloadButton(" not in source
     assert "file_export = gr.File(" not in source
-
-    def reject_server_side_fetch(*args, **kwargs):
-        raise AssertionError("Gradio attempted to copy the export into its cache")
-
-    monkeypatch.setattr(
-        "gradio.processing_utils.save_url_to_cache",
-        reject_server_side_fetch,
-    )
-    button = gr.DownloadButton()
-    capability = "https://chat.example.test/api/exports/one-use-capability"
-    rendered = button.postprocess(capability)
-    assert rendered is not None
-    assert rendered.path == capability
+    ticket = 'eyJhbGciOi.eyJzdWIi.sig"><script>'
+    monkeypatch.setattr(gradio_ui, "_api", lambda *args: {"download_url": f"/api/exports/{ticket}"})
+    monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
+    callback, dependency = _button_event(runtime_demo, "Xuất JSON")
+    link_update, *_ = callback.fn("token", "session-id", "", "")
+    markup = link_update["value"]
+    assert link_update["visible"] is True
+    assert 'href="/api/exports/eyJhbGciOi.eyJzdWIi.sig&quot;&gt;&lt;script&gt;"' in markup
+    assert " download " in markup and "<script>" not in markup
+    assert not markup.split('href="', 1)[1].startswith("http")
 
 
 def test_totp_qr_is_inline_and_has_no_file_toolbar():
