@@ -415,7 +415,9 @@ def test_every_guarded_handler_skips_exactly_its_outputs(runtime_demo):
         code = getattr(wrapper, "__code__", None)
         if code is None or code.co_name != "wrapper" or "n_outputs" not in code.co_freevars:
             continue
-        cells = dict(zip(code.co_freevars, (cell.cell_contents for cell in wrapper.__closure__)))
+        cells = dict(zip(
+            code.co_freevars, (cell.cell_contents for cell in wrapper.__closure__), strict=True,
+        ))
         outputs = len(dependency["outputs"])
         name = getattr(cells["fn"], "__name__", "?")
         assert cells["n_outputs"] == outputs or cells["n_outputs"] <= 1 >= outputs, (name, outputs)
@@ -688,6 +690,96 @@ def test_ai_consent_notice_is_inline_and_can_retry_the_composer():
     assert "def consent_and_resend(token, session_id, message):" in source
     assert '"/api/auth/ai-consent", {"ai_data_consent": True}' in source
     assert 'gr.Warning("Đã che dữ liệu nhạy cảm' not in source
+
+
+def test_send_button_and_enter_share_one_pending_event(runtime_demo):
+    """Mobile can emit submit and click before its previous send has completed."""
+    click, dependency = _button_event(runtime_demo, "Gửi")
+    composer = runtime_demo.blocks[dependency["inputs"][-1]]
+    submit, submit_dependency = _event_for(runtime_demo, composer, "submit")
+    assert submit is click
+    assert submit_dependency is dependency
+    assert dependency["trigger_mode"] == "once"
+
+
+@pytest.mark.parametrize("first_session", [None, "existing"])
+def test_failed_send_keeps_composer_and_displays_persistent_error(
+    runtime_demo, monkeypatch, first_session,
+):
+    from src.app import gradio_ui
+
+    calls = []
+
+    def api(token, method, path, body=None, **kwargs):
+        calls.append((method, path))
+        if (method, path) == ("POST", "/api/sessions"):
+            return {"id": "new", "title": body["title"]}
+        if method == "POST" and path.endswith("/messages"):
+            raise gr.Error("AI tạm thời không khả dụng. Thử lại sau 30 giây.")
+        if path == "/api/sessions":
+            return [{"id": "new", "title": "Cuộc hội thoại mới", "security_mode": "secure"}]
+        if path.endswith("/messages"):
+            return []
+        return {"id": path.rsplit("/", 1)[-1], "security_mode": "secure"}
+
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
+    callback, _ = _button_event(runtime_demo, "Gửi")
+    result = callback.fn("token", first_session, "câu hỏi vẫn còn trong ô nhập")
+    assert result[3] == gr.skip(), "A refused send must not clear typed text"
+    assert result[4]["visible"] is True
+    assert "AI tạm thời không khả dụng" in result[4]["value"]
+    assert result[5] == gr.update(visible=False)
+    if first_session is None:
+        assert result[0]["value"] == result[1]["value"] == "new"
+        callback.fn("token", result[0]["value"], "câu hỏi vẫn còn trong ô nhập")
+        assert calls.count(("POST", "/api/sessions")) == 1
+    else:
+        assert result[:3] == (gr.skip(),) * 3
+
+
+def test_successful_send_with_failed_history_read_does_not_invite_duplicate_retry(
+    runtime_demo, monkeypatch,
+):
+    from src.app import gradio_ui
+
+    def api(token, method, path, body=None, **kwargs):
+        if method == "POST":
+            return {"content": "trả lời", "dlp_redacted": []}
+        if path == "/api/sessions":
+            raise gr.Error("Máy chủ tạm thời bận.")
+        return {"security_mode": "secure"}
+
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    callback, _ = _button_event(runtime_demo, "Gửi")
+    result = callback.fn("token", "existing", "đã được lưu")
+    assert result[3] == ""
+    assert result[4]["visible"] is True
+    assert "Tin nhắn đã gửi" in result[4]["value"]
+    assert "Xem tất cả" in result[4]["value"]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "protocol"])
+def test_api_transport_errors_are_safe_user_notices(monkeypatch, failure):
+    import httpx
+
+    from src.app import gradio_ui
+
+    def failed_transport(request):
+        kind = httpx.ReadTimeout if failure == "timeout" else httpx.RemoteProtocolError
+        raise kind("private upstream detail and secret credential", request=request)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(failed_transport), **kwargs,
+    ))
+    monkeypatch.setattr(gradio_ui, "_SESSION_STORE", None)
+    with pytest.raises(gr.Error) as raised:
+        gradio_ui._api("token", "POST", "/api/sessions/existing/messages", {"content": "hello"})
+    message = gradio_ui._error_text(raised.value)
+    assert "chưa xác nhận được" in message
+    assert "lịch sử hội thoại" in message
+    assert "secret" not in message and "private upstream" not in message
 
 
 def test_export_is_a_same_origin_link_the_browser_redeems(runtime_demo, monkeypatch):

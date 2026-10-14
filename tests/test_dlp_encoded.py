@@ -255,6 +255,43 @@ def _service(settings, response="Safe answer"):
     return service, provider
 
 
+@pytest.mark.parametrize("encode", [lambda text: text, _base64, _percent, _entities])
+@pytest.mark.parametrize("in_history", [False, True], ids=["current-prompt", "history"])
+def test_gemini_auth_key_is_blocked_before_provider_egress(settings, encode, in_history):
+    secret = "AQ.AbSYNTHETIC_key_For_DLP_tests_0123456789"
+    payload = encode(secret)
+    service, provider = _service(settings)
+    history = [{"role": "user", "content": payload}] if in_history else []
+
+    with pytest.raises(DLPPolicyViolation) as error:
+        service.generate(
+            "Explain security" if in_history else payload,
+            history,
+            allow_external_ai=True,
+            data_class="public",
+        )
+
+    assert error.value.action is DLPAction.BLOCK
+    assert not provider.calls
+    assert secret not in str(error.value) and payload not in str(error.value)
+
+
+@pytest.mark.parametrize("encode", [lambda text: text, _base64, _percent, _entities])
+def test_gemini_auth_key_is_redacted_from_provider_output(settings, encode):
+    secret = "AQ.AbSYNTHETIC_key_For_DLP_tests_0123456789"
+    payload = encode(secret)
+    service, provider = _service(settings, f"before ;{payload}; after")
+
+    response, labels = service.generate(
+        "Explain security", [], allow_external_ai=True, data_class="public"
+    )
+
+    assert len(provider.calls) == 1
+    assert response == "before ;[REDACTED:API_KEY]; after"
+    assert labels == ["API key / token"]
+    assert secret not in response and payload not in response
+
+
 def test_demo_sample_redacts_plain_and_encoded_email_before_offline_echo(settings):
     email = "sinhvien@example.com"
     encoded = _base64(email)

@@ -451,7 +451,8 @@ _REGEX_RULES: tuple[_RegexRule, ...] = (
         FindingType.API_KEY,
         re.compile(
             r"\b(?:api[_ -]?key|x-api-key|access[_ -]?token|refresh[_ -]?token|"
-            r"auth[_ -]?token|google[_ -]?api[_ -]?key)\s*[:=]\s*"
+            r"auth[_ -]?token|google[_ -]?(?:genai[_ -]?)?api[_ -]?key|"
+            r"gemini[_ -]?api[_ -]?key)\s*[:=]\s*"
             r"(?P<value>\"(?:\\.|[^\"\\\r\n]){6,}\"|'(?:\\.|[^'\\\r\n]){6,}'|[^\s,;]{6,})",
             _FLAGS,
         ),
@@ -462,6 +463,7 @@ _REGEX_RULES: tuple[_RegexRule, ...] = (
         FindingType.API_KEY,
         re.compile(
             r"(?<![A-Za-z0-9_-])(?P<value>(?:AIza[0-9A-Za-z_-]{30,}|"
+            r"AQ\.[0-9A-Za-z_-]{30,}|"
             r"(?:AKIA|ASIA)[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9]{30,255}|"
             r"github_pat_[A-Za-z0-9_]{30,255}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
             r"xox[baprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{16,}))"

@@ -238,6 +238,34 @@ trong `backups/`. **Không xóa hoặc tạo lại `deploy/.env.vps`.**
 | `curl` trên Windows 10 báo `SEC_E_UNSUPPORTED_FUNCTION` | Windows 10 không có TLS 1.3 mà SCAP yêu cầu; mở bằng Chrome/Edge/Firefox |
 | PowerShell chặn script | `powershell -ExecutionPolicy Bypass -File deploy\deploy.ps1 <lệnh> …` |
 
+#### Gemini báo chưa có API key sau khi deploy
+
+Khóa trong `.env` trên máy Windows chỉ dùng cho môi trường local. VPS đọc
+`deploy/.env.vps`; file `.env` local không nằm trong image và không được tự tải
+lên server. Khi `GOOGLE_GENAI_API_KEY` để trống và `ALLOW_DEMO_AI=true`, ứng dụng
+chuyển sang AI demo ngoại tuyến.
+
+Trong Termius, tại `/root/scap`, kiểm tra **container đang chạy** có khóa hay chưa.
+Lệnh này chỉ in `True`/`False`, không in API key:
+
+```bash
+bash deploy/vps-compose.sh exec -T app /app/.venv/bin/python -c 'import os; print(bool(os.environ.get("GOOGLE_GENAI_API_KEY", "").strip()))'
+```
+
+Nếu là `False`, mở `deploy/.env.vps` trên VPS bằng trình soạn thảo và chỉ điền
+`GOOGLE_GENAI_API_KEY`. Có thể đặt thêm `ALLOW_DEMO_AI=false` để bắt buộc dùng
+Gemini thật. Giữ nguyên mọi bí mật khác, đặc biệt `APP_SECRET_KEY`,
+`MASTER_ENCRYPTION_KEY` và mật khẩu database; không ghi đè cả file bằng `.env`
+local, không xóa file hoặc tạo lại khóa. Nếu deploy bằng `deploy.ps1`, cập nhật
+cùng hai trường trong file riêng trên Windows để lần upload sau giữ cấu hình này.
+
+Sau khi lưu, tạo lại container app để nạp environment mới, rồi chạy lại lệnh
+kiểm tra phía trên (phải trả về `True`). Không cần build lại image:
+
+```bash
+bash deploy/vps-compose.sh up -d --no-deps --force-recreate app
+```
+
 Các mục bên dưới mô tả chi tiết từng bước khi muốn làm thủ công ở chế độ `direct`.
 
 ## 1. Chuẩn bị ngay trên máy cá nhân

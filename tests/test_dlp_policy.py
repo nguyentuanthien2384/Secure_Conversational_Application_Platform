@@ -37,6 +37,9 @@ def _types(scanner: DLPScanner, text: str) -> set[FindingType]:
             FindingType.PRIVATE_KEY,
         ),
         ("api_key=AIzaSyABCDEFGHIJKLMNOPQRSTUVWX1234567", FindingType.API_KEY),
+        ("AQ.AbSYNTHETIC_key_For_DLP_tests_0123456789", FindingType.API_KEY),
+        ("GOOGLE_GENAI_API_KEY=synthetic-unknown-key-format", FindingType.API_KEY),
+        ("GEMINI_API_KEY=synthetic-unknown-key-format", FindingType.API_KEY),
         ("OpenAI sk-proj-abcdefghijklmnopqrstuvwx_123456", FindingType.API_KEY),
     ],
 )
@@ -221,6 +224,9 @@ def test_reports_and_reprs_never_contain_matched_values():
         "Cấu hình /health và health check cho load balancer.",
         "Tài liệu nói chung về diabetes và cancer.",
         "sketch-not-an-api-key",
+        "AQ. version 1.2.3 describes an ordinary abbreviation.",
+        "AQ.short_identifier",
+        "ReleaseAQ.AbSYNTHETIC_key_For_DLP_tests_0123456789",
         "header.payload.signature không phải JWT",
     ],
 )

@@ -892,6 +892,18 @@ def _api(token, method, path, body=None, *, params=None):
             f"Không kết nối được API nội bộ tại {BASE_URL}. "
             "Nếu server chạy ở cổng khác, hãy đặt SELF_BASE_URL trong .env."
         ) from exc
+    except httpx.TimeoutException as exc:
+        # Do not pass transport exceptions (URLs/headers) through Gradio. A
+        # timed-out write may have completed; never retry it automatically.
+        raise gr.Error(
+            "Máy chủ phản hồi quá chậm; chưa xác nhận được kết quả yêu cầu. "
+            "Hãy tải lại lịch sử hội thoại trước khi gửi lại."
+        ) from exc
+    except httpx.RequestError as exc:
+        raise gr.Error(
+            "Kết nối tới máy chủ bị gián đoạn; chưa xác nhận được kết quả yêu cầu. "
+            "Hãy tải lại lịch sử hội thoại trước khi gửi lại."
+        ) from exc
     if resp.status_code == 204:
         return {}
     try:
@@ -2726,19 +2738,19 @@ def build_ui(
             if not message:
                 return gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False)
             created_session = False
-            if not session_id:
-                # Never copy plaintext message content into the unencrypted
-                # conversation-title metadata column.
-                created = _api(
-                    token,
-                    "POST",
-                    "/api/sessions",
-                    {"title": "Cuộc hội thoại mới"},
-                )
-                session_id = created["id"]
-                created_session = True
-                gr.Info("Đã tự tạo hội thoại mới.")
             try:
+                if not session_id:
+                    # Never copy plaintext message content into the unencrypted
+                    # conversation-title metadata column.
+                    created = _api(
+                        token,
+                        "POST",
+                        "/api/sessions",
+                        {"title": "Cuộc hội thoại mới"},
+                    )
+                    session_id = created["id"]
+                    created_session = True
+                    gr.Info("Đã tự tạo hội thoại mới.")
                 session_metadata = _api(token, "GET", f"/api/sessions/{session_id}")
                 if session_metadata.get("security_mode") == "private_e2ee":
                     raise gr.Error(
@@ -2751,6 +2763,19 @@ def build_ui(
                     {"content": message, "confirm_external_ai": bool(confirm_external)},
                 )
             except gr.Error as err:
+                # Keep every refusal beside the composer. A toast disappears
+                # quickly on mobile, making a failed send look like lost text.
+                selection = (gr.skip(), gr.skip(), gr.skip())
+                if created_session:
+                    try:
+                        selection = refresh_sessions(token, session_id)
+                    except gr.Error:
+                        # The session was definitely created, even if the next
+                        # read is unavailable. Keep it selected for the retry.
+                        update = gr.update(
+                            choices=[("🔒  Cuộc hội thoại mới", session_id)], value=session_id
+                        )
+                        selection = (update, update, gr.skip())
                 # Consent là lựa chọn người dùng, không phải lỗi kỹ thuật. Hiển thị
                 # ngay cạnh ô nhập và giữ nguyên nội dung để họ có thể gửi lại sau.
                 needs_consent = EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err)
@@ -2759,16 +2784,36 @@ def build_ui(
                         value=CONSENT_NOTICE if needs_consent else CONFIDENTIAL_CONFIRM_NOTICE,
                         visible=True,
                     )
-                    # Keep an auto-created conversation selected; otherwise the
-                    # retry would create (and orphan) another empty one.
-                    selection = (
-                        refresh_sessions(token, session_id)
-                        if created_session
-                        else (gr.skip(), gr.skip(), gr.skip())
-                    )
                     return (*selection, gr.skip(), notice, gr.update(visible=True))
-                raise
-            dd1, dd2, history = refresh_sessions(token, session_id)
+                notice = gr.update(
+                    value=(
+                        "⚠️ **Chưa nhận được phản hồi.** " + _safe_chat_text(_error_text(err))
+                        + "\n\nNội dung bạn nhập vẫn được giữ trong ô tin nhắn."
+                    ),
+                    visible=True,
+                )
+                return (*selection, gr.skip(), notice, gr.update(visible=False))
+            try:
+                dd1, dd2, history = refresh_sessions(token, session_id)
+            except gr.Error as err:
+                # The POST succeeded. Keep that success distinct from a failed
+                # history read so retrying does not send the same text twice.
+                selection = (
+                    gr.update(choices=[("🔒  Cuộc hội thoại mới", session_id)], value=session_id)
+                    if created_session else gr.skip()
+                )
+                return (
+                    selection, selection, gr.skip(), "",
+                    gr.update(
+                        value=(
+                            "✅ **Tin nhắn đã gửi.** Chưa tải lại được lịch sử hội thoại. "
+                            + _safe_chat_text(_error_text(err))
+                            + "\n\nBấm **Xem tất cả** để tải lại nội dung."
+                        ),
+                        visible=True,
+                    ),
+                    gr.update(visible=False),
+                )
             # Nếu DLP đã che dữ liệu nhạy cảm, nói rõ cho người dùng biết đã che
             # NHÓM nào — không bao giờ hiện lại giá trị gốc.
             labels = (sent or {}).get("dlp_redacted") or []
@@ -2786,8 +2831,15 @@ def build_ui(
             return dd1, dd2, history, "", banner, gr.update(visible=False)
 
         SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_chat_notice, btn_consent_send]
-        btn_send.click(_guard(send_message, 6), [st_token, dd_session, tb_msg], SEND_OUTS)
-        tb_msg.submit(_guard(send_message, 6), [st_token, dd_session, tb_msg], SEND_OUTS)
+        # One event covers Enter and tapping Send. Separate events could both
+        # run while mobile Chrome was still waiting for the first response.
+        gr.on(
+            triggers=[btn_send.click, tb_msg.submit],
+            fn=_guard(send_message, 6),
+            inputs=[st_token, dd_session, tb_msg],
+            outputs=SEND_OUTS,
+            trigger_mode="once",
+        )
 
         def consent_and_resend(token, session_id, message):
             """Record one explicit decision, then retry the still-visible message once.
