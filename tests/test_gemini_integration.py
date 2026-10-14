@@ -107,7 +107,7 @@ def test_blocked_or_empty_candidates_raise_a_clear_runtime_error(response):
         client.generate("ping")
 
 
-def test_system_instruction_matches_the_plain_text_chat_view(tmp_path):
+def test_system_instruction_matches_safe_markdown_chat_view(tmp_path):
     captured = {}
 
     class Recorder:
@@ -118,8 +118,8 @@ def test_system_instruction_matches_the_plain_text_chat_view(tmp_path):
     service = AIService(Settings(environment="test", database_url=f"sqlite:///{tmp_path / 'p.db'}"))
     service._client = Recorder()
     service.generate("Xin chào", [], allow_external_ai=True)
-    assert "văn bản thuần" in captured["system_instruction"]
-    assert "**" in captured["system_instruction"]  # names the syntax to avoid
+    assert "Dùng Markdown" in captured["system_instruction"]
+    assert "Không dùng HTML thô hoặc ảnh" in captured["system_instruction"]
 
 
 # ───────────────────────── UI consent / confirmation flow ─────────────────────────
@@ -182,7 +182,7 @@ class FakeApi:
 def test_consent_retry_reuses_the_auto_created_conversation(demo, monkeypatch):
     api = FakeApi(consent=False)
     monkeypatch.setattr(gradio_ui, "_api", api)
-    send = _callback(demo, "send_message")
+    send = _callback(demo, "submit_chat_message")
     resend = _callback(demo, "consent_and_resend")
 
     outputs = send("token", None, "Xin chào")
@@ -198,7 +198,7 @@ def test_consent_retry_reuses_the_auto_created_conversation(demo, monkeypatch):
 def test_consent_click_does_not_also_confirm_confidential_content(demo, monkeypatch):
     api = FakeApi(consent=False, mode="confidential")
     monkeypatch.setattr(gradio_ui, "_api", api)
-    send = _callback(demo, "send_message")
+    send = _callback(demo, "submit_chat_message")
     resend = _callback(demo, "consent_and_resend")
 
     assert send("token", "s9", "Kế hoạch nội bộ")[4]["value"] == gradio_ui.CONSENT_NOTICE
@@ -209,11 +209,15 @@ def test_consent_click_does_not_also_confirm_confidential_content(demo, monkeypa
     assert first[5]["visible"] is True
 
     resend("token", "s9", "Kế hoạch nội bộ")
-    assert api.sent == [{"content": "Kế hoạch nội bộ", "confirm_external_ai": True}]
+    assert api.sent == [{
+        "content": "Kế hoạch nội bộ", "confirm_external_ai": True, "use_web_search": False,
+    }]
 
 
 def test_secure_conversation_sends_after_a_single_consent_click(demo, monkeypatch):
     api = FakeApi(consent=False)
     monkeypatch.setattr(gradio_ui, "_api", api)
     _callback(demo, "consent_and_resend")("token", "s1", "Câu hỏi")
-    assert api.sent == [{"content": "Câu hỏi", "confirm_external_ai": False}]
+    assert api.sent == [{
+        "content": "Câu hỏi", "confirm_external_ai": False, "use_web_search": False,
+    }]

@@ -268,6 +268,59 @@ bash deploy/vps-compose.sh up -d --no-deps --force-recreate app
 
 Các mục bên dưới mô tả chi tiết từng bước khi muốn làm thủ công ở chế độ `direct`.
 
+#### Cấu hình Gemini trả lời dài hơn và nhớ ngữ cảnh
+
+Sau khi đã nạp khóa Gemini trên VPS, có thể chọn cấu hình `balanced` trong
+Termius. Lệnh chỉ đổi `AI_MAX_OUTPUT_TOKENS=2048`, `AI_HISTORY_MESSAGES=16` và
+`ALLOW_DEMO_AI=false`; giữ nguyên model, API key, mọi khóa mã hóa và quota.
+File cấu hình cũ chưa có `AI_HISTORY_MESSAGES` được thêm trường này một lần.
+
+```bash
+cd /root/scap &&
+git pull --ff-only &&
+python3 -m scripts.prepare_vps configure --project . --ai-quality balanced &&
+bash deploy/update.sh
+```
+
+Model mặc định vẫn là `gemini-flash-lite-latest`; cấu hình này không tự đổi model,
+bật tìm kiếm hoặc mở khóa hạn mức của Google. Miễn phí hay tính phí còn tùy
+quota và billing của project Google gắn với key. Câu trả lời dài hơn và lịch sử dài
+hơn sử dụng nhiều token hơn trong quota của tài khoản. Giới hạn trên VPS là
+4.096 token đầu ra và 2–40 tin nhắn lịch sử; 16 tin nhắn tương đương khoảng
+8 lượt hỏi–đáp. Deadline mỗi lần gọi Gemini giữ ở 20 giây, tối đa 25 giây.
+
+Nội dung gửi đi vẫn cần sự đồng ý và qua DLP; model không nhận những giá trị đã
+bị ẩn. Câu trả lời được kiểm tra toàn bộ trước khi hiển thị, giữ đến 32.000 ký
+tự thay vì cắt âm thầm ở 8.000. Nếu placeholder DLP làm nội dung vượt giới hạn,
+giao diện có thông báo yêu cầu tiếp tục. Giao diện cho phép Markdown đã được
+lọc an toàn; HTML thô và ảnh từ nguồn không tin cậy không được thực thi.
+Tính chính xác phụ thuộc model và nguồn thông tin; API key chỉ cấp quyền truy
+cập, không bảo đảm mọi câu trả lời đúng hoặc giống ứng dụng Gemini.
+
+#### Tra cứu Internet có nguồn (mặc định tắt)
+
+`GEMINI_WEB_SEARCH_ENABLED=false` giữ tra cứu tắt để ưu tiên quota miễn phí.
+Google Search qua Gemini API là dịch vụ có thể tính phí; xem
+[bảng giá Google](https://ai.google.dev/gemini-api/docs/pricing) trước khi bật.
+Khi đã kiểm tra quota/billing, quản trị viên có thể đặt trường này thành `true`
+trong `deploy/.env.vps` và recreate app bằng `bash deploy/vps-compose.sh up -d --no-deps --force-recreate app`.
+
+Trong giao diện, tạo/chọn hội thoại **Public**, chọn **Tra cứu Internet và dẫn
+nguồn**, rồi gửi câu hỏi chỉ chứa thông tin công khai. Lượt tra cứu có đồng thuận,
+DLP, kiểm tra chủ sở hữu và dùng chung quota với chat. Server chỉ gửi câu hỏi
+hiện tại; không giải mã hoặc gửi lịch sử hội thoại cho tìm kiếm. Kết quả hiển thị
+ở mục riêng và không lưu câu hỏi/kết quả/gợi ý vào database, export hoặc audit
+nội dung. Gợi ý được xóa khi đổi hội thoại, gửi lượt tiếp theo hoặc đăng xuất;
+tải lại trang không phục hồi kết quả tra cứu.
+
+Trích dẫn gắn với metadata Google trả về, gồm vị trí UTF-8 của đoạn văn được
+dẫn nguồn. Widget gợi ý Google được kiểm tra rồi hiển thị nguyên bản trong vùng
+DOM có CSS riêng; nếu có script, ảnh tải từ xa, CSS gọi mạng hoặc liên kết không
+hợp lệ, toàn bộ kết quả bị từ chối. App không tự tải các URL nguồn. Search có thể
+không được model sử dụng cho một câu hỏi; khi không có nguồn, giao diện nói rõ
+thay vì khẳng định đã kiểm chứng. Chế độ chat thường không truy cập Internet.
+Xem [tài liệu Grounding](https://ai.google.dev/gemini-api/docs/generate-content/google-search).
+
 ## 1. Chuẩn bị ngay trên máy cá nhân
 
 Tại thư mục dự án, dùng PowerShell:

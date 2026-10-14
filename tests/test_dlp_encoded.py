@@ -377,11 +377,11 @@ def test_encoded_custom_terms_apply_to_provider_response(settings):
         ("a " * 3990 + "-----BEGIN PRIVATE KEY-----\nZXhhbXBsZS1rZXk=\n-----END PRIVATE KEY-----", "khóa riêng tư"),
     ],
 )
-def test_output_secret_straddling_display_limit_is_removed_before_truncation(settings, provider_response, expected_label):
+def test_output_secret_after_old_display_limit_is_removed_without_cutting_the_answer(settings, provider_response, expected_label):
     service, provider = _service(settings, provider_response)
     response, labels = service.generate("Hello", [], allow_external_ai=True)
     assert len(provider.calls) == 1
-    assert len(response) <= 8000
+    assert len(response) <= MAX_PROVIDER_RESPONSE_CHARACTERS
     assert response.startswith("a " * 3990)
     assert "-----BEGIN" not in response
     assert "cGFzc3dvcmQ" not in response

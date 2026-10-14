@@ -74,13 +74,24 @@ _LIMITS = {
     "REQUEST_IP_MAX_CONCURRENT": (16, 32), "REQUEST_IP_MAX_STREAMS": (4, 8),
     "PASSWORD_MAX_CONCURRENT": (1, 1), "AI_MAX_CONCURRENT": (1, 1),
     "AI_GLOBAL_MAX_ATTEMPTS": (1, 60), "AI_DAILY_MAX_ATTEMPTS": (1, 1000),
-    "AI_MAX_OUTPUT_TOKENS": (128, 1024), "GRADIO_QUEUE_MAX_SIZE": (1, 16),
+    "AI_MAX_OUTPUT_TOKENS": (128, 4096), "AI_HISTORY_MESSAGES": (2, 40),
+    "GRADIO_QUEUE_MAX_SIZE": (1, 16),
     "GRADIO_CONCURRENCY_LIMIT": (1, 2), "GRADIO_RETAINED_EVENTS": (1, 128),
     "GRADIO_STATE_CAPACITY": (1, 256), "UVICORN_LIMIT_CONCURRENCY": (32, 64),
     "UVICORN_BACKLOG": (16, 128), "UVICORN_KEEPALIVE_SECONDS": (1, 10),
     "UVICORN_SHUTDOWN_SECONDS": (10, 60), "GEMINI_TIMEOUT_SECONDS": (5, 25),
     "MAIL_MAX_PENDING": (1, 16),
 }
+_AI_QUALITY_PROFILES = {
+    "balanced": {
+        "AI_MAX_OUTPUT_TOKENS": "2048",
+        "AI_HISTORY_MESSAGES": "16",
+        "ALLOW_DEMO_AI": "false",
+    },
+}
+# Configurations from earlier versions can keep running before the new optional
+# history field is explicitly added through the balanced quality profile.
+_OPTIONAL_LIMIT_DEFAULTS = {"AI_HISTORY_MESSAGES": "16"}
 
 
 class PreparationError(RuntimeError):
@@ -207,11 +218,20 @@ def initialize(project: str | Path, *, domain: str = "", email: str = "") -> str
 
 
 def configure(project: str | Path, *, domain: str = "", email: str = "",
-              images: dict[str, str] | None = None, edge_mode: str = "") -> list[str]:
+              images: dict[str, str] | None = None, edge_mode: str = "",
+              ai_quality: str = "") -> list[str]:
     """Fill public deployment fields in the existing private file; secrets stay unchanged."""
     target = _project(project) / "deploy" / ".env.vps"
     lines, values = _read(target, private=True)
     replacements = {}
+    if ai_quality:
+        if ai_quality not in _AI_QUALITY_PROFILES:
+            raise PreparationError("AI quality: use balanced.")
+        replacements.update(_AI_QUALITY_PROFILES[ai_quality])
+        if "AI_HISTORY_MESSAGES" not in values:
+            lines = [*lines, "# AI history setting added by prepare_vps configure.",
+                     "AI_HISTORY_MESSAGES=16"]
+            values = {**values, "AI_HISTORY_MESSAGES": "16"}
     if edge_mode:
         if edge_mode not in _EDGE_MODES:
             raise PreparationError(f"SCAP_EDGE_MODE: use {' or '.join(_EDGE_MODES)}.")
@@ -240,7 +260,7 @@ def configure(project: str | Path, *, domain: str = "", email: str = "",
             raise PreparationError(f"{key}: use one of {', '.join(_IMAGES)} with name@sha256:<64 hex>.")
         replacements[key] = value
     if not replacements:
-        raise PreparationError("Nothing to configure; pass a domain, email, image or edge mode.")
+        raise PreparationError("Nothing to configure; pass a domain, email, image, edge mode or AI quality.")
     if not replacements.keys() <= values.keys():
         raise PreparationError("Deployment configuration is missing template fields; recreate it with init.")
     output = []
@@ -321,11 +341,13 @@ def check(project: str | Path) -> list[str]:
     for key in ("ALLOW_DEMO_AI", "ALLOW_SELF_REGISTRATION"):
         if values.get(key) not in {"true", "false"}:
             issues.append(f"{key}: use true or false.")
+    if values.get("GEMINI_WEB_SEARCH_ENABLED", "false") not in {"true", "false"}:
+        issues.append("GEMINI_WEB_SEARCH_ENABLED: use true or false.")
     if values.get("ALLOW_DEMO_AI") == "false" and not values.get("GOOGLE_GENAI_API_KEY"):
         issues.append("GOOGLE_GENAI_API_KEY: required when offline demo AI is disabled.")
     for key, (minimum, maximum) in _LIMITS.items():
         try:
-            if not minimum <= int(values.get(key, "")) <= maximum:
+            if not minimum <= int(values.get(key, _OPTIONAL_LIMIT_DEFAULTS.get(key, ""))) <= maximum:
                 raise ValueError
         except ValueError:
             issues.append(f"{key}: outside this small-VPS budget.")
@@ -402,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
     update.add_argument("--email", default="")
     update.add_argument("--image", action="append", default=[], metavar="KEY=NAME@sha256:DIGEST")
     update.add_argument("--edge-mode", choices=_EDGE_MODES, default="")
+    update.add_argument("--ai-quality", choices=tuple(_AI_QUALITY_PROFILES), default="",
+                        help="Set bounded answer/history budgets and require real Gemini; keep model and keys.")
     verify = commands.add_parser("check", help="Check readiness without printing secrets or starting services.")
     verify.add_argument("--project", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
@@ -414,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "configure":
             images = dict(item.split("=", 1) if "=" in item else (item, "") for item in args.image)
             changed = configure(args.project, domain=args.domain, email=args.email, images=images,
-                                edge_mode=args.edge_mode)
+                                edge_mode=args.edge_mode, ai_quality=args.ai_quality)
             print(f"Updated deploy/.env.vps: {', '.join(changed)}; secrets unchanged.")
             return 0
         issues = check(args.project)

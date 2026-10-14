@@ -31,7 +31,8 @@ AVAILABILITY_ENV_LIMITS = {
     "AI_MAX_CONCURRENT": (2, 1, 32),
     "AI_GLOBAL_MAX_ATTEMPTS": (60, 1, 100_000),
     "AI_DAILY_MAX_ATTEMPTS": (1_000, 1, 1_000_000),
-    "AI_MAX_OUTPUT_TOKENS": (1_024, 128, 8_192),
+    "AI_MAX_OUTPUT_TOKENS": (2_048, 128, 8_192),
+    "AI_HISTORY_MESSAGES": (16, 2, 40),
     "GRADIO_QUEUE_MAX_SIZE": (32, 1, 1_024),
     "GRADIO_CONCURRENCY_LIMIT": (4, 1, 32),
     "GRADIO_RETAINED_EVENTS": (128, 1, 4_096),
@@ -205,7 +206,8 @@ class Settings:
     ai_max_concurrent: int = 2
     ai_global_max_attempts: int = 60
     ai_daily_max_attempts: int = 1_000
-    ai_max_output_tokens: int = 1_024
+    ai_max_output_tokens: int = 2_048
+    ai_history_messages: int = 16
     gradio_queue_max_size: int = 32
     gradio_concurrency_limit: int = 4
     gradio_retained_events: int = 128
@@ -229,6 +231,7 @@ class Settings:
     allow_demo_ai: bool = True
     google_genai_api_key: str = ""
     gemini_model: str = "gemini-flash-lite-latest"
+    gemini_web_search_enabled: bool = False
     # Per-attempt provider deadline; one retry is allowed. 2 x 25 s plus backoff
     # still ends before the UI gives up on the API call at 60 s.
     gemini_timeout_seconds: int = 20
@@ -682,6 +685,7 @@ class Settings:
             allow_demo_ai=_bool_env("ALLOW_DEMO_AI", True),
             google_genai_api_key=google_genai_api_key,
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest"),
+            gemini_web_search_enabled=_bool_env("GEMINI_WEB_SEARCH_ENABLED", False),
             bootstrap_admin_username=os.getenv("BOOTSTRAP_ADMIN_USERNAME", ""),
             bootstrap_admin_password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD", ""),
             docs_enabled=_bool_env("DOCS_ENABLED", environment != "production"),

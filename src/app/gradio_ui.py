@@ -19,14 +19,18 @@ import time
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import gradio as gr
+from markdown_it import MarkdownIt
+from markdown_it.renderer import RendererHTML
 
 from src.app.account_security import DEVICE_COOKIE_NAME, DEVICE_TOKEN_HEADER
 from src.app.audit import sign_ui_client_context
 from src.app.gradio_capacity import install_gradio_capacity
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
 from src.app.ui_session import COOKIE_NAME, BrowserSessionStore, UISessionCapacityError
+from src.core.ai_core.gemini_ai import validate_search_suggestions_html
 
 BASE_URL = os.getenv("SELF_BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", BASE_URL).rstrip("/")
@@ -994,22 +998,88 @@ def _session_choices(token):
     ]
 
 
-def _safe_chat_text(content: str) -> str:
-    """Render untrusted chat content as text, never as browser markup.
+class _SafeChatRenderer(RendererHTML):
+    """Render a small Markdown surface without browser-side image requests."""
 
-    ``gr.Chatbot(render_markdown=False)`` disables Markdown expansion, but its
-    frontend still places sanitized HTML into the DOM.  DOM sanitizers commonly
-    allow passive elements such as ``img``; an attacker-controlled remote image
-    would therefore still be able to beacon the reader's browser.  Escaping at
-    this final display boundary keeps the encrypted source message unchanged
-    while ensuring HTML, Markdown links/images, and Mermaid blocks remain inert.
+    def image(self, tokens, idx, options, env):
+        # Parse images before dropping them: inline/reference images and escaped
+        # backslashes have the same treatment, without a regex parser bypass.
+        token = tokens[idx]
+        label = self.renderInlineAsText(token.children or [], options, env)
+        return html.escape(label or "[Ảnh đã ẩn]", quote=True)
+
+    def fence(self, tokens, idx, options, env):
+        # Code is always inert. Do not opt untrusted fences into Mermaid, math,
+        # custom components, or any executable browser renderer.
+        return "<pre><code>" + html.escape(tokens[idx].content, quote=False) + "</code></pre>\n"
+
+
+_CHAT_MARKDOWN = MarkdownIt(
+    "commonmark", {"html": False, "breaks": True}, renderer_cls=_SafeChatRenderer,
+).enable(["table", "strikethrough"])
+
+
+def _safe_chat_link(value: str) -> bool:
+    # Reject browser-normalized control characters/backslashes before parsing.
+    if any(ord(char) < 33 or ord(char) == 127 for char in value) or "\\" in value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme.lower() in {"http", "https"}
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError:
+        return False
+
+
+def _safe_chat_text(content: str) -> str:
+    """Render safe formatting while keeping source messages unchanged.
+
+    Raw input HTML is escaped by the server parser. Images become text and only
+    HTTP(S) links can navigate, with no referrer or opener. Gradio sanitizes the
+    generated standard markup once more. Rendering server-generated block HTML
+    also avoids interpreting leftover Markdown under a second parser dialect.
     """
 
     # Provider output and legacy rows did not necessarily pass through the API
     # schema. Make directional controls visible at the display boundary too.
     for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)):
         content = content.replace(chr(codepoint), f"\\u{codepoint:04X}")
-    return html.escape(content, quote=True)
+    tokens = _CHAT_MARKDOWN.parse(content)
+    for token in tokens:
+        if token.type != "inline":
+            continue
+        safe_links = []
+        for child in token.children or []:
+            if child.type == "link_open":
+                allowed = _safe_chat_link(child.attrGet("href") or "")
+                safe_links.append(allowed)
+                if allowed:
+                    child.attrSet("target", "_blank")
+                    child.attrSet("rel", "noopener noreferrer")
+                    child.attrSet("referrerpolicy", "no-referrer")
+            elif child.type == "link_close":
+                allowed = safe_links.pop() if safe_links else False
+            else:
+                continue
+            if not allowed:
+                # Keep the label, but discard both ends of a rejected link.
+                child.type, child.tag, child.content, child.nesting = "text", "", "", 0
+                child.attrs = {}
+    return _CHAT_MARKDOWN.renderer.render(tokens, _CHAT_MARKDOWN.options, {})
+
+
+def _search_widget_marker(original: str | None) -> str:
+    """Only validated, unchanged Google markup enters the scoped widget bridge."""
+    if original is None:
+        return ""
+    if not validate_search_suggestions_html(original):
+        raise gr.Error("Không hiển thị được gợi ý Google Search an toàn. Vui lòng thử lại.")
+    encoded = base64.b64encode(original.encode("utf-8")).decode("ascii")
+    return f'<div data-scap-google-search-widget="{encoded}"></div>'
 
 
 def _safe_markdown_text(value) -> str:
@@ -1326,9 +1396,9 @@ def _static_html(markup: str, **kwargs) -> gr.Markdown:
     rendering HTML". gr.Markdown dựng DOM trực tiếp, không eval, nên hiển thị
     đúng markup mà chính sách vẫn giữ nguyên.
 
-    ``sanitize_html=False`` là an toàn ở đây vì mọi chuỗi truyền vào đều là hằng
-    số trong mã nguồn; không có đường nào cho dữ liệu người dùng lọt vào (kể cả
-    thang đo mật khẩu bên dưới cũng chỉ dùng độ dài, không in lại mật khẩu).
+    ``sanitize_html=False`` chỉ dành cho markup do server tạo: hằng số, giá trị
+    đã escape, hoặc marker base64 sau khi widget Google đã được kiểm tra. Không
+    truyền HTML thô của người dùng/provider vào component này.
     """
     classes = kwargs.pop("elem_classes", [])
     if isinstance(classes, str):
@@ -1388,6 +1458,7 @@ def build_ui(
     retained_events: int = 128,
     result_ttl_seconds: int = 120,
     state_capacity: int = 256,
+    gemini_web_search_enabled: bool = False,
 ) -> gr.Blocks:
     global _CLIENT_CONTEXT_KEY, _SESSION_STORE
     if any(type(value) is not int or value < 1 for value in (queue_max_size, concurrency_limit)):
@@ -1696,13 +1767,13 @@ def build_ui(
                                 placeholder=CHAT_WELCOME_HTML,
                                 avatar_images=AVATARS,
                                 buttons=["copy", "copy_all"],
-                                # Chat/provider output is untrusted.  Keep it as
-                                # inert text instead of creating links, remote
-                                # images, HTML elements, or Mermaid diagrams.
-                                render_markdown=False,
+                                # Formatting is generated by the server's safe
+                                # Markdown parser; raw HTML/images stay inert.
+                                render_markdown=True,
                                 sanitize_html=True,
                                 allow_tags=False,
                                 allow_file_downloads=False,
+                                latex_delimiters=[],
                             )
                             with gr.Row(elem_id="chat-composer"):
                                 tb_msg = gr.Textbox(
@@ -1715,6 +1786,18 @@ def build_ui(
                                 btn_send = gr.Button(
                                     "Gửi", variant="primary", scale=1, min_width=110
                                 )
+                            cb_web_search = gr.Checkbox(
+                                label="Tra cứu Internet và dẫn nguồn",
+                                value=False,
+                                interactive=gemini_web_search_enabled,
+                                elem_id="chat-web-search",
+                                info=(
+                                    "Chỉ dùng trong hội thoại Public. Truy vấn tìm kiếm được gửi tới Google "
+                                    "và có thể tính phí. Tra cứu riêng, không dùng hoặc lưu lịch sử chat."
+                                    if gemini_web_search_enabled else
+                                    "Máy chủ đang tắt tra cứu Internet để ưu tiên hạn mức miễn phí."
+                                ),
+                            )
                             # Thông báo cố định dưới ô nhập, dùng cho consent và DLP.
                             # Không dùng toast vì toast che nội dung hội thoại trên màn hình nhỏ.
                             md_chat_notice = gr.Markdown(
@@ -1725,6 +1808,14 @@ def build_ui(
                             # ban đầu là sự đồng ý chia sẻ dữ liệu.
                             btn_consent_send = gr.Button(
                                 "Đồng ý và gửi", variant="primary", size="sm", visible=False
+                            )
+                            md_search_answer = gr.Markdown(
+                                "", visible=False, sanitize_html=True,
+                                latex_delimiters=[],
+                                elem_id="chat-search-answer",
+                            )
+                            md_search_suggestions = _static_html(
+                                "", visible=False, elem_id="chat-search-suggestions",
                             )
                             with gr.Row():
                                 tb_search = gr.Textbox(
@@ -2080,8 +2171,11 @@ def build_ui(
             (tb_export_code, ""),
             (file_export, gr.update(value="", visible=False)),
             (tb_msg, ""),
+            (cb_web_search, gr.update(value=False)),
             (md_chat_notice, gr.update(value="", visible=False)),
             (btn_consent_send, gr.update(visible=False)),
+            (md_search_answer, gr.update(value="", visible=False)),
+            (md_search_suggestions, gr.update(value="", visible=False)),
             (tb_search, ""),
             (df_cipher, _table_html(CIPHER_HEADERS, [])),
             (tb_gq, ""),
@@ -2630,16 +2724,18 @@ def build_ui(
         # Thông báo consent/DLP thuộc về lượt gửi trước; giữ lại khi đã sang
         # hội thoại khác sẽ gắn nhầm cảnh báo vào hội thoại đang xem.
         NOTICE_HIDDEN = (gr.update(value="", visible=False), gr.update(visible=False))
+        SEARCH_HIDDEN = (gr.update(value="", visible=False), gr.update(value="", visible=False))
 
         def pick_session(token, session_id):
             """Bấm một hàng trong danh sách: nạp hội thoại và điền sẵn tên hiện tại."""
             history = _chat_history(token, session_id)
-            return history, _session_title(token, session_id), *NOTICE_HIDDEN
+            return history, _session_title(token, session_id), *NOTICE_HIDDEN, *SEARCH_HIDDEN
 
         dd_session.input(
-            _guard(pick_session, 4),
+            _guard(pick_session, 6),
             [st_token, dd_session],
-            [chatbot, tb_rename, md_chat_notice, btn_consent_send],
+            [chatbot, tb_rename, md_chat_notice, btn_consent_send,
+             md_search_answer, md_search_suggestions],
         )
 
         def create_session(token, title, security_mode, data_classification):
@@ -2657,12 +2753,14 @@ def build_ui(
             dd1, dd2, history = refresh_sessions(token, created["id"])
             # Ô "Đổi tên" phải theo hội thoại vừa chọn, nếu không bấm "Lưu tên
             # mới" sẽ chép tên hội thoại cũ sang hội thoại mới.
-            return dd1, dd2, history, "", _session_title(token, created["id"]), *NOTICE_HIDDEN
+            return (dd1, dd2, history, "", _session_title(token, created["id"]),
+                    *NOTICE_HIDDEN, *SEARCH_HIDDEN)
 
         btn_create.click(
-            _guard(create_session, 7),
+            _guard(create_session, 9),
             [st_token, tb_new_title, dd_new_security, dd_new_class],
-            [dd_session, dd_cipher, chatbot, tb_new_title, tb_rename, md_chat_notice, btn_consent_send],
+            [dd_session, dd_cipher, chatbot, tb_new_title, tb_rename, md_chat_notice, btn_consent_send,
+             md_search_answer, md_search_suggestions],
         )
 
         def rename_session(token, session_id, title):
@@ -2683,15 +2781,17 @@ def build_ui(
         def delete_session(token, session_id):
             if not session_id:
                 gr.Warning("Chọn một hội thoại trước.")
-                return tuple(gr.skip() for _ in range(6))
+                return tuple(gr.skip() for _ in range(8))
             _api(token, "DELETE", f"/api/sessions/{session_id}")
             gr.Info("Đã xóa hội thoại và toàn bộ bản mã của nó.")
             dd1, dd2, history = refresh_sessions(token)
-            return dd1, dd2, history, _session_title(token, dd1["value"]), *NOTICE_HIDDEN
+            return (dd1, dd2, history, _session_title(token, dd1["value"]),
+                    *NOTICE_HIDDEN, *SEARCH_HIDDEN)
 
         btn_delete.click(
-            _guard(delete_session, 6), [st_token, dd_session],
-            [dd_session, dd_cipher, chatbot, tb_rename, md_chat_notice, btn_consent_send],
+            _guard(delete_session, 8), [st_token, dd_session],
+            [dd_session, dd_cipher, chatbot, tb_rename, md_chat_notice, btn_consent_send,
+             md_search_answer, md_search_suggestions],
         )
 
         def export_session(token, session_id, password, code):
@@ -2733,12 +2833,19 @@ def build_ui(
             [file_export, tb_export_password, tb_export_code],
         )
 
-        def send_message(token, session_id, message, confirm_external=False):
+        def _send_chat_message(token, session_id, message, confirm_external=False, use_web_search=False):
             message = (message or "").strip()
             if not message:
                 return gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False)
             created_session = False
             try:
+                if use_web_search and not gemini_web_search_enabled:
+                    raise gr.Error("Máy chủ chưa bật tra cứu Internet. Bỏ chọn tra cứu để gửi tin nhắn.")
+                if use_web_search and not session_id:
+                    raise gr.Error(
+                        "Để tra cứu Internet, chọn Public trong Thiết lập hội thoại mới, "
+                        "rồi bấm + Hội thoại mới. Chỉ dùng nội dung công khai."
+                    )
                 if not session_id:
                     # Never copy plaintext message content into the unencrypted
                     # conversation-title metadata column.
@@ -2756,11 +2863,19 @@ def build_ui(
                     raise gr.Error(
                         "Phiên Private E2EE chỉ nhận bản mã từ client Double Ratchet/MLS."
                     )
+                if use_web_search and session_metadata.get("data_classification") != "public":
+                    raise gr.Error(
+                        "Tra cứu Internet chỉ dùng trong hội thoại Public. Chọn Public trong "
+                        "Thiết lập hội thoại mới rồi bấm + Hội thoại mới, hoặc bỏ chọn tra cứu."
+                    )
                 sent = _api(
                     token,
                     "POST",
                     f"/api/sessions/{session_id}/messages",
-                    {"content": message, "confirm_external_ai": bool(confirm_external)},
+                    {
+                        "content": message, "confirm_external_ai": bool(confirm_external),
+                        "use_web_search": bool(use_web_search),
+                    },
                 )
             except gr.Error as err:
                 # Keep every refusal beside the composer. A toast disappears
@@ -2787,7 +2902,7 @@ def build_ui(
                     return (*selection, gr.skip(), notice, gr.update(visible=True))
                 notice = gr.update(
                     value=(
-                        "⚠️ **Chưa nhận được phản hồi.** " + _safe_chat_text(_error_text(err))
+                        "⚠️ **Chưa nhận được phản hồi.** " + _safe_markdown_text(_error_text(err))
                         + "\n\nNội dung bạn nhập vẫn được giữ trong ô tin nhắn."
                     ),
                     visible=True,
@@ -2807,7 +2922,7 @@ def build_ui(
                     gr.update(
                         value=(
                             "✅ **Tin nhắn đã gửi.** Chưa tải lại được lịch sử hội thoại. "
-                            + _safe_chat_text(_error_text(err))
+                            + _safe_markdown_text(_error_text(err))
                             + "\n\nBấm **Xem tất cả** để tải lại nội dung."
                         ),
                         visible=True,
@@ -2830,18 +2945,64 @@ def build_ui(
                 banner = gr.update(value="", visible=False)
             return dd1, dd2, history, "", banner, gr.update(visible=False)
 
-        SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_chat_notice, btn_consent_send]
+        def send_message(token, session_id, message, confirm_external=False, use_web_search=False):
+            if not use_web_search:
+                return (*_send_chat_message(token, session_id, message, confirm_external),
+                        *SEARCH_HIDDEN)
+            message = (message or "").strip()
+            if not message:
+                return (gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN, *SEARCH_HIDDEN)
+            try:
+                if not gemini_web_search_enabled:
+                    raise gr.Error("Máy chủ chưa bật tra cứu Internet. Bỏ chọn tra cứu để gửi tin nhắn.")
+                if not session_id:
+                    raise gr.Error(
+                        "Để tra cứu Internet, chọn Public trong Thiết lập hội thoại mới, "
+                        "rồi bấm + Hội thoại mới. Chỉ dùng nội dung công khai."
+                    )
+                session_metadata = _api(token, "GET", f"/api/sessions/{session_id}")
+                if session_metadata.get("data_classification") != "public":
+                    raise gr.Error("Tra cứu Internet chỉ dùng trong hội thoại Public.")
+                result = _api(token, "POST", f"/api/sessions/{session_id}/web-search", {
+                    "content": message, "confirm_external_ai": bool(confirm_external),
+                })
+                # Revalidate at the rendering boundary. The provider widget is
+                # transient and never becomes Chatbot content or chat history.
+                marker = _search_widget_marker(result.get("search_suggestions_html"))
+                answer = _safe_chat_text(result["content"])
+            except gr.Error as err:
+                needs_consent = EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err)
+                notice = gr.update(
+                    value=CONSENT_NOTICE if needs_consent else (
+                        "⚠️ **Chưa nhận được kết quả tra cứu.** "
+                        + _safe_markdown_text(_error_text(err))
+                        + "\n\nNội dung bạn nhập vẫn được giữ trong ô tin nhắn."
+                    ), visible=True,
+                )
+                return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), notice,
+                        gr.update(visible=needs_consent), *SEARCH_HIDDEN)
+            return (
+                gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN,
+                gr.update(value=answer, visible=True),
+                gr.update(value=marker, visible=bool(marker)),
+            )
+
+        SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_chat_notice, btn_consent_send,
+                     md_search_answer, md_search_suggestions]
+        def submit_chat_message(token, session_id, message, use_web_search=False):
+            return send_message(token, session_id, message, use_web_search=use_web_search)
+
         # One event covers Enter and tapping Send. Separate events could both
         # run while mobile Chrome was still waiting for the first response.
         gr.on(
             triggers=[btn_send.click, tb_msg.submit],
-            fn=_guard(send_message, 6),
-            inputs=[st_token, dd_session, tb_msg],
+            fn=_guard(submit_chat_message, 8),
+            inputs=[st_token, dd_session, tb_msg, cb_web_search],
             outputs=SEND_OUTS,
             trigger_mode="once",
         )
 
-        def consent_and_resend(token, session_id, message):
+        def consent_and_resend(token, session_id, message, use_web_search=False):
             """Record one explicit decision, then retry the still-visible message once.
 
             Account consent and confirming a confidential message are separate
@@ -2857,15 +3018,18 @@ def build_ui(
                     "",
                     gr.update(value="", visible=False),
                     gr.update(visible=False),
+                    *SEARCH_HIDDEN,
                 )
             if not _api(token, "GET", "/api/auth/me").get("ai_data_consent"):
                 _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
-                return send_message(token, session_id, message, False)
-            return send_message(token, session_id, message, True)
+                return send_message(token, session_id, message, False, use_web_search)
+            return send_message(token, session_id, message, True, use_web_search)
 
         btn_consent_send.click(
-            _guard(consent_and_resend, 6), [st_token, dd_session, tb_msg], SEND_OUTS
+            _guard(consent_and_resend, 8), [st_token, dd_session, tb_msg, cb_web_search], SEND_OUTS
         )
+        cb_web_search.input(lambda _selected: SEARCH_HIDDEN, [cb_web_search],
+                            [md_search_answer, md_search_suggestions], api_name=False)
 
         def search_in_session(token, session_id, query):
             if not session_id:

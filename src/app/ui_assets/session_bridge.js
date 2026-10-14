@@ -79,12 +79,121 @@
     }
   }
 
+  function chatText(content) {
+    const text = (content.innerText || content.textContent || "").trim();
+    const links = new Set();
+    for (const anchor of content.querySelectorAll("a[href]")) {
+      try {
+        const url = new URL(anchor.getAttribute("href"));
+        if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password &&
+            !text.includes(url.href)) links.add(url.href);
+      } catch (_) {
+        // A relative or malformed destination is never copied as a source URL.
+      }
+    }
+    return text + (links.size ? `\n\nLiên kết:\n${[...links].join("\n")}` : "");
+  }
+
+  async function writeChatClipboard(text) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) {
+      // Some mobile browsers deny the Clipboard API; retain the user gesture's
+      // legacy copy path without keeping plaintext in storage or calling APIs.
+    }
+    const focus = document.activeElement;
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.readOnly = true;
+    area.style.position = "fixed";
+    area.style.left = "-9999px";
+    document.body.append(area);
+    area.select();
+    let copied = false;
+    try { copied = document.execCommand("copy"); } catch (_) { /* Leave selection available. */ }
+    area.remove();
+    focus?.focus({preventScroll: true});
+    return copied;
+  }
+
+  function copyChat(event) {
+    const button = event.target instanceof Element ? event.target.closest("button[aria-label]") : null;
+    const chat = document.getElementById("chat-history");
+    if (!button || !chat?.contains(button)) return;
+    const label = button.getAttribute("aria-label");
+    const all = ["Copy conversation", "Copied conversation"].includes(label);
+    if (!all && !["Copy message", "Copied message"].includes(label)) return;
+    // Each button group follows its own row; .message-wrap contains the whole
+    // conversation, so selecting its first row would copy somebody else's turn.
+    const sibling = button.closest(".message-buttons")?.previousElementSibling;
+    const row = button.closest(".message-row") ||
+      (sibling?.matches(".message-row") ? sibling : null);
+    if (!all && !row) return;
+    const rows = all ? [...chat.querySelectorAll(".message-row")] : [row];
+    const messages = rows.map(item => {
+      const contents = [...item.querySelectorAll(".message-content")].map(chatText).filter(Boolean);
+      const text = contents.join("\n\n");
+      if (!text || !all) return text;
+      return `${item.classList.contains("user-row") ? "Bạn" : "Trợ lý"}:\n${text}`;
+    }).filter(Boolean);
+    if (!messages.length) return;
+    // Gradio copies its content prop, which now contains generated safe HTML.
+    // Stop only these native chat copy actions, then copy the visible text.
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const originalTitle = button.getAttribute("title");
+    writeChatClipboard(messages.join("\n\n")).then(copied => {
+      button.setAttribute("title", copied ? "Đã sao chép" : "Chưa sao chép được; hãy chọn nội dung để sao chép.");
+      setTimeout(() => {
+        if (originalTitle === null) button.removeAttribute("title");
+        else button.setAttribute("title", originalTitle);
+      }, 2000);
+    });
+  }
+
+  const searchWidgets = new WeakMap();
+  function renderSearchWidgets() {
+    const panel = document.getElementById("chat-search-suggestions");
+    for (const node of panel?.querySelectorAll("[data-scap-google-search-widget]") || []) {
+      const encoded = node.getAttribute("data-scap-google-search-widget");
+      const previous = searchWidgets.get(node);
+      if (!encoded || encoded.length > 45000 || previous?.encoded === encoded) continue;
+      try {
+        // This marker is created only after strict server validation. No raw
+        // widget HTML enters the outer page; a closed shadow root contains the
+        // provider's unchanged markup and scopes its branding styles.
+        const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+        const original = new TextDecoder("utf-8", {fatal: true}).decode(bytes);
+        if (!original || original.length > 32000) continue;
+        // Paint/layout containment prevents even valid provider CSS from
+        // covering controls outside the widget's own visible area.
+        node.style.contain = "layout paint style";
+        node.style.display = "block";
+        node.style.overflow = "auto";
+        const shadow = previous?.shadow || node.attachShadow({mode: "closed"});
+        shadow.innerHTML = original;
+        searchWidgets.set(node, {encoded, shadow});
+      } catch (_) {
+        // Reject malformed markers without exposing contents in browser logs.
+      }
+    }
+  }
+
   function start() {
     new MutationObserver(inspect).observe(document.body, {
       childList: true, subtree: true, attributes: true,
       attributeFilter: ["data-scap-session-ticket", "data-scap-session-clear"],
     });
+    new MutationObserver(renderSearchWidgets).observe(document.body, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ["data-scap-google-search-widget"],
+    });
+    document.addEventListener("click", copyChat, {capture: true});
     inspect();
+    renderSearchWidgets();
     setInterval(tickCountdowns, 500);
   }
   if (document.readyState === "loading") {

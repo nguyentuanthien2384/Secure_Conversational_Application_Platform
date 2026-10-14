@@ -468,6 +468,7 @@ class SessionResponse(BaseModel):
 class MessageSend(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     confirm_external_ai: bool = False
+    use_web_search: bool = False
 
     @field_validator("content")
     @classmethod
@@ -491,6 +492,12 @@ class MessageResponse(BaseModel):
     # (ví dụ ["mật khẩu", "số thẻ"]). Chỉ chứa nhãn, tuyệt đối không chứa giá trị
     # gốc, nên an toàn để hiển thị trên giao diện và ghi vào audit log.
     dlp_redacted: list[str] = Field(default_factory=list)
+
+
+class WebSearchResponse(BaseModel):
+    # Search suggestions are transient UI metadata, never conversation rows.
+    content: str = Field(max_length=32_000)
+    search_suggestions_html: str | None = Field(default=None, max_length=32_000)
 
 
 class RawMessageResponse(BaseModel):

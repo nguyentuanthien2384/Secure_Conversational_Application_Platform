@@ -687,7 +687,7 @@ def test_ai_consent_notice_is_inline_and_can_retry_the_composer():
     assert '"Đồng ý và gửi"' in source
     assert "EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err)" in source
     assert "Bấm **Đồng ý và gửi** bên dưới" in source
-    assert "def consent_and_resend(token, session_id, message):" in source
+    assert "def consent_and_resend(token, session_id, message, use_web_search=False):" in source
     assert '"/api/auth/ai-consent", {"ai_data_consent": True}' in source
     assert 'gr.Warning("Đã che dữ liệu nhạy cảm' not in source
 
@@ -695,11 +695,156 @@ def test_ai_consent_notice_is_inline_and_can_retry_the_composer():
 def test_send_button_and_enter_share_one_pending_event(runtime_demo):
     """Mobile can emit submit and click before its previous send has completed."""
     click, dependency = _button_event(runtime_demo, "Gửi")
-    composer = runtime_demo.blocks[dependency["inputs"][-1]]
+    composer = runtime_demo.blocks[dependency["inputs"][2]]
     submit, submit_dependency = _event_for(runtime_demo, composer, "submit")
     assert submit is click
     assert submit_dependency is dependency
     assert dependency["trigger_mode"] == "once"
+
+
+@pytest.fixture(scope="module")
+def search_demo():
+    from src.app.gradio_ui import build_ui
+
+    return build_ui(gemini_web_search_enabled=True)
+
+
+class _SearchApi:
+    def __init__(self, *, data_class="public", consent=True):
+        self.data_class = data_class
+        self.consent = consent
+        self.calls = []
+        self.sent = []
+
+    def __call__(self, _token, method, path, body=None, **_kwargs):
+        from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
+
+        self.calls.append((method, path, body))
+        if path == "/api/auth/me":
+            return {"ai_data_consent": self.consent}
+        if path == "/api/auth/ai-consent":
+            self.consent = body["ai_data_consent"]
+            return {}
+        if method == "POST" and path.endswith(("/messages", "/web-search")):
+            if not self.consent:
+                raise gr.Error(EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE)
+            self.sent.append(body)
+            if path.endswith("/web-search"):
+                return {"content": "**Kết quả công khai**", "search_suggestions_html": (
+                    '<a href="https://www.google.com/search?q=public+fact">public fact</a>'
+                )}
+            return {"dlp_redacted": []}
+        session = {
+            "id": "public-session", "title": "Nội dung công khai", "security_mode": "secure",
+            "data_classification": self.data_class,
+        }
+        if path == "/api/sessions":
+            return [session]
+        if method == "GET" and path.endswith("/messages"):
+            return []
+        if method == "GET" and path == "/api/sessions/public-session":
+            return session
+        raise AssertionError((method, path, body))
+
+
+def test_web_search_is_an_explicit_default_off_choice_with_cost_and_privacy_info(
+    runtime_demo, search_demo,
+):
+    for demo, enabled in ((runtime_demo, False), (search_demo, True)):
+        toggle = next(component for component in demo.blocks.values()
+                      if component.elem_id == "chat-web-search")
+        assert isinstance(toggle, gr.Checkbox)
+        assert toggle.value is False and toggle.interactive is enabled
+        send, dependency = _button_event(demo, "Gửi")
+        consent, consent_dependency = _button_event(demo, "Đồng ý và gửi")
+        assert dependency["inputs"][-1] == toggle._id
+        assert consent_dependency["inputs"][-1] == toggle._id
+        assert len(send.inputs) == len(consent.inputs) == 4
+        # Gradio follows __wrapped__ when injecting arguments. A wrapper that
+        # advertises send_message's five parameters would break real queue runs.
+        import inspect
+
+        assert len(inspect.signature(send.fn).parameters) == len(send.inputs)
+        assert len(inspect.signature(consent.fn).parameters) == len(consent.inputs)
+    assert "Google" in toggle.info and "phí" in toggle.info and "Public" in toggle.info
+
+
+@pytest.mark.parametrize("use_web_search", [False, True])
+def test_public_chat_forwards_the_explicit_search_choice(search_demo, monkeypatch, use_web_search):
+    from src.app import gradio_ui
+
+    api = _SearchApi()
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    send, _dependency = _button_event(search_demo, "Gửi")
+    result = send.fn("token", "public-session", "Kiểm tra tin mới", use_web_search)
+    body = {"content": "Kiểm tra tin mới", "confirm_external_ai": False}
+    if not use_web_search:
+        body["use_web_search"] = False
+    assert api.sent == [body]
+    endpoint = "/web-search" if use_web_search else "/messages"
+    assert any(method == "POST" and path.endswith(endpoint) for method, path, _ in api.calls)
+    if use_web_search:
+        assert not any(path.endswith("/messages") for _method, path, _body in api.calls)
+        assert result[2] == gr.skip()
+        assert "<strong>" in result[6]["value"]
+        assert "data-scap-google-search-widget" in result[7]["value"]
+    assert result[3] == ""
+
+
+@pytest.mark.parametrize("session_id, data_class", [
+    (None, "public"), ("public-session", "internal"), ("public-session", "confidential"),
+])
+def test_search_requires_a_precreated_public_conversation(
+    search_demo, monkeypatch, session_id, data_class,
+):
+    from src.app import gradio_ui
+
+    api = _SearchApi(data_class=data_class)
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    send, _dependency = _button_event(search_demo, "Gửi")
+    result = send.fn("token", session_id, "Nội dung vẫn trong ô nhập", True)
+    assert not api.sent
+    assert not any(method == "POST" for method, _path, _body in api.calls)
+    assert result[3] == gr.skip()
+    assert result[4]["visible"] is True and "Public" in result[4]["value"]
+
+
+def test_disabled_search_cannot_be_enabled_by_forging_the_ui_value(runtime_demo, monkeypatch):
+    from src.app import gradio_ui
+
+    api = _SearchApi()
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    send, _dependency = _button_event(runtime_demo, "Gửi")
+    result = send.fn("token", "public-session", "Tin mới", True)
+    assert not api.calls
+    assert result[3] == gr.skip()
+    assert "chưa bật tra cứu Internet" in result[4]["value"]
+
+
+def test_consent_retry_preserves_the_search_choice(search_demo, monkeypatch):
+    from src.app import gradio_ui
+
+    api = _SearchApi(consent=False)
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    send, _dependency = _button_event(search_demo, "Gửi")
+    consent, _consent_dependency = _button_event(search_demo, "Đồng ý và gửi")
+    first = send.fn("token", "public-session", "Tin mới", True)
+    assert first[4]["value"] == gradio_ui.CONSENT_NOTICE and not api.sent
+    result = consent.fn("token", "public-session", "Tin mới", True)
+    assert api.sent == [{"content": "Tin mới", "confirm_external_ai": False}]
+    assert result[3] == ""
+
+
+def test_logout_clears_the_previous_search_choice(search_demo, monkeypatch):
+    from src.app import gradio_ui
+
+    monkeypatch.setattr(gradio_ui, "_api", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(gr, "Info", lambda *_args, **_kwargs: None)
+    logout, dependency = _button_event(search_demo, "Đăng xuất")
+    result = logout.fn("previous-token")
+    toggle = next(component for component in search_demo.blocks.values()
+                  if component.elem_id == "chat-web-search")
+    assert dict(zip(dependency["outputs"], result, strict=True))[toggle._id] == gr.update(value=False)
 
 
 @pytest.mark.parametrize("first_session", [None, "existing"])

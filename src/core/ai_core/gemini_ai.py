@@ -1,11 +1,237 @@
+import ipaddress
 import os
+import re
 from collections.abc import Sequence
+from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 _ = load_dotenv()
+
+_MAX_GROUNDING_LINKS = 20
+_MAX_SEARCH_SUGGESTIONS = 5
+
+
+def _grounding_url(value: object, *, google_search: bool = False) -> str | None:
+    """Validate a display-only URL; the application never fetches these links."""
+    if not isinstance(value, str) or not 1 <= len(value) <= 4096:
+        return None
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 or char in '<>\\' for char in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        host = (parts.hostname or '').lower().rstrip('.')
+        if parts.scheme != 'https' or not host or parts.username or parts.password:
+            return None
+        if parts.port not in {None, 443}:
+            return None
+        if google_search:
+            direct_search = host in {'google.com', 'www.google.com'} and parts.path == '/search'
+            # Google's widget can use its signed grounding redirect instead of
+            # a direct google.com/search URL. Preserve that provider URL exactly.
+            signed_redirect = (
+                host == 'vertexaisearch.cloud.google.com'
+                and re.fullmatch(r'/grounding-api-redirect/[A-Za-z0-9_=-]+', parts.path)
+                and not parts.query and not parts.fragment
+            )
+            if not (direct_search or signed_redirect):
+                return None
+        else:
+            try:
+                if not ipaddress.ip_address(host).is_global:
+                    return None
+            except ValueError:
+                if '.' not in host or host.endswith(('.localhost', '.local', '.internal', '.lan')):
+                    return None
+    except ValueError:
+        return None
+    return value
+
+
+def _grounding_label(value: object) -> str:
+    if not isinstance(value, str):
+        return ''
+    label = ' '.join(value.split())
+    if not label or len(label) > 500:
+        return ''
+    # Captions are data. Escape Markdown so they cannot add markup or images.
+    return re.sub(r'([\\`*_{}\[\]()#!<>|~])', r'\\\1', label)
+
+
+def _inert_css(value: str) -> bool:
+    # Preserve the widget verbatim or reject it. Escapes are not needed by the
+    # Google widget; rejecting them prevents obfuscating network-capable CSS.
+    if '\\' in value or any(ord(c) < 32 and c not in '\t\r\n' for c in value):
+        return False
+    css = re.sub(r'/\*.*?\*/', '', value, flags=re.S).lower()
+    if re.search(r'(?:url|image(?:-set)?|cross-fade|element|expression|src)\s*\(', css):
+        return False
+    return all(match.group(1) in {'media', 'supports'}
+               for match in re.finditer(r'@([a-z-]+)', css))
+
+
+class _SearchWidgetValidator(HTMLParser):
+    """Validate the original widget; never sanitize, rewrite or fetch it."""
+
+    tags = {'div', 'span', 'p', 'a', 'style', 'svg', 'g', 'path', 'rect',
+            'circle', 'line', 'polyline', 'polygon', 'br'}
+    attributes = {'class', 'id', 'style', 'aria-label', 'aria-hidden', 'role', 'title',
+                  'href', 'target', 'rel', 'xmlns', 'viewbox', 'width', 'height',
+                  'fill', 'fill-rule', 'clip-rule', 'd', 'stroke', 'stroke-width',
+                  'stroke-linecap', 'stroke-linejoin', 'opacity', 'fill-opacity',
+                  'stroke-opacity', 'transform', 'x', 'y', 'rx', 'ry', 'cx', 'cy',
+                  'r', 'x1', 'x2', 'y1', 'y2', 'points', 'version', 'focusable'}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.valid = True
+        self.stack: list[str] = []
+        self.links = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in self.tags:
+            self.valid = False
+        names = [name for name, _ in attrs]
+        if len(names) != len(set(names)):
+            self.valid = False
+        for name, value in attrs:
+            if name not in self.attributes or value is None or not _inert_css(value):
+                self.valid = False
+            if name == 'href' and (tag != 'a' or not _grounding_url(value, google_search=True)):
+                self.valid = False
+            if name == 'target' and value not in {'_blank', '_self'}:
+                self.valid = False
+            if name == 'xmlns' and value != 'http://www.w3.org/2000/svg':
+                self.valid = False
+        if tag == 'a':
+            if not _grounding_url(dict(attrs).get('href'), google_search=True):
+                self.valid = False
+            self.links += 1
+        if tag != 'br':
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag != 'br':
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack.pop() != tag:
+            self.valid = False
+
+    def handle_data(self, data):
+        if self.stack and self.stack[-1] == 'style' and not _inert_css(data):
+            self.valid = False
+
+    def handle_decl(self, decl):
+        self.valid = False
+
+    def unknown_decl(self, data):
+        self.valid = False
+
+    def handle_pi(self, data):
+        self.valid = False
+
+
+def validate_search_suggestions_html(value: object) -> bool:
+    """Allow only an inert, self-contained Google widget for a scoped DOM root."""
+    if not isinstance(value, str) or not 1 <= len(value) <= 32000:
+        return False
+    try:
+        if len(value.encode('utf-8')) > 32000:
+            return False
+    except UnicodeEncodeError:
+        return False
+    parser = _SearchWidgetValidator()
+    try:
+        parser.feed(value)
+        parser.close()
+    except (ValueError, AssertionError):
+        return False
+    return parser.valid and not parser.stack and 1 <= parser.links <= _MAX_SEARCH_SUGGESTIONS
+
+
+class GroundedAnswer(str):
+    """Text plus transient widget, for the stateless authenticated search UI."""
+
+    def __new__(cls, text: str, search_suggestions_html: str | None = None):
+        result = super().__new__(cls, text)
+        result.search_suggestions_html = search_suggestions_html
+        return result
+
+
+def _grounded_answer(candidate, visible_parts: list[tuple[int, str]]) -> GroundedAnswer:
+    metadata = getattr(candidate, 'grounding_metadata', None)
+    chunks = getattr(metadata, 'grounding_chunks', None) or []
+    text = ''.join(part for _, part in visible_parts)
+    if not chunks:
+        entry = getattr(metadata, 'search_entry_point', None)
+        if getattr(entry, 'rendered_content', None) or getattr(metadata, 'web_search_queries', None):
+            raise RuntimeError('Kết quả tra cứu thiếu thông tin nguồn đầy đủ.')
+        return GroundedAnswer(text + '\n\nTra cứu Internet: lần trả lời này không có nguồn kiểm chứng từ Google Search.')
+    if len(chunks) > _MAX_GROUNDING_LINKS:
+        raise RuntimeError('Số nguồn tra cứu vượt giới hạn hiển thị an toàn.')
+    sources: list[tuple[str, str]] = []
+    for chunk in chunks:
+        web = getattr(chunk, 'web', None)
+        if web is None:
+            raise RuntimeError('Nhà cung cấp không trả nguồn web kiểm chứng được.')
+        uri = _grounding_url(getattr(web, 'uri', None))
+        label = _grounding_label(getattr(web, 'title', None))
+        if not uri:
+            raise RuntimeError('Nhà cung cấp trả nguồn tra cứu không an toàn.')
+        sources.append((label or _grounding_label(urlsplit(uri).hostname), uri))
+    entry = getattr(metadata, 'search_entry_point', None)
+    html = getattr(entry, 'rendered_content', None)
+    if not validate_search_suggestions_html(html):
+        raise RuntimeError('Thiếu liên kết gợi ý Google Search hợp lệ.')
+    # SDK segment offsets are UTF-8 bytes in the original Part, not Python
+    # character offsets. Add citations only to the exact supported segment.
+    supports = getattr(metadata, 'grounding_supports', None) or []
+    if len(supports) > 100:
+        raise RuntimeError('Số trích dẫn vượt giới hạn hiển thị an toàn.')
+    visible = dict(visible_parts)
+    inserts: dict[int, dict[int, set[int]]] = {}
+    for support in supports:
+        segment = getattr(support, 'segment', None)
+        part_index = getattr(segment, 'part_index', None) or 0
+        start, end = getattr(segment, 'start_index', None), getattr(segment, 'end_index', None)
+        if start is None:
+            # Protobuf JSON omits a zero startIndex for the first segment.
+            start = 0
+        indices = getattr(support, 'grounding_chunk_indices', None) or []
+        if not indices:
+            continue
+        if (type(part_index) is not int or part_index not in visible
+                or type(start) is not int or type(end) is not int or not 0 <= start < end
+                or any(type(i) is not int or not 0 <= i < len(sources) for i in indices)):
+            raise RuntimeError('Thông tin trích dẫn không hợp lệ.')
+        encoded = visible[part_index].encode('utf-8')
+        if end > len(encoded):
+            raise RuntimeError('Thông tin trích dẫn không hợp lệ.')
+        try:
+            segment_text = encoded[start:end].decode('utf-8')
+            position = len(encoded[:end].decode('utf-8'))
+        except UnicodeDecodeError as exc:
+            raise RuntimeError('Thông tin trích dẫn không hợp lệ.') from exc
+        provided_text = getattr(segment, 'text', None)
+        if provided_text is not None and provided_text != segment_text:
+            raise RuntimeError('Thông tin trích dẫn không khớp câu trả lời.')
+        inserts.setdefault(part_index, {}).setdefault(position, set()).update(indices)
+    cited_parts = []
+    for part_index, part in visible_parts:
+        for position, indices in sorted(inserts.get(part_index, {}).items(), reverse=True):
+            citations = ' '.join(f'[{i + 1}](<{sources[i][1]}>)' for i in sorted(indices))
+            part = part[:position] + citations + part[position:]
+        cited_parts.append(part)
+    source_lines = [f'- [{i + 1}: {label}](<{uri}>)' for i, (label, uri) in enumerate(sources)]
+    return GroundedAnswer(
+        ''.join(cited_parts) + '\n\nNguồn Google Search trả về:\n' + '\n'.join(source_lines),
+        html,
+    )
 
 
 class GeminiClient:
@@ -113,6 +339,7 @@ class GeminiClient:
         temperature: float | None = None,
         extra_config: dict | None = None,
         model: str | None = None,
+        use_web_search: bool = False,
     ) -> str:
         """Gọi `models.generate_content` và trả về text.
 
@@ -126,6 +353,8 @@ class GeminiClient:
             temperature: Nhiệt độ sampling (nếu model hỗ trợ).
             extra_config: Dict bổ sung vào `GenerateContentConfig` (advanced).
             model: Ghi đè model mặc định cho lần gọi này (tùy chọn).
+            use_web_search: Bật Google Search khi ứng dụng đã kiểm tra quyền,
+                đồng thuận và dữ liệu công khai. Công cụ có thể tính phí.
 
         Returns:
             Chuỗi văn bản tổng hợp từ các `parts` dạng text của candidate đầu tiên.
@@ -148,6 +377,10 @@ class GeminiClient:
             cfg_kwargs["temperature"] = temperature
         if extra_config:
             cfg_kwargs.update(extra_config)
+        if use_web_search:
+            # This interface grants only the built-in search tool, never custom
+            # actions, code execution or unrestricted URL fetching by our app.
+            cfg_kwargs['tools'] = [types.Tool(google_search=types.GoogleSearch())]
 
         generate_content_config = (
             types.GenerateContentConfig(**cfg_kwargs)
@@ -177,16 +410,35 @@ class GeminiClient:
             cand = resp.candidates[0]
             parts = getattr(cand, "content", None).parts or []  # type: ignore[attr-defined]
         except Exception as e:
-            raise RuntimeError(f"Không có candidate hợp lệ trong phản hồi: {e}") from e
+            raise RuntimeError("Không có candidate hợp lệ trong phản hồi.") from e
 
-        texts: list[str] = []
-        for p in parts:
+        reason = getattr(cand, 'finish_reason', None)
+        reason = getattr(reason, 'value', reason)
+        if reason and str(reason) not in {'STOP', 'MAX_TOKENS', 'FINISH_REASON_UNSPECIFIED'}:
+            raise RuntimeError('Nhà cung cấp không hoàn tất câu trả lời an toàn.')
+
+        visible_parts: list[tuple[int, str]] = []
+        for index, p in enumerate(parts):
+            if getattr(p, 'thought', False):
+                continue
             t = getattr(p, "text", None)
             if t:
-                texts.append(t)
-        out = "".join(texts).strip()
-        if not out:
+                visible_parts.append((index, t))
+        out = "".join(text for _, text in visible_parts)
+        if not out.strip():
             raise RuntimeError("Candidate không chứa phần text nào.")
+        if use_web_search:
+            # Never label a partial grounded result complete or modify its
+            # text with a truncation notice. The caller can retry a smaller query.
+            if reason == 'MAX_TOKENS':
+                raise RuntimeError('Kết quả tra cứu chưa hoàn tất; hãy thu gọn câu hỏi.')
+            return _grounded_answer(cand, visible_parts)
+        out = out.strip()
+        if reason == 'MAX_TOKENS':
+            out += (
+                '\n\n[Câu trả lời đã đạt giới hạn token và có thể chưa đầy đủ. '
+                'Bạn có thể yêu cầu tiếp tục phần còn lại.]'
+            )
         return out
 
 

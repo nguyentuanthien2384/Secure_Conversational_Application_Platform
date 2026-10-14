@@ -225,11 +225,53 @@ def test_configure_changes_only_requested_fields(project):
     assert vps.check(project) == []
 
 
+def test_balanced_ai_profile_preserves_model_keys_and_other_configuration(project):
+    ready(project)
+    replace(project, GOOGLE_GENAI_API_KEY="unit-test-provider-key", AI_MAX_OUTPUT_TOKENS="512",
+            AI_HISTORY_MESSAGES="8", ALLOW_DEMO_AI="true", GEMINI_WEB_SEARCH_ENABLED="true")
+    before = values(project)
+
+    changed = vps.configure(project, ai_quality="balanced")
+
+    expected = {"AI_MAX_OUTPUT_TOKENS": "2048", "AI_HISTORY_MESSAGES": "16",
+                "ALLOW_DEMO_AI": "false"}
+    assert changed == sorted(expected)
+    assert values(project) == {**before, **expected}
+    check_private_file(project / "deploy/.env.vps")
+    assert vps.check(project) == []
+
+
+def test_balanced_ai_profile_adds_history_field_to_older_configuration(project):
+    ready(project)
+    replace(project, GOOGLE_GENAI_API_KEY="unit-test-provider-key")
+    path = project / "deploy/.env.vps"
+    original_lines = vps._read(path, private=True)[0]
+    path.write_text("\n".join(line for line in original_lines
+                              if not line.startswith("AI_HISTORY_MESSAGES=")) + "\n",
+                    encoding="utf-8")
+    assert vps.check(project) == []
+
+    assert vps.main(["configure", "--project", str(project), "--ai-quality", "balanced"]) == 0
+    assert values(project)["AI_HISTORY_MESSAGES"] == "16"
+    assert sum(line.startswith("AI_HISTORY_MESSAGES=")
+               for line in vps._read(path, private=True)[0]) == 1
+    assert vps.check(project) == []
+
+
+@pytest.mark.parametrize("value,accepted", [("4096", True), ("4097", False)])
+def test_vps_answer_token_budget_remains_bounded(project, value, accepted):
+    ready(project)
+    replace(project, AI_MAX_OUTPUT_TOKENS=value)
+    issues = vps.check(project)
+    assert any("AI_MAX_OUTPUT_TOKENS" in issue for issue in issues) is not accepted
+
+
 @pytest.mark.parametrize("kwargs,field", [
     ({"domain": "demo.example.org"}, "PUBLIC_DOMAIN"),
     ({"email": "root@localhost"}, "CADDY_EMAIL"),
     ({"images": {"BASE_IMAGE": "python:3.12-slim"}}, "BASE_IMAGE"),
     ({"images": {"APP_SECRET_KEY": "x@sha256:" + "a" * 64}}, "APP_SECRET_KEY"),
+    ({"ai_quality": "unlimited"}, "AI quality"),
     ({}, "Nothing to configure"),
 ])
 def test_configure_rejects_invalid_values_without_writing(project, kwargs, field):
