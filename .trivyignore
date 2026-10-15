@@ -1,0 +1,43 @@
+# Time-bounded risk record for HIGH findings that have NO upstream fix yet.
+# Policy (docs/supply-chain/README.md): no global ignore-unfixed switch; each
+# unfixed finding is listed by ID with a reason and an expiry. When an entry
+# expires, Trivy reports it again and CI fails until it is re-reviewed or the
+# base image digest is bumped to a release that contains the fix.
+#
+# Reviewed: 2026-10-15 against python:3.12-slim (Debian 13.7) digest
+# sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1.
+# Trivy status for every entry below: "affected" or "fix_deferred" (no fixed
+# Debian package exists). Anything with a published fix must be upgraded, not
+# listed here.
+#
+# Shared runtime context: the app runs as the unprivileged `app` user with
+# cap-drop ALL, no-new-privileges, a read-only root filesystem and no shell
+# access; it never invokes mount, nsenter, infocmp, perl or ACL tools.
+
+# util-linux (bsdutils, libblkid1, libmount1, libsmartcols1, libuuid1,
+# liblastlog2-2, login, mount, util-linux). All four need SUID mount(8) helper
+# options, fstab-authorised bind mounts or nsenter --join-cgroup run by a local
+# user. The image has no fstab entries, never runs mount/nsenter, and
+# no-new-privileges neutralises SUID. util-linux stays because the entrypoint
+# drops privileges with setpriv.
+CVE-2026-76642 exp:2027-01-15
+CVE-2026-78408 exp:2027-01-15
+CVE-2026-78409 exp:2027-01-15
+CVE-2026-78410 exp:2027-01-15
+
+# acl (libacl1): symlink traversal in pathname-based libacl calls used by a
+# privileged process. Nothing in the image calls libacl on attacker-controlled
+# paths, and the app process holds no privilege to escalate from.
+CVE-2026-54369 exp:2027-01-15
+
+# ncurses (libncursesw6, libtinfo6, ncurses-base, ncurses-bin): stack overflow
+# in the infocmp CLI only. infocmp is never executed by the service.
+CVE-2025-69720 exp:2027-01-15
+
+# systemd (libsystemd0, libudev1): flaw is in the systemd-homed daemon. Only
+# the client libraries are present as apt dependencies; no systemd daemon runs.
+CVE-2026-16742 exp:2027-01-15
+
+# perl-base: Archive::Tar memory exhaustion on a crafted tar. The service never
+# runs Perl or parses tar archives with Archive::Tar. Debian: fix_deferred.
+CVE-2026-9538 exp:2027-01-15

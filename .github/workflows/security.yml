@@ -150,7 +150,9 @@ jobs:
           persist-credentials: false
       - name: Require an immutable production base image
         env:
-          BASE_IMAGE: ${{ vars.PYTHON_BASE_IMAGE }}
+          # Repository variable wins; otherwise use the reviewed pin below so a
+          # fork or fresh clone still builds the same immutable base image.
+          BASE_IMAGE: ${{ vars.PYTHON_BASE_IMAGE || 'python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1' }}
         shell: bash
         run: |
           if [[ ! "$BASE_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
@@ -175,6 +177,8 @@ jobs:
           image-ref: secure-chat:ci
           severity: HIGH,CRITICAL
           exit-code: "1"
+          # Reviewed, expiring risk records for findings with no upstream fix.
+          trivyignores: .trivyignore
       - name: Generate CycloneDX SBOM from built image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -210,10 +214,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      BASE_IMAGE: ${{ vars.PYTHON_BASE_IMAGE }}
-      POSTGRES_IMAGE: ${{ vars.POSTGRES_IMAGE }}
-      REDIS_IMAGE: ${{ vars.REDIS_IMAGE }}
-      CADDY_IMAGE: ${{ vars.CADDY_IMAGE }}
+      # Repository variables win; otherwise use the reviewed digest pins.
+      BASE_IMAGE: ${{ vars.PYTHON_BASE_IMAGE || 'python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1' }}
+      POSTGRES_IMAGE: ${{ vars.POSTGRES_IMAGE || 'postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24' }}
+      REDIS_IMAGE: ${{ vars.REDIS_IMAGE || 'redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499' }}
+      CADDY_IMAGE: ${{ vars.CADDY_IMAGE || 'caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

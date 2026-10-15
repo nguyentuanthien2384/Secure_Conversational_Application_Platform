@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from src.app.models import AuditEvent
@@ -163,10 +163,13 @@ def append_lock(db: Session):
     """Serialise appends. Postgres gets a transaction-scoped advisory lock."""
     dialect = db.get_bind().dialect.name if db.get_bind() is not None else ""
     if dialect == "postgresql":
-        from sqlalchemy import text
-
         db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": _ADVISORY_LOCK_ID})
         return _NullContext()
+    if dialect == "sqlite":
+        # Claim SQLite's database writer before the process mutex. This both
+        # serializes independent worker processes and prevents a mutex owner
+        # waiting on a business writer which needs the same mutex to commit.
+        db.execute(text("UPDATE audit_events SET id = id WHERE 1 = 0"))
     return _LOCK
 
 

@@ -88,6 +88,9 @@ GRANT CONNECT ON DATABASE secure_chat TO scap_app;
 GRANT USAGE  ON SCHEMA public         TO scap_app;   -- USAGE, KHÔNG phải CREATE
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO scap_app;
 GRANT USAGE, SELECT                  ON ALL SEQUENCES IN SCHEMA public TO scap_app;
+-- intrusion_sources / intrusion_detections are bounded operational IDS state:
+-- runtime DML above is required for atomic scores, expiring bans and pruning.
+-- Durable IDS audit events remain in the append-only audit_events table below.
 
 -- Bảng tạo về sau cũng tự thừa hưởng đúng quyền này.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public

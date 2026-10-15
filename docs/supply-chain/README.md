@@ -27,8 +27,13 @@ overlay requires verified, immutable `name@sha256:<digest>` references for
 PostgreSQL, Redis, and Caddy as well as the Python base image. Store those four
 references in the matching repository variables so CI validates exactly the
 same class of deployment input used in production: `PYTHON_BASE_IMAGE`,
-`POSTGRES_IMAGE`, `REDIS_IMAGE`, and `CADDY_IMAGE`. A missing or tag-only value
-fails with the variable name before Compose validation begins.
+`POSTGRES_IMAGE`, `REDIS_IMAGE`, and `CADDY_IMAGE`. When a variable is not set,
+`security.yml` falls back to a reviewed `name@sha256` pin written in the
+workflow itself (verified with `docker buildx imagetools inspect` on
+2026-10-15), so a fork or fresh repository still builds and validates immutable
+images. Update those pins in the same reviewed change whenever the upstream
+digest is re-verified. A tag-only value still fails with the variable name
+before Compose validation begins.
 
 ## CI trust boundaries
 

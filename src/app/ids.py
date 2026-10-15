@@ -26,20 +26,22 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import re
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any
 from urllib.parse import unquote_plus
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, delete, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from src.app.db import utcnow
-from src.app.models import AuditEvent
+from src.app.models import AuditEvent, IntrusionDetection, IntrusionSource
 
 # ─────────────────────────── signature engine ───────────────────────────
 
@@ -339,10 +341,8 @@ def run_safe_detection_verification() -> dict[str, Any]:
 class IntrusionState:
     """In-memory detection log + dynamic blocklist (the 'P' in IPS).
 
-    In-memory is the right scope for a single-instance teaching deployment. A
-    real multi-node deployment must share this state — Redis, or better, push
-    the decision to the edge (fail2ban / Caddy / cloud WAF) so blocked traffic
-    never reaches the application at all.
+    Kept for isolated unit tests. Application runtimes use
+    ``PersistentIntrusionState`` so workers share detection history and bans.
     """
 
     def __init__(
@@ -433,7 +433,7 @@ class IntrusionState:
                 return False, 0
             return True, max(1, int(expiry - now))
 
-    def unblock(self, source_ip: str) -> bool:
+    def unblock(self, source_ip: str, *, db: Session | None = None) -> bool:
         with self._lock:
             self._scores.pop(source_ip, None)
             return self._blocked.pop(source_ip, None) is not None
@@ -452,6 +452,167 @@ class IntrusionState:
         with self._lock:
             items = list(self._detections)[-limit:]
         return [item.as_dict() for item in reversed(items)]
+
+
+class PersistentIntrusionState:
+    """Database-backed IDS state shared across processes and application restarts.
+
+    Mutation transactions serialize on a dedicated PostgreSQL advisory lock or
+    SQLite's writer lock. This covers the score, one-time block transition,
+    unblock, and capacity pruning together; Python locks cannot protect separate
+    workers. Read-only checks use expiry predicates and never take a writer lock.
+    The bounded operational history is separate from the append-only audit log.
+    All PostgreSQL workers use the database clock for score windows and bans.
+    """
+
+    _ADVISORY_LOCK_ID = 0x53434150494453  # SCAPIDS; distinct from audit/maintenance locks.
+    _SEVERITY_WEIGHT = IntrusionState._SEVERITY_WEIGHT
+
+    def __init__(
+        self,
+        session_factory: Callable[[], Session],
+        *,
+        block_threshold: int = 5,
+        block_seconds: int = 900,
+        history: int = 500,
+        max_sources: int = 10_000,
+    ) -> None:
+        if min(block_threshold, block_seconds, history, max_sources) <= 0:
+            raise ValueError("IDS thresholds, retention and source capacity must be positive.")
+        self._session_factory = session_factory
+        self.block_threshold = block_threshold
+        self.block_seconds = block_seconds
+        self.history = history
+        self.max_sources = max_sources
+
+    @staticmethod
+    def _utc(value: datetime) -> datetime:
+        # SQLite's DateTime adapter returns a naive UTC value.
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+    def _now(self, db: Session) -> datetime:
+        if db.get_bind().dialect.name == "postgresql":
+            return self._utc(db.scalar(select(func.clock_timestamp())))
+        return self._utc(utcnow())
+
+    def _lock_writer(self, db: Session, *, existing_transaction: bool = False) -> None:
+        dialect = db.get_bind().dialect.name
+        if dialect == "postgresql":
+            db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": self._ADVISORY_LOCK_ID})
+        elif dialect == "sqlite":
+            if not existing_transaction:
+                # Acquire the writer reservation before reading scores; a
+                # deferred read followed by UPDATE can race or fail to upgrade.
+                db.execute(text("BEGIN IMMEDIATE"))
+            elif not db.connection().connection.driver_connection.in_transaction:
+                raise RuntimeError("Shared IDS mutation requires an active SQLite write transaction.")
+        else:
+            raise RuntimeError("Persistent IDS state supports SQLite and PostgreSQL only.")
+
+    def _prune_sources(self, db: Session, now: datetime) -> None:
+        cutoff = now - timedelta(seconds=self.block_seconds)
+        db.execute(delete(IntrusionSource).where(or_(
+            IntrusionSource.blocked_until <= now,
+            and_(IntrusionSource.blocked_until.is_(None), IntrusionSource.last_seen_at <= cutoff),
+        )))
+
+    def _retain_detection(self, db: Session, detection: Detection) -> None:
+        # Detection.as_dict is an explicit allowlist. Request bodies, raw query
+        # strings, and header evidence are never persisted here. The request
+        # scanner supplies its already-sanitized path and evidence digest.
+        db.add(IntrusionDetection(payload_json=json.dumps(detection.as_dict(), ensure_ascii=False)))
+        db.flush()
+        oldest_retained = db.scalar(
+            select(IntrusionDetection.id).order_by(IntrusionDetection.id.desc())
+            .offset(self.history - 1).limit(1)
+        )
+        if oldest_retained is not None:
+            db.execute(delete(IntrusionDetection).where(IntrusionDetection.id < oldest_retained))
+
+    def record(self, detection: Detection) -> bool:
+        """Persist one sanitized hit, atomically returning the new-ban transition."""
+        with self._session_factory() as db, db.begin():
+            self._lock_writer(db)
+            now = self._now(db)
+            self._prune_sources(db, now)
+            self._retain_detection(db, detection)
+            source = db.get(IntrusionSource, detection.source_ip)
+            if source is None:
+                if db.scalar(select(func.count()).select_from(IntrusionSource)) >= self.max_sources:
+                    oldest = db.scalar(
+                        select(IntrusionSource).where(IntrusionSource.blocked_until.is_(None))
+                        .order_by(IntrusionSource.last_seen_at, IntrusionSource.source_ip).limit(1)
+                    )
+                    # Retain active bans under a source-rotation flood. When
+                    # all slots are blocked, only detection history is updated.
+                    if oldest is None:
+                        return False
+                    db.delete(oldest)
+                source = IntrusionSource(source_ip=detection.source_ip, score_times_json="[]", last_seen_at=now)
+                db.add(source)
+            cutoff = (now - timedelta(seconds=self.block_seconds)).timestamp()
+            scores = [stamp for stamp in json.loads(source.score_times_json) if stamp > cutoff]
+            scores.extend([now.timestamp()] * self._SEVERITY_WEIGHT.get(detection.severity, 1))
+            scores = scores[-self.block_threshold:]
+            source.score_times_json = json.dumps(scores)
+            source.last_seen_at = now
+            if len(scores) >= self.block_threshold and source.blocked_until is None:
+                source.blocked_until = now + timedelta(seconds=self.block_seconds)
+                return True
+        return False
+
+    def is_blocked(self, source_ip: str) -> tuple[bool, int]:
+        with self._session_factory() as db:
+            now = self._now(db)
+            expiry = db.scalar(select(IntrusionSource.blocked_until).where(
+                IntrusionSource.source_ip == source_ip, IntrusionSource.blocked_until > now,
+            ))
+            if expiry is None:
+                return False, 0
+            return True, max(1, int((self._utc(expiry) - now).total_seconds()))
+
+    def _unblock(self, db: Session, source_ip: str, *, existing_transaction: bool) -> bool:
+        self._lock_writer(db, existing_transaction=existing_transaction)
+        now = self._now(db)
+        source = db.get(IntrusionSource, source_ip)
+        if source is None:
+            return False
+        active = source.blocked_until is not None and self._utc(source.blocked_until) > now
+        db.delete(source)
+        return active
+
+    def unblock(self, source_ip: str, *, db: Session | None = None) -> bool:
+        """Clear a score/ban, optionally in the caller's admin/audit transaction.
+
+        A supplied SQLite session must already hold its account-policy writer
+        reservation. No commit is issued for a supplied session, so an audit
+        failure rolls back the unblock too. PostgreSQL takes the IDS lock after
+        the caller's account-policy lock and holds it until that transaction ends.
+        """
+        if db is not None:
+            return self._unblock(db, source_ip, existing_transaction=True)
+        with self._session_factory() as session, session.begin():
+            return self._unblock(session, source_ip, existing_transaction=False)
+
+    def blocked_sources(self) -> list[dict[str, Any]]:
+        with self._session_factory() as db:
+            now = self._now(db)
+            return [
+                {"source_ip": ip, "seconds_remaining": max(1, int((self._utc(expiry) - now).total_seconds()))}
+                for ip, expiry in db.execute(
+                    select(IntrusionSource.source_ip, IntrusionSource.blocked_until)
+                    .where(IntrusionSource.blocked_until > now).order_by(IntrusionSource.source_ip)
+                )
+            ]
+
+    def recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        with self._session_factory() as db:
+            return [json.loads(payload) for payload in db.scalars(
+                select(IntrusionDetection.payload_json).order_by(IntrusionDetection.id.desc())
+                .limit(min(limit, self.history))
+            )]
 
 
 # ─────────────────────────── anomaly engine ───────────────────────────

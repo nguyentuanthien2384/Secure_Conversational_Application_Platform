@@ -982,6 +982,12 @@ def _api(token, method, path, body=None, *, params=None):
         error = gr.Error(message)
         # Callers that expect a permission boundary (403) can render it quietly.
         error.status_code = resp.status_code
+        # A rejected precondition is safe to retry once after step-up. Error
+        # text alone must never replay an HTTP write whose outcome is unknown.
+        error.step_up_required = (
+            resp.status_code == 403
+            and resp.headers.get("X-Step-Up-Required", "").lower() == "true"
+        )
         raise error
     return data
 
@@ -1369,7 +1375,15 @@ def _with_step_up(token, password, code, call, action):
     try:
         return call()
     except gr.Error as err:
-        if "xác thực lại" not in str(err).lower():
+        required = getattr(err, "step_up_required", None)
+        # Compatibility for local callers which synthesize Gradio errors;
+        # every real HTTP error carries the explicit flag set in _api().
+        if required is None:
+            required = (
+                getattr(err, "status_code", None) is None
+                and "xác thực lại" in str(err).lower()
+            )
+        if not required:
             raise
         if not password:
             raise gr.Error(
@@ -2177,6 +2191,19 @@ def build_ui(
                     df_users = _data_table(
                         USER_HEADERS, elem_id="users-table", elem_classes=["dashboard-table"]
                     )
+                    gr.Markdown(
+                        "Khi cần xác thực lại, nhập mật khẩu của bạn và mã 2FA (nếu đã bật) "
+                        "trước khi thực hiện thao tác quản trị. Thông tin này được xóa sau thao tác."
+                    )
+                    with gr.Row():
+                        tb_admin_pw = gr.Textbox(
+                            label="Mật khẩu quản trị viên (khi cần xác thực lại)",
+                            type="password", max_length=128, elem_id="admin-step-up-password",
+                        )
+                        tb_admin_code = gr.Textbox(
+                            label="Mã 2FA quản trị viên", type="password", max_length=32,
+                            elem_id="admin-step-up-code",
+                        )
                     with gr.Row():
                         dd_user_pick = _pick_dropdown(label="Người dùng", choices=[], scale=2)
                         dd_role_new = _pick_dropdown(
@@ -2238,8 +2265,9 @@ def build_ui(
                     with gr.Accordion("1 · Toàn vẹn nhật ký kiểm toán (hash chain)", open=True):
                         gr.Markdown(
                             "Mỗi bản ghi cam kết vào bản ghi trước bằng "
-                            "`HMAC-SHA256(khóa, prev_hash ‖ bản_ghi)`. Sửa hoặc xoá một dòng "
-                            "sẽ làm gãy chuỗi và bị phát hiện tại đây. *Chức năng này cần vai trò admin.*"
+                            "`HMAC-SHA256(khóa, prev_hash ‖ bản_ghi)`. Chuỗi nội bộ kiểm tra "
+                            "nội dung và liên kết các bản ghi còn lưu; phát hiện mất phần đuôi cần "
+                            "checkpoint neo ngoài (WORM). *Chức năng này cần vai trò admin.*"
                         )
                         btn_sec_verify = gr.Button("Xác minh chuỗi", variant="primary", size="sm")
                         md_sec_verdict = gr.Markdown(
@@ -2284,6 +2312,15 @@ def build_ui(
                         with gr.Row():
                             tb_sec_ip = gr.Textbox(label="IP cần gỡ chặn", max_lines=1, scale=3)
                             btn_sec_unblock = gr.Button("Gỡ chặn", size="sm", scale=1)
+                        with gr.Row():
+                            tb_sec_pw = gr.Textbox(
+                                label="Mật khẩu hiện tại (khi cần xác thực lại)",
+                                type="password", max_length=128, elem_id="security-step-up-password",
+                            )
+                            tb_sec_code = gr.Textbox(
+                                label="Mã 2FA (nếu đã bật)", type="password", max_length=32,
+                                elem_id="security-step-up-code",
+                            )
 
         # ══════════════════════ HANDLERS ══════════════════════
         # Giai đoạn 1 (nhẹ, ít output): xác thực + chuyển màn hình.
@@ -2389,6 +2426,8 @@ def build_ui(
             (dd_role_new, "user"),
             (tb_cu_name, ""),
             (tb_cu_pw, ""),
+            (tb_admin_pw, ""),
+            (tb_admin_code, ""),
             (dd_cu_role, "user"),
             (sl_audit, 100),
             (df_audit, _table_html(AUDIT_HEADERS, [])),
@@ -2402,6 +2441,8 @@ def build_ui(
             (md_sec_ids_verdict, md_sec_ids_verdict.value),
             (df_sec_block, _table_html(BLOCKLIST_HEADERS, [])),
             (tb_sec_ip, ""),
+            (tb_sec_pw, ""),
+            (tb_sec_code, ""),
         ]
         # Hai output cuối là đồng hồ và cờ cảnh báo của phiên.
         RESET_OUTS =STAGE1 + STAGE2 + [item[0] for item in EXTRA_RESET] + [
@@ -3701,46 +3742,68 @@ def build_ui(
         # phủ lớp "processing" lên từng thẻ.
         adm_tab.select(_guard(refresh_admin, 8), [st_token], ADMIN_OUTS, show_progress="hidden")
 
-        def set_role(token, user_id, role):
+        def clear_admin_credentials():
+            return "", "", ""
+
+        ADMIN_SECRET_OUTS = [tb_admin_pw, tb_admin_code, tb_cu_pw]
+
+        def set_role(token, user_id, role, password="", code=""):
             if not user_id:
                 gr.Warning("Chọn một người dùng trước.")
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
-            _api(token, "PATCH", f"/api/admin/users/{user_id}/role", {"role": role})
+            _with_step_up(
+                token, password, code,
+                lambda: _api(token, "PATCH", f"/api/admin/users/{user_id}/role", {"role": role}),
+                "Đổi vai trò",
+            )
             gr.Info(f"Đã đổi vai trò thành {role}.")
             return refresh_admin(token, keep=user_id)
 
-        btn_set_role.click(_guard(set_role, len(ADMIN_OUTS)), [st_token, dd_user_pick, dd_role_new], ADMIN_OUTS)
+        btn_set_role.click(
+            _guard(set_role, len(ADMIN_OUTS)),
+            [st_token, dd_user_pick, dd_role_new, tb_admin_pw, tb_admin_code], ADMIN_OUTS,
+        ).then(clear_admin_credentials, [], ADMIN_SECRET_OUTS, show_progress="hidden")
 
-        def set_status(token, user_id, active):
+        def set_status(token, user_id, active, password="", code=""):
             if not user_id:
                 gr.Warning("Chọn một người dùng trước.")
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
-            _api(token, "PATCH", f"/api/admin/users/{user_id}/status", {"is_active": active})
+            _with_step_up(
+                token, password, code,
+                lambda: _api(token, "PATCH", f"/api/admin/users/{user_id}/status", {"is_active": active}),
+                "Mở khóa" if active else "Khóa",
+            )
             gr.Info("Đã mở khóa tài khoản." if active else "Đã khóa tài khoản.")
             return refresh_admin(token, keep=user_id)
 
         btn_lock.click(
-            _guard(lambda tk, uid: set_status(tk, uid, False), len(ADMIN_OUTS)),
-            [st_token, dd_user_pick],
+            _guard(lambda tk, uid, pw="", code="": set_status(tk, uid, False, pw, code), len(ADMIN_OUTS)),
+            [st_token, dd_user_pick, tb_admin_pw, tb_admin_code],
             ADMIN_OUTS,
-        )
+        ).then(clear_admin_credentials, [], ADMIN_SECRET_OUTS, show_progress="hidden")
         btn_unlock.click(
-            _guard(lambda tk, uid: set_status(tk, uid, True), len(ADMIN_OUTS)),
-            [st_token, dd_user_pick],
+            _guard(lambda tk, uid, pw="", code="": set_status(tk, uid, True, pw, code), len(ADMIN_OUTS)),
+            [st_token, dd_user_pick, tb_admin_pw, tb_admin_code],
             ADMIN_OUTS,
-        )
+        ).then(clear_admin_credentials, [], ADMIN_SECRET_OUTS, show_progress="hidden")
 
-        def delete_user(token, user_id):
+        def delete_user(token, user_id, password="", code=""):
             if not user_id:
                 gr.Warning("Chọn một người dùng trước.")
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
-            _api(token, "DELETE", f"/api/admin/users/{user_id}")
+            _with_step_up(
+                token, password, code,
+                lambda: _api(token, "DELETE", f"/api/admin/users/{user_id}"), "Xóa tài khoản",
+            )
             gr.Info("Đã xóa tài khoản cùng toàn bộ dữ liệu của người đó.")
             return refresh_admin(token)
 
-        btn_del_user.click(_guard(delete_user, len(ADMIN_OUTS)), [st_token, dd_user_pick], ADMIN_OUTS)
+        btn_del_user.click(
+            _guard(delete_user, len(ADMIN_OUTS)),
+            [st_token, dd_user_pick, tb_admin_pw, tb_admin_code], ADMIN_OUTS,
+        ).then(clear_admin_credentials, [], ADMIN_SECRET_OUTS, show_progress="hidden")
 
-        def create_user(token, username, password, role):
+        def create_user(token, username, password, role, admin_password="", code=""):
             username = (username or "").strip()
             if not 3 <= len(username) <= 32:
                 gr.Warning("Tên đăng nhập phải từ 3 đến 32 ký tự.")
@@ -3748,20 +3811,22 @@ def build_ui(
             if len(password or "") < PASSWORD_MIN:
                 gr.Warning(f"Mật khẩu phải có ít nhất {PASSWORD_MIN} ký tự.")
                 return tuple(gr.skip() for _ in range(len(ADMIN_OUTS) + 2))
-            _api(
-                token,
-                "POST",
-                "/api/admin/users",
-                {"username": username, "password": password, "role": role},
+            _with_step_up(
+                token, admin_password, code,
+                lambda: _api(
+                    token, "POST", "/api/admin/users",
+                    {"username": username, "password": password, "role": role},
+                ),
+                "Tạo",
             )
             gr.Info("Đã tạo tài khoản mới.")
             return refresh_admin(token) + ("", "")
 
         btn_cu.click(
             _guard(create_user, len(ADMIN_OUTS) + 2),
-            [st_token, tb_cu_name, tb_cu_pw, dd_cu_role],
+            [st_token, tb_cu_name, tb_cu_pw, dd_cu_role, tb_admin_pw, tb_admin_code],
             ADMIN_OUTS + [tb_cu_name, tb_cu_pw],
-        )
+        ).then(clear_admin_credentials, [], ADMIN_SECRET_OUTS, show_progress="hidden")
 
         # ---- nhật ký ----
         def load_audit(token, limit):
@@ -3813,42 +3878,74 @@ def build_ui(
             except gr.Error as err:
                 if getattr(err, "status_code", None) == 403:
                     return "**Không thể xác minh chuỗi:** chức năng này cần vai trò admin."
-                return f"**Không thể xác minh chuỗi:** {_error_text(err)}"
-            total = data.get("total_events", 0)
-            verified = data.get("verified_events", 0)
-            unsealed = data.get("unsealed_events", 0)
-            checked_at = _fmt(data.get("checked_at"))
-            checked_by = data.get("checked_by") or "admin"
-            if total == 0:
-                return (
+                return f"**Không thể xác minh chuỗi:** {_safe_markdown_text(_error_text(err))}"
+            total = _safe_markdown_text(data.get("total_events", 0))
+            verified = _safe_markdown_text(data.get("verified_events", 0))
+            unsealed = _safe_markdown_text(data.get("unsealed_events", 0))
+            checked_at = _safe_markdown_text(_fmt(data.get("checked_at")))
+            checked_by = _safe_markdown_text(data.get("checked_by") or "admin")
+            if data.get("total_events") == 0:
+                chain = (
                     "**Chưa có nhật ký để xác minh.** Hệ thống sẽ tạo nhật ký khi có đăng ký, "
                     "đăng nhập, tạo hội thoại hoặc gửi tin nhắn."
                 )
-            if data.get("chain_intact"):
-                return (
-                    f"**Chuỗi nguyên vẹn.** Đã xác minh **{verified}/{total}** bản ghi; "
-                    "toàn bộ nhật ký đều được chuỗi băm bảo vệ. Không có dấu hiệu bản ghi bị "
-                    f"sửa, xóa hoặc đảo thứ tự.\n\nKiểm tra lúc {checked_at} bởi {checked_by}."
+            elif data.get("chain_intact"):
+                chain = (
+                    f"**Chuỗi nội bộ nguyên vẹn.** Đã xác minh **{verified}/{total}** bản ghi "
+                    "còn lưu; nội dung và liên kết trong chuỗi khớp."
                 )
             # Trường hợp riêng: không có mắt xích nào sai, nhưng một số bản ghi
             # nằm ngoài chuỗi. Đó là lỗ hổng phạm vi bảo vệ, không phải bằng
             # chứng bị tấn công — và phải nói đúng như vậy.
-            if data.get("reason") == "unsealed_events":
-                return (
+            elif data.get("reason") == "unsealed_events":
+                chain = (
                     f"**Chuỗi chưa phủ hết nhật ký.** {verified}/{total} bản ghi được bảo vệ; "
                     f"**{unsealed} bản ghi chưa được niêm phong** (bản ghi đầu tiên: "
-                    f"#{data.get('first_unsealed_id')}). Các bản ghi này có thể bị sửa mà "
+                    f"#{_safe_markdown_text(data.get('first_unsealed_id'))}). Các bản ghi này có thể bị sửa mà "
                     "không bị phát hiện. Chạy python scripts/repair_audit_chain.py để vá."
                 )
-            reason = {
-                "entry_hash_mismatch": "nội dung bản ghi đã bị sửa",
-                "prev_hash_mismatch": "có bản ghi bị xoá hoặc bị đảo thứ tự",
-            }.get(data.get("reason"), data.get("reason") or "không xác định")
+            else:
+                reason = {
+                    "entry_hash_mismatch": "nội dung bản ghi đã bị sửa",
+                    "prev_hash_mismatch": "có bản ghi bị xoá hoặc bị đảo thứ tự",
+                }.get(data.get("reason"), data.get("reason") or "không xác định")
+                chain = (
+                    "**Chuỗi đã bị phá vỡ.** Bản ghi đầu tiên có vấn đề: "
+                    f"#{_safe_markdown_text(data.get('first_broken_id'))} - "
+                    f"{_safe_markdown_text(reason)}. Đã xác minh được "
+                    f"{verified}/{total} bản ghi trước điểm gãy."
+                )
+            # An intact local chain does not establish external anchoring. A
+            # missing/deleted tail may only be visible in the checkpoint result,
+            # including when no local events remain.
+            if data.get("checkpoint_intact") is False:
+                checkpoint = (
+                    "**Checkpoint không hợp lệ.** Chưa thể xác nhận toàn vẹn đầy đủ. "
+                    f"Lý do: {_safe_markdown_text(data.get('checkpoint_reason') or 'không xác định')}."
+                )
+            elif "checkpoint_intact" not in data:
+                checkpoint = "**Chưa có kết quả checkpoint.** Chưa xác nhận được neo WORM bên ngoài."
+            elif data.get("external_checkpoint_required") is False:
+                checkpoint = (
+                    "**Giới hạn bảo vệ: chưa có neo WORM bên ngoài.** "
+                    "Chuỗi nội bộ không đủ để loại trừ việc xóa phần đuôi nhật ký."
+                )
+            elif (
+                data.get("chain_intact") is True
+                and data.get("checkpoint_intact") is True
+                and data.get("external_checkpoint_required") is True
+                and data.get("high_assurance_intact") is True
+            ):
+                checkpoint = "**Đủ bằng chứng neo WORM:** checkpoint và chuỗi khớp theo kết quả máy chủ."
+            else:
+                pending = _safe_markdown_text(data.get("checkpoint_unanchored_events", "chưa xác định"))
+                checkpoint = (
+                    "**Chưa đủ bằng chứng neo WORM.** "
+                    f"Số bản ghi chưa được neo: {pending}. "
+                    f"Trạng thái: {_safe_markdown_text(data.get('checkpoint_reason') or 'checkpoint chưa được xác nhận đầy đủ')}."
+                )
             return (
-                "**Chuỗi đã bị phá vỡ.** Bản ghi đầu tiên có vấn đề: "
-                f"#{data.get('first_broken_id')} - {reason}. Đã xác minh được "
-                f"{verified}/{total} bản ghi trước điểm gãy. Sự kiện phát hiện này cũng đã "
-                "được ghi vào nhật ký."
+                f"{chain}\n\n{checkpoint}\n\nKiểm tra lúc {checked_at} bởi {checked_by}."
             )
 
         def detection_rows(token):
@@ -3915,20 +4012,54 @@ def build_ui(
             )
 
         def load_anomalies(token, window):
-            return _table_html(ANOMALY_HEADERS, anomaly_rows(token, window))
+            return security_snapshot(
+                lambda: anomaly_rows(token, window), "Bất thường", ANOMALY_HEADERS,
+                f"Cửa sổ {int(window)} phút",
+            )
 
         def blocklist_rows(token):
             rows = _api(token, "GET", "/api/admin/ids/blocklist")
             return [[r.get("source_ip", ""), r.get("seconds_remaining", "")] for r in (rows or [])]
 
-        def unblock_ip(token, ip):
+        def unblock_ip(token, ip, password="", code=""):
             ip = (ip or "").strip()
             if not ip:
                 gr.Warning("Nhập địa chỉ IP cần gỡ chặn.")
-                return gr.skip(), gr.skip()
-            _api(token, "DELETE", f"/api/admin/ids/blocklist/{ip}")
+                return gr.skip(), gr.skip(), gr.skip()
+            _with_step_up(
+                token, password, code,
+                lambda: _api(token, "DELETE", f"/api/admin/ids/blocklist/{ip}"), "Gỡ chặn",
+            )
             gr.Info(f"Đã gỡ chặn {ip}.")
-            return _table_html(BLOCKLIST_HEADERS, blocklist_rows(token)), ""
+            metric, table = security_snapshot(
+                lambda: blocklist_rows(token), "Nguồn bị chặn", BLOCKLIST_HEADERS,
+                "Đang hiệu lực", admin_only=True,
+            )
+            return metric, table, ""
+
+        def security_snapshot(fetch_rows, title, headers, detail, *, admin_only=False):
+            """Render one response consistently in both its card and table.
+
+            Never turn an unavailable response into an empty successful result.
+            The attempted read time remains visible even after its toast fades.
+            """
+            checked_at = time.strftime("%d/%m/%Y %H:%M:%S UTC", time.gmtime())
+            try:
+                rows = fetch_rows()
+            except gr.Error as err:
+                if admin_only and getattr(err, "status_code", None) == 403:
+                    status = "Cần vai trò admin"
+                else:
+                    status = "Không tải được"
+                    gr.Warning(_error_text(err))
+                metric = f"**{title}**\n\n## —\n\n{status} · {detail}\n\nLần thử: {checked_at}"
+                diagnostic = _safe_markdown_text(_error_text(err))
+                table = f"**{status}.** {diagnostic}\n\nLần thử: {checked_at}"
+                return metric, table
+            return (
+                f"**{title}**\n\n## {len(rows)}\n\n{detail}\n\nCập nhật: {checked_at}",
+                _table_html(headers, rows),
+            )
 
         def refresh_security(token, window):
             """Nạp ba thẻ số liệu và ba bảng IDS. Mỗi khối bọc riêng để thiếu
@@ -3939,34 +4070,17 @@ def build_ui(
             bản ghi; nó chạy ở bước .then() riêng để các thẻ không phải chờ.
             """
 
-            def safe(fn, fallback, *, admin_only=False):
-                try:
-                    return fn()
-                except gr.Error as err:
-                    # Moderators lack the admin-only blocklist by design and the
-                    # section says so; refreshing must not look like a fault.
-                    if admin_only and getattr(err, "status_code", None) == 403:
-                        return None
-                    gr.Warning(_error_text(err))
-                    return fallback
-
-            det = safe(lambda: detection_rows(token), [])
-            anom = safe(lambda: anomaly_rows(token, window), [])
-            block = safe(lambda: blocklist_rows(token), [], admin_only=True)
-            blocked = (
-                f"**Nguồn bị chặn**\n\n## {len(block)}\n\nĐang hiệu lực" if block is not None
-                else "**Nguồn bị chặn**\n\n## —\n\nCần vai trò admin"
+            det, det_table = security_snapshot(
+                lambda: detection_rows(token), "Dấu hiệu IDS", DETECTION_HEADERS,
+                "Tối đa 100 dấu hiệu gần nhất",
             )
-            metrics = (
-                f"**Dấu hiệu IDS**\n\n## {len(det)}\n\nTrong bộ nhớ hiện tại",
-                f"**Bất thường**\n\n## {len(anom)}\n\nCửa sổ {int(window)} phút",
-                blocked,
+            anom, anom_table = load_anomalies(token, window)
+            block, block_table = security_snapshot(
+                lambda: blocklist_rows(token), "Nguồn bị chặn", BLOCKLIST_HEADERS,
+                "Đang hiệu lực", admin_only=True,
             )
             return (
-                *metrics,
-                _table_html(DETECTION_HEADERS, det),
-                _table_html(ANOMALY_HEADERS, anom),
-                _table_html(BLOCKLIST_HEADERS, block or []),
+                det, anom, block, det_table, anom_table, block_table,
             )
 
         SEC_OUTS = [
@@ -3986,10 +4100,15 @@ def build_ui(
             ).then(verify_chain_ui, [st_token], [md_sec_verdict], show_progress="hidden")
         btn_sec_verify.click(verify_chain_ui, [st_token], [md_sec_verdict])
         btn_sec_verify_ids.click(verify_ids_detection_ui, [st_token], [md_sec_ids_verdict])
-        btn_sec_anom.click(_guard(load_anomalies, 1), [st_token, sl_sec_win], [df_sec_anom])
+        for trigger in (btn_sec_anom.click, sl_sec_win.change):
+            trigger(
+                _guard(load_anomalies, 2), [st_token, sl_sec_win], [md_sec_anomalies, df_sec_anom],
+                show_progress="hidden", trigger_mode="always_last",
+            )
         btn_sec_unblock.click(
-            _guard(unblock_ip, 2), [st_token, tb_sec_ip], [df_sec_block, tb_sec_ip]
-        )
+            _guard(unblock_ip, 3), [st_token, tb_sec_ip, tb_sec_pw, tb_sec_code],
+            [md_sec_blocks, df_sec_block, tb_sec_ip],
+        ).then(lambda: ("", ""), [], [tb_sec_pw, tb_sec_code], show_progress="hidden")
 
     # The page triggers events by fn_index. Nothing needs Gradio's public API
     # catalogue (/gradio_api/info, "Use via API"), which listed every handler —

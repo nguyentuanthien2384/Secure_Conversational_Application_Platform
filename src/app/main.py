@@ -1723,6 +1723,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return auth_session
 
+    def lock_admin_mutation(
+        credentials: HTTPAuthorizationCredentials,
+        admin: User,
+        db: Session,
+        *,
+        target_id: str | None = None,
+    ) -> User | None:
+        """Recheck authority while holding locks through the mutation/audit commit.
+
+        Authentication updates activity in an earlier transaction. Slow password
+        work or a concurrent logout/role change can invalidate that decision.
+        Lock all involved accounts in ID order before the actor's session, so
+        two administrators changing each other cannot invert the row locks.
+        """
+        try:
+            claims = token_service.decode(credentials.credentials)
+        except jwt.PyJWTError as exc:
+            raise HTTPException(
+                status_code=401, detail="Token không hợp lệ.",
+                headers=INVALID_TOKEN_CHALLENGE,
+            ) from exc
+        locked_users: dict[str, User] = {}
+        for user_id in sorted({admin.id} | ({target_id} if target_id else set())):
+            row = db.get(User, user_id)
+            if row is not None and lock_user_row(db, row, require_active=False) is not None:
+                locked_users[user_id] = row
+        actor = locked_users.get(admin.id)
+        if (
+            actor is None or not actor.is_active or claims.get("sub") != actor.id
+            or claims.get("ver") != actor.token_version
+        ):
+            raise HTTPException(
+                status_code=401, detail="Tài khoản không hợp lệ.",
+                headers=INVALID_TOKEN_CHALLENGE,
+            )
+        session = lock_auth_session_row(db, str(claims["jti"]), actor.id)
+        if (
+            session is None
+            or db.get(RevokedToken, str(claims["jti"])) is not None
+            or auth_session_expiry_reason(session, utcnow()) is not None
+        ):
+            raise HTTPException(
+                status_code=401, detail="Phiên đăng nhập không hợp lệ.",
+                headers=INVALID_TOKEN_CHALLENGE,
+            )
+        if actor.role != "admin":
+            raise HTTPException(status_code=403, detail="Chỉ admin được dùng chức năng này.")
+        if settings.security_profile == "high" and not actor.mfa_enabled:
+            raise HTTPException(status_code=403, detail="Tài khoản quản trị bắt buộc bật MFA.")
+        require_recent_step_up(credentials, actor, db)
+        if target_id is not None and target_id not in locked_users:
+            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
+        return locked_users.get(target_id)
+
     def load_mfa_secret(user: User) -> str | None:
         if not user.mfa_secret_ciphertext or not user.mfa_secret_nonce:
             return None
@@ -4735,26 +4789,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             password_hash=password_service.hash(payload.password),
             role=payload.role,
         )
+        lock_admin_mutation(credentials, admin, db)
         db.add(user)
         try:
-            db.commit()
-            db.refresh(user)
+            # Allocate the immutable target ID without committing the account
+            # before its audit entry. record_audit commits both or neither.
+            db.flush()
+            record_audit(
+                db,
+                request,
+                "admin.user_create",
+                actor_id=admin.id,
+                target_type="user",
+                target_id=user.id,
+                details={"role": user.role},
+            )
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(
                 status_code=409, detail="Không thể tạo tài khoản với thông tin này."
             ) from exc
-        record_audit(
-            db,
-            request,
-            "admin.user_create",
-            actor_id=admin.id,
-            target_type="user",
-            target_id=user.id,
-            # The immutable target id is sufficient for correlation; avoid
-            # copying an account identifier into long-lived WORM audit data.
-            details={"role": user.role},
-        )
         return user
 
     @app.delete("/api/admin/users/{user_id}", status_code=204)
@@ -4765,19 +4819,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, admin, db)
-        target = db.get(User, user_id)
-        if target is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
-        if lock_user_row(db, target, require_active=False) is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
+        target = lock_admin_mutation(credentials, admin, db, target_id=user_id)
         if target.id == admin.id:
             raise HTTPException(status_code=400, detail="Admin không thể tự xóa chính mình.")
         if target.role == "admin":
             raise HTTPException(status_code=400, detail="Không thể xóa tài khoản admin khác.")
-        revoked_memberships, advanced_sessions = revoke_active_e2ee_memberships(db, target.id)
-        # Lock every owned conversation before its cascade removes wrapped key
-        # metadata. Content writers use the same account/session order.
+        # Lock the union of owned and joined conversations in one order. Two
+        # users may own/join each other's E2EE conversations; separate lock
+        # passes for memberships and owned rows would invert that order.
         owned_session_ids = list(
             db.scalars(
                 select(ChatSession.id)
@@ -4785,10 +4834,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 .order_by(ChatSession.id.asc())
             )
         )
-        for owned_session_id in owned_session_ids:
-            owned_session = db.get(ChatSession, owned_session_id)
+        joined_session_ids = list(db.scalars(
+            select(ConversationMember.session_id)
+            .where(ConversationMember.user_id == target.id,
+                   ConversationMember.removed_at.is_(None))
+        ))
+        for affected_session_id in sorted(set(owned_session_ids + joined_session_ids)):
+            owned_session = db.get(ChatSession, affected_session_id)
             if owned_session is not None:
                 lock_chat_session_row(db, owned_session)
+        revoked_memberships, advanced_sessions = revoke_active_e2ee_memberships(db, target.id)
 
         # A pre-delete wipe removes currently cached account/session DEKs; the
         # post-commit wipe catches any cache entry populated by an older in-flight
@@ -4796,22 +4851,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         envelope_crypto_service.clear_cache()
         try:
             db.delete(target)
-            db.commit()
+            record_audit(
+                db,
+                request,
+                "admin.user_delete",
+                actor_id=admin.id,
+                target_type="user",
+                target_id=user_id,
+                details={
+                    "e2ee_memberships_revoked": revoked_memberships,
+                    "e2ee_epochs_advanced": advanced_sessions,
+                    "owned_sessions_deleted": len(owned_session_ids),
+                },
+            )
         finally:
             envelope_crypto_service.clear_cache()
-        record_audit(
-            db,
-            request,
-            "admin.user_delete",
-            actor_id=admin.id,
-            target_type="user",
-            target_id=user_id,
-            details={
-                "e2ee_memberships_revoked": revoked_memberships,
-                "e2ee_epochs_advanced": advanced_sessions,
-                "owned_sessions_deleted": len(owned_session_ids),
-            },
-        )
         return Response(status_code=204)
 
     @app.patch("/api/admin/users/{user_id}/role", response_model=UserResponse)
@@ -4823,10 +4877,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, admin, db)
-        target = db.get(User, user_id)
-        if target is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
+        target = lock_admin_mutation(credentials, admin, db, target_id=user_id)
         if target.id == admin.id:
             raise HTTPException(
                 status_code=400, detail="Admin không thể tự đổi role của chính mình."
@@ -4834,8 +4885,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         old_role = target.role
         target.role = payload.role
         revoke_all_auth_sessions(db, target)
-        db.commit()
-        db.refresh(target)
         record_audit(
             db,
             request,
@@ -4856,12 +4905,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, admin, db)
-        target = db.get(User, user_id)
-        if target is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
-        if lock_user_row(db, target, require_active=False) is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
+        target = lock_admin_mutation(credentials, admin, db, target_id=user_id)
         if target.id == admin.id and not payload.is_active:
             raise HTTPException(
                 status_code=400, detail="Admin không thể tự khóa chính mình."
@@ -4877,7 +4921,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             target.is_active = payload.is_active
             if status_changed:
                 revoke_all_auth_sessions(db, target)
-            db.commit()
             record_audit(
                 db,
                 request,
@@ -5045,7 +5088,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         if audit_checkpoint_service is None:
             raise HTTPException(status_code=409, detail="Audit chain đang tắt.")
-        require_recent_step_up(credentials, admin, db)
+        lock_admin_mutation(credentials, admin, db)
         record_audit(
             db,
             request,

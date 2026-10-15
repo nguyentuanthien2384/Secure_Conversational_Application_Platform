@@ -169,8 +169,9 @@ def record_audit(
 ) -> AuditEvent | None:
     """Persist one audit entry, seal it into the hash chain, mirror it to the SIEM.
 
-    Failure to log is itself a security event, so chain/SIEM problems are logged
-    loudly but never turned into a 500 for the end user.
+    Pending business changes and the audit entry commit together. Database or
+    sealing failures propagate so the caller can roll back the transaction;
+    external SIEM/checkpoint delivery remains best effort after that commit.
     """
     # Repeated anonymous throttle denials must not amplify a cheap request
     # into a DB commit, chain lock, SIEM line and WORM delivery each time.
@@ -200,11 +201,14 @@ def record_audit(
         details_json=safe_json(details),
     )
 
+    # Flush business rows before taking the audit-chain lock. Otherwise an
+    # audit writer can hold the chain lock while waiting for a User row held
+    # by a transaction which is itself waiting to append its audit event.
+    db.flush()
     key = _audit_key(request)
     if key is None:
         db.add(event)
         db.commit()
-        db.refresh(event)
     else:
         # Appends must be serialised: two concurrent writers reading the same
         # "last hash" would fork the chain and break verification.
@@ -212,7 +216,6 @@ def record_audit(
             seal_event(db, event, key)
             db.add(event)
             db.commit()
-            db.refresh(event)
 
     emit_security_event(
         event.event_type,
@@ -230,7 +233,10 @@ def record_audit(
     checkpoint_service = getattr(request.app.state, "audit_checkpoint_service", None)
     if checkpoint_service is not None:
         try:
-            checkpoint_service.maybe_anchor(db, event)
+            # A failed external checkpoint may roll back its own transaction.
+            # Keep that separate from the already-committed response objects.
+            with Session(bind=db.get_bind(), expire_on_commit=False) as checkpoint_db:
+                checkpoint_service.maybe_anchor(checkpoint_db, event)
         except Exception:  # noqa: BLE001 - audit anchoring must not break requests
             logger.exception("Could not anchor the audit chain to the configured WORM sink.")
             emit_security_event(

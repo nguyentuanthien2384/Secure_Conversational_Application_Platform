@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, create_engine, event, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -194,10 +194,17 @@ class Database:
             if "last_activity_at" not in auth_session_columns:
                 # Match the model's timezone-aware type so PostgreSQL preserves
                 # issued_at's instant even when the session timezone is not UTC.
-                activity_type = DateTime(timezone=True).compile(dialect=self.engine.dialect)
-                connection.execute(
-                    text(f"ALTER TABLE auth_sessions ADD COLUMN last_activity_at {activity_type}")
-                )
+                # Constant DDL per dialect (no f-string) keeps the SAST rule happy.
+                if self.engine.dialect.name == "postgresql":
+                    activity_ddl = (
+                        "ALTER TABLE auth_sessions ADD COLUMN last_activity_at "
+                        "TIMESTAMP WITH TIME ZONE"
+                    )
+                else:
+                    activity_ddl = (
+                        "ALTER TABLE auth_sessions ADD COLUMN last_activity_at DATETIME"
+                    )
+                connection.execute(text(activity_ddl))
                 # Preserve a conservative existing timestamp rather than grant
                 # every old session a new inactivity window at deployment.
                 connection.execute(
@@ -393,6 +400,8 @@ class Database:
                 "encryption_scheme",
             },
             "e2ee_envelopes": {"replay_key"},
+            "intrusion_detections": {"payload_json"},
+            "intrusion_sources": {"score_times_json", "last_seen_at", "blocked_until"},
         }
         incomplete: list[str] = []
         inspector = inspect(self.engine)

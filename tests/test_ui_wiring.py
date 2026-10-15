@@ -561,7 +561,9 @@ def test_moderator_security_refresh_marks_the_admin_only_blocklist_without_a_war
         "chain verdict for a moderator"
     )
     blocklist = runtime_demo.blocks[dependency["outputs"][-1]]
-    assert result[-1] == gradio_ui._table_html(gradio_ui.BLOCKLIST_HEADERS, [])
+    # A denied read is shown as such, never as an empty "no blocked IPs" table.
+    assert "Cần vai trò admin" in result[-1]
+    assert result[-1] != gradio_ui._table_html(gradio_ui.BLOCKLIST_HEADERS, [])
     assert blocklist.elem_id == "sec-blocklist-table"
 
     verify, _ = _button_event(runtime_demo, "Chạy kiểm chứng Hit/Miss")

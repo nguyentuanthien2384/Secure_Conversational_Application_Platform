@@ -27,7 +27,10 @@ RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
 # uv.lock được COPY để cài đặt tái lập được (Bài 8 §chuỗi cung ứng).
 # Build dừng ngay nếu lockfile thiếu hoặc không còn khớp pyproject.toml.
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --no-dev --frozen
+# uv chỉ cần lúc build; runtime gọi thẳng /app/.venv/bin. Gỡ nó khỏi image cuối
+# để bản Rust nhúng trong uv không thành bề mặt tấn công/lỗ hổng bị quét thấy.
+RUN uv sync --no-dev --frozen \
+    && pip uninstall --yes uv
 
 COPY src ./src
 COPY scripts/migrate_database.py ./scripts/migrate_database.py

@@ -370,6 +370,28 @@ class E2eeEnvelope(Base):
     session: Mapped[ChatSession] = relationship(back_populates="e2ee_envelopes")
 
 
+class IntrusionDetection(Base):
+    """Bounded operational IDS history; raw payloads/credentials are never stored."""
+
+    __tablename__ = "intrusion_detections"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class IntrusionSource(Base):
+    """Shared rolling score and UTC ban expiry, independent of worker lifetime."""
+
+    __tablename__ = "intrusion_sources"
+
+    source_ip: Mapped[str] = mapped_column(String(64), primary_key=True)
+    score_times_json: Mapped[str] = mapped_column(Text, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    blocked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_events_created", "created_at"),)

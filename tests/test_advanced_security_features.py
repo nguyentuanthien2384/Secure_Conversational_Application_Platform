@@ -7,7 +7,7 @@ from src.app.db import utcnow
 from src.app.dlp import DLPScanner, FindingType
 from src.app.ids import detect_anomalies
 from src.app.models import AuditEvent
-from src.app.services import AIService
+from src.app.services import MAX_PROVIDER_RESPONSE_CHARACTERS, AIService
 
 
 def test_dlp_inspects_percent_and_base64_encoded_secrets():
@@ -25,11 +25,14 @@ def test_dlp_inspects_percent_and_base64_encoded_secrets():
 
 def test_provider_output_is_scanned_before_display_truncation(settings):
     service = AIService(settings)
+    encoded = base64.b64encode(b"password:provider-secret").decode("ascii")
 
     class FakeProvider:
         def generate(self, *_args, **_kwargs):
-            encoded = base64.b64encode(b"password:provider-secret").decode("ascii")
-            return "x" * 8_100 + "\n" + encoded
+            # The secret sits in the very last characters of the largest
+            # response the service accepts, so any pre-scan cut would miss it.
+            filler = "x" * (MAX_PROVIDER_RESPONSE_CHARACTERS - len(encoded) - 1)
+            return filler + "\n" + encoded
 
     service._client = FakeProvider()
     output, labels = service.generate(
@@ -39,7 +42,8 @@ def test_provider_output_is_scanned_before_display_truncation(settings):
         data_class="public",
     )
 
-    assert len(output) <= 8_000
+    assert len(output) <= MAX_PROVIDER_RESPONSE_CHARACTERS
+    assert encoded not in output
     assert "provider-secret" not in output
     assert "mật khẩu" in labels
 
