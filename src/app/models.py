@@ -50,6 +50,19 @@ class User(Base):
     secret_crypto_epoch: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # Highest TOTP time-counter already accepted; blocks replay within a step.
     mfa_last_counter: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Consecutive wrong second factors after a correct password. Unlike
+    # failed_login_attempts, a correct password never resets it; only a
+    # successful second factor or a new password/MFA setup does. The lock is
+    # kept apart from locked_until because a mailbox reset lifts that one, and
+    # the second factor must still hold when the mailbox is compromised.
+    # server_default matches the migration's DEFAULT 0, so inserts written
+    # before this column existed keep working on freshly created tables too.
+    mfa_failed_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    mfa_locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

@@ -412,8 +412,12 @@ class TotpService:
         module — below what a phone camera reliably resolves off a screen, which
         is why the code could not be scanned. Non-default settings are always
         emitted, because omitting them would produce wrong codes.
+
+        The label separator is a literal ``:``, the form used by the Key Uri
+        Format examples and by common libraries such as pyotp, so every
+        authenticator splits issuer and account the same way.
         """
-        label = quote(f"{issuer}:{account_name}")
+        label = f"{quote(issuer, safe='')}:{quote(account_name, safe='')}"
         params = [f"secret={secret_b32}", f"issuer={quote(issuer)}"]
         defaults = compact and self.algorithm.lower() == "sha1"
         if not (defaults and self.digits == 6 and self.period == 30):

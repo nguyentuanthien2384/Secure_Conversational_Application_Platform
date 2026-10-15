@@ -568,6 +568,9 @@ footer { display: none !important; }
   outline: 2px solid var(--scap-ok-fg); outline-offset: 2px;
 }
 #session-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Fixed-choice dropdowns are pick-only (filterable=False makes the input
+   readOnly); hide the text caret so the field does not look editable. */
+.pick-only input { caret-color: transparent; cursor: pointer; }
 
 /* Shared surfaces and clear hierarchy across all eight workspace tabs. */
 #workspace-tabs > .tab-wrapper {
@@ -1018,6 +1021,16 @@ _DATA_CLASS_LABELS = {
     **{value: label for label, value in DATA_CLASS_CHOICES},
     "e2ee_private": "E2EE private",
 }
+
+
+def _pick_dropdown(**kwargs) -> gr.Dropdown:
+    """Dropdown chỉ để chọn, dùng cho mọi dropdown của UI.
+
+    Gradio mặc định ``filterable=True`` biến ô thành ô gõ chữ có con trỏ, trông
+    như sửa được giá trị. ``filterable=False`` làm ô nhập readOnly; lớp
+    ``pick-only`` ẩn nốt con trỏ.
+    """
+    return gr.Dropdown(filterable=False, elem_classes=["pick-only"], **kwargs)
 
 
 def _session_policy_markdown(token, session_id):
@@ -1776,12 +1789,12 @@ def build_ui(
                                     max_lines=1,
                                     placeholder="Ví dụ: Ôn tập bảo mật ứng dụng",
                                 )
-                                dd_new_security = gr.Dropdown(
+                                dd_new_security = _pick_dropdown(
                                     choices=SECURITY_MODE_CHOICES,
                                     value="secure",
                                     label="Chế độ bảo mật (cho hội thoại mới)",
                                 )
-                                dd_new_class = gr.Dropdown(
+                                dd_new_class = _pick_dropdown(
                                     choices=DATA_CLASS_CHOICES,
                                     value="internal",
                                     label="Phân loại dữ liệu (cho hội thoại mới)",
@@ -1887,7 +1900,7 @@ def build_ui(
                         '<p>Chọn hội thoại để xem bản mã, nonce và phiên bản khóa lưu trên máy chủ.</p></div>'
                     )
                     with gr.Row():
-                        dd_cipher = gr.Dropdown(
+                        dd_cipher = _pick_dropdown(
                             label="Hội thoại", choices=[], interactive=True, scale=3
                         )
                         btn_cipher = gr.Button("Tải bản mã", scale=1)
@@ -1953,6 +1966,16 @@ def build_ui(
                                         elem_classes=["scap-totp-qr-panel"],
                                     )
                                     with gr.Column(scale=2):
+                                        # Camera iPhone mở QR otpauth:// trong app
+                                        # Mật khẩu, nơi mã phải gắn vào một mục đã lưu.
+                                        gr.Markdown(
+                                            "**Cách quét:** mở ứng dụng xác thực (Google Authenticator, "
+                                            "Microsoft Authenticator, 2FAS…) → **+** → quét QR.\n\n"
+                                            "**iPhone dùng app Mật khẩu có sẵn:** mã phải gắn vào một mục "
+                                            "mật khẩu đã lưu. Tạo mục cho trang này trước (Mật khẩu → **+** "
+                                            "→ trang web và tên đăng nhập), mở mục đó → **Thiết lập mã xác "
+                                            "minh** → quét QR hoặc nhập khóa thủ công."
+                                        )
                                         tb_secret = gr.Textbox(
                                             label="Khóa thủ công",
                                             info="Chỉ dùng khi không quét được QR; sẽ xóa sau khi kích hoạt.",
@@ -1976,7 +1999,7 @@ def build_ui(
                             "Các mốc trong bảng được kiểm tra ở máy chủ."
                         )
                         with gr.Row():
-                            dd_revoke = gr.Dropdown(label="Phiên cần thu hồi", choices=[], scale=3)
+                            dd_revoke = _pick_dropdown(label="Phiên cần thu hồi", choices=[], scale=3)
                             btn_revoke = gr.Button("Thu hồi", size="sm", scale=1)
                             btn_dev_refresh = gr.Button("Làm mới", size="sm", scale=1)
                         btn_logout_all = gr.Button(
@@ -2027,7 +2050,7 @@ def build_ui(
                             elem_id="btn-passkey-create",
                         )
                         with gr.Row():
-                            dd_passkey_remove = gr.Dropdown(
+                            dd_passkey_remove = _pick_dropdown(
                                 label="Passkey cần xóa", choices=[], scale=3
                             )
                             btn_passkey_remove = gr.Button(
@@ -2065,8 +2088,8 @@ def build_ui(
                         USER_HEADERS, elem_id="users-table", elem_classes=["dashboard-table"]
                     )
                     with gr.Row():
-                        dd_user_pick = gr.Dropdown(label="Người dùng", choices=[], scale=2)
-                        dd_role_new = gr.Dropdown(
+                        dd_user_pick = _pick_dropdown(label="Người dùng", choices=[], scale=2)
+                        dd_role_new = _pick_dropdown(
                             label="Vai trò mới",
                             choices=["user", "moderator", "admin"],
                             value="user",
@@ -2081,7 +2104,7 @@ def build_ui(
                         with gr.Row():
                             tb_cu_name = gr.Textbox(label="Tên đăng nhập", max_length=32)
                             tb_cu_pw = gr.Textbox(label="Mật khẩu", type="password", max_length=128)
-                            dd_cu_role = gr.Dropdown(
+                            dd_cu_role = _pick_dropdown(
                                 label="Vai trò",
                                 choices=["user", "moderator", "admin"],
                                 value="user",

@@ -388,6 +388,7 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             raise generic
         user.password_hash = ctx.password_service.hash(payload.new_password)
         # Proving the mailbox lifts a lockout, like self-service reset elsewhere.
+        # The second-factor lock (mfa_locked_until) stays: a mailbox is not a TOTP.
         user.failed_login_attempts = 0
         user.locked_until = None
         ctx.revoke_all_auth_sessions(db, user)

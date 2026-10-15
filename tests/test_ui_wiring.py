@@ -443,6 +443,20 @@ def test_selected_conversation_mode_is_shown_read_only(runtime_demo, monkeypatch
     assert '/security"' not in UI_SOURCE.read_text(encoding="utf-8")
 
 
+def test_dropdowns_cannot_be_typed_into(runtime_demo):
+    """A filterable dropdown is a text input: users saw a caret and thought they could edit it."""
+    dropdowns = [component for component in runtime_demo.blocks.values()
+                 if isinstance(component, gr.Dropdown)]
+    assert len(dropdowns) >= 8
+    for component in dropdowns:
+        assert component.filterable is False, component.label
+        assert component.allow_custom_value is False, component.label
+        assert "pick-only" in (component.elem_classes or []), component.label
+    source = UI_SOURCE.read_text(encoding="utf-8")
+    assert source.count("gr.Dropdown(") == 1, "Tạo dropdown qua _pick_dropdown()"
+    assert ".pick-only input { caret-color: transparent;" in source
+
+
 def test_every_guarded_handler_skips_exactly_its_outputs(runtime_demo):
     """A failed API call returns one gr.skip() per output.
 

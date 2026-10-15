@@ -289,6 +289,8 @@ def _title(event: AuditEvent) -> str:
             return f"{title} (địa chỉ mạng mới)"
     if details.get("reason") == "account_locked":
         return f"{title} — tài khoản đang tạm khóa với nguồn lạ"
+    if details.get("reason") == "mfa_locked":
+        return f"{title} — bước 2FA đang tạm khóa với nguồn lạ"
     return title
 
 

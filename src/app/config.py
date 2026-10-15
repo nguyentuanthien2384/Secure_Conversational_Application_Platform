@@ -221,6 +221,10 @@ class Settings:
     mfa_recovery_codes: int = 10
     mfa_window_seconds: int = 300
     mfa_max_attempts: int = 5
+    # Every N consecutive wrong second factors lock the account against
+    # unfamiliar sources; each further lock doubles, up to the cap.
+    mfa_lockout_attempts: int = 10
+    mfa_lockout_max_seconds: int = 86400
     redis_url: str = ""
     allowed_origins: tuple[str, ...] = ()
     allowed_hosts: tuple[str, ...] = ()
@@ -675,6 +679,8 @@ class Settings:
             mfa_recovery_codes=int(os.getenv("MFA_RECOVERY_CODES", "10")),
             mfa_window_seconds=int(os.getenv("MFA_WINDOW_SECONDS", "300")),
             mfa_max_attempts=int(os.getenv("MFA_MAX_ATTEMPTS", "5")),
+            mfa_lockout_attempts=max(1, int(os.getenv("MFA_LOCKOUT_ATTEMPTS", "10"))),
+            mfa_lockout_max_seconds=int(os.getenv("MFA_LOCKOUT_MAX_SECONDS", "86400")),
             redis_url=redis_url,
             allowed_origins=_csv_env("ALLOWED_ORIGINS"),
             allowed_hosts=effective_allowed_hosts(configured_hosts, environment),

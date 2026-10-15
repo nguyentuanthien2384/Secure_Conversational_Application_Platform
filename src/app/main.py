@@ -1805,6 +1805,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return consumed.rowcount == 1
 
+    def record_mfa_failure(db: Session, user: User) -> int:
+        """Count a wrong second factor; every Nth consecutive one locks the account.
+
+        The per-window limiter alone could be cycled forever by someone who
+        already knows the password, because a correct password clears the login
+        counters. This counter survives that and only resets on a successful
+        second factor or a new password/MFA setup. Returns the lock in seconds,
+        or 0. Like the password lock, it only applies to unfamiliar sources.
+        """
+        db.execute(
+            update(User)
+            .where(User.id == user.id)
+            .values(mfa_failed_attempts=User.mfa_failed_attempts + 1)
+            .execution_options(synchronize_session=False)
+        )
+        db.refresh(user)
+        threshold = settings.mfa_lockout_attempts
+        if user.mfa_failed_attempts % threshold:
+            return 0
+        doublings = min(user.mfa_failed_attempts // threshold - 1, 16)
+        lock_seconds = min(
+            settings.login_lockout_seconds * 2**doublings, settings.mfa_lockout_max_seconds
+        )
+        user.mfa_locked_until = utcnow() + timedelta(seconds=lock_seconds)
+        return lock_seconds
+
+    def mfa_locked_error(seconds: float) -> HTTPException:
+        return HTTPException(
+            status_code=429,
+            detail=(
+                "Nhập sai mã xác thực hai lớp quá nhiều lần nên bước 2FA đang tạm khóa "
+                "với thiết bị/mạng lạ. Thử lại sau hoặc đăng nhập từ thiết bị quen thuộc."
+            ),
+            headers={"Retry-After": str(int(seconds) + 1)},
+        )
+
     @app.get("/api/health")
     def health():
         # Deliberately minimal: an unauthenticated probe should confirm liveness
@@ -2121,6 +2157,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details={"reason": "account_state_changed"},
             )
             raise HTTPException(status_code=401, detail="Không xác thực được mã.")
+        # Assess before this sign-in's own audit row makes the source familiar.
+        device_id = presented_device_id(request, user)
+        source = sign_in_source(db, request, user.id, ip, device_id)
+        lock_remaining = (
+            (as_utc(user.mfa_locked_until) - utcnow()).total_seconds()
+            if user.mfa_locked_until is not None
+            else 0
+        )
+        if lock_remaining > 0 and not source.familiar:
+            # A challenge issued before the lock must not keep guessing.
+            record_audit(
+                db,
+                request,
+                "auth.mfa.verify",
+                actor_id=user.id,
+                outcome="blocked",
+                details={"reason": "mfa_locked"},
+            )
+            raise mfa_locked_error(lock_remaining)
         secret = load_mfa_secret(user)
         if secret is None:
             record_audit(
@@ -2145,15 +2200,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expected_token_version=int(challenge["ver"]),
             )
             if not used_recovery:
+                lock_seconds = record_mfa_failure(db, user)
                 db.commit()
                 record_audit(
                     db,
                     request,
                     "auth.mfa.verify",
                     actor_id=user.id,
-                    outcome="failure",
-                    details={"reason": "invalid_code"},
+                    outcome="blocked" if lock_seconds else "failure",
+                    details=(
+                        {"reason": "mfa_locked", "lockout_seconds": lock_seconds}
+                        if lock_seconds
+                        else {"reason": "invalid_code"}
+                    ),
                 )
+                if lock_seconds and not source.familiar:
+                    raise mfa_locked_error(lock_seconds)
                 raise HTTPException(status_code=401, detail="Không xác thực được mã.")
         else:
             if not claim_totp_counter(
@@ -2173,6 +2235,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 raise HTTPException(status_code=401, detail="Không xác thực được mã.")
 
+        user.mfa_failed_attempts = 0
         mfa_limiter.reset(f"mfa:{user_id}")
         db.add(
             RevokedToken(
@@ -2197,9 +2260,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 details={"reason": "challenge_replayed"},
             )
             raise HTTPException(status_code=401, detail="Phiên MFA đã được sử dụng.") from exc
-        # Assess before this sign-in's own audit row makes the source familiar.
-        device_id = presented_device_id(request, user)
-        source = sign_in_source(db, request, user.id, ip, device_id)
         return finish_sign_in(
             db,
             request,
@@ -2284,7 +2344,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 User.mfa_enabled.is_(False),
                 User.mfa_last_counter < matched_counter,
             )
-            .values(mfa_enabled=True, mfa_last_counter=matched_counter)
+            .values(
+                mfa_enabled=True,
+                mfa_last_counter=matched_counter,
+                mfa_failed_attempts=0,
+                mfa_locked_until=None,
+            )
             .execution_options(synchronize_session=False)
         )
         if activated.rowcount != 1:
@@ -2430,6 +2495,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 mfa_secret_ciphertext=None,
                 mfa_secret_nonce=None,
                 mfa_last_counter=0,
+                mfa_failed_attempts=0,
+                mfa_locked_until=None,
             )
             .execution_options(synchronize_session=False)
         )
@@ -2800,6 +2867,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Mật khẩu mới đã xuất hiện trong dữ liệu rò rỉ công khai; hãy chọn mật khẩu khác.",
             )
         user.password_hash = password_service.hash(payload.new_password)
+        # Whoever was guessing second factors no longer knows the password.
+        user.mfa_failed_attempts = 0
+        user.mfa_locked_until = None
         revoke_all_auth_sessions(db, user)
         db.commit()
         record_audit(

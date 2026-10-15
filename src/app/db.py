@@ -165,6 +165,15 @@ class Database:
                 connection.execute(
                     text("ALTER TABLE users ADD COLUMN mfa_last_counter INTEGER NOT NULL DEFAULT 0")
                 )
+            if "mfa_failed_attempts" not in columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN mfa_failed_attempts "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
+            if "mfa_locked_until" not in columns:
+                connection.execute(text("ALTER TABLE users ADD COLUMN mfa_locked_until TIMESTAMP"))
             # Mốc đăng nhập gốc cho trần tuyệt đối của sliding session.
             if "root_issued_at" not in auth_session_columns:
                 connection.execute(
@@ -359,6 +368,8 @@ class Database:
                 "secret_kek_uri",
                 "secret_kek_version",
                 "secret_crypto_epoch",
+                "mfa_failed_attempts",
+                "mfa_locked_until",
             },
             "auth_sessions": {
                 "root_issued_at",
