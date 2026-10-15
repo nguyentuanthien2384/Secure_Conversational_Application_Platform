@@ -392,8 +392,8 @@ def test_switching_conversation_programmatically_clears_notices_and_rename(runti
         result = callback.fn("token", "Hồ sơ mật", "confidential", "internal")
         expected_title = "Hồ sơ mật"
     else:
-        callback, dependency = _button_event(runtime_demo, "Xóa")
-        result = callback.fn("token", "new")
+        callback, dependency = _button_event(runtime_demo, "Xác nhận xóa vĩnh viễn")
+        result = callback.fn("token", "new", "new")
         expected_title = "Ôn tập"
     outputs = {runtime_demo.blocks[item].elem_id or getattr(runtime_demo.blocks[item], "label", None)
                or runtime_demo.blocks[item].value: value
@@ -401,6 +401,46 @@ def test_switching_conversation_programmatically_clears_notices_and_rename(runti
     assert outputs["chat-notice"] == gr.update(value="", visible=False)
     assert outputs["Đồng ý và gửi"] == gr.update(visible=False)
     assert outputs["Đổi tên"] == expected_title
+
+
+def test_selected_conversation_mode_is_shown_read_only(runtime_demo, monkeypatch):
+    """The 'new conversation' dropdowns were mistaken for the selected chat's mode."""
+    from src.app import gradio_ui
+
+    sessions = {
+        "conf": {"security_mode": "confidential", "data_classification": "highly_confidential"},
+        "odd": {"security_mode": "[x](https://evil.example)", "data_classification": "internal"},
+    }
+    calls = []
+
+    def api(token, method, path, body=None, **kwargs):
+        calls.append((method, path))
+        return sessions[path.rsplit("/", 1)[-1]]
+
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    fields = {component.elem_id: component for component in runtime_demo.blocks.values()}
+    callback, dependency = _event_for(runtime_demo, fields["session-list"], "change")
+    assert dependency["outputs"] == [fields["session-policy"]._id]
+    assert not isinstance(fields["session-policy"], (gr.Dropdown, gr.Radio, gr.Textbox))
+
+    shown = callback.fn("token", "conf")
+    assert calls == [("GET", "/api/sessions/conf")]
+    assert "Confidential — DLP/xác nhận nghiêm ngặt · Highly confidential" in shown
+    assert "không thể đổi" in shown
+    assert "](" not in callback.fn("token", "odd"), "API values stay inert Markdown text"
+    calls.clear()
+    assert callback.fn("", None) == "" and calls == [], "no conversation, no request"
+
+    # The presets only feed the create call; the UI has no path to change a mode.
+    presets = {component._id for component in runtime_demo.blocks.values()
+               if isinstance(component, gr.Dropdown)
+               and (component.label or "").endswith("(cho hội thoại mới)")}
+    assert len(presets) == 2
+    _, create_dependency = _button_event(runtime_demo, "+ Hội thoại mới")
+    readers = [item for item in runtime_demo.config["dependencies"]
+               if presets & set(item["inputs"])]
+    assert readers == [create_dependency]
+    assert '/security"' not in UI_SOURCE.read_text(encoding="utf-8")
 
 
 def test_every_guarded_handler_skips_exactly_its_outputs(runtime_demo):
@@ -755,6 +795,7 @@ def test_web_search_is_an_explicit_default_off_choice_with_cost_and_privacy_info
                       if component.elem_id == "chat-web-search")
         assert isinstance(toggle, gr.Checkbox)
         assert toggle.value is False and toggle.interactive is enabled
+        assert toggle.visible is enabled
         send, dependency = _button_event(demo, "Gửi")
         consent, consent_dependency = _button_event(demo, "Đồng ý và gửi")
         assert dependency["inputs"][-1] == toggle._id
@@ -901,7 +942,7 @@ def test_successful_send_with_failed_history_read_does_not_invite_duplicate_retr
     assert result[3] == ""
     assert result[4]["visible"] is True
     assert "Tin nhắn đã gửi" in result[4]["value"]
-    assert "Xem tất cả" in result[4]["value"]
+    assert "Làm mới" in result[4]["value"]
 
 
 @pytest.mark.parametrize("failure", ["timeout", "protocol"])

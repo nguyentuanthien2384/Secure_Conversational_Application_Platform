@@ -584,6 +584,7 @@ footer { display: none !important; }
 #workspace-tabs .gr-accordion > button { align-items: center; }
 #workspace-tabs > .tabitem { padding: 16px 0 !important; }
 #chat-sidebar { border-top: 3px solid #10b981; }
+#session-delete-confirm { border: 1px solid var(--scap-bad-bd); border-radius: 12px; padding: 12px; }
 #chat-main { min-width: 0 !important; }
 #chat-history {
   border: 1px solid var(--scap-line); border-radius: 14px;
@@ -996,6 +997,46 @@ def _session_choices(token):
         (f"{icons.get(row.get('security_mode'), '🔒')}  {row['title']}", row["id"])
         for row in _api(token, "GET", "/api/sessions")
     ]
+
+
+# Dùng chung cho dropdown "Thiết lập hội thoại mới" và dòng chế độ đã khóa.
+SECURITY_MODE_CHOICES = [
+    ("Secure — mã hóa phía máy chủ", "secure"),
+    ("Confidential — DLP/xác nhận nghiêm ngặt", "confidential"),
+]
+DATA_CLASS_CHOICES = [
+    ("Public", "public"),
+    ("Internal", "internal"),
+    ("Confidential", "confidential"),
+    ("Highly confidential", "highly_confidential"),
+]
+_SECURITY_MODE_LABELS = {
+    **{value: label for label, value in SECURITY_MODE_CHOICES},
+    "private_e2ee": "Private E2EE — mã hóa đầu cuối",
+}
+_DATA_CLASS_LABELS = {
+    **{value: label for label, value in DATA_CLASS_CHOICES},
+    "e2ee_private": "E2EE private",
+}
+
+
+def _session_policy_markdown(token, session_id):
+    """Chế độ của hội thoại đang chọn, chỉ để xem.
+
+    Chế độ được chốt khi tạo: UI không có đường nào để đổi, còn API từ chối
+    đổi trust boundary khi hội thoại đã có dữ liệu.
+    """
+    if not session_id:
+        return ""
+    session = _api(token, "GET", f"/api/sessions/{session_id}")
+    mode = session.get("security_mode")
+    data_class = session.get("data_classification")
+    mode_label = _SECURITY_MODE_LABELS.get(mode) or _safe_markdown_text(mode)
+    class_label = _DATA_CLASS_LABELS.get(data_class) or _safe_markdown_text(data_class)
+    return (
+        f"🔒 **Hội thoại đang chọn:** {mode_label} · {class_label}  \n"
+        "Đã khóa khi tạo, không thể đổi. Cần chế độ khác thì tạo hội thoại mới."
+    )
 
 
 class _SafeChatRenderer(RendererHTML):
@@ -1701,6 +1742,34 @@ def build_ui(
                                 elem_id="session-list",
                                 container=False,
                             )
+                            # Chế độ của hội thoại đang chọn chỉ hiển thị, không
+                            # chỉnh được; dropdown bên dưới chỉ dành cho hội thoại mới.
+                            md_session_policy = gr.Markdown("", elem_id="session-policy")
+                            st_delete_target = gr.State("")
+                            btn_delete = gr.Button(
+                                "Xóa vĩnh viễn", variant="stop", size="sm",
+                                elem_id="btn-session-delete",
+                            )
+                            with gr.Column(visible=False, elem_id="session-delete-confirm") as grp_delete_confirm:
+                                md_delete_confirm = gr.Markdown("", elem_id="session-delete-notice")
+                                with gr.Column(visible=False, elem_id="session-delete-auth") as grp_delete_auth:
+                                    tb_delete_password = gr.Textbox(
+                                        label="Mật khẩu để xác thực lại", type="password",
+                                        max_length=128, elem_id="session-delete-password",
+                                    )
+                                    tb_delete_code = gr.Textbox(
+                                        label="Mã 2FA (nếu đã bật)", max_length=32,
+                                        elem_id="session-delete-code",
+                                    )
+                                with gr.Row():
+                                    btn_delete_confirm = gr.Button(
+                                        "Xác nhận xóa vĩnh viễn", variant="stop", size="sm",
+                                        min_width=120, elem_id="btn-session-delete-confirm",
+                                    )
+                                    btn_delete_cancel = gr.Button(
+                                        "Hủy xóa", size="sm", min_width=85,
+                                        elem_id="btn-session-delete-cancel",
+                                    )
                             with gr.Accordion("Thiết lập hội thoại mới", open=False):
                                 tb_new_title = gr.Textbox(
                                     label="Tiêu đề (không bắt buộc)",
@@ -1708,26 +1777,19 @@ def build_ui(
                                     placeholder="Ví dụ: Ôn tập bảo mật ứng dụng",
                                 )
                                 dd_new_security = gr.Dropdown(
-                                    choices=[
-                                        ("Secure — mã hóa phía máy chủ", "secure"),
-                                        ("Confidential — DLP/xác nhận nghiêm ngặt", "confidential"),
-                                    ],
+                                    choices=SECURITY_MODE_CHOICES,
                                     value="secure",
-                                    label="Chế độ bảo mật",
+                                    label="Chế độ bảo mật (cho hội thoại mới)",
                                 )
                                 dd_new_class = gr.Dropdown(
-                                    choices=[
-                                        ("Public", "public"),
-                                        ("Internal", "internal"),
-                                        ("Confidential", "confidential"),
-                                        ("Highly confidential", "highly_confidential"),
-                                    ],
+                                    choices=DATA_CLASS_CHOICES,
                                     value="internal",
-                                    label="Phân loại dữ liệu",
+                                    label="Phân loại dữ liệu (cho hội thoại mới)",
                                 )
                                 gr.Markdown(
-                                    "Mặc định: **Secure / Internal**. Các thiết lập này áp dụng "
-                                    "khi bạn bấm **+ Hội thoại mới**; không đổi hội thoại đang chọn."
+                                    "Mặc định: **Secure / Internal**. Chỉ áp dụng cho hội thoại "
+                                    "tạo khi bấm **+ Hội thoại mới**. Hội thoại đã tạo giữ nguyên "
+                                    "chế độ của nó và không thể đổi."
                                 )
                             with gr.Row():
                                 btn_create = gr.Button(
@@ -1748,7 +1810,6 @@ def build_ui(
                                 )
                                 with gr.Row():
                                     btn_export = gr.Button("Xuất JSON", size="sm")
-                                    btn_delete = gr.Button("Xóa", variant="stop", size="sm")
                             # A plain same-origin link: the browser redeems the one-time
                             # ticket itself. gr.DownloadButton fetched the URL server-side
                             # into Gradio's cache, spending the ticket and storing the
@@ -1786,16 +1847,17 @@ def build_ui(
                                 btn_send = gr.Button(
                                     "Gửi", variant="primary", scale=1, min_width=110
                                 )
+                            # Hidden while the server has web search off so the
+                            # chat column is not padded by a control nobody can use.
                             cb_web_search = gr.Checkbox(
                                 label="Tra cứu Internet và dẫn nguồn",
                                 value=False,
                                 interactive=gemini_web_search_enabled,
+                                visible=gemini_web_search_enabled,
                                 elem_id="chat-web-search",
                                 info=(
                                     "Chỉ dùng trong hội thoại Public. Truy vấn tìm kiếm được gửi tới Google "
                                     "và có thể tính phí. Tra cứu riêng, không dùng hoặc lưu lịch sử chat."
-                                    if gemini_web_search_enabled else
-                                    "Máy chủ đang tắt tra cứu Internet để ưu tiên hạn mức miễn phí."
                                 ),
                             )
                             # Thông báo cố định dưới ô nhập, dùng cho consent và DLP.
@@ -1817,15 +1879,6 @@ def build_ui(
                             md_search_suggestions = _static_html(
                                 "", visible=False, elem_id="chat-search-suggestions",
                             )
-                            with gr.Row():
-                                tb_search = gr.Textbox(
-                                    label="Tìm trong hội thoại",
-                                    placeholder="Tìm trong hội thoại này…",
-                                    max_lines=1,
-                                    scale=4,
-                                )
-                                btn_search = gr.Button("Tìm", size="sm", scale=1)
-                                btn_search_clear = gr.Button("Xem tất cả", size="sm", scale=1)
 
                 # ---------- DỮ LIỆU MÃ HÓA ----------
                 with gr.Tab("Dữ liệu mã hóa"):
@@ -2166,9 +2219,16 @@ def build_ui(
             (tb_new_title, ""),
             (dd_new_security, "secure"),
             (dd_new_class, "internal"),
+            (md_session_policy, ""),
             (tb_rename, ""),
             (tb_export_password, ""),
             (tb_export_code, ""),
+            (st_delete_target, ""),
+            (grp_delete_confirm, gr.update(visible=False)),
+            (md_delete_confirm, ""),
+            (grp_delete_auth, gr.update(visible=False)),
+            (tb_delete_password, ""),
+            (tb_delete_code, ""),
             (file_export, gr.update(value="", visible=False)),
             (tb_msg, ""),
             (cb_web_search, gr.update(value=False)),
@@ -2176,7 +2236,6 @@ def build_ui(
             (btn_consent_send, gr.update(visible=False)),
             (md_search_answer, gr.update(value="", visible=False)),
             (md_search_suggestions, gr.update(value="", visible=False)),
-            (tb_search, ""),
             (df_cipher, _table_html(CIPHER_HEADERS, [])),
             (tb_gq, ""),
             (df_gsearch, _table_html(SEARCH_HEADERS, [])),
@@ -2737,6 +2796,12 @@ def build_ui(
             [chatbot, tb_rename, md_chat_notice, btn_consent_send,
              md_search_answer, md_search_suggestions],
         )
+        # Bấm chọn, tạo, xóa, gửi hay đăng nhập đều đổi value của danh sách,
+        # nên một listener .change giữ dòng chế độ đã khóa luôn đúng hội thoại.
+        dd_session.change(
+            _guard(_session_policy_markdown, 1), [st_token, dd_session], [md_session_policy],
+            api_name=False, show_progress="hidden",
+        )
 
         def create_session(token, title, security_mode, data_classification):
             created = _api(
@@ -2778,20 +2843,95 @@ def build_ui(
             [dd_session, dd_cipher, tb_rename],
         )
 
-        def delete_session(token, session_id):
+        DELETE_HIDDEN = ("", gr.update(visible=False), "", gr.update(visible=False), "", "")
+        DELETE_CONFIRM_OUTS = [st_delete_target, grp_delete_confirm, md_delete_confirm,
+                               grp_delete_auth, tb_delete_password, tb_delete_code]
+        DELETE_VIEW_RESET = (gr.update(value="", visible=False), "",
+                             _table_html(CIPHER_HEADERS, []), _table_html(SEARCH_HEADERS, []))
+        DELETE_OUTS = [dd_session, dd_cipher, chatbot, tb_rename, md_chat_notice, btn_consent_send,
+                       md_search_answer, md_search_suggestions, *DELETE_CONFIRM_OUTS,
+                       file_export, tb_msg, df_cipher, df_gsearch]
+
+        def cancel_delete_session():
+            return DELETE_HIDDEN
+
+        def request_delete_session(token, session_id):
             if not session_id:
-                gr.Warning("Chọn một hội thoại trước.")
-                return tuple(gr.skip() for _ in range(8))
-            _api(token, "DELETE", f"/api/sessions/{session_id}")
-            gr.Info("Đã xóa hội thoại và toàn bộ bản mã của nó.")
-            dd1, dd2, history = refresh_sessions(token)
-            return (dd1, dd2, history, _session_title(token, dd1["value"]),
-                    *NOTICE_HIDDEN, *SEARCH_HIDDEN)
+                gr.Warning("Chọn hội thoại cần xóa trước.")
+                return DELETE_HIDDEN
+            session = _api(token, "GET", f"/api/sessions/{session_id}")
+            title = _safe_markdown_text(session.get("title") or "Hội thoại đang chọn")
+            return (
+                session_id, gr.update(visible=True),
+                f"**Xóa vĩnh viễn hội thoại “{title}”?**\n\n"
+                "Hội thoại và toàn bộ tin nhắn sẽ bị xóa. "
+                "Thao tác này không thể hoàn tác trong ứng dụng.",
+                gr.update(visible=False), "", "",
+            )
 
         btn_delete.click(
-            _guard(delete_session, 8), [st_token, dd_session],
-            [dd_session, dd_cipher, chatbot, tb_rename, md_chat_notice, btn_consent_send,
-             md_search_answer, md_search_suggestions],
+            _guard(request_delete_session, 6), [st_token, dd_session], DELETE_CONFIRM_OUTS,
+            trigger_mode="once",
+        )
+        btn_delete_cancel.click(cancel_delete_session, None, DELETE_CONFIRM_OUTS, api_name=False)
+        # Clear confirmation immediately on a new selection, even if loading
+        # that conversation fails. The frozen ID is also checked on confirm.
+        dd_session.input(cancel_delete_session, None, DELETE_CONFIRM_OUTS, queue=False, api_name=False)
+        btn_create.click(cancel_delete_session, None, DELETE_CONFIRM_OUTS, queue=False, api_name=False)
+        btn_refresh.click(cancel_delete_session, None, DELETE_CONFIRM_OUTS, queue=False, api_name=False)
+
+        def delete_session(token, session_id, pending_id, password="", code=""):
+            if not pending_id or session_id != pending_id:
+                gr.Warning("Hội thoại đã thay đổi. Chọn lại hội thoại và xác nhận xóa.")
+                return (*(gr.skip() for _ in range(8)), *DELETE_HIDDEN,
+                        *(gr.skip() for _ in range(len(DELETE_VIEW_RESET))))
+            try:
+                try:
+                    _api(token, "DELETE", f"/api/sessions/{pending_id}")
+                except gr.Error as err:
+                    if "xác thực lại" not in _error_text(err).lower():
+                        raise
+                    if not password:
+                        return (
+                            *(gr.skip() for _ in range(8)), pending_id, gr.update(visible=True),
+                            "**Cần xác thực lại để xóa vĩnh viễn.**\n\n"
+                            "Nhập mật khẩu và mã 2FA (nếu đã bật), rồi bấm xác nhận xóa lần nữa.",
+                            gr.update(visible=True), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET))),
+                        )
+                    _api(token, "POST", "/api/auth/step-up", {
+                        "password": password, "code": (code or "").strip() or None,
+                    })
+                    _api(token, "DELETE", f"/api/sessions/{pending_id}")
+            except gr.Error as err:
+                # A persistent error belongs beside this destructive action;
+                # clear credential fields after every attempt, including failures.
+                return (
+                    *(gr.skip() for _ in range(8)), pending_id, gr.update(visible=True),
+                    "⚠️ **Chưa xóa được hội thoại.** " + _safe_markdown_text(_error_text(err)),
+                    gr.skip(), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET))),
+                )
+            gr.Info("Đã xóa vĩnh viễn hội thoại và toàn bộ tin nhắn.")
+            try:
+                dd1, dd2, history = refresh_sessions(token)
+                title = _session_title(token, dd1["value"])
+            except gr.Error:
+                # The DELETE succeeded. Never leave deleted plaintext selected
+                # because a later list/history read failed, or invite a retry.
+                empty = gr.update(choices=[], value=None)
+                return (
+                    empty, empty, [], "",
+                    gr.update(value="Đã xóa hội thoại. Bấm **Làm mới** để tải lại danh sách.", visible=True),
+                    gr.update(visible=False), *SEARCH_HIDDEN, *DELETE_HIDDEN,
+                    *DELETE_VIEW_RESET,
+                )
+            return (dd1, dd2, history, title, *NOTICE_HIDDEN, *SEARCH_HIDDEN,
+                    *DELETE_HIDDEN, *DELETE_VIEW_RESET)
+
+        btn_delete_confirm.click(
+            _guard(delete_session, len(DELETE_OUTS)),
+            [st_token, dd_session, st_delete_target, tb_delete_password, tb_delete_code],
+            DELETE_OUTS,
+            trigger_mode="once",
         )
 
         def export_session(token, session_id, password, code):
@@ -2923,7 +3063,7 @@ def build_ui(
                         value=(
                             "✅ **Tin nhắn đã gửi.** Chưa tải lại được lịch sử hội thoại. "
                             + _safe_markdown_text(_error_text(err))
-                            + "\n\nBấm **Xem tất cả** để tải lại nội dung."
+                            + "\n\nBấm **Làm mới** để tải lại nội dung."
                         ),
                         visible=True,
                     ),
@@ -3030,28 +3170,6 @@ def build_ui(
         )
         cb_web_search.input(lambda _selected: SEARCH_HIDDEN, [cb_web_search],
                             [md_search_answer, md_search_suggestions], api_name=False)
-
-        def search_in_session(token, session_id, query):
-            if not session_id:
-                gr.Warning("Chọn một hội thoại trước.")
-                return gr.skip()
-            query = (query or "").strip()
-            if not query:
-                return _chat_history(token, session_id)
-            rows = _api(
-                token, "GET", f"/api/sessions/{session_id}/messages", params={"query": query}
-            )
-            gr.Info(f"Tìm thấy {len(rows)} tin nhắn.")
-            return [
-                {"role": row["role"], "content": _safe_chat_text(row["content"])} for row in rows
-            ]
-
-        btn_search.click(_guard(search_in_session, 1), [st_token, dd_session, tb_search], [chatbot])
-        btn_search_clear.click(
-            _guard(lambda tk, sid: (_chat_history(tk, sid), ""), 2),
-            [st_token, dd_session],
-            [chatbot, tb_search],
-        )
 
         # ---- dữ liệu mã hóa ----
         def load_cipher(token, session_id):
