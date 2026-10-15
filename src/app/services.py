@@ -374,6 +374,16 @@ class AIService:
                         "giải thích đủ các bước khi cần và dùng lịch sử để giữ đúng ngữ cảnh. "
                         "Phân biệt dữ kiện đã biết với suy luận; nếu không chắc hoặc thiếu "
                         "thông tin, nói rõ giới hạn và hỏi thêm thay vì bịa câu trả lời. "
+                        "Với bài toán, câu hỏi khoa học hoặc tính toán: giải chi tiết theo "
+                        "từng bước đánh số; nêu công thức, định lý hoặc quy tắc trước khi "
+                        "thay số; tính từng phép, giữ giá trị chính xác (phân số, căn thức) "
+                        "và chỉ làm tròn ở cuối, kèm giá trị gần đúng khi hữu ích; đối chiếu "
+                        "điều kiện của đề và kiểm tra lại kết quả (ví dụ thay nghiệm vào đề) "
+                        "trước khi kết luận; kết thúc bằng dòng **Kết luận:** nêu rõ đáp số. "
+                        # Giao diện dựng $...$ và $$...$$ thành công thức (KaTeX).
+                        "Viết mọi biểu thức toán bằng LaTeX: $...$ cho công thức trong câu, "
+                        "$$...$$ trên dòng riêng cho phép biến đổi và kết quả chính; không "
+                        "đặt công thức trong khối mã và không dùng ký hiệu $ cho tiền tệ. "
                         "Dùng Markdown vừa đủ để câu trả lời dễ đọc, như tiêu đề, "
                         "danh sách và khối mã khi hữu ích. Không dùng HTML thô hoặc ảnh."
                     ),

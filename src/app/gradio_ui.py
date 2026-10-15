@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import http.cookiejar
 import json
 import os
 import re
@@ -879,6 +880,47 @@ def _validation_text(items) -> str:
     return " ".join(dict.fromkeys(messages)) or "Dữ liệu không hợp lệ."
 
 
+class _RejectCookies(http.cookiejar.DefaultCookiePolicy):
+    """The shared API client serves every user: never store or replay a cookie."""
+
+    def set_ok(self, cookie, request):
+        return False
+
+    def return_ok(self, cookie, request):
+        return False
+
+
+# Mỗi lần mở hội thoại hay chuyển tab, handler gọi API 3–5 lần. Tạo
+# httpx.Client mới cho từng lần tốn ~35 ms (dựng SSL context + mở TCP), so với
+# ~2 ms trên kết nối keep-alive dùng lại — phần lớn thời gian "processing" mà
+# người dùng thấy. Một client có pool dùng chung cho mọi luồng (httpx.Client an
+# toàn đa luồng).
+_API_CLIENT = None  # (factory, client)
+_API_CLIENT_LOCK = threading.Lock()
+# Ngắn hơn --timeout-keep-alive mặc định của uvicorn (5 giây): client bỏ kết nối
+# rảnh trước khi máy chủ đóng, để không ghi yêu cầu lên socket vừa bị đóng.
+_API_KEEPALIVE_SECONDS = 2.0
+
+
+def _api_client():
+    import httpx
+
+    global _API_CLIENT
+    with _API_CLIENT_LOCK:
+        # Dựng lại khi httpx.Client bị thay (test thay bằng lớp/hàm giả).
+        if _API_CLIENT is None or _API_CLIENT[0] is not httpx.Client:
+            _API_CLIENT = (httpx.Client, httpx.Client(
+                timeout=60,
+                limits=httpx.Limits(
+                    max_connections=100,
+                    max_keepalive_connections=20,
+                    keepalive_expiry=_API_KEEPALIVE_SECONDS,
+                ),
+                cookies=http.cookiejar.CookieJar(policy=_RejectCookies()),
+            ))
+        return _API_CLIENT[1]
+
+
 def _api(token, method, path, body=None, *, params=None):
     import httpx
 
@@ -889,12 +931,12 @@ def _api(token, method, path, body=None, *, params=None):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        with httpx.Client(base_url=BASE_URL, timeout=60) as client:
-            func = getattr(client, method.lower())
-            if body is not None and method != "GET":
-                resp = func(path, headers=headers, json=body)
-            else:
-                resp = func(path, headers=headers, params=params)
+        func = getattr(_api_client(), method.lower())
+        url = BASE_URL.rstrip("/") + path
+        if body is not None and method != "GET":
+            resp = func(url, headers=headers, json=body)
+        else:
+            resp = func(url, headers=headers, params=params)
     except httpx.ConnectError as exc:
         raise gr.Error(
             f"Không kết nối được API nội bộ tại {BASE_URL}. "
@@ -1048,7 +1090,8 @@ def _session_policy_markdown(token, session_id):
     class_label = _DATA_CLASS_LABELS.get(data_class) or _safe_markdown_text(data_class)
     return (
         f"🔒 **Hội thoại đang chọn:** {mode_label} · {class_label}  \n"
-        "Đã khóa khi tạo, không thể đổi. Cần chế độ khác thì tạo hội thoại mới."
+        "Đã khóa khi tạo, không thể đổi. Cần chế độ khác thì tạo hội thoại mới.  \n"
+        "Bấm **Gửi** là xác nhận gửi tin nhắn tới AI; DLP vẫn che hoặc chặn dữ liệu nhạy cảm."
     )
 
 
@@ -1089,6 +1132,52 @@ def _safe_chat_link(value: str) -> bool:
         return False
 
 
+# Công thức LaTeX trong tin nhắn. markdown-it làm hỏng chúng nếu phân tích như
+# văn bản thường: ``$x_1$ … $x_2$`` thành chữ nghiêng, ``\\`` mất một gạch,
+# ``\{`` mất gạch. Mã (khối ``` và `inline`) được khớp trước để ký hiệu $ trong
+# mã giữ nguyên; ``\$`` là ký tự $ thường. $...$ theo quy tắc của Pandoc: không
+# có khoảng trắng sát bên trong và không có chữ số ngay sau dấu đóng, nên
+# "giá 5$ và 10$" không bị coi là công thức.
+_MATH_SOURCE = re.compile(
+    r"(?P<fence>^[ \t]*(?P<mark>`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^[ \t]*(?P=mark)[ \t]*$|\Z))"
+    r"|(?P<code>(?<!`)(?P<ticks>`+)(?!`)[\s\S]+?(?<!`)(?P=ticks)(?!`))"
+    r"|(?P<literal>\\[\\$])"
+    r"|\$\$(?P<display>[\s\S]+?)\$\$"
+    r"|\\\[(?P<display_b>[\s\S]+?)\\\]"
+    r"|\\\((?P<inline_b>[\s\S]+?)\\\)"
+    r"|\$(?P<inline>[^\s$](?:[^\n$]*?[^\s$\\])?)\$(?!\d)",
+    re.M,
+)
+# Trình duyệt chỉ dựng công thức trong \( \) và \[ \] — dạng máy chủ viết ra sau
+# khi đã tách. Không dùng $: ký hiệu $ còn lại trong văn bản là ký tự thường.
+# KaTeX của Gradio chạy với trust=false (không \href, \url, \html...) và bỏ qua
+# <pre>/<code>.
+CHAT_LATEX_DELIMITERS = [
+    {"left": "\\[", "right": "\\]", "display": True},
+    {"left": "\\(", "right": "\\)", "display": False},
+]
+
+
+def _protect_math(content: str) -> tuple[str, re.Pattern[str], list[str]]:
+    """Swap formulas for placeholders markdown-it leaves alone."""
+    nonce = secrets.token_hex(8)
+    segments: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        display = match.group("display") or match.group("display_b")
+        tex = display or match.group("inline_b") or match.group("inline")
+        if tex is None or not tex.strip():
+            return match.group(0)
+        # Dòng trống kết thúc khối HTML ở bộ Markdown phía trình duyệt; LaTeX
+        # vốn bỏ qua nó, nên gộp lại.
+        tex = html.escape(re.sub(r"\n\s*\n", "\n", tex.strip()), quote=True)
+        segments.append(rf"\[{tex}\]" if display else rf"\({tex}\)")
+        return f"{nonce}:{len(segments) - 1}"
+
+    placeholder = re.compile(f"{nonce}:(\\d+)")
+    return _MATH_SOURCE.sub(replace, content), placeholder, segments
+
+
 def _safe_chat_text(content: str) -> str:
     """Render safe formatting while keeping source messages unchanged.
 
@@ -1096,12 +1185,15 @@ def _safe_chat_text(content: str) -> str:
     HTTP(S) links can navigate, with no referrer or opener. Gradio sanitizes the
     generated standard markup once more. Rendering server-generated block HTML
     also avoids interpreting leftover Markdown under a second parser dialect.
+    Formulas bypass the Markdown parser as escaped text in \\( \\) / \\[ \\],
+    which the browser typesets with KaTeX.
     """
 
     # Provider output and legacy rows did not necessarily pass through the API
     # schema. Make directional controls visible at the display boundary too.
     for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)):
         content = content.replace(chr(codepoint), f"\\u{codepoint:04X}")
+    content, placeholder, formulas = _protect_math(content)
     tokens = _CHAT_MARKDOWN.parse(content)
     for token in tokens:
         if token.type != "inline":
@@ -1123,7 +1215,8 @@ def _safe_chat_text(content: str) -> str:
                 # Keep the label, but discard both ends of a rejected link.
                 child.type, child.tag, child.content, child.nesting = "text", "", "", 0
                 child.attrs = {}
-    return _CHAT_MARKDOWN.renderer.render(tokens, _CHAT_MARKDOWN.options, {})
+    rendered = _CHAT_MARKDOWN.renderer.render(tokens, _CHAT_MARKDOWN.options, {})
+    return placeholder.sub(lambda match: formulas[int(match.group(1))], rendered)
 
 
 def _search_widget_marker(original: str | None) -> str:
@@ -1213,10 +1306,11 @@ def _data_table(headers, *, elem_id=None, elem_classes=()) -> gr.Markdown:
     )
 
 
-def _chat_history(token, session_id):
+def _chat_history(token, session_id, session=None):
     if not session_id:
         return []
-    session = _api(token, "GET", f"/api/sessions/{session_id}")
+    if session is None:
+        session = _api(token, "GET", f"/api/sessions/{session_id}")
     if session.get("security_mode") == "private_e2ee":
         return [
             {
@@ -1258,11 +1352,6 @@ CONSENT_NOTICE = (
     "⚠️ **Tin nhắn chưa được gửi.** Bấm **Đồng ý và gửi** bên dưới "
     "để lưu lựa chọn cho tài khoản này. Trước khi gửi tới AI bên ngoài, "
     "nội dung vẫn được lớp DLP kiểm tra và che dữ liệu nhạy cảm."
-)
-CONFIDENTIAL_CONFIRM_NOTICE = (
-    "⚠️ **Hội thoại này được phân loại mật — tin nhắn chưa được gửi.** "
-    "Bấm **Đồng ý và gửi** để xác nhận gửi riêng tin nhắn này tới AI bên ngoài. "
-    "Lớp DLP vẫn kiểm tra và che dữ liệu nhạy cảm trước khi gửi."
 )
 ACTIVITY_PLACEHOLDER = "_Hoạt động bảo mật sẽ hiển thị sau khi đăng nhập._"
 EMAIL_PLACEHOLDER = "_Thông tin email khôi phục sẽ hiển thị sau khi đăng nhập._"
@@ -1843,11 +1932,12 @@ def build_ui(
                                 buttons=["copy", "copy_all"],
                                 # Formatting is generated by the server's safe
                                 # Markdown parser; raw HTML/images stay inert.
+                                # Formulas arrive escaped in \( \) / \[ \].
                                 render_markdown=True,
                                 sanitize_html=True,
                                 allow_tags=False,
                                 allow_file_downloads=False,
-                                latex_delimiters=[],
+                                latex_delimiters=CHAT_LATEX_DELIMITERS,
                             )
                             with gr.Row(elem_id="chat-composer"):
                                 tb_msg = gr.Textbox(
@@ -1886,7 +1976,7 @@ def build_ui(
                             )
                             md_search_answer = gr.Markdown(
                                 "", visible=False, sanitize_html=True,
-                                latex_delimiters=[],
+                                latex_delimiters=CHAT_LATEX_DELIMITERS,
                                 elem_id="chat-search-answer",
                             )
                             md_search_suggestions = _static_html(
@@ -2530,7 +2620,9 @@ def build_ui(
         demo.load(
             _guard(restore_session, len(STAGE1)), None, STAGE1,
             api_name=False, show_progress="hidden",
-        ).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+        ).then(
+            _guard(load_workspace, len(STAGE2)), [st_token], STAGE2, show_progress="hidden",
+        ).then(
             lambda: '<span data-scap-login-ready="1"></span>', None, [login_ready],
             api_name=False, show_progress="hidden",
         ).then(
@@ -2549,9 +2641,11 @@ def build_ui(
             triggers=[btn_login.click, li_user.submit, li_pass.submit],
             fn=_guard(do_login, len(STAGE1)), inputs=[li_user, li_pass], outputs=STAGE1,
             trigger_mode="once",
-        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+        )).then(
+            _guard(load_workspace, len(STAGE2)), [st_token], STAGE2, show_progress="hidden",
+        ).then(
             _guard(announce_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
-            api_name=False,
+            api_name=False, show_progress="hidden",
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
@@ -2584,18 +2678,22 @@ def build_ui(
 
         persist_after(btn_mfa_verify.click(
             _guard(do_mfa_verify, len(STAGE1)), [st_mfa, tb_mfa_code], STAGE1
-        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+        )).then(
+            _guard(load_workspace, len(STAGE2)), [st_token], STAGE2, show_progress="hidden",
+        ).then(
             _guard(announce_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
-            api_name=False,
+            api_name=False, show_progress="hidden",
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
         )
         persist_after(tb_mfa_code.submit(
             _guard(do_mfa_verify, len(STAGE1)), [st_mfa, tb_mfa_code], STAGE1,
-        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+        )).then(
+            _guard(load_workspace, len(STAGE2)), [st_token], STAGE2, show_progress="hidden",
+        ).then(
             _guard(announce_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
-            api_name=False,
+            api_name=False, show_progress="hidden",
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
@@ -2640,9 +2738,11 @@ def build_ui(
         persist_after(btn_passkey_login_done.click(
             _guard(finish_passkey_login, len(STAGE1) + 1), [tb_passkey_result],
             STAGE1 + [tb_passkey_result], api_name=False,
-        )).then(_guard(load_workspace, len(STAGE2)), [st_token], STAGE2).then(
+        )).then(
+            _guard(load_workspace, len(STAGE2)), [st_token], STAGE2, show_progress="hidden",
+        ).then(
             _guard(announce_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
-            api_name=False,
+            api_name=False, show_progress="hidden",
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
@@ -2810,14 +2910,22 @@ def build_ui(
 
         def pick_session(token, session_id):
             """Bấm một hàng trong danh sách: nạp hội thoại và điền sẵn tên hiện tại."""
-            history = _chat_history(token, session_id)
-            return history, _session_title(token, session_id), *NOTICE_HIDDEN, *SEARCH_HIDDEN
+            if not session_id:
+                return [], "", *NOTICE_HIDDEN, *SEARCH_HIDDEN
+            # Một lần đọc metadata đủ cho cả lịch sử lẫn tên; _session_title
+            # tải lại cả danh sách hội thoại chỉ để lấy một tiêu đề.
+            session = _api(token, "GET", f"/api/sessions/{session_id}")
+            history = _chat_history(token, session_id, session)
+            return history, session.get("title") or "", *NOTICE_HIDDEN, *SEARCH_HIDDEN
 
+        # Chọn hội thoại là điều hướng, không phải thao tác chờ: nội dung cũ ở
+        # lại tới khi nội dung mới về, không phủ lớp "processing" lên khung chat.
         dd_session.input(
             _guard(pick_session, 6),
             [st_token, dd_session],
             [chatbot, tb_rename, md_chat_notice, btn_consent_send,
              md_search_answer, md_search_suggestions],
+            show_progress="hidden",
         )
         # Bấm chọn, tạo, xóa, gửi hay đăng nhập đều đổi value của danh sách,
         # nên một listener .change giữ dòng chế độ đã khóa luôn đúng hội thoại.
@@ -2899,7 +3007,8 @@ def build_ui(
         btn_delete_cancel.click(cancel_delete_session, None, DELETE_CONFIRM_OUTS, api_name=False)
         # Clear confirmation immediately on a new selection, even if loading
         # that conversation fails. The frozen ID is also checked on confirm.
-        dd_session.input(cancel_delete_session, None, DELETE_CONFIRM_OUTS, queue=False, api_name=False)
+        dd_session.input(cancel_delete_session, None, DELETE_CONFIRM_OUTS, queue=False, api_name=False,
+                         show_progress="hidden")
         btn_create.click(cancel_delete_session, None, DELETE_CONFIRM_OUTS, queue=False, api_name=False)
         btn_refresh.click(cancel_delete_session, None, DELETE_CONFIRM_OUTS, queue=False, api_name=False)
 
@@ -3056,12 +3165,8 @@ def build_ui(
                         selection = (update, update, gr.skip())
                 # Consent là lựa chọn người dùng, không phải lỗi kỹ thuật. Hiển thị
                 # ngay cạnh ô nhập và giữ nguyên nội dung để họ có thể gửi lại sau.
-                needs_consent = EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err)
-                if needs_consent or "xác nhận riêng" in str(err).lower():
-                    notice = gr.update(
-                        value=CONSENT_NOTICE if needs_consent else CONFIDENTIAL_CONFIRM_NOTICE,
-                        visible=True,
-                    )
+                if EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err):
+                    notice = gr.update(value=CONSENT_NOTICE, visible=True)
                     return (*selection, gr.skip(), notice, gr.update(visible=True))
                 notice = gr.update(
                     value=(
@@ -3153,7 +3258,11 @@ def build_ui(
         SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_chat_notice, btn_consent_send,
                      md_search_answer, md_search_suggestions]
         def submit_chat_message(token, session_id, message, use_web_search=False):
-            return send_message(token, session_id, message, use_web_search=use_web_search)
+            # Bấm Gửi chính là xác nhận gửi tin nhắn này tới AI bên ngoài (dòng
+            # chế độ hội thoại nói rõ điều đó), nên hội thoại Internal/Confidential
+            # không còn hỏi lại từng tin. API vẫn đòi confirm_external_ai cho
+            # mọi client; DLP vẫn che dữ liệu nhạy cảm và chặn Highly confidential.
+            return send_message(token, session_id, message, True, use_web_search)
 
         # One event covers Enter and tapping Send. Separate events could both
         # run while mobile Chrome was still waiting for the first response.
@@ -3166,12 +3275,10 @@ def build_ui(
         )
 
         def consent_and_resend(token, session_id, message, use_web_search=False):
-            """Record one explicit decision, then retry the still-visible message once.
+            """Grant the one-time account consent, then send the still-visible message.
 
-            Account consent and confirming a confidential message are separate
-            decisions. Without consent, this click only grants consent; if the
-            conversation is confidential the server then asks again, and only
-            that second click confirms sending this message.
+            The consent is stored for the account, so this button appears only
+            once. As with the Send button, sending is the per-message confirmation.
             """
             if not (message or "").strip():
                 return (
@@ -3185,7 +3292,6 @@ def build_ui(
                 )
             if not _api(token, "GET", "/api/auth/me").get("ai_data_consent"):
                 _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
-                return send_message(token, session_id, message, False, use_web_search)
             return send_message(token, session_id, message, True, use_web_search)
 
         btn_consent_send.click(
@@ -3591,7 +3697,9 @@ def build_ui(
             dd_user_pick,
         ]
         btn_adm_refresh.click(_guard(refresh_admin, 8), [st_token], ADMIN_OUTS)
-        adm_tab.select(_guard(refresh_admin, 8), [st_token], ADMIN_OUTS)
+        # Mở tab là điều hướng: số liệu cũ ở lại tới khi số liệu mới về, không
+        # phủ lớp "processing" lên từng thẻ.
+        adm_tab.select(_guard(refresh_admin, 8), [st_token], ADMIN_OUTS, show_progress="hidden")
 
         def set_role(token, user_id, role):
             if not user_id:
@@ -3676,7 +3784,7 @@ def build_ui(
             ])
 
         btn_audit.click(_guard(load_audit, 1), [st_token, sl_audit], [df_audit])
-        mod_tab.select(_guard(load_audit, 1), [st_token, sl_audit], [df_audit])
+        mod_tab.select(_guard(load_audit, 1), [st_token, sl_audit], [df_audit], show_progress="hidden")
         # Cả phần kéo và ô số đều là cùng một Slider. Phải tải lại bảng khi
         # giá trị đổi, nếu không giao diện chỉ đổi con số cục bộ còn dữ liệu
         # vẫn là lần tải trước đó.
@@ -3823,8 +3931,13 @@ def build_ui(
             return _table_html(BLOCKLIST_HEADERS, blocklist_rows(token)), ""
 
         def refresh_security(token, window):
-            """Nạp cả bốn khối. Mỗi khối bọc riêng để thiếu quyền ở một khối
-            không làm trắng toàn bộ màn hình (moderator không có quyền admin)."""
+            """Nạp ba thẻ số liệu và ba bảng IDS. Mỗi khối bọc riêng để thiếu
+            quyền ở một khối không làm trắng toàn bộ màn hình (moderator không
+            có quyền admin).
+
+            Xác minh chuỗi audit duyệt lại toàn bộ nhật ký nên chậm dần theo số
+            bản ghi; nó chạy ở bước .then() riêng để các thẻ không phải chờ.
+            """
 
             def safe(fn, fallback, *, admin_only=False):
                 try:
@@ -3837,9 +3950,6 @@ def build_ui(
                     gr.Warning(_error_text(err))
                     return fallback
 
-            verdict = safe(
-                lambda: verify_chain_ui(token), "**Không thể xác minh chuỗi.**"
-            )
             det = safe(lambda: detection_rows(token), [])
             anom = safe(lambda: anomaly_rows(token, window), [])
             block = safe(lambda: blocklist_rows(token), [], admin_only=True)
@@ -3853,7 +3963,7 @@ def build_ui(
                 blocked,
             )
             return (
-                *metrics, verdict,
+                *metrics,
                 _table_html(DETECTION_HEADERS, det),
                 _table_html(ANOMALY_HEADERS, anom),
                 _table_html(BLOCKLIST_HEADERS, block or []),
@@ -3863,13 +3973,17 @@ def build_ui(
             md_sec_detections,
             md_sec_anomalies,
             md_sec_blocks,
-            md_sec_verdict,
             df_sec_det,
             df_sec_anom,
             df_sec_block,
         ]
-        btn_sec_all.click(_guard(refresh_security, 7), [st_token, sl_sec_win], SEC_OUTS)
-        sec_tab.select(_guard(refresh_security, 7), [st_token, sl_sec_win], SEC_OUTS)
+        # Mở tab hay "Làm mới toàn bộ": thẻ số liệu cập nhật tại chỗ, không phủ
+        # lớp "processing"; kết luận chuỗi audit điền vào khi kiểm xong.
+        for trigger in (btn_sec_all.click, sec_tab.select):
+            trigger(
+                _guard(refresh_security, len(SEC_OUTS)), [st_token, sl_sec_win], SEC_OUTS,
+                show_progress="hidden",
+            ).then(verify_chain_ui, [st_token], [md_sec_verdict], show_progress="hidden")
         btn_sec_verify.click(verify_chain_ui, [st_token], [md_sec_verdict])
         btn_sec_verify_ids.click(verify_ids_detection_ui, [st_token], [md_sec_ids_verdict])
         btn_sec_anom.click(_guard(load_anomalies, 1), [st_token, sl_sec_win], [df_sec_anom])

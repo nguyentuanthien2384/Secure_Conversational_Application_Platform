@@ -197,7 +197,7 @@ def test_ai_service_passes_configured_token_cap_to_provider(settings: Settings, 
         return EchoProvider()
 
     monkeypatch.setattr(gemini_ai, "GeminiClient", fake_client)
-    AIService(replace(settings, google_genai_api_key="unit-test-key", ai_max_output_tokens=512))
+    AIService(replace(settings, google_genai_api_key="unit-test-key", AI_MAX_OUTPUT_TOKENS=4096))
     assert captured["max_output_tokens"] == 512
 
 

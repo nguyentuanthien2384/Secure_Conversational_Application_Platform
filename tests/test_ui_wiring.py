@@ -555,7 +555,11 @@ def test_moderator_security_refresh_marks_the_admin_only_blocklist_without_a_war
     result = callback.fn("moderator-token", 60)
     assert warnings == []
     assert "Cần vai trò admin" in result[2]
-    assert "cần vai trò admin" in result[3], "chain verdict for a moderator"
+    chain = next(item for item in runtime_demo.config["dependencies"]
+                 if item["trigger_after"] == dependency["id"])
+    assert "cần vai trò admin" in runtime_demo.fns[chain["id"]].fn("moderator-token"), (
+        "chain verdict for a moderator"
+    )
     blocklist = runtime_demo.blocks[dependency["outputs"][-1]]
     assert result[-1] == gradio_ui._table_html(gradio_ui.BLOCKLIST_HEADERS, [])
     assert blocklist.elem_id == "sec-blocklist-table"
@@ -832,7 +836,7 @@ def test_public_chat_forwards_the_explicit_search_choice(search_demo, monkeypatc
     monkeypatch.setattr(gradio_ui, "_api", api)
     send, _dependency = _button_event(search_demo, "Gửi")
     result = send.fn("token", "public-session", "Kiểm tra tin mới", use_web_search)
-    body = {"content": "Kiểm tra tin mới", "confirm_external_ai": False}
+    body = {"content": "Kiểm tra tin mới", "confirm_external_ai": True}
     if not use_web_search:
         body["use_web_search"] = False
     assert api.sent == [body]
@@ -886,7 +890,7 @@ def test_consent_retry_preserves_the_search_choice(search_demo, monkeypatch):
     first = send.fn("token", "public-session", "Tin mới", True)
     assert first[4]["value"] == gradio_ui.CONSENT_NOTICE and not api.sent
     result = consent.fn("token", "public-session", "Tin mới", True)
-    assert api.sent == [{"content": "Tin mới", "confirm_external_ai": False}]
+    assert api.sent == [{"content": "Tin mới", "confirm_external_ai": True}]
     assert result[3] == ""
 
 
@@ -957,6 +961,78 @@ def test_successful_send_with_failed_history_read_does_not_invite_duplicate_retr
     assert result[4]["visible"] is True
     assert "Tin nhắn đã gửi" in result[4]["value"]
     assert "Làm mới" in result[4]["value"]
+
+
+def test_opening_a_conversation_reads_it_once_without_a_progress_overlay(runtime_demo, monkeypatch):
+    """Picking a conversation is navigation: two reads, no "processing" over the chat."""
+    from src.app import gradio_ui
+
+    calls = []
+
+    def api(token, method, path, body=None, **kwargs):
+        calls.append((method, path))
+        if path.endswith("/messages"):
+            return [{"role": "user", "content": "Xin chào"}]
+        return {"id": "s1", "title": "Ôn tập", "security_mode": "secure"}
+
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    fields = {component.elem_id: component for component in runtime_demo.blocks.values()}
+    pick = next(item for item in runtime_demo.config["dependencies"]
+                if (fields["session-list"]._id, "input") in item["targets"]
+                and runtime_demo.fns[item["id"]].fn.__name__ == "pick_session")
+    assert pick["show_progress"] == "hidden"
+    history, title, *_ = runtime_demo.fns[pick["id"]].fn("token", "s1")
+    assert calls == [("GET", "/api/sessions/s1"), ("GET", "/api/sessions/s1/messages")]
+    assert title == "Ôn tập" and history[0]["role"] == "user"
+
+
+def test_opening_a_tab_or_the_workspace_shows_no_progress_overlay(runtime_demo):
+    """Tab loads replace values in place; the slow audit-chain walk runs after the cards."""
+    names = {item["id"]: runtime_demo.fns[item["id"]].fn.__name__
+             for item in runtime_demo.config["dependencies"]}
+    tabs = {component._id: component.label for component in runtime_demo.blocks.values()
+            if isinstance(component, gr.Tab)}
+    selects = {tabs[target]: item for item in runtime_demo.config["dependencies"]
+               for target, event in item["targets"] if event == "select" and target in tabs}
+    assert {"Quản trị", "Nhật ký kiểm toán", "Bảo mật"} <= set(selects)
+    for label in ("Quản trị", "Nhật ký kiểm toán", "Bảo mật"):
+        assert selects[label]["show_progress"] == "hidden", label
+    security = selects["Bảo mật"]
+    assert names[security["id"]] == "refresh_security"
+    chain = next(item for item in runtime_demo.config["dependencies"]
+                 if item["trigger_after"] == security["id"])
+    assert names[chain["id"]] == "verify_chain_ui" and chain["show_progress"] == "hidden"
+    workspace = [item for item in runtime_demo.config["dependencies"]
+                 if names[item["id"]] == "load_workspace"]
+    assert workspace and all(item["show_progress"] == "hidden" for item in workspace)
+
+
+def test_ui_api_calls_share_one_client_that_never_replays_cookies(monkeypatch):
+    """One pooled client serves every user, so it must not carry cookies between them."""
+    import httpx
+
+    from src.app import gradio_ui
+
+    sent_cookies = []
+
+    def handler(request):
+        sent_cookies.append(request.headers.get("cookie"))
+        return httpx.Response(200, json={}, headers={"Set-Cookie": "scap_device=user-a; Path=/"})
+
+    built = []
+    real_client = httpx.Client
+
+    def factory(**kwargs):
+        built.append(kwargs)
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", factory)
+    monkeypatch.setattr(gradio_ui, "_SESSION_STORE", None)
+    monkeypatch.setattr(gradio_ui, "_browser_context_headers", lambda: {})
+    gradio_ui._api("token-a", "GET", "/api/auth/me")
+    gradio_ui._api("token-b", "GET", "/api/auth/me")
+    assert len(built) == 1, "a new client per call cost ~35 ms (SSL context + TCP connect)"
+    assert sent_cookies == [None, None]
 
 
 @pytest.mark.parametrize("failure", ["timeout", "protocol"])

@@ -58,7 +58,43 @@ def test_chatbot_keeps_html_sanitization_without_file_or_custom_renderers():
     assert chatbot.sanitize_html is True
     assert chatbot.allow_tags is False
     assert chatbot.allow_file_downloads is False
-    assert chatbot.latex_delimiters == []
+    # Only the escaped \( \) / \[ \] the server writes; a stray $ stays text.
+    assert chatbot.latex_delimiters == gradio_ui.CHAT_LATEX_DELIMITERS
+    assert {item["left"] for item in chatbot.latex_delimiters} == {"\\(", "\\["}
+
+
+@pytest.mark.parametrize("source, formula", [
+    (r"Nghiệm $x_1 = \frac{-b + \sqrt{\Delta}}{2a}$ và $x_2$", r"\(x_1 = \frac{-b + \sqrt{\Delta}}{2a}\)"),
+    (r"$$\begin{cases} x + y = 3 \\ x - y = 1 \end{cases}$$",
+     r"\[\begin{cases} x + y = 3 \\ x - y = 1 \end{cases}\]"),
+    (r"**Bước 1: dạng $ax^2 + bx + c = 0$**", r"<strong>Bước 1: dạng \(ax^2 + bx + c = 0\)</strong>"),
+    (r"Lãi $6\% = 0{,}06$", r"\(6\% = 0{,}06\)"),
+    (r"Đã có \(x^2\) và \[\int_0^1 x\,dx\]", r"\(x^2\) và \[\int_0^1 x\,dx\]"),
+])
+def test_formulas_reach_katex_unchanged_by_markdown(source, formula):
+    """markdown-it turned x_1 … x_2 into italics and ate LaTeX backslashes."""
+    rendered = gradio_ui._safe_chat_text(source)
+    assert formula in rendered
+    assert "<em>" not in rendered
+
+
+@pytest.mark.parametrize("source, expected", [
+    ("giá 5$ và 10$, hoặc $5 và $10", "giá 5$ và 10$, hoặc $5 và $10"),
+    (r"chi phí \$20 và \$30", "chi phí $20 và $30"),
+    ("mã `$x_1$` giữ nguyên", "<code>$x_1$</code>"),
+    ("```\nprint('$a_1$ * $b_2$')\n```", "<pre><code>print('$a_1$ * $b_2$')"),
+])
+def test_currency_and_code_are_not_formulas(source, expected):
+    rendered = gradio_ui._safe_chat_text(source)
+    assert expected in rendered
+    assert "\\(" not in rendered and "\\[" not in rendered
+
+
+def test_formula_text_stays_escaped_and_cannot_forge_a_placeholder():
+    rendered = gradio_ui._safe_chat_text("$a<img src=x onerror=alert(1)>$ 0:0 $$\n\n$$")
+    assert "<img" not in rendered
+    assert r"\(a&lt;img src=x onerror=alert(1)&gt;\)" in rendered
+    assert "0:0" in rendered, "only this call's random marker is replaced"
 
 
 class _Elements(HTMLParser):

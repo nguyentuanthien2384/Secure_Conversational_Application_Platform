@@ -269,6 +269,10 @@ bộ. Audit chỉ ghi category/count, không ghi mẫu dữ liệu.
 
 - public/internal: allow hoặc redact theo policy;
 - confidential: cần xác nhận riêng và redact;
+
+API đòi `confirm_external_ai=true` cho mỗi tin nhắn internal/confidential. Giao
+diện web coi thao tác bấm **Gửi** là xác nhận đó (dòng chế độ hội thoại nói rõ),
+nên không hỏi lại từng tin; consent của tài khoản vẫn chỉ hỏi một lần.
 - highly confidential: block egress;
 - e2ee private: local-only phía client, máy chủ không gọi provider.
 

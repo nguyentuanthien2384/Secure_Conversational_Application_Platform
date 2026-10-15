@@ -120,6 +120,10 @@ def test_system_instruction_matches_safe_markdown_chat_view(tmp_path):
     service.generate("Xin chào", [], allow_external_ai=True)
     assert "Dùng Markdown" in captured["system_instruction"]
     assert "Không dùng HTML thô hoặc ảnh" in captured["system_instruction"]
+    # Calculations: numbered steps, verified result, LaTeX the chat view typesets.
+    assert "từng bước" in captured["system_instruction"]
+    assert "kiểm tra lại kết quả" in captured["system_instruction"]
+    assert "$...$" in captured["system_instruction"] and "$$...$$" in captured["system_instruction"]
 
 
 # ───────────────────────── UI consent / confirmation flow ─────────────────────────
@@ -195,29 +199,26 @@ def test_consent_retry_reuses_the_auto_created_conversation(demo, monkeypatch):
     assert len(api.sent) == 1
 
 
-def test_consent_click_does_not_also_confirm_confidential_content(demo, monkeypatch):
-    api = FakeApi(consent=False, mode="confidential")
+def test_send_button_confirms_a_confidential_message_without_a_second_prompt(demo, monkeypatch):
+    """Tapping Send is the per-message confirmation; the API still requires the flag."""
+    api = FakeApi(consent=True, mode="confidential")
     monkeypatch.setattr(gradio_ui, "_api", api)
-    send = _callback(demo, "submit_chat_message")
-    resend = _callback(demo, "consent_and_resend")
-
-    assert send("token", "s9", "Kế hoạch nội bộ")[4]["value"] == gradio_ui.CONSENT_NOTICE
-    first = resend("token", "s9", "Kế hoạch nội bộ")
-    assert api.consent is True
-    assert api.sent == []  # consent alone must not send confidential content
-    assert first[4]["value"] == gradio_ui.CONFIDENTIAL_CONFIRM_NOTICE
-    assert first[5]["visible"] is True
-
-    resend("token", "s9", "Kế hoạch nội bộ")
+    outputs = _callback(demo, "submit_chat_message")("token", "s9", "Kế hoạch nội bộ")
     assert api.sent == [{
         "content": "Kế hoạch nội bộ", "confirm_external_ai": True, "use_web_search": False,
     }]
+    assert outputs[3] == "" and outputs[4]["visible"] is False and outputs[5]["visible"] is False
 
 
-def test_secure_conversation_sends_after_a_single_consent_click(demo, monkeypatch):
-    api = FakeApi(consent=False)
+def test_one_consent_click_sends_even_in_a_confidential_conversation(demo, monkeypatch):
+    api = FakeApi(consent=False, mode="confidential")
     monkeypatch.setattr(gradio_ui, "_api", api)
-    _callback(demo, "consent_and_resend")("token", "s1", "Câu hỏi")
+    send = _callback(demo, "submit_chat_message")
+
+    assert send("token", "s9", "Kế hoạch nội bộ")[4]["value"] == gradio_ui.CONSENT_NOTICE
+    assert api.sent == []  # the account-level consent is still asked for once
+    _callback(demo, "consent_and_resend")("token", "s9", "Kế hoạch nội bộ")
+    assert api.consent is True
     assert api.sent == [{
-        "content": "Câu hỏi", "confirm_external_ai": False, "use_web_search": False,
+        "content": "Kế hoạch nội bộ", "confirm_external_ai": True, "use_web_search": False,
     }]
