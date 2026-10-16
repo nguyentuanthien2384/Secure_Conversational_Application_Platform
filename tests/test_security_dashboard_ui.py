@@ -92,6 +92,21 @@ def test_chain_ui_requests_new_verification_when_observation_scope_changed(demo,
     assert "Checkpoint không hợp lệ" not in result
 
 
+def test_chain_ui_identifies_damaged_historical_checkpoint_without_rendering_markup(demo, monkeypatch):
+    monkeypatch.setattr(gradio_ui, "_api", lambda *a, **k: {
+        "chain_intact": True, "total_events": 10, "verified_events": 10,
+        "checkpoint_intact": False, "high_assurance_intact": False,
+        "checkpoint_reason": "historical_checkpoint_root_mismatch",
+        "checkpoint_failed_id": "![checkpoint](https://example.invalid)",
+        "checkpoint_failed_event_id": 7,
+    })
+    result = callback(demo, "verify_chain_ui")("token")
+    assert "Checkpoint không hợp lệ" in result and "Checkpoint lỗi:" in result
+    assert "Bản ghi được neo: #7" in result
+    assert "![checkpoint](https://example.invalid)" not in result
+    assert "Đủ bằng chứng neo WORM" not in result
+
+
 @pytest.mark.parametrize("status", [401, 403, 503])
 def test_audit_refresh_error_replaces_previous_rows_with_persistent_diagnostic(demo, monkeypatch, status):
     monkeypatch.setattr(gradio_ui, "_api", lambda *a, **k: [{

@@ -167,12 +167,28 @@ def record_audit(
     outcome: str = "success",
     details: dict[str, Any] | None = None,
 ) -> AuditEvent | None:
-    """Persist one audit entry, seal it into the hash chain, mirror it to the SIEM.
+    """Commit one audit event with pending business changes; see record_audits."""
+    events = record_audits(db, request, [{
+        "event_type": event_type,
+        "actor_id": actor_id,
+        "target_type": target_type,
+        "target_id": target_id,
+        "outcome": outcome,
+        "details": details,
+    }])
+    return events[0] if events else None
 
-    Pending business changes and the audit entry commit together. Database or
-    sealing failures propagate so the caller can roll back the transaction;
-    external SIEM/checkpoint delivery remains best effort after that commit.
-    """
+
+def _prepare_audit(
+    request: Request,
+    event_type: str,
+    *,
+    actor_id: str | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    outcome: str = "success",
+    details: dict[str, Any] | None = None,
+) -> tuple[AuditEvent, dict[str, Any] | None] | None:
     # Repeated anonymous throttle denials must not amplify a cheap request
     # into a DB commit, chain lock, SIEM line and WORM delivery each time.
     # Sample only this narrow fixed set; account changes and credential
@@ -200,23 +216,56 @@ def record_audit(
         request_id=request_id,
         details_json=safe_json(details),
     )
+    return event, details
 
+
+def record_audits(
+    db: Session,
+    request: Request,
+    events: list[dict[str, Any]],
+) -> list[AuditEvent]:
+    """Commit related audit entries and pending business changes atomically.
+
+    Each item accepts the same event fields as record_audit. All entries are
+    sealed in order under one chain lock, then committed once. No SIEM success
+    or WORM checkpoint is delivered before the complete transaction succeeds.
+    A database/sealing failure propagates for the caller to roll back. An empty
+    or entirely sampled-out batch does not commit unrelated pending work.
+    """
+    prepared = [item for spec in events if (item := _prepare_audit(request, **spec)) is not None]
+    if not prepared:
+        return []
     # Flush business rows before taking the audit-chain lock. Otherwise an
-    # audit writer can hold the chain lock while waiting for a User row held
-    # by a transaction which is itself waiting to append its audit event.
+    # audit writer can hold the chain lock while waiting for a User/IDS row
+    # held by a transaction which is itself waiting to append its audit event.
     db.flush()
     key = _audit_key(request)
     if key is None:
-        db.add(event)
+        db.add_all([event for event, _details in prepared])
         db.commit()
     else:
-        # Appends must be serialised: two concurrent writers reading the same
-        # "last hash" would fork the chain and break verification.
         with append_lock(db):
-            seal_event(db, event, key)
-            db.add(event)
+            for event, _details in prepared:
+                seal_event(db, event, key)
+                db.add(event)
+                # Make this event visible as the predecessor of the next one.
+                # Flush never exposes a partial batch outside this transaction.
+                db.flush()
             db.commit()
 
+    for event, details in prepared:
+        _deliver_committed_audit(db, request, event, details)
+    return [event for event, _details in prepared]
+
+
+def _deliver_committed_audit(
+    db: Session,
+    request: Request,
+    event: AuditEvent,
+    details: dict[str, Any] | None,
+) -> None:
+    """Best-effort external delivery, called only after the audit commit."""
+    request_id = getattr(request.state, "request_id", None)
     emit_security_event(
         event.event_type,
         outcome=event.outcome,
@@ -246,4 +295,3 @@ def record_audit(
                 entry_hash=event.entry_hash,
                 request_id=request_id,
             )
-    return event

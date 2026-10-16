@@ -12,6 +12,7 @@ import inspect
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 
@@ -81,6 +82,8 @@ class _ResultQueue(asyncio.Queue):
 class _RetainedEvent:
     session_hash: str
     terminal_at: float | None = None
+    fn_index: int | None = None
+    auth_binding: tuple | None = None
 
 
 class _StateHolder(StateHolder):
@@ -126,6 +129,9 @@ class GradioCapacity:
         self.metadata_lock = threading.RLock()
         self.admission_lock = asyncio.Lock()
         self.analytics_lock = threading.RLock()
+        # Installed by the UI session guard. Bindings contain generation and
+        # digests, never bearer tokens, and retire with this bounded event map.
+        self.capture_auth_binding = None
         self._validate_structure()
         # Each accepted event can create at most one result-session queue.
         # Match the cache size to admission so it cannot evict active sessions.
@@ -165,6 +171,10 @@ class GradioCapacity:
         if any(inspect.isgeneratorfunction(fn.fn) or inspect.isasyncgenfunction(fn.fn)
                for fn in self.blocks.fns.values() if fn.fn is not None):
             raise RuntimeError("Bounded retention requires non-streaming Gradio callbacks.")
+        if any(fn.batch for fn in self.blocks.fns.values()):
+            # Gradio drops the per-event ID when batching. Session bindings
+            # must stay attached to each request through callback execution.
+            raise RuntimeError("Session-bound retention requires non-batched Gradio callbacks.")
         if any(hasattr(fn.fn, "cache") for fn in self.blocks.fns.values() if fn.fn is not None):
             raise RuntimeError("Bounded retention does not support cached Gradio callbacks.")
 
@@ -260,15 +270,37 @@ class GradioCapacity:
                 if admitting is not None:
                     self.admitting_sessions.add(admitting)
             try:
+                # Gradio otherwise creates this identifier inside _push. Make
+                # the same session available before its first possible await
+                # so a logout during admission cannot rebind submitted inputs.
+                if admitting is None:
+                    admitting = body.session_hash = uuid.uuid4().hex
+                    with self.metadata_lock:
+                        self.admitting_sessions.add(admitting)
+                binding = None
+                if self.capture_auth_binding is not None:
+                    state = self.blocks.state_holder[admitting]
+                    binding = await self.capture_auth_binding(state)
                 result = await self._push(body=body, request=request, username=username)
                 if result[0]:
                     event = self.queue.event_ids_to_events[result[1]]
                     with self.metadata_lock:
-                        self.events[result[1]] = _RetainedEvent(event.session_hash)
+                        self.events[result[1]] = _RetainedEvent(
+                            event.session_hash, fn_index=event.fn._id, auth_binding=binding,
+                        )
                 return result
             finally:
                 with self.metadata_lock:
                     self.admitting_sessions.discard(admitting)
+
+    def admitted_auth_binding(self, event_id, session_hash, fn_index):
+        """Missing, retired or mismatched queue identities must fail closed."""
+        with self.metadata_lock:
+            record = self.events.get(event_id)
+            if (record is None or record.session_hash != session_hash
+                or record.fn_index != fn_index):
+                return None
+            return record.auth_binding
 
     def send_message(self, event, event_message) -> None:
         messages = self.queue.pending_messages_per_session.get(event.session_hash)

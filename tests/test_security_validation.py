@@ -129,14 +129,19 @@ def test_missing_detection_evidence_fails_even_when_http_prevention_works(monkey
     # broken. This regression must cause CI to fail rather than claim coverage.
     import src.app.main as application
 
-    original = application.record_audit
+    original = application.record_audits
 
-    def missing_signature(db, request, event_type, **kwargs):
-        if event_type != "ids.signature":
-            return original(db, request, event_type, **kwargs)
-        return None
+    def missing_signature(db, request, events):
+        retained = [event for event in events if event["event_type"] != "ids.signature"]
+        result = original(db, request, retained)
+        if not retained:
+            # Deliberately bypass the evidence requirement in this sabotage:
+            # prevention still operates, but its signature audit is missing.
+            # Production's empty batch correctly leaves pending work uncommitted.
+            db.commit()
+        return result
 
-    monkeypatch.setattr(application, "record_audit", missing_signature)
+    monkeypatch.setattr(application, "record_audits", missing_signature)
     report = validation.run_validation(["encoded-sqli"])
     assert report["failed_scenarios"] == 1
     scenario = report["scenarios"][0]

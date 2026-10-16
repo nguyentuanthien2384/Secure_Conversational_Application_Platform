@@ -531,45 +531,79 @@ class PersistentIntrusionState:
 
     def record(self, detection: Detection) -> bool:
         """Persist one sanitized hit, atomically returning the new-ban transition."""
-        with self._session_factory() as db, db.begin():
-            self._lock_writer(db)
-            now = self._now(db)
-            self._prune_sources(db, now)
-            self._retain_detection(db, detection)
-            source = db.get(IntrusionSource, detection.source_ip)
-            if source is None:
-                if db.scalar(select(func.count()).select_from(IntrusionSource)) >= self.max_sources:
-                    oldest = db.scalar(
-                        select(IntrusionSource).where(IntrusionSource.blocked_until.is_(None))
-                        .order_by(IntrusionSource.last_seen_at, IntrusionSource.source_ip).limit(1)
-                    )
-                    # Retain active bans under a source-rotation flood. When
-                    # all slots are blocked, only detection history is updated.
-                    if oldest is None:
-                        return False
-                    db.delete(oldest)
-                source = IntrusionSource(source_ip=detection.source_ip, score_times_json="[]", last_seen_at=now)
-                db.add(source)
-            cutoff = (now - timedelta(seconds=self.block_seconds)).timestamp()
-            scores = [stamp for stamp in json.loads(source.score_times_json) if stamp > cutoff]
-            scores.extend([now.timestamp()] * self._SEVERITY_WEIGHT.get(detection.severity, 1))
-            scores = scores[-self.block_threshold:]
-            source.score_times_json = json.dumps(scores)
-            source.last_seen_at = now
-            if len(scores) >= self.block_threshold and source.blocked_until is None:
-                source.blocked_until = now + timedelta(seconds=self.block_seconds)
-                return True
+        return self.record_many([detection])
+
+    def record_many(self, detections: list[Detection], *, db: Session | None = None) -> bool:
+        """Apply a complete request's hits, optionally in its audit transaction.
+
+        A supplied session is not committed. A fresh SQLite session acquires
+        its writer reservation here; an existing transaction must already own
+        that reservation. The IDS lock is held until the caller commits or
+        rolls back, so signature history, scores and new bans can be committed
+        together with the complete immutable audit batch.
+        """
+        if not detections:
+            return False
+        if db is not None:
+            # Claim any pending account/business writes before the IDS lock,
+            # preserving the account -> IDS -> audit ordering for all callers.
+            db.flush()
+            self._lock_writer(db, existing_transaction=db.in_transaction())
+            return self._record_many_locked(db, detections)
+        with self._session_factory() as session, session.begin():
+            self._lock_writer(session)
+            return self._record_many_locked(session, detections)
+
+    def _record_many_locked(self, db: Session, detections: list[Detection]) -> bool:
+        now = self._now(db)
+        self._prune_sources(db, now)
+        newly_blocked = False
+        for detection in detections:
+            newly_blocked = self._record_locked(db, detection, now) or newly_blocked
+        return newly_blocked
+
+    def _record_locked(self, db: Session, detection: Detection, now: datetime) -> bool:
+        self._retain_detection(db, detection)
+        source = db.get(IntrusionSource, detection.source_ip)
+        if source is None:
+            if db.scalar(select(func.count()).select_from(IntrusionSource)) >= self.max_sources:
+                oldest = db.scalar(
+                    select(IntrusionSource).where(IntrusionSource.blocked_until.is_(None))
+                    .order_by(IntrusionSource.last_seen_at, IntrusionSource.source_ip).limit(1)
+                )
+                # Retain active bans under a source-rotation flood. When
+                # all slots are blocked, only detection history is updated.
+                if oldest is None:
+                    return False
+                db.delete(oldest)
+            source = IntrusionSource(source_ip=detection.source_ip, score_times_json="[]", last_seen_at=now)
+            db.add(source)
+        cutoff = (now - timedelta(seconds=self.block_seconds)).timestamp()
+        scores = [stamp for stamp in json.loads(source.score_times_json) if stamp > cutoff]
+        scores.extend([now.timestamp()] * self._SEVERITY_WEIGHT.get(detection.severity, 1))
+        scores = scores[-self.block_threshold:]
+        source.score_times_json = json.dumps(scores)
+        source.last_seen_at = now
+        if len(scores) >= self.block_threshold and source.blocked_until is None:
+            source.blocked_until = now + timedelta(seconds=self.block_seconds)
+            return True
         return False
 
-    def is_blocked(self, source_ip: str) -> tuple[bool, int]:
-        with self._session_factory() as db:
-            now = self._now(db)
-            expiry = db.scalar(select(IntrusionSource.blocked_until).where(
-                IntrusionSource.source_ip == source_ip, IntrusionSource.blocked_until > now,
-            ))
-            if expiry is None:
-                return False, 0
-            return True, max(1, int((self._utc(expiry) - now).total_seconds()))
+    def is_blocked(self, source_ip: str, *, db: Session | None = None) -> tuple[bool, int]:
+        """Read a live ban, optionally within the caller's IDS transaction."""
+        if db is not None:
+            return self._is_blocked(db, source_ip)
+        with self._session_factory() as session:
+            return self._is_blocked(session, source_ip)
+
+    def _is_blocked(self, db: Session, source_ip: str) -> tuple[bool, int]:
+        now = self._now(db)
+        expiry = db.scalar(select(IntrusionSource.blocked_until).where(
+            IntrusionSource.source_ip == source_ip, IntrusionSource.blocked_until > now,
+        ))
+        if expiry is None:
+            return False, 0
+        return True, max(1, int((self._utc(expiry) - now).total_seconds()))
 
     def _unblock(self, db: Session, source_ip: str, *, existing_transaction: bool) -> bool:
         self._lock_writer(db, existing_transaction=existing_transaction)

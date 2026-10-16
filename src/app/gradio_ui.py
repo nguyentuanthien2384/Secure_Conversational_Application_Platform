@@ -1064,26 +1064,66 @@ def _install_session_result_guard(demo, token_component, mfa_component):
     generation also covers logout while a login is still pending (both start
     with an empty token), and challenge cancellation. No cookie or JWT parsing
     is needed: restored sessions and raw token callers use the same boundary.
-    GradioCapacity already rejects streaming callbacks in this application.
+    Queued inputs retain their admission identity until invocation; checking
+    publication alone would let an old request execute with the next token.
+    GradioCapacity rejects streaming/batched callbacks in this application.
     """
-    process_api, postprocess_data = demo.process_api, demo.postprocess_data
+    process_api, postprocess_data, call_function = demo.process_api, demo.postprocess_data, demo.call_function
     identity_ids = (token_component._id, mfa_component._id)
     reset_names = {"do_logout", "expire_session", "logout_all", "change_password",
                    "mfa_activate", "mfa_disable"}
 
-    @wraps(process_api)
-    async def process(*args, **kwargs):
-        state = kwargs.get("state", args[2] if len(args) > 2 else None)
-        if state is None:
-            return await process_api(*args, **kwargs)
+    def prepare_state(state):
         if not hasattr(state, "_scap_output_lock"):
             state._scap_output_lock = asyncio.Lock()
             state._scap_auth_generation = 0
-        observation = {
-            "state": state, "generation": state._scap_auth_generation,
-            "identity": tuple(state[item] for item in identity_ids),
-            "identity_ids": identity_ids, "stale": False,
+
+    def binding(state):
+        return (id(state), state._scap_auth_generation,
+                tuple(_token_digest(str(state[item])) for item in identity_ids))
+
+    async def capture_binding(state):
+        prepare_state(state)
+        async with state._scap_output_lock:
+            return binding(state)
+
+    def stale(observation):
+        state = observation["state"]
+        return (observation["stale"] or state._scap_auth_generation != observation["generation"]
+                or tuple(state[item] for item in identity_ids) != observation["identity"])
+
+    def skipped_result(block_fn):
+        return {
+            "data": [gr.skip() for _ in block_fn.outputs], "is_generating": False,
+            "iterator": None, "duration": 0, "average_duration": 0,
+            "render_config": None, "changed_state_ids": [], "used_cache": None,
         }
+
+    demo.scap_capacity.capture_auth_binding = capture_binding
+
+    @wraps(process_api)
+    async def process(*args, **kwargs):
+        state = kwargs.get("state", args[2] if len(args) > 2 else None)
+        event_id = kwargs.get("event_id", args[6] if len(args) > 6 else None)
+        block_fn = kwargs.get("block_fn", args[0] if args else None)
+        if isinstance(block_fn, int):
+            block_fn = demo.fns[block_fn]
+        if state is None:
+            if event_id is not None:
+                return skipped_result(block_fn)
+            return await process_api(*args, **kwargs)
+        prepare_state(state)
+        async with state._scap_output_lock:
+            if event_id is not None:
+                session_hash = kwargs.get("session_hash", args[5] if len(args) > 5 else None)
+                admitted = demo.scap_capacity.admitted_auth_binding(event_id, session_hash, block_fn._id)
+                if admitted is None or admitted != binding(state):
+                    return skipped_result(block_fn)
+            observation = {
+                "state": state, "generation": state._scap_auth_generation,
+                "identity": tuple(state[item] for item in identity_ids),
+                "identity_ids": identity_ids, "stale": False,
+            }
         handle = _UI_RESULT_SESSION.set(observation)
         try:
             result = await process_api(*args, **kwargs)
@@ -1096,6 +1136,18 @@ def _install_session_result_guard(demo, token_component, mfa_component):
         finally:
             _UI_RESULT_SESSION.reset(handle)
 
+    @wraps(call_function)
+    async def invoke(*args, **kwargs):
+        observation = _UI_RESULT_SESSION.get()
+        # Preprocessing awaits component work. Recheck before calling any
+        # handler so a token read after an intervening logout cannot execute an
+        # older request using the next account's credentials.
+        if observation is not None and stale(observation):
+            observation["stale"] = True
+            return {"prediction": gr.skip(), "duration": 0,
+                    "is_generating": False, "iterator": None}
+        return await call_function(*args, **kwargs)
+
     @wraps(postprocess_data)
     async def publish(block_fn, predictions, state):
         observation = _UI_RESULT_SESSION.get()
@@ -1103,8 +1155,7 @@ def _install_session_result_guard(demo, token_component, mfa_component):
             return await postprocess_data(block_fn, predictions, state)
         async with state._scap_output_lock:
             before = tuple(state[item] for item in identity_ids)
-            if (state._scap_auth_generation != observation["generation"]
-                or before != observation["identity"]):
+            if stale(observation):
                 observation["stale"] = True
                 # Do not pass skips through postprocess_data: even gr.skip()
                 # reconstructs component config. Leave the current state intact.
@@ -1124,6 +1175,7 @@ def _install_session_result_guard(demo, token_component, mfa_component):
 
     demo.process_api = process
     demo.postprocess_data = publish
+    demo.call_function = invoke
 
 
 def _session_choices(token):
@@ -4040,6 +4092,14 @@ def build_ui(
                     "**Checkpoint không hợp lệ.** Chưa thể xác nhận toàn vẹn đầy đủ. "
                     f"Lý do: {_safe_markdown_text(data.get('checkpoint_reason') or 'không xác định')}."
                 )
+                if data.get("checkpoint_failed_id") is not None:
+                    checkpoint += (
+                        f" Checkpoint lỗi: {_safe_markdown_text(data['checkpoint_failed_id'])}."
+                    )
+                if data.get("checkpoint_failed_event_id") is not None:
+                    checkpoint += (
+                        f" Bản ghi được neo: #{_safe_markdown_text(data['checkpoint_failed_event_id'])}."
+                    )
             elif "checkpoint_intact" not in data:
                 checkpoint = "**Chưa có kết quả checkpoint.** Chưa xác nhận được neo WORM bên ngoài."
             elif data.get("external_checkpoint_required") is False:

@@ -54,6 +54,7 @@ if [ -f scap-image.tar.gz ]; then
 fi
 docker image inspect "$APP_IMAGE" >/dev/null 2>&1 \
   || die "VPS chua co image $APP_IMAGE; chay bash deploy/update.sh (hoac deploy.ps1 deploy khong kem -SkipBuild)."
+expected_image_id=$(docker image inspect --format '{{.Id}}' "$APP_IMAGE")
 image_arch=$(docker image inspect --format '{{.Architecture}}' "$APP_IMAGE")
 host_arch=$(uname -m)
 case "$host_arch" in x86_64) host_arch=amd64 ;; aarch64) host_arch=arm64 ;; esac
@@ -96,6 +97,29 @@ fi
 compose up -d --no-deps --force-recreate caddy
 compose ps
 
+# A mutable tag can hide a stale app/migration container. Compare the actual
+# content IDs after Compose has run, and require the matching migration to
+# have completed successfully before accepting the deployment.
+verify_service_image() {
+  local service=$1 expected_state=$2 containers container image_id state exit_code
+  containers=$(compose ps --all --quiet "$service")
+  [ -n "$containers" ] || die "Khong tim thay container $service sau deploy."
+  for container in $containers; do
+    read -r image_id state exit_code <<< "$(docker inspect --format '{{.Image}} {{.State.Status}} {{.State.ExitCode}}' "$container")"
+    [ "$image_id" = "$expected_image_id" ] \
+      || die "Container $service khong dung image vua deploy; kiem tra migrate/app truoc khi tiep tuc."
+    [ "$state" = "$expected_state" ] \
+      || die "Container $service co trang thai $state, can $expected_state."
+    if [ "$service" = migrate ] && [ "$exit_code" != 0 ]; then
+      die "Migration that bai (ma loi $exit_code); chua xac nhan deploy thanh cong."
+    fi
+  done
+}
+verify_service_image migrate exited
+verify_service_image app running
+app_containers=$(compose ps --all --quiet app)
+[ -n "$app_containers" ] || die "Khong tim thay container app de kiem tra readiness."
+
 if [ "$EDGE_MODE" = shared-proxy ]; then
   echo "==> Gan $DOMAIN vao front proxy"
   site=$(sed -e "s/__PUBLIC_DOMAIN__/$DOMAIN/g" -e "s/__SCAP_CADDY__/$SHARED_CADDY_IPV4/g" \
@@ -116,21 +140,29 @@ if [ "$EDGE_MODE" = shared-proxy ]; then
   fi
 fi
 
-echo "==> Kiem tra https://$DOMAIN/api/health (cho Caddy xin chung chi)"
+echo "==> Kiem tra readiness noi bo va https://$DOMAIN/api/health (cho Caddy xin chung chi)"
 healthy=0
 command -v curl >/dev/null || die "VPS thieu curl; chay lai setup-server."
 for _ in $(seq 1 30); do
-  if curl -fsS -o /dev/null --max-time 5 "https://$DOMAIN/api/health"; then
+  ready=1
+  for container in $app_containers; do
+    # The image HEALTHCHECK probes /api/ready inside the container. Caddy
+    # deliberately keeps that dependency endpoint inaccessible publicly.
+    health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container") || health=unknown
+    [ "$health" = healthy ] || ready=0
+  done
+  if [ "$ready" -eq 1 ] && curl -fsS -o /dev/null --max-time 5 "https://$DOMAIN/api/health"; then
     healthy=1
     break
   fi
   sleep 4
 done
 if [ "$healthy" -eq 1 ]; then
-  echo "  [OK] https://$DOMAIN dang hoat dong."
+  echo "  [OK] App/migration dung image; readiness va https://$DOMAIN deu dat."
 else
-  echo "  [!] Chua truy cap duoc https://$DOMAIN. Kiem tra ban ghi DNS A tro ve IP VPS," >&2
-  echo "      va log: bash $HERE/vps-compose.sh logs --tail 80 caddy app" >&2
+  echo "  [!] Readiness noi bo hoac https://$DOMAIN chua dat. Kiem tra DNS va log:" >&2
+  echo "      bash $HERE/vps-compose.sh logs --tail 80 caddy app migrate" >&2
+  die "Deploy chua san sang; khong bao thanh cong."
 fi
 
 # Sao lưu PostgreSQL hằng ngày lúc 03:00 (giờ VPS) bằng crontab của tài khoản này.

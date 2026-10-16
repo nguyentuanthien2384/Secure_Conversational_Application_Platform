@@ -90,6 +90,8 @@ class CheckpointVerification:
     fully_anchored: bool = False
     reason: str | None = None
     root_hash: str | None = None
+    failed_checkpoint_id: str | None = None
+    failed_checkpoint_event_id: int | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -103,6 +105,8 @@ class CheckpointVerification:
             "checkpoint_fully_anchored": self.fully_anchored,
             "checkpoint_reason": self.reason,
             "checkpoint_root_hash": self.root_hash,
+            "checkpoint_failed_id": self.failed_checkpoint_id,
+            "checkpoint_failed_event_id": self.failed_checkpoint_event_id,
         }
 
 
@@ -391,6 +395,30 @@ class AuditCheckpointService:
 
             return verification
 
+    def _integrity_reason(
+        self, checkpoint: AuditCheckpoint, event_id: int | None, entry_hash: str | None,
+    ) -> str | None:
+        if event_id is None:
+            return "anchored_event_missing"
+        if not valid_sha256_digest(checkpoint.root_hash):
+            return "checkpoint_root_mismatch"
+        try:
+            payload = canonical_checkpoint(
+                checkpoint_id=checkpoint.id,
+                last_event_id=checkpoint.last_event_id,
+                root_hash=checkpoint.root_hash,
+                created_at=checkpoint.created_at,
+            )
+        except (TypeError, ValueError, AttributeError):
+            return "checkpoint_fields_invalid"
+        expected = sign_checkpoint(self.key, payload)
+        if (not valid_sha256_digest(checkpoint.signature)
+            or not secrets.compare_digest(expected, checkpoint.signature)):
+            return "checkpoint_signature_mismatch"
+        if not valid_sha256_digest(entry_hash) or not secrets.compare_digest(entry_hash, checkpoint.root_hash):
+            return "checkpoint_root_mismatch"
+        return None
+
     def verify_latest(self, db: Session) -> CheckpointVerification:
         # Avoid returning cached ORM values after an out-of-band edit and keep
         # latest-id/tail-count telemetry within one database statement.
@@ -418,31 +446,11 @@ class AuditCheckpointService:
         ).one()
         event = db.get(AuditEvent, checkpoint.last_event_id)
         delivered = checkpoint.delivered_at is not None and bool(checkpoint.external_receipt)
-        if event is None:
-            return CheckpointVerification(
-                present=True,
-                intact=False,
-                externally_delivered=delivered,
-                last_event_id=checkpoint.last_event_id,
-                latest_event_id=latest_event_id,
-                unanchored_events=unanchored_events,
-                reason="anchored_event_missing",
-            )
-        if not valid_sha256_digest(checkpoint.root_hash):
-            return CheckpointVerification(
-                present=True, intact=False, externally_delivered=delivered,
-                last_event_id=checkpoint.last_event_id, latest_event_id=latest_event_id,
-                unanchored_events=unanchored_events, reason="checkpoint_root_mismatch",
-            )
-        payload = canonical_checkpoint(
-            checkpoint_id=checkpoint.id,
-            last_event_id=checkpoint.last_event_id,
-            root_hash=checkpoint.root_hash,
-            created_at=checkpoint.created_at,
+        reason = self._integrity_reason(
+            checkpoint, event.id if event is not None else None,
+            event.entry_hash if event is not None else None,
         )
-        expected = sign_checkpoint(self.key, payload)
-        if (not valid_sha256_digest(checkpoint.signature)
-            or not secrets.compare_digest(expected, checkpoint.signature)):
+        if reason is not None:
             return CheckpointVerification(
                 present=True,
                 intact=False,
@@ -450,21 +458,30 @@ class AuditCheckpointService:
                 last_event_id=checkpoint.last_event_id,
                 latest_event_id=latest_event_id,
                 unanchored_events=unanchored_events,
-                reason="checkpoint_signature_mismatch",
+                reason=reason,
+                failed_checkpoint_id=checkpoint.id,
+                failed_checkpoint_event_id=checkpoint.last_event_id,
             )
-        if not valid_sha256_digest(event.entry_hash) or not secrets.compare_digest(
-            event.entry_hash,
-            checkpoint.root_hash,
-        ):
-            return CheckpointVerification(
-                present=True,
-                intact=False,
-                externally_delivered=delivered,
-                last_event_id=checkpoint.last_event_id,
-                latest_event_id=latest_event_id,
-                unanchored_events=unanchored_events,
-                reason="checkpoint_root_mismatch",
-            )
+        # Older retained anchors remain evidence even if an earlier app version
+        # already superseded a damaged checkpoint. Read them with their event
+        # hashes in one streaming join: no per-checkpoint query or unbounded list.
+        with db.execute(
+            select(AuditCheckpoint, AuditEvent.id, AuditEvent.entry_hash)
+            .outerjoin(AuditEvent, AuditEvent.id == AuditCheckpoint.last_event_id)
+            .where(AuditCheckpoint.last_event_id < checkpoint.last_event_id)
+            .order_by(AuditCheckpoint.last_event_id.asc())
+            .execution_options(populate_existing=True, yield_per=128)
+        ) as history:
+            for previous, event_id, entry_hash in history:
+                reason = self._integrity_reason(previous, event_id, entry_hash)
+                if reason is not None:
+                    return CheckpointVerification(
+                        present=True, intact=False, externally_delivered=delivered,
+                        last_event_id=checkpoint.last_event_id, latest_event_id=latest_event_id,
+                        unanchored_events=unanchored_events, reason=f"historical_{reason}",
+                        failed_checkpoint_id=previous.id,
+                        failed_checkpoint_event_id=previous.last_event_id,
+                    )
         fresh = unanchored_events <= self.max_unanchored_events
         fully_anchored = delivered and unanchored_events == 0
         return CheckpointVerification(

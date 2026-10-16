@@ -43,6 +43,7 @@ from src.app.audit import (
     client_user_agent,
     derive_ui_client_context_key,
     record_audit,
+    record_audits,
     safe_user_agent,
 )
 from src.app.audit_chain import append_lock, derive_audit_key, seal_event, verify_chain
@@ -655,41 +656,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
 
             if detections:
-                newly_blocked = False
-                for detection in detections:
-                    newly_blocked = intrusion_state.record(detection) or newly_blocked
                 with database.session_factory() as ids_db:
-                    for detection in detections:
-                        record_audit(
-                            ids_db,
-                            request,
-                            "ids.signature",
-                            outcome="blocked" if newly_blocked else "denied",
-                            target_type="request",
-                            target_id=detection.rule_id,
-                            details={
-                                "rule": detection.rule_id,
-                                "severity": detection.severity,
-                                "mitre_technique": detection.mitre_technique,
-                                "path": detection.path,
-                                "method": detection.method,
-                                # Evidence can be attacker-controlled and may
-                                # contain credentials. Keep only a correlation
-                                # hash in the long-lived audit/SIEM stream.
-                                "evidence_sha256": detection.evidence_sha256,
-                            },
-                        )
+                    # The IDS writer reservation remains held through the
+                    # audit commit. Any missing signature/block event rolls
+                    # back this request's history, scores and new ban too.
+                    newly_blocked = intrusion_state.record_many(detections, db=ids_db)
+                    ids_db.flush()
+                    # A competing worker may have banned this source between
+                    # the initial check and our writer lock. Decide while the
+                    # shared lock is still held, before the single commit.
+                    blocked, retry_after = intrusion_state.is_blocked(source_ip, db=ids_db)
+                    audit_entries = [{
+                        "event_type": "ids.signature",
+                        "outcome": "blocked" if blocked else "denied",
+                        "target_type": "request",
+                        "target_id": detection.rule_id,
+                        "details": {
+                            "rule": detection.rule_id,
+                            "severity": detection.severity,
+                            "mitre_technique": detection.mitre_technique,
+                            "path": detection.path,
+                            "method": detection.method,
+                            # Keep only a digest of attacker-controlled
+                            # evidence in the long-lived audit/SIEM stream.
+                            "evidence_sha256": detection.evidence_sha256,
+                        },
+                    } for detection in detections]
                     if newly_blocked:
-                        record_audit(
-                            ids_db,
-                            request,
-                            "ids.block",
-                            outcome="blocked",
-                            target_type="source_ip",
-                            target_id=source_ip,
-                            details={"block_seconds": settings.ids_block_seconds},
-                        )
-                if newly_blocked:
+                        audit_entries.append({
+                            "event_type": "ids.block",
+                            "outcome": "blocked",
+                            "target_type": "source_ip",
+                            "target_id": source_ip,
+                            "details": {"block_seconds": settings.ids_block_seconds},
+                        })
+                    record_audits(ids_db, request, audit_entries)
+                if newly_blocked or blocked:
                     return JSONResponse(
                         status_code=status.HTTP_403_FORBIDDEN,
                         content={
@@ -697,7 +699,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         },
                         headers={
                             "X-Request-ID": request_id,
-                            "Retry-After": str(settings.ids_block_seconds),
+                            "Retry-After": str(retry_after if blocked else settings.ids_block_seconds),
                         },
                     )
 
@@ -1663,21 +1665,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sign-in with its source classification, and raises new-device alerts.
         """
         token = issue_access_session(db, request, user, ip, mark_step_up=True)
-        db.commit()
         device_id = device_id or DeviceTokenService.new_device_id()
-        record_audit(
-            db,
-            request,
-            event_type,
-            actor_id=user.id,
-            target_type="user",
-            target_id=user.id,
-            details={
+        events = [{
+            "event_type": event_type,
+            "actor_id": user.id,
+            "target_type": "user",
+            "target_id": user.id,
+            "details": {
                 **(details or {}),
                 "sign_in_source": source.classification,
                 "device_ref": device_ref(device_id),
             },
-        )
+        }]
+        if source.classification == "new_device":
+            events.append({
+                "event_type": NEW_DEVICE_EVENT,
+                "actor_id": user.id,
+                "target_type": "user",
+                "target_id": user.id,
+                "details": {
+                    "device": describe_user_agent(client_user_agent(request)) or "unknown",
+                    "known_network": source.known_ip,
+                },
+            })
+        # The factor claim, credential rehash, bearer and both required audit
+        # entries commit together. A failed secondary alert must not consume a
+        # one-time proof or leave a live bearer the client never received.
+        record_audits(db, request, events)
         alert_new_device_sign_in(db, request, user, source)
         return TokenResponse(
             access_token=token,
@@ -1688,21 +1702,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def alert_new_device_sign_in(
         db: Session, request: Request, user: User, source: SignInSource
     ) -> None:
-        """Tell the user and the SIEM about a completed sign-in from a new device."""
+        """Notify after the sign-in and new-device audit committed together."""
         if source.classification != "new_device":
             return
-        record_audit(
-            db,
-            request,
-            NEW_DEVICE_EVENT,
-            actor_id=user.id,
-            target_type="user",
-            target_id=user.id,
-            details={
-                "device": describe_user_agent(client_user_agent(request)) or "unknown",
-                "known_network": source.known_ip,
-            },
-        )
         notify(
             db, mailer, user_id=user.id, username=user.username, kind="new_device",
             ip=client_ip(request), device=describe_user_agent(client_user_agent(request)),
@@ -2057,8 +2059,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         db.add(user)
         try:
-            db.commit()
-            db.refresh(user)
+            # Reserve the account/identifier, but do not publish it until its
+            # audit insert succeeds. Limit uniqueness handling to this flush.
+            db.flush()
         except IntegrityError as exc:
             db.rollback()
             record_audit(
@@ -2187,7 +2190,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 user.token_version,
                 settings.mfa_challenge_minutes,
             )
-            db.commit()
             record_audit(
                 db,
                 request,
@@ -2725,9 +2727,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_ai_consent(
         payload: AIConsentUpdate,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
+        lock_account_mutation(credentials, user, db)
         consent_version_changed = (
             payload.ai_data_consent and user.ai_consent_version != settings.ai_consent_version
         )
@@ -2737,8 +2741,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             user.ai_consent_version = (
                 settings.ai_consent_version if payload.ai_data_consent else None
             )
-            db.commit()
-            db.refresh(user)
             record_audit(
                 db,
                 request,
@@ -2790,7 +2792,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     reason="logout",
                 )
             )
-        db.commit()
         record_audit(
             db,
             request,
@@ -2879,7 +2880,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         )
         old_session.revoked_at = now
-        db.commit()
         record_audit(
             db,
             request,
