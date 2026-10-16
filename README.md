@@ -198,7 +198,7 @@ FastAPI và Gradio chạy trong **một tiến trình**, Gradio mount tại `/`.
 - **DLP/AI:** kiểm tra prompt/context và phản hồi provider, xử lý mã hóa nhiều lớp, che hoặc chặn dữ liệu theo policy; consent có phiên bản, giảm ngữ cảnh gửi ra ngoài; timeout/retry và ngân sách lời gọi AI.
 - **Ranh giới HTTP/UI:** TrustedHost/CORS, kiểm tra Origin, giới hạn body/URI/header/JSON, CSP nonce, dữ liệu chat dạng inert text, ký IP/UA của trình duyệt giữa UI và API.
 - **Khả dụng:** hạn mức HTTP/SSE trước khi parse body, Redis cho quota dùng chung, giới hạn Argon2/AI/Gradio/mail, dashboard ngân sách từng worker và cảnh báo HTTP.
-- **IDS/audit:** chữ ký SQLi/XSS/traversal/scanner và tương quan audit; HMAC hash chain, checkpoint có ký tới WORM/SIEM.
+- **IDS/audit:** chữ ký SQLi/XSS/traversal/scanner và tương quan audit; dấu hiệu và danh sách chặn lưu trong database dùng chung giữa các worker, giữ qua lần khởi động lại; HMAC hash chain, checkpoint có ký tới WORM/SIEM.
 - **Production/high profile:** guard fail-closed; PostgreSQL có vai trò runtime quyền tối thiểu, KMS/OIDC/WORM và TLS nội bộ có xác minh CA trong hồ sơ high.
 
 </details>
@@ -238,6 +238,10 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml logs --tail=100
 ```
 
 Overlay local bật docs/seed và tắt Caddy. Khác launcher demo tạm, PostgreSQL trong Docker dùng volume và giữ dữ liệu qua các lần khởi động.
+
+Khi nâng cấp bản có IDS lưu bền, cần chạy service `migrate` bằng image mới trước khi khởi động app mới; Compose đã đặt app phụ thuộc migration thành công. Hai bảng `intrusion_detections` và `intrusion_sources` được tạo bằng tài khoản schema owner, rồi cấp quyền cho runtime. Không dùng tài khoản runtime để tự tạo bảng. Local dùng SQLite được nâng schema khi khởi động.
+
+Tab Quản trị/Bảo mật đọc API của chính bản đang chạy. Các worker dùng cùng database sẽ thấy cùng trạng thái IDS/IPS; local và VPS dùng hai database riêng thì số liệu của chúng độc lập. Lịch sử IDS vận hành giữ tối đa 500 dấu hiệu, giao diện lấy 100 dấu hiệu gần nhất; audit có vòng đời riêng. Lỗi tải hiển thị trạng thái chưa xác định, thao tác nhạy cảm yêu cầu xác thực lại, và kết quả chuỗi audit phân biệt với bằng chứng checkpoint WORM.
 
 ### Production và VPS demo
 
@@ -305,6 +309,8 @@ node --test tests/login_credentials.test.cjs
 ```
 
 Các test bao phủ xác thực/ownership/RBAC, race condition, crypto/AAD, DLP, passkey/email, token reuse, audit/WORM, E2EE relay, retention, UI callback, quyền lưu trữ và giới hạn tài nguyên. Xem [tests/](tests/) để chọn phạm vi phù hợp khi sửa mã nguồn.
+
+Kiểm thử PostgreSQL tùy chọn trong `tests/test_postgres_security_integration.py` dùng biến `SCAP_TEST_POSTGRES_URL`. Chỉ trỏ biến này tới cluster thử nghiệm mới trên loopback, database quản trị `scap_security_tests`, chưa có role `scap_app`/`scap_auditor`. Fixture tạo/xóa database ngẫu nhiên riêng từng test và hai role thử nghiệm, không dùng database local/VPS đang vận hành. Khi không đặt biến, nhóm test này được bỏ qua.
 
 Kiểm chứng tải/diễn tập khôi phục dựng môi trường tạm riêng, không dùng DB local hay AI trả phí:
 

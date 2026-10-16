@@ -43,6 +43,9 @@ def error(message="API unavailable", status=503, step_up=False):
 @pytest.mark.parametrize("extra,expected", [
     ({"checkpoint_intact": False, "checkpoint_reason": "checkpoint_root_mismatch",
       "external_checkpoint_required": True, "high_assurance_intact": False}, "Checkpoint không hợp lệ"),
+    ({"checkpoint_intact": False, "checkpoint_present": False,
+      "checkpoint_reason": "missing_checkpoint", "external_checkpoint_required": True,
+      "high_assurance_intact": False}, "Chưa có checkpoint"),
     ({"checkpoint_intact": True, "external_checkpoint_required": False,
       "high_assurance_intact": False}, "chưa có neo WORM"),
     ({"checkpoint_intact": True, "external_checkpoint_required": True,
@@ -85,6 +88,24 @@ def test_failed_security_requests_stay_unknown_in_cards_and_tables(demo, monkeyp
     for item in result:
         assert "Không tải được" in item
         assert "## 0" not in item and "Chưa có dữ liệu" not in item
+
+
+@pytest.mark.parametrize("failed_endpoint", ["stats", "security-alerts", "users"])
+def test_admin_refresh_failure_clears_stale_observation_and_account_choice(demo, monkeypatch, failed_endpoint):
+    def api(token, method, path, *args, **kwargs):
+        if path == f"/api/admin/{failed_endpoint}":
+            raise error("<script>unavailable</script>")
+        if path.endswith("stats"):
+            return {"total_users": 12, "active_users": 10, "total_sessions": 21,
+                    "total_messages": 44, "recent_login_failures": 0, "recent_auth_denials": 0}
+        return []
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    result = callback(demo, "refresh_admin")("token", "stale-user")
+    assert len(result) == 8
+    for item in result[:7]:
+        assert "Không tải được" in item and "Lần thử:" in item
+        assert "## 0" not in item and "<script>" not in item
+    assert result[7]["choices"] == [] and result[7]["value"] is None
 
 
 def test_security_partial_failure_keeps_successful_data_and_role_boundary(demo, monkeypatch):

@@ -80,7 +80,7 @@ from src.app.ids import (
     DECOY_PATHS,
     SCANNER_AGENTS,
     Detection,
-    IntrusionState,
+    PersistentIntrusionState,
     detect_anomalies,
     evidence_fingerprint,
     mitre_technique_for_rule,
@@ -394,8 +394,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     chat_service = ChatService(envelope_crypto_service, AIService(settings, provider_limiter=ai_limiter))
     # Structured JSON security log on stdout for SIEM ingestion (Bài 7 §SIEM).
     configure_siem_logging(enabled=settings.siem_json_logs)
-    # Application-layer IDS/IPS state (Bài 7 §7.3).
-    intrusion_state = IntrusionState(
+    # Shared, bounded IDS history and bans survive worker/application restarts.
+    intrusion_state = PersistentIntrusionState(
+        database.session_factory,
         block_threshold=settings.ids_block_threshold,
         block_seconds=settings.ids_block_seconds,
     )
@@ -583,64 +584,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
         )
 
-    @app.middleware("http")
-    async def security_middleware(request: Request, call_next):
-        request.state.scap_csp_nonce = secrets.token_urlsafe(24)
-        supplied_request_id = request.headers.get("x-request-id", "")
-        request_id = (
-            supplied_request_id
-            if REQUEST_ID_RE.fullmatch(supplied_request_id)
-            else str(uuid.uuid4())
-        )
-        request.state.request_id = request_id
-
-        origin_denial = browser_request_denial(request, settings.allowed_origins)
-        if origin_denial is not None:
-            # Bound telemetry for unauthenticated browser denials without
-            # persisting headers, URL paths, credentials, or request bodies.
-            source_allowed, _ = await anyio.to_thread.run_sync(lambda: auth_audit_limiter.allow(
-                f"browser-origin:source:{client_ip(request)}", 10, 60
-            ))
-            if source_allowed:
-                global_allowed, _ = await anyio.to_thread.run_sync(
-                    lambda: auth_audit_limiter.allow("browser-origin:global", 100, 60)
-                )
-                if global_allowed:
-                    emit_security_event(
-                        "browser.origin.denied",
-                        outcome="denied",
-                        source_ip=client_ip(request),
-                        request_id=request_id,
-                        details={"reason": origin_denial},
-                    )
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Nguồn yêu cầu trình duyệt không được cho phép."},
-                headers={
-                    "X-Request-ID": request_id,
-                    "X-Content-Type-Options": "nosniff",
-                    "X-Frame-Options": "DENY",
-                    "Cache-Control": "no-store",
-                    "Referrer-Policy": "no-referrer",
-                    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-                    "Vary": "Origin, Sec-Fetch-Site",
-                },
-            )
-
-        if _is_disabled_gradio_file_request(request.scope["path"]):
-            # Return 404 rather than advertising an unused file-processing
-            # surface. Do this before IDS/audit so attacker-controlled remote
-            # URLs never enter telemetry and no network fetch can begin.
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content={"detail": "File transfer is not available."},
-                headers={
-                    "X-Request-ID": request_id,
-                    "X-Content-Type-Options": "nosniff",
-                    "Cache-Control": "no-store",
-                },
-            )
-
+    def inspect_intrusion(request: Request, request_id: str) -> JSONResponse | None:
         # ── IDS/IPS: inspect before the request reaches any handler ──
         # Only URL and headers are signature-scanned. The outer request guard
         # bounds actual body bytes before Pydantic parses them.
@@ -756,6 +700,84 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "Retry-After": str(settings.ids_block_seconds),
                         },
                     )
+
+        return None
+
+    @app.middleware("http")
+    async def security_middleware(request: Request, call_next):
+        request.state.scap_csp_nonce = secrets.token_urlsafe(24)
+        supplied_request_id = request.headers.get("x-request-id", "")
+        request_id = (
+            supplied_request_id
+            if REQUEST_ID_RE.fullmatch(supplied_request_id)
+            else str(uuid.uuid4())
+        )
+        request.state.request_id = request_id
+
+        origin_denial = browser_request_denial(request, settings.allowed_origins)
+        if origin_denial is not None:
+            # Bound telemetry for unauthenticated browser denials without
+            # persisting headers, URL paths, credentials, or request bodies.
+            source_allowed, _ = await anyio.to_thread.run_sync(lambda: auth_audit_limiter.allow(
+                f"browser-origin:source:{client_ip(request)}", 10, 60
+            ))
+            if source_allowed:
+                global_allowed, _ = await anyio.to_thread.run_sync(
+                    lambda: auth_audit_limiter.allow("browser-origin:global", 100, 60)
+                )
+                if global_allowed:
+                    emit_security_event(
+                        "browser.origin.denied",
+                        outcome="denied",
+                        source_ip=client_ip(request),
+                        request_id=request_id,
+                        details={"reason": origin_denial},
+                    )
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Nguồn yêu cầu trình duyệt không được cho phép."},
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Frame-Options": "DENY",
+                    "Cache-Control": "no-store",
+                    "Referrer-Policy": "no-referrer",
+                    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+                    "Vary": "Origin, Sec-Fetch-Site",
+                },
+            )
+
+        if _is_disabled_gradio_file_request(request.scope["path"]):
+            # Return 404 rather than advertising an unused file-processing
+            # surface. Do this before IDS/audit so attacker-controlled remote
+            # URLs never enter telemetry and no network fetch can begin.
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": "File transfer is not available."},
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "no-store",
+                },
+            )
+
+        if settings.ids_enabled:
+            # Database lookups, audit sealing and external checkpoint delivery
+            # are synchronous. Keep them off the ASGI loop so one slow sink
+            # cannot stall every request handled by this worker.
+            try:
+                intrusion_response = await anyio.to_thread.run_sync(
+                    inspect_intrusion, request, request_id,
+                )
+            except (OperationalError, DatabasePoolTimeout) as exc:
+                # Middleware runs outside FastAPI's endpoint exception handler.
+                # An unavailable shared blocklist must not silently allow a
+                # blocked source or expose database connection/SQL details.
+                response = await unavailable_security_dependency(request, exc)
+                response.headers["X-Request-ID"] = request_id
+                return response
+            if intrusion_response is not None:
+                return intrusion_response
 
         response = await call_next(request)
         if response.status_code in {429, 503}:
@@ -4795,20 +4817,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Allocate the immutable target ID without committing the account
             # before its audit entry. record_audit commits both or neither.
             db.flush()
-            record_audit(
-                db,
-                request,
-                "admin.user_create",
-                actor_id=admin.id,
-                target_type="user",
-                target_id=user.id,
-                details={"role": user.role},
-            )
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(
                 status_code=409, detail="Không thể tạo tài khoản với thông tin này."
             ) from exc
+        record_audit(
+            db,
+            request,
+            "admin.user_create",
+            actor_id=admin.id,
+            target_type="user",
+            target_id=user.id,
+            details={"role": user.role},
+        )
         return user
 
     @app.delete("/api/admin/users/{user_id}", status_code=204)
@@ -5119,7 +5141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _: Annotated[User, Depends(moderator_or_admin)],
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
     ):
-        """Recent signature-engine hits held in memory by the IPS."""
+        """Recent signature-engine hits retained in shared persistent storage."""
         return intrusion_state.recent(limit)
 
     @app.get("/api/admin/ids/anomalies")
@@ -5179,8 +5201,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin: Annotated[User, Depends(admin_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, admin, db)
-        removed = intrusion_state.unblock(source_ip)
+        lock_admin_mutation(credentials, admin, db)
+        removed = intrusion_state.unblock(source_ip, db=db)
         record_audit(
             db,
             request,

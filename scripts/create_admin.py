@@ -101,18 +101,20 @@ an isolated database without loading environment settings or the web app.
     key = derive_audit_key(settings.secret_key)
     try:
         with database.session_factory() as db, db.begin():
+            # Take the username/index lock before the audit advisory lock,
+            # matching account creation through the API. Otherwise concurrent
+            # provisioning of one username can invert those two locks.
+            if db.scalar(select(User.id).where(User.username == payload.username)) is not None:
+                raise AdminProvisioningError("That username already exists; no account was changed.")
+            user = User(username=payload.username, password_hash=password_hash, role="admin")
+            db.add(user)
+            db.flush()
             with append_lock(db):
-                # Recheck inside the transaction; the unique constraint also
-                # rejects a concurrent insertion by another provisioning tool.
-                if db.scalar(select(User.id).where(User.username == payload.username)) is not None:
-                    raise AdminProvisioningError("That username already exists; no account was changed.")
+                # A broken chain still rolls back the uncommitted account.
                 if not verify_chain(db, key).intact:
                     raise AdminProvisioningError(
                         "The existing audit chain is not intact; investigate before provisioning."
                     )
-                user = User(username=payload.username, password_hash=password_hash, role="admin")
-                db.add(user)
-                db.flush()
                 event = AuditEvent(
                     event_type="admin.bootstrap_create",
                     target_type="user",

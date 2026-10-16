@@ -18,9 +18,9 @@ Limits worth stating in the report (honest scope):
 - The key lives in the same process, so full host compromise still allows
   forgery. Real deployments ship each entry to append-only/WORM storage or a
   remote SIEM, which this project does via ``siem.py``.
-- Serialisation of appends is enforced with a mutex plus a row lock, which is
-  correct for a single instance; multi-writer Postgres should use the advisory
-  lock shown in ``append_event``.
+- Appends serialize across workers with a PostgreSQL transaction advisory lock
+  or SQLite's database writer reservation followed by a process mutex. Pending
+  business writes are flushed before acquiring the audit-chain lock.
 """
 
 from __future__ import annotations

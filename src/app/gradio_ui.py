@@ -2257,7 +2257,7 @@ def build_ui(
                         elem_classes="dashboard-hero",
                     )
                     with gr.Row(equal_height=True, elem_classes="metric-grid"):
-                        md_sec_detections = gr.Markdown("**Dấu hiệu IDS**\n\n## —\n\nTrong bộ nhớ", elem_classes=["metric-card", "metric-card-blue"])
+                        md_sec_detections = gr.Markdown("**Dấu hiệu IDS**\n\n## —\n\nTối đa 100 dấu hiệu gần nhất", elem_classes=["metric-card", "metric-card-blue"])
                         md_sec_anomalies = gr.Markdown("**Bất thường**\n\n## —\n\nTheo audit log", elem_classes=["metric-card", "metric-card-amber"])
                         md_sec_blocks = gr.Markdown("**Nguồn bị chặn**\n\n## —\n\nĐang hiệu lực", elem_classes=["metric-card", "metric-card-red"])
                     btn_sec_all = gr.Button("Làm mới toàn bộ", variant="primary", size="sm")
@@ -3631,7 +3631,7 @@ def build_ui(
         btn_logout_all.click(_guard(logout_all, len(RESET_OUTS)), [st_token], RESET_OUTS)
 
         # ---- quản trị ----
-        def refresh_admin(token, keep=None):
+        def admin_snapshot(token, keep=None):
             stats = _api(token, "GET", "/api/admin/stats")
             metrics = (
                 f"**Người dùng**\n\n## {stats['total_users']}\n\nĐang hoạt động {stats['active_users']}",
@@ -3641,7 +3641,8 @@ def build_ui(
             )
             stats_md = (
                 "**Tóm tắt phiên quan sát** · Các chỉ số được làm mới trực tiếp từ API quản trị. "
-                "Ưu tiên rà soát hai chỉ số cuối khi chuẩn bị trình diễn hoặc báo cáo."
+                "Ưu tiên rà soát hai chỉ số cuối khi chuẩn bị trình diễn hoặc báo cáo.\n\n"
+                f"Cập nhật: {time.strftime('%d/%m/%Y %H:%M:%S UTC', time.gmtime())}"
             )
             availability = stats.get("availability")
             if availability:
@@ -3726,6 +3727,22 @@ def build_ui(
             # clearing it made the next button answer "Chọn một người dùng trước.".
             selected = keep if keep in {u["id"] for u in users} else None
             return (*metrics, stats_md, alerts_md, table, gr.update(choices=choices, value=selected))
+
+        def refresh_admin(token, keep=None):
+            try:
+                return admin_snapshot(token, keep)
+            except gr.Error as err:
+                # A failed multi-API refresh cannot leave an older observation
+                # looking current, or retain an account choice no longer read.
+                checked_at = time.strftime("%d/%m/%Y %H:%M:%S UTC", time.gmtime())
+                diagnostic = _safe_markdown_text(_error_text(err))
+                message = f"**Không tải được dữ liệu quản trị.** {diagnostic}\n\nLần thử: {checked_at}"
+                gr.Warning(_error_text(err))
+                metrics = tuple(
+                    f"**{title}**\n\n## —\n\nKhông tải được\n\nLần thử: {checked_at}"
+                    for title in ("Người dùng", "Hội thoại", "Đăng nhập lỗi", "Từ chối quyền")
+                )
+                return (*metrics, message, message, message, gr.update(choices=[], value=None))
 
         ADMIN_OUTS = [
             md_metric_users,
@@ -3918,7 +3935,13 @@ def build_ui(
             # An intact local chain does not establish external anchoring. A
             # missing/deleted tail may only be visible in the checkpoint result,
             # including when no local events remain.
-            if data.get("checkpoint_intact") is False:
+            if (data.get("checkpoint_present") is False
+                and data.get("checkpoint_reason") == "missing_checkpoint"):
+                checkpoint = (
+                    "**Chưa có checkpoint.** Chưa có bằng chứng neo WORM để xác nhận "
+                    "toàn vẹn đầy đủ; cần tạo và xác minh checkpoint đầu tiên."
+                )
+            elif data.get("checkpoint_intact") is False:
                 checkpoint = (
                     "**Checkpoint không hợp lệ.** Chưa thể xác nhận toàn vẹn đầy đủ. "
                     f"Lý do: {_safe_markdown_text(data.get('checkpoint_reason') or 'không xác định')}."
