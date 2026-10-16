@@ -43,6 +43,15 @@ _LOCK = threading.Lock()
 _ADVISORY_LOCK_ID = 0x5343_4150  # "SCAP"
 
 
+def valid_sha256_digest(value: object) -> bool:
+    """Validate stored digests before constant-time ASCII comparisons."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
 def derive_audit_key(secret_key: str) -> bytes:
     """Derive the audit HMAC key from the app secret with domain separation."""
     return hashlib.sha256(("secure-chat:audit-chain:v1:" + secret_key).encode("utf-8")).digest()
@@ -193,6 +202,8 @@ class ChainVerification:
     unsealed: int = 0
     first_unsealed_id: int | None = None
     segments: int = 1
+    verified_through_event_id: int | None = None
+    verified_through_entry_hash: str | None = None
 
     @property
     def coverage(self) -> float:
@@ -213,6 +224,8 @@ class ChainVerification:
             "first_unsealed_id": self.first_unsealed_id,
             "chain_segments": self.segments,
             "coverage": round(self.coverage, 4),
+            "verified_through_event_id": self.verified_through_event_id,
+            "verified_through_entry_hash": self.verified_through_entry_hash,
         }
 
 
@@ -251,6 +264,8 @@ def verify_chain(
     unsealed = 0
     first_unsealed: int | None = None
     segments = 1
+    verified_through_id: int | None = None
+    verified_through_hash: str | None = None
     for event in db.scalars(stmt):
         total += 1
         if event.entry_hash is None:
@@ -265,19 +280,25 @@ def verify_chain(
             continue
         if event.prev_hash != prev:
             return ChainVerification(
-                total, verified, False, event.id, "prev_hash_mismatch", unsealed, first_unsealed, segments
+                total, verified, False, event.id, "prev_hash_mismatch", unsealed, first_unsealed,
+                segments, verified_through_id, verified_through_hash,
             )
         expected = compute_hash(key, prev, entry_canonical(event))
-        if not hmac.compare_digest(expected, event.entry_hash):
+        if (not valid_sha256_digest(event.entry_hash)
+            or not hmac.compare_digest(expected, event.entry_hash)):
             return ChainVerification(
-                total, verified, False, event.id, "entry_hash_mismatch", unsealed, first_unsealed, segments
+                total, verified, False, event.id, "entry_hash_mismatch", unsealed, first_unsealed,
+                segments, verified_through_id, verified_through_hash,
             )
         verified += 1
         prev = event.entry_hash
+        verified_through_id = event.id
+        verified_through_hash = event.entry_hash
     intact = verified == total if strict else True
     reason = None if intact else "unsealed_events"
     return ChainVerification(
-        total, verified, intact, None, reason, unsealed, first_unsealed, segments
+        total, verified, intact, None, reason, unsealed, first_unsealed, segments,
+        verified_through_id, verified_through_hash,
     )
 
 

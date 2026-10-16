@@ -1745,6 +1745,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return auth_session
 
+    def lock_account_mutation(
+        credentials: HTTPAuthorizationCredentials,
+        user: User,
+        db: Session,
+        *,
+        step_up: bool = False,
+    ) -> AuthSession:
+        """Revalidate the exact bearer while holding account/session locks.
+
+        The authentication dependency commits activity before the handler runs.
+        Logout can revoke only this JTI without changing the account version,
+        so both checks must remain locked through the mutation/audit commit.
+        """
+        try:
+            claims = token_service.decode(credentials.credentials)
+        except jwt.PyJWTError as exc:
+            raise HTTPException(
+                status_code=401, detail="Token không hợp lệ.",
+                headers=INVALID_TOKEN_CHALLENGE,
+            ) from exc
+        if (claims.get("sub") != user.id or lock_user_row(db, user) is None
+                or claims.get("ver") != user.token_version):
+            raise HTTPException(
+                status_code=401, detail="Tài khoản không hợp lệ.",
+                headers=INVALID_TOKEN_CHALLENGE,
+            )
+        session = lock_auth_session_row(db, str(claims["jti"]), user.id)
+        if (session is None or db.get(RevokedToken, str(claims["jti"])) is not None
+                or auth_session_expiry_reason(session, utcnow()) is not None):
+            raise HTTPException(
+                status_code=401, detail="Phiên đăng nhập không hợp lệ.",
+                headers=INVALID_TOKEN_CHALLENGE,
+            )
+        if step_up:
+            require_recent_step_up(credentials, user, db)
+        return session
+
     def lock_admin_mutation(
         credentials: HTTPAuthorizationCredentials,
         admin: User,
@@ -2354,7 +2391,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, user, db)
+        lock_account_mutation(credentials, user, db, step_up=True)
         if user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA đã được bật cho tài khoản này.")
         secret = totp_service.generate_secret()
@@ -2367,7 +2404,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # user copied the seed correctly into their authenticator app.
         user.mfa_secret_ciphertext = ciphertext
         user.mfa_secret_nonce = nonce
-        db.commit()
         record_audit(
             db, request, "auth.mfa.enroll", actor_id=user.id, target_type="user", target_id=user.id
         )
@@ -2382,6 +2418,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def mfa_activate(
         payload: MfaActivateRequest,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
@@ -2396,6 +2433,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Thử kích hoạt MFA quá nhiều lần.",
                 headers={"Retry-After": str(retry_after)},
             )
+        lock_account_mutation(credentials, user, db)
         if user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA đã được bật.")
         secret = load_mfa_secret(user)
@@ -2442,17 +2480,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         # Force other devices to re-authenticate now that a second factor exists.
         revoke_all_auth_sessions(db, user)
-        db.commit()
-        mfa_limiter.reset(f"mfa-activate:{user.id}")
         record_audit(
             db, request, "auth.mfa.enabled", actor_id=user.id, target_type="user", target_id=user.id
         )
+        mfa_limiter.reset(f"mfa-activate:{user.id}")
         return MfaActivateResponse(recovery_codes=plain_codes)
 
     @app.post("/api/auth/mfa/disable", status_code=204)
     def mfa_disable(
         payload: MfaDisableRequest,
         request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
@@ -2467,6 +2505,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Thử tắt MFA quá nhiều lần.",
                 headers={"Retry-After": str(retry_after)},
             )
+        lock_account_mutation(credentials, user, db)
         if not user.mfa_enabled:
             raise HTTPException(status_code=409, detail="MFA chưa được bật.")
         expected_token_version = user.token_version
@@ -2591,8 +2630,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for record in db.scalars(select(MfaRecoveryCode).where(MfaRecoveryCode.user_id == user.id)):
             db.delete(record)
         revoke_all_auth_sessions(db, user)
-        db.commit()
-        mfa_limiter.reset(f"mfa-disable:{user.id}")
         record_audit(
             db,
             request,
@@ -2601,6 +2638,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             target_type="user",
             target_id=user.id,
         )
+        mfa_limiter.reset(f"mfa-disable:{user.id}")
         notify(
             db, mailer, user_id=user.id, username=user.username, kind="mfa_disabled",
             ip=client_ip(request),
@@ -2631,6 +2669,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Xác thực lại quá nhiều lần.",
                 headers={"Retry-After": str(retry_after)},
             )
+        auth_session = lock_account_mutation(credentials, user, db)
         valid = password_service.verify(user.password_hash, payload.password)
         matched_counter: int | None = None
         used_recovery = False
@@ -2665,14 +2704,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=401, detail="Không xác thực được yêu cầu.")
 
-        token_payload = token_service.decode(credentials.credentials)
-        auth_session = db.get(AuthSession, str(token_payload["jti"]))
-        if auth_session is None or auth_session.user_id != user.id:
-            raise HTTPException(status_code=401, detail="Phiên đăng nhập không hợp lệ.")
         verified_at = utcnow()
         auth_session.last_step_up_at = verified_at
-        db.commit()
-        password_change_limiter.reset(f"step-up:{user.id}")
         record_audit(
             db,
             request,
@@ -2682,6 +2715,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             target_id=auth_session.jti,
             details={"method": "recovery_code" if used_recovery else "password_mfa"},
         )
+        password_change_limiter.reset(f"step-up:{user.id}")
         return StepUpResponse(
             verified_at=verified_at,
             valid_for_seconds=settings.step_up_minutes * 60,
@@ -2947,7 +2981,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user.mfa_failed_attempts = 0
         user.mfa_locked_until = None
         revoke_all_auth_sessions(db, user)
-        db.commit()
         record_audit(
             db,
             request,
@@ -3034,9 +3067,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, user, db)
-        if lock_user_row(db, user) is None:
-            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+        lock_account_mutation(credentials, user, db, step_up=True)
         auth_session = db.get(AuthSession, session_jti)
         if auth_session is None or auth_session.user_id != user.id:
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên đăng nhập.")
@@ -3049,7 +3080,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if revoked == 0:
             raise HTTPException(status_code=404, detail="Không tìm thấy phiên đăng nhập.")
-        db.commit()
         record_audit(
             db,
             request,
@@ -3068,11 +3098,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, user, db)
-        if lock_user_row(db, user) is None:
-            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+        lock_account_mutation(credentials, user, db, step_up=True)
         revoke_all_auth_sessions(db, user)
-        db.commit()
         record_audit(
             db, request, "auth.logout_all", actor_id=user.id, target_type="user", target_id=user.id
         )
@@ -5092,10 +5119,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.update(checkpoint_verification.as_dict())
             checkpoint_required = bool(settings.audit_worm_endpoint)
             payload["external_checkpoint_required"] = checkpoint_required
+            # READ COMMITTED can observe a newer checkpoint after the chain
+            # walk. Only associate its WORM evidence with the tip actually
+            # verified, never with an appended row we have not checked.
+            same_scope = (
+                result.verified_through_event_id is not None
+                and checkpoint_verification.last_event_id == result.verified_through_event_id
+                and checkpoint_verification.latest_event_id == result.verified_through_event_id
+                and checkpoint_verification.root_hash == result.verified_through_entry_hash
+            )
+            payload["verification_scope_changed"] = bool(
+                result.intact
+                and checkpoint_verification.latest_event_id != result.verified_through_event_id
+            )
             payload["high_assurance_intact"] = bool(
                 result.intact
                 and checkpoint_required
                 and checkpoint_verification.fully_anchored
+                and same_scope
             )
         payload["checked_at"] = utcnow().isoformat()
         payload["checked_by"] = admin.username
@@ -5233,6 +5274,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             require_recent_step_up=require_recent_step_up,
             revoke_all_auth_sessions=revoke_all_auth_sessions,
             lock_user_row=lock_user_row,
+            lock_account_mutation=lock_account_mutation,
             password_is_compromised=password_is_compromised,
             presented_device_id=presented_device_id,
             sign_in_source=sign_in_source,

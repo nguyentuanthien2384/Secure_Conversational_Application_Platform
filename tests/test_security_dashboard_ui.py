@@ -79,6 +79,39 @@ def test_chain_ui_full_assurance_is_explicit_and_escapes_api_fields(demo, monkey
     assert "neo WORM" in result and "![x](https://x.invalid)" not in result
 
 
+def test_chain_ui_requests_new_verification_when_observation_scope_changed(demo, monkeypatch):
+    monkeypatch.setattr(gradio_ui, "_api", lambda *a, **k: {
+        "chain_intact": True, "total_events": 10, "verified_events": 10,
+        "checkpoint_intact": True, "high_assurance_intact": False,
+        "external_checkpoint_required": True, "verification_scope_changed": True,
+    })
+    result = callback(demo, "verify_chain_ui")("token")
+    assert "Nhật ký đã thay đổi trong lúc xác minh" in result
+    assert "chạy xác minh lại" in result
+    assert "Đủ bằng chứng neo WORM" not in result
+    assert "Checkpoint không hợp lệ" not in result
+
+
+@pytest.mark.parametrize("status", [401, 403, 503])
+def test_audit_refresh_error_replaces_previous_rows_with_persistent_diagnostic(demo, monkeypatch, status):
+    monkeypatch.setattr(gradio_ui, "_api", lambda *a, **k: [{
+        "id": 1, "event_type": "OLD AUDIT ROW", "outcome": "success",
+        "created_at": "2026-10-15T00:00:00Z",
+    }])
+    load = callback(demo, "load_audit")
+    previous = load("token", 100)
+    assert "OLD AUDIT ROW" in previous and "Cập nhật:" in previous
+
+    def unavailable(*args, **kwargs):
+        raise error("<script>unavailable</script>", status)
+
+    monkeypatch.setattr(gradio_ui, "_api", unavailable)
+    current = load("token", 100)
+    assert isinstance(current, str) and "Không tải được nhật ký kiểm toán" in current
+    assert "Lần thử:" in current
+    assert "OLD AUDIT ROW" not in current and "<script>" not in current
+
+
 def test_failed_security_requests_stay_unknown_in_cards_and_tables(demo, monkeypatch):
     def unavailable(*a, **k):
         raise error()

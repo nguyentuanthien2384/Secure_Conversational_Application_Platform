@@ -66,6 +66,7 @@ class AccountRouteContext:
     require_recent_step_up: Callable[..., Any]
     revoke_all_auth_sessions: Callable[..., Any]
     lock_user_row: Callable[..., Any]
+    lock_account_mutation: Callable[..., Any]
     password_is_compromised: Callable[..., bool]
     presented_device_id: Callable[..., str | None]
     sign_in_source: Callable[..., Any]
@@ -118,13 +119,6 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             ip=client_ip(request), **kwargs,
         )
 
-    def lock_current_account(db: Session, user: User) -> None:
-        # Authentication updated activity in an earlier transaction. Serialize
-        # recovery-channel mutations with resets and re-check account version.
-        expected_version = user.token_version
-        if ctx.lock_user_row(db, user) is None or user.token_version != expected_version:
-            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
-
     # ───────────────────────── recovery email ─────────────────────────
 
     def email_view(db: Session, user: User) -> AccountEmailResponse:
@@ -160,36 +154,37 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
     ):
         """Send a code to a new address. Changing the recovery channel is a
         takeover vector, so it needs a recent password/MFA re-check."""
-        ctx.require_recent_step_up(credentials, user, db)
         require_mail()
         normalized = normalize_email(payload.email)
         if normalized is None:
             raise HTTPException(status_code=422, detail="Địa chỉ email không hợp lệ.")
         throttle(db, request, f"email-verify:{user.id}", 5, 3600, "account.email.verification",
                  user.id)
-        lock_current_account(db, user)
+        ctx.lock_account_mutation(credentials, user, db, step_up=True)
         code = issue_code(
             db, ctx.recovery_key, user_id=user.id, purpose="email_verify", now=utcnow(),
             minutes=settings.password_reset_minutes, target_email=normalized,
-        )
-        db.commit()
-        send_code(
-            ctx.mailer, normalized, purpose="email_verify", username=user.username, code=code,
-            minutes=settings.password_reset_minutes,
         )
         record_audit(
             db, request, "account.email.verification", actor_id=user.id, target_type="user",
             target_id=user.id, details={"email": mask_email(normalized)},
         )
+        # Deliver only after the code and its audit event committed. Mail is an
+        # external side effect and cannot be rolled back with the database.
+        send_code(
+            ctx.mailer, normalized, purpose="email_verify", username=user.username, code=code,
+            minutes=settings.password_reset_minutes,
+        )
         return email_view(db, user)
 
     @app.post("/api/auth/email/verify", response_model=AccountEmailResponse)
     def verify_account_email(
-        payload: RecoveryCodeRequest, request: Request, user: CurrentUser, db: DB
+        payload: RecoveryCodeRequest, request: Request, credentials: Credentials,
+        user: CurrentUser, db: DB
     ):
         throttle(db, request, f"email-verify-code:{user.id}", 10, 3600, "account.email.verify",
                  user.id)
-        lock_current_account(db, user)
+        ctx.lock_account_mutation(credentials, user, db)
         now = utcnow()
         record = consume_code(
             db, ctx.recovery_key, user_id=user.id, purpose="email_verify", code=payload.code,
@@ -226,7 +221,7 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
                 .execution_options(synchronize_session=False)
             )
         try:
-            db.commit()
+            db.flush()
         except IntegrityError as exc:
             db.rollback()
             # Shown only to someone who received the code at that address.
@@ -245,8 +240,7 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
     def remove_account_email(
         request: Request, credentials: Credentials, user: CurrentUser, db: DB
     ):
-        ctx.require_recent_step_up(credentials, user, db)
-        lock_current_account(db, user)
+        ctx.lock_account_mutation(credentials, user, db, step_up=True)
         record = db.get(AccountEmail, user.id)
         if record is None:
             raise HTTPException(status_code=404, detail="Tài khoản chưa có email khôi phục.")
@@ -258,7 +252,6 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             .values(consumed_at=utcnow())
             .execution_options(synchronize_session=False)
         )
-        db.commit()
         record_audit(
             db, request, "account.email.remove", actor_id=user.id, target_type="user",
             target_id=user.id,
@@ -402,13 +395,12 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
             .values(consumed_at=now)
             .execution_options(synchronize_session=False)
         )
-        db.commit()
-        ctx.clear_login_throttle(user.username, ip)
         record_audit(
             db, request, "auth.password_reset", actor_id=user.id, target_type="user",
             target_id=user.id,
             details={"token_version": user.token_version, "mfa_still_required": user.mfa_enabled},
         )
+        ctx.clear_login_throttle(user.username, ip)
         notify_user(db, request, user, "password_reset")
         return Response(status_code=204)
 
@@ -427,8 +419,8 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
     def passkey_registration_options(
         request: Request, credentials: Credentials, user: CurrentUser, db: DB
     ):
-        ctx.require_recent_step_up(credentials, user, db)
         throttle(db, request, f"passkey-register:{user.id}", 10, 3600, "auth.passkey.add", user.id)
+        ctx.lock_account_mutation(credentials, user, db, step_up=True)
         try:
             options = ctx.passkeys.registration_options(
                 db, user_id=user.id, username=user.username, now=utcnow()
@@ -452,7 +444,7 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
         user: CurrentUser,
         db: DB,
     ):
-        ctx.require_recent_step_up(credentials, user, db)
+        ctx.lock_account_mutation(credentials, user, db, step_up=True)
         name = clean_passkey_name(
             payload.name, describe_user_agent(client_user_agent(request)) or "Passkey"
         )
@@ -468,7 +460,6 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
                 details={"reason": exc.reason},
             )
             raise HTTPException(status_code=400, detail="Không xác minh được passkey.") from exc
-        db.commit()
         record_audit(
             db, request, "auth.passkey.add", actor_id=user.id, target_type="passkey",
             target_id=row.id, details={"name": row.name, "backed_up": row.backed_up},
@@ -480,13 +471,12 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
     def delete_passkey(
         passkey_id: str, request: Request, credentials: Credentials, user: CurrentUser, db: DB
     ):
-        ctx.require_recent_step_up(credentials, user, db)
+        ctx.lock_account_mutation(credentials, user, db, step_up=True)
         row = db.get(WebAuthnCredential, passkey_id)
         if row is None or row.user_id != user.id:
             raise HTTPException(status_code=404, detail="Không tìm thấy passkey.")
         name = row.name
         db.delete(row)
-        db.commit()
         record_audit(
             db, request, "auth.passkey.remove", actor_id=user.id, target_type="passkey",
             target_id=passkey_id, details={"name": name},

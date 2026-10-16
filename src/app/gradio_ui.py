@@ -7,7 +7,9 @@ trò chuyện, bản mã, tìm kiếm toàn cục, tài khoản, thiết bị, q
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextvars
 import hashlib
 import html
 import http.cookiejar
@@ -40,6 +42,7 @@ PASSWORD_MIN = 15
 _CLIENT_CONTEXT_KEY: bytes | None = None
 # Set by build_ui(); lets _api() follow token rotations made by another tab.
 _SESSION_STORE: BrowserSessionStore | None = None
+_UI_RESULT_SESSION = contextvars.ContextVar("scap_ui_result_session", default=None)
 
 # Fixed markup consumed by our static CSP-compatible session bridge. Bearer
 # tokens never enter this DOM component, cookies readable by JS, or storage.
@@ -1033,12 +1036,94 @@ def _guard(fn, n_outputs):
         try:
             return fn(*args, **kwargs)
         except gr.Error as err:
-            gr.Warning(_error_text(err))
+            _ui_notice(gr.Warning, _error_text(err))
             if n_outputs <= 1:
                 return gr.skip()
             return tuple(gr.skip() for _ in range(n_outputs))
 
     return wrapper
+
+
+def _ui_notice(notice, *args, **kwargs):
+    """Keep obsolete callbacks from sending account details through toasts."""
+    observation = _UI_RESULT_SESSION.get()
+    if observation is not None:
+        state = observation["state"]
+        if (state._scap_auth_generation != observation["generation"]
+            or tuple(state[item] for item in observation["identity_ids"]) != observation["identity"]):
+            return
+    return notice(*args, **kwargs)
+
+
+def _install_session_result_guard(demo, token_component, mfa_component):
+    """Discard results belonging to a login that has since ended or changed.
+
+    Gradio runs callbacks concurrently, including logout and workspace loading.
+    Check at publication, before postprocessing writes any component/state, and
+    serialize only that short publication step per browser SessionState. A
+    generation also covers logout while a login is still pending (both start
+    with an empty token), and challenge cancellation. No cookie or JWT parsing
+    is needed: restored sessions and raw token callers use the same boundary.
+    GradioCapacity already rejects streaming callbacks in this application.
+    """
+    process_api, postprocess_data = demo.process_api, demo.postprocess_data
+    identity_ids = (token_component._id, mfa_component._id)
+    reset_names = {"do_logout", "expire_session", "logout_all", "change_password",
+                   "mfa_activate", "mfa_disable"}
+
+    @wraps(process_api)
+    async def process(*args, **kwargs):
+        state = kwargs.get("state", args[2] if len(args) > 2 else None)
+        if state is None:
+            return await process_api(*args, **kwargs)
+        if not hasattr(state, "_scap_output_lock"):
+            state._scap_output_lock = asyncio.Lock()
+            state._scap_auth_generation = 0
+        observation = {
+            "state": state, "generation": state._scap_auth_generation,
+            "identity": tuple(state[item] for item in identity_ids),
+            "identity_ids": identity_ids, "stale": False,
+        }
+        handle = _UI_RESULT_SESSION.set(observation)
+        try:
+            result = await process_api(*args, **kwargs)
+            if observation["stale"]:
+                # A different callback may have changed State while this one
+                # was running. Do not trigger change events on its behalf.
+                result["changed_state_ids"] = []
+                result["render_config"] = None
+            return result
+        finally:
+            _UI_RESULT_SESSION.reset(handle)
+
+    @wraps(postprocess_data)
+    async def publish(block_fn, predictions, state):
+        observation = _UI_RESULT_SESSION.get()
+        if observation is None or observation["state"] is not state:
+            return await postprocess_data(block_fn, predictions, state)
+        async with state._scap_output_lock:
+            before = tuple(state[item] for item in identity_ids)
+            if (state._scap_auth_generation != observation["generation"]
+                or before != observation["identity"]):
+                observation["stale"] = True
+                # Do not pass skips through postprocess_data: even gr.skip()
+                # reconstructs component config. Leave the current state intact.
+                return [gr.skip() for _ in block_fn.outputs]
+            clears_session = (
+                block_fn.fn is not None and block_fn.fn.__name__ in reset_names
+                and token_component in block_fn.outputs
+                and isinstance(predictions, (tuple, list))
+                and predictions[block_fn.outputs.index(token_component)] == ""
+            )
+            try:
+                return await postprocess_data(block_fn, predictions, state)
+            finally:
+                after = tuple(state[item] for item in identity_ids)
+                if clears_session or after != before:
+                    state._scap_auth_generation += 1
+
+    demo.process_api = process
+    demo.postprocess_data = publish
 
 
 def _session_choices(token):
@@ -2491,15 +2576,15 @@ def build_ui(
         def do_register(username, password):
             username = (username or "").strip()
             if not (3 <= len(username) <= 32):
-                gr.Warning("Tên đăng nhập phải từ 3 đến 32 ký tự.")
+                _ui_notice(gr.Warning, "Tên đăng nhập phải từ 3 đến 32 ký tự.")
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip()
             if len(password or "") < PASSWORD_MIN:
-                gr.Warning(f"Mật khẩu phải có ít nhất {PASSWORD_MIN} ký tự.")
+                _ui_notice(gr.Warning, f"Mật khẩu phải có ít nhất {PASSWORD_MIN} ký tự.")
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip()
             data = _api(
                 None, "POST", "/api/auth/register", {"username": username, "password": password}
             )
-            gr.Info(f"Tạo tài khoản “{data['username']}” thành công — mời đăng nhập.")
+            _ui_notice(gr.Info, f"Tạo tài khoản “{data['username']}” thành công — mời đăng nhập.")
             return "", "", data["username"], gr.Tabs(selected="tab_login")
 
         btn_register.click(
@@ -2510,13 +2595,13 @@ def build_ui(
         def do_login(username, password):
             username = (username or "").strip()
             if not username or not password:
-                gr.Warning("Vui lòng nhập đầy đủ tên đăng nhập và mật khẩu.")
+                _ui_notice(gr.Warning, "Vui lòng nhập đầy đủ tên đăng nhập và mật khẩu.")
                 return tuple(gr.skip() for _ in STAGE1)
             data = _api(
                 None, "POST", "/api/auth/login", {"username": username, "password": password}
             )
             if data.get("mfa_required"):
-                gr.Info("Tài khoản đã bật 2FA — nhập mã xác thực để tiếp tục.")
+                _ui_notice(gr.Info, "Tài khoản đã bật 2FA — nhập mã xác thực để tiếp tục.")
                 return (
                     "",
                     0.0,
@@ -2530,7 +2615,7 @@ def build_ui(
                 )
             if data.get("device_token"):
                 session_store.remember_device(data["access_token"], data["device_token"])
-            gr.Info("Đăng nhập thành công.")
+            _ui_notice(gr.Info, "Đăng nhập thành công.")
             return (
                 data["access_token"],
                 time.time() + data["expires_in"],
@@ -2592,7 +2677,7 @@ def build_ui(
                     f'<span data-scap-session-ticket="{html.escape(ticket, quote=True)}"></span>'
                 )
             except UISessionCapacityError:
-                gr.Warning("Không lưu được phiên trình duyệt lúc này. Vui lòng thử lại.")
+                _ui_notice(gr.Warning, "Không lưu được phiên trình duyệt lúc này. Vui lòng thử lại.")
                 return completed
 
         def persist_after(event):
@@ -2655,7 +2740,7 @@ def build_ui(
                 return gr.skip(), gr.skip()
             summary, rows, alerts = _security_activity_snapshot(token)
             for alert in alerts:
-                gr.Warning(alert)
+                _ui_notice(gr.Warning, alert)
             return summary, rows
 
         demo.load(
@@ -2694,7 +2779,7 @@ def build_ui(
 
         def do_mfa_verify(mfa_token, code):
             if not mfa_token:
-                gr.Warning("Phiên xác thực đã hết — hãy đăng nhập lại.")
+                _ui_notice(gr.Warning, "Phiên xác thực đã hết — hãy đăng nhập lại.")
                 return tuple(gr.skip() for _ in STAGE1)
             data = _api(
                 None,
@@ -2704,7 +2789,7 @@ def build_ui(
             )
             if data.get("device_token"):
                 session_store.remember_device(data["access_token"], data["device_token"])
-            gr.Info("Đăng nhập thành công.")
+            _ui_notice(gr.Info, "Đăng nhập thành công.")
             return (
                 data["access_token"],
                 time.time() + data["expires_in"],
@@ -2749,7 +2834,7 @@ def build_ui(
         def finish_passkey_login(result):
             payload = _passkey_payload(result, "get")
             if "error" in payload:
-                gr.Warning(_passkey_error_message(payload))
+                _ui_notice(gr.Warning, _passkey_error_message(payload))
                 return tuple(gr.skip() for _ in STAGE1) + ("",)
             data = _api(
                 None,
@@ -2762,7 +2847,7 @@ def build_ui(
             )
             if data.get("device_token"):
                 session_store.remember_device(data["access_token"], data["device_token"])
-            gr.Info("Đăng nhập bằng passkey thành công.")
+            _ui_notice(gr.Info, "Đăng nhập bằng passkey thành công.")
             return (
                 data["access_token"],
                 time.time() + data["expires_in"],
@@ -2793,22 +2878,22 @@ def build_ui(
         def send_reset_code(identifier):
             identifier = (identifier or "").strip()
             if len(identifier) < 3:
-                gr.Warning("Nhập tên đăng nhập hoặc email khôi phục.")
+                _ui_notice(gr.Warning, "Nhập tên đăng nhập hoặc email khôi phục.")
                 return
             data = _api(
                 None, "POST", "/api/auth/password-reset/request", {"identifier": identifier}
             )
-            gr.Info(data.get("message") or "Đã tiếp nhận yêu cầu.")
+            _ui_notice(gr.Info, data.get("message") or "Đã tiếp nhận yêu cầu.")
 
         btn_reset_send.click(_guard(send_reset_code, 0), [tb_reset_identifier], None)
 
         def confirm_reset(identifier, code, new_password):
             identifier = (identifier or "").strip()
             if len(identifier) < 3 or not (code or "").strip():
-                gr.Warning("Nhập tên đăng nhập/email và mã trong email.")
+                _ui_notice(gr.Warning, "Nhập tên đăng nhập/email và mã trong email.")
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip()
             if len(new_password or "") < PASSWORD_MIN:
-                gr.Warning(f"Mật khẩu mới phải có ít nhất {PASSWORD_MIN} ký tự.")
+                _ui_notice(gr.Warning, f"Mật khẩu mới phải có ít nhất {PASSWORD_MIN} ký tự.")
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip()
             _api(
                 None,
@@ -2816,7 +2901,7 @@ def build_ui(
                 "/api/auth/password-reset/confirm",
                 {"identifier": identifier, "code": code.strip(), "new_password": new_password},
             )
-            gr.Info("Đã đặt lại mật khẩu. Hãy đăng nhập bằng mật khẩu mới.")
+            _ui_notice(gr.Info, "Đã đặt lại mật khẩu. Hãy đăng nhập bằng mật khẩu mới.")
             username = identifier if "@" not in identifier else gr.skip()
             return "", "", gr.Tabs(selected="tab_login"), username
 
@@ -2837,9 +2922,9 @@ def build_ui(
                     continue
                 try:
                     _api(active_token, "POST", "/api/auth/logout")
-                    gr.Info("Đã đăng xuất và thu hồi token trên máy chủ.")
+                    _ui_notice(gr.Info, "Đã đăng xuất và thu hồi token trên máy chủ.")
                 except Exception:
-                    gr.Warning("Không xác nhận được với máy chủ; trạng thái cục bộ đã xóa.")
+                    _ui_notice(gr.Warning, "Không xác nhận được với máy chủ; trạng thái cục bộ đã xóa.")
             return _reset_tuple(request)
 
         btn_logout.click(_guard(do_logout, len(RESET_OUTS)), [st_token], RESET_OUTS)
@@ -2866,7 +2951,7 @@ def build_ui(
             if left <= 0:
                 return "", False, gr.Timer(active=False), exp
             if left <= WARN_BEFORE_EXPIRY and not warned:
-                gr.Warning(
+                _ui_notice(gr.Warning,
                     f"Phiên sẽ hết hạn sau {left} giây. "
                     "Bấm “Gia hạn phiên” để tiếp tục làm việc."
                 )
@@ -2890,12 +2975,12 @@ def build_ui(
             if not expired_at:
                 return tuple(gr.skip() for _ in RESET_OUTS)
             if expired_at < 0:
-                gr.Warning(
+                _ui_notice(gr.Warning,
                     "Phiên đăng nhập này không còn hiệu lực (đã bị thu hồi, tài khoản bị khóa "
                     "hoặc bị xóa) — vui lòng đăng nhập lại."
                 )
             else:
-                gr.Warning("Phiên đã hết hạn — vui lòng đăng nhập lại.")
+                _ui_notice(gr.Warning, "Phiên đã hết hạn — vui lòng đăng nhập lại.")
             # A newer token in another tab may still be valid. Clear only
             # this tab; expired cookie records are pruned by the store.
             result = list(_reset_tuple())
@@ -2915,7 +3000,7 @@ def build_ui(
             data = _api(token, "POST", "/api/auth/refresh")
             expires_at = time.time() + data["expires_in"]
             session_store.rotate_token(token, data["access_token"], expires_at)
-            gr.Info("Đã gia hạn phiên.")
+            _ui_notice(gr.Info, "Đã gia hạn phiên.")
             return data["access_token"], expires_at, False
 
         persist_after(btn_extend.click(
@@ -2986,7 +3071,7 @@ def build_ui(
                     "data_classification": data_classification or "internal",
                 },
             )
-            gr.Info("Đã tạo hội thoại.")
+            _ui_notice(gr.Info, "Đã tạo hội thoại.")
             dd1, dd2, history = refresh_sessions(token, created["id"])
             # Ô "Đổi tên" phải theo hội thoại vừa chọn, nếu không bấm "Lưu tên
             # mới" sẽ chép tên hội thoại cũ sang hội thoại mới.
@@ -3002,10 +3087,10 @@ def build_ui(
 
         def rename_session(token, session_id, title):
             if not session_id or not (title or "").strip():
-                gr.Warning("Chọn hội thoại và nhập tiêu đề mới.")
+                _ui_notice(gr.Warning, "Chọn hội thoại và nhập tiêu đề mới.")
                 return gr.skip(), gr.skip(), gr.skip()
             _api(token, "PATCH", f"/api/sessions/{session_id}", {"title": title.strip()})
-            gr.Info("Đã đổi tên hội thoại.")
+            _ui_notice(gr.Info, "Đã đổi tên hội thoại.")
             dd1, dd2, _ = refresh_sessions(token, session_id)
             return dd1, dd2, ""
 
@@ -3029,7 +3114,7 @@ def build_ui(
 
         def request_delete_session(token, session_id):
             if not session_id:
-                gr.Warning("Chọn hội thoại cần xóa trước.")
+                _ui_notice(gr.Warning, "Chọn hội thoại cần xóa trước.")
                 return DELETE_HIDDEN
             session = _api(token, "GET", f"/api/sessions/{session_id}")
             title = _safe_markdown_text(session.get("title") or "Hội thoại đang chọn")
@@ -3055,7 +3140,7 @@ def build_ui(
 
         def delete_session(token, session_id, pending_id, password="", code=""):
             if not pending_id or session_id != pending_id:
-                gr.Warning("Hội thoại đã thay đổi. Chọn lại hội thoại và xác nhận xóa.")
+                _ui_notice(gr.Warning, "Hội thoại đã thay đổi. Chọn lại hội thoại và xác nhận xóa.")
                 return (*(gr.skip() for _ in range(8)), *DELETE_HIDDEN,
                         *(gr.skip() for _ in range(len(DELETE_VIEW_RESET))))
             try:
@@ -3083,7 +3168,7 @@ def build_ui(
                     "⚠️ **Chưa xóa được hội thoại.** " + _safe_markdown_text(_error_text(err)),
                     gr.skip(), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET))),
                 )
-            gr.Info("Đã xóa vĩnh viễn hội thoại và toàn bộ tin nhắn.")
+            _ui_notice(gr.Info, "Đã xóa vĩnh viễn hội thoại và toàn bộ tin nhắn.")
             try:
                 dd1, dd2, history = refresh_sessions(token)
                 title = _session_title(token, dd1["value"])
@@ -3109,7 +3194,7 @@ def build_ui(
 
         def export_session(token, session_id, password, code):
             if not session_id:
-                gr.Warning("Chọn một hội thoại trước.")
+                _ui_notice(gr.Warning, "Chọn một hội thoại trước.")
                 return gr.skip(), gr.skip(), gr.skip()
             try:
                 grant = _api(token, "POST", f"/api/sessions/{session_id}/export-ticket")
@@ -3137,7 +3222,7 @@ def build_ui(
                 f'<a class="scap-export-link" href="{html.escape(grant["download_url"], quote=True)}"'
                 ' download rel="noopener">⬇ Tải tệp JSON (hết hạn sau 60 giây)</a>'
             )
-            gr.Info("Vé tải có hiệu lực 60 giây và chỉ dùng được một lần.")
+            _ui_notice(gr.Info, "Vé tải có hiệu lực 60 giây và chỉ dùng được một lần.")
             return gr.update(value=link, visible=True), "", ""
 
         btn_export.click(
@@ -3170,7 +3255,7 @@ def build_ui(
                     )
                     session_id = created["id"]
                     created_session = True
-                    gr.Info("Đã tự tạo hội thoại mới.")
+                    _ui_notice(gr.Info, "Đã tự tạo hội thoại mới.")
                 session_metadata = _api(token, "GET", f"/api/sessions/{session_id}")
                 if session_metadata.get("security_mode") == "private_e2ee":
                     raise gr.Error(
@@ -3344,11 +3429,11 @@ def build_ui(
         # ---- dữ liệu mã hóa ----
         def load_cipher(token, session_id):
             if not session_id:
-                gr.Warning("Chọn một hội thoại trước.")
+                _ui_notice(gr.Warning, "Chọn một hội thoại trước.")
                 return gr.skip()
             rows = _api(token, "GET", f"/api/sessions/{session_id}/ciphertexts")
             if not rows:
-                gr.Info("Hội thoại này chưa có tin nhắn nào.")
+                _ui_notice(gr.Info, "Hội thoại này chưa có tin nhắn nào.")
             return _table_html(CIPHER_HEADERS, [
                 [
                     row["id"],
@@ -3367,10 +3452,10 @@ def build_ui(
         def global_search(token, query):
             query = (query or "").strip()
             if not query:
-                gr.Warning("Nhập từ khóa trước.")
+                _ui_notice(gr.Warning, "Nhập từ khóa trước.")
                 return gr.skip()
             rows = _api(token, "GET", "/api/search/messages", params={"q": query})
-            gr.Info(
+            _ui_notice(gr.Info,
                 f"Tìm thấy {len(rows)} tin nhắn "
                 f"trong {len({r['session_id'] for r in rows})} hội thoại."
             )
@@ -3390,17 +3475,17 @@ def build_ui(
         # ---- tài khoản ----
         def set_consent(token, consent):
             data = _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": bool(consent)})
-            gr.Info("Đã cập nhật lựa chọn chia sẻ dữ liệu AI.")
+            _ui_notice(gr.Info, "Đã cập nhật lựa chọn chia sẻ dữ liệu AI.")
             return gr.update(value=bool(data["ai_data_consent"]))
 
         chk_consent.input(_guard(set_consent, 1), [st_token, chk_consent], [chk_consent])
 
         def change_password(token, current, new, request: gr.Request = None):
             if not (current or "").strip() or not (new or "").strip():
-                gr.Warning("Nhập cả mật khẩu hiện tại và mật khẩu mới.")
+                _ui_notice(gr.Warning, "Nhập cả mật khẩu hiện tại và mật khẩu mới.")
                 return tuple(gr.skip() for _ in RESET_OUTS)
             if len(new) < PASSWORD_MIN:
-                gr.Warning(f"Mật khẩu mới phải có ít nhất {PASSWORD_MIN} ký tự.")
+                _ui_notice(gr.Warning, f"Mật khẩu mới phải có ít nhất {PASSWORD_MIN} ký tự.")
                 return tuple(gr.skip() for _ in RESET_OUTS)
             _api(
                 token,
@@ -3408,7 +3493,7 @@ def build_ui(
                 "/api/auth/password",
                 {"current_password": current, "new_password": new},
             )
-            gr.Info("Đã đổi mật khẩu — mọi phiên bị thu hồi, mời đăng nhập lại.")
+            _ui_notice(gr.Info, "Đã đổi mật khẩu — mọi phiên bị thu hồi, mời đăng nhập lại.")
             return _reset_tuple(request)
 
         btn_pw.click(
@@ -3424,13 +3509,13 @@ def build_ui(
             try:
                 markup = _totp_qr_markup(data["provisioning_uri"], QR_DISPLAY_PX)
             except ImportError:
-                gr.Warning("Thiếu thư viện qrcode (chạy `uv sync`) — dùng khóa thủ công bên dưới.")
+                _ui_notice(gr.Warning, "Thiếu thư viện qrcode (chạy `uv sync`) — dùng khóa thủ công bên dưới.")
             except Exception:
-                gr.Warning("Không dựng được mã QR — hãy dùng khóa thủ công bên dưới.")
+                _ui_notice(gr.Warning, "Không dựng được mã QR — hãy dùng khóa thủ công bên dưới.")
             if markup:
-                gr.Info("Quét mã QR rồi nhập mã 6 số để kích hoạt. QR chỉ hiển thị tạm thời, không tạo tệp tải xuống.")
+                _ui_notice(gr.Info, "Quét mã QR rồi nhập mã 6 số để kích hoạt. QR chỉ hiển thị tạm thời, không tạo tệp tải xuống.")
             else:
-                gr.Info("Nhập khóa thủ công vào ứng dụng xác thực, rồi nhập mã 6 số.")
+                _ui_notice(gr.Info, "Nhập khóa thủ công vào ứng dụng xác thực, rồi nhập mã 6 số.")
             return (
                 gr.update(visible=True),
                 gr.update(value=markup, visible=bool(markup)),
@@ -3446,13 +3531,13 @@ def build_ui(
         def mfa_activate(token, code, request: gr.Request = None):
             data = _api(token, "POST", "/api/auth/mfa/activate", {"code": (code or "").strip()})
             codes = data.get("recovery_codes", [])
-            gr.Info(
+            _ui_notice(gr.Info,
                 "Lưu các mã khôi phục sau ở nơi an toàn, mỗi mã chỉ dùng một lần: "
                 + " · ".join(codes),
                 duration=None,
                 title="Mã khôi phục 2FA",
             )
-            gr.Info(
+            _ui_notice(gr.Info,
                 "2FA đã được kích hoạt — mọi phiên bị thu hồi, mời đăng nhập lại "
                 "bằng mật khẩu và mã 6 số."
             )
@@ -3469,7 +3554,7 @@ def build_ui(
                 "/api/auth/mfa/disable",
                 {"password": password, "code": (code or "").strip()},
             )
-            gr.Info("Đã tắt xác thực hai lớp — mọi phiên bị thu hồi, mời đăng nhập lại.")
+            _ui_notice(gr.Info, "Đã tắt xác thực hai lớp — mọi phiên bị thu hồi, mời đăng nhập lại.")
             return _reset_tuple(request)
 
         btn_disable.click(
@@ -3480,14 +3565,14 @@ def build_ui(
         def send_email_code(token, email, password, code):
             email = (email or "").strip()
             if not email:
-                gr.Warning("Nhập địa chỉ email khôi phục.")
+                _ui_notice(gr.Warning, "Nhập địa chỉ email khôi phục.")
                 return gr.skip(), gr.skip(), gr.skip()
             data = _with_step_up(
                 token, password, code,
                 lambda: _api(token, "POST", "/api/auth/email", {"email": email}),
                 "Gửi mã xác minh",
             )
-            gr.Info("Đã gửi mã xác minh tới email mới. Mã có hiệu lực trong vài phút.")
+            _ui_notice(gr.Info, "Đã gửi mã xác minh tới email mới. Mã có hiệu lực trong vài phút.")
             return _email_markdown(data), "", ""
 
         btn_email_send.click(
@@ -3497,10 +3582,10 @@ def build_ui(
 
         def verify_email_code(token, code):
             if not (code or "").strip():
-                gr.Warning("Nhập mã xác minh trong email.")
+                _ui_notice(gr.Warning, "Nhập mã xác minh trong email.")
                 return gr.skip(), gr.skip(), gr.skip()
             data = _api(token, "POST", "/api/auth/email/verify", {"code": code.strip()})
-            gr.Info("Đã xác minh email khôi phục.")
+            _ui_notice(gr.Info, "Đã xác minh email khôi phục.")
             return _email_markdown(data), "", ""
 
         btn_email_verify.click(
@@ -3514,7 +3599,7 @@ def build_ui(
                 lambda: _api(token, "DELETE", "/api/auth/email"),
                 "Gỡ email khôi phục",
             )
-            gr.Info("Đã gỡ email khôi phục.")
+            _ui_notice(gr.Info, "Đã gỡ email khôi phục.")
             return _email_markdown(_api(token, "GET", "/api/auth/email")), "", ""
 
         btn_email_remove.click(
@@ -3558,10 +3643,10 @@ def build_ui(
             payload = _passkey_payload(result, "create")
             closed = ("", {}, gr.update(value="", visible=False), gr.update(visible=False), "")
             if not state or payload.get("nonce") != state.get("nonce"):
-                gr.Warning("Yêu cầu tạo passkey đã hết hạn; hãy bấm “Thêm passkey” lại.")
+                _ui_notice(gr.Warning, "Yêu cầu tạo passkey đã hết hạn; hãy bấm “Thêm passkey” lại.")
                 return closed + (gr.skip(), gr.skip(), gr.skip())
             if "error" in payload:
-                gr.Warning(_passkey_error_message(payload))
+                _ui_notice(gr.Warning, _passkey_error_message(payload))
                 return closed + (gr.skip(), gr.skip(), gr.skip())
             row = _api(
                 token,
@@ -3573,7 +3658,7 @@ def build_ui(
                     "name": state.get("name") or None,
                 },
             )
-            gr.Info(f"Đã thêm passkey “{row['name']}”.")
+            _ui_notice(gr.Info, f"Đã thêm passkey “{row['name']}”.")
             table, choices = _passkeys_snapshot(token)
             return closed + (table, gr.update(choices=choices, value=None), "")
 
@@ -3586,14 +3671,14 @@ def build_ui(
 
         def remove_passkey(token, passkey_id, password, code):
             if not passkey_id:
-                gr.Warning("Chọn passkey cần xóa.")
+                _ui_notice(gr.Warning, "Chọn passkey cần xóa.")
                 return gr.skip(), gr.skip(), gr.skip(), gr.skip()
             _with_step_up(
                 token, password, code,
                 lambda: _api(token, "DELETE", f"/api/auth/passkeys/{passkey_id}"),
                 "Xóa passkey",
             )
-            gr.Info("Đã xóa passkey.")
+            _ui_notice(gr.Info, "Đã xóa passkey.")
             table, choices = _passkeys_snapshot(token)
             return table, gr.update(choices=choices, value=None), "", ""
 
@@ -3611,10 +3696,10 @@ def build_ui(
 
         def revoke_device(token, jti):
             if not jti:
-                gr.Warning("Chọn một phiên cần thu hồi.")
+                _ui_notice(gr.Warning, "Chọn một phiên cần thu hồi.")
                 return gr.skip(), gr.skip()
             _api(token, "DELETE", f"/api/auth/sessions/{jti}")
-            gr.Info("Đã thu hồi phiên đăng nhập.")
+            _ui_notice(gr.Info, "Đã thu hồi phiên đăng nhập.")
             return refresh_devices(token)
 
         btn_revoke.click(_guard(revoke_device, 2), [st_token, dd_revoke], [df_devices, dd_revoke])
@@ -3623,9 +3708,9 @@ def build_ui(
             try:
                 _api(token, "POST", "/api/auth/logout-all")
             except Exception:
-                gr.Warning("Không thể thu hồi phiên lúc này. Vui lòng thử lại.")
+                _ui_notice(gr.Warning, "Không thể thu hồi phiên lúc này. Vui lòng thử lại.")
                 return tuple(gr.skip() for _ in RESET_OUTS)
-            gr.Info("Đã thu hồi mọi phiên đăng nhập.")
+            _ui_notice(gr.Info, "Đã thu hồi mọi phiên đăng nhập.")
             return _reset_tuple(request)
 
         btn_logout_all.click(_guard(logout_all, len(RESET_OUTS)), [st_token], RESET_OUTS)
@@ -3737,7 +3822,7 @@ def build_ui(
                 checked_at = time.strftime("%d/%m/%Y %H:%M:%S UTC", time.gmtime())
                 diagnostic = _safe_markdown_text(_error_text(err))
                 message = f"**Không tải được dữ liệu quản trị.** {diagnostic}\n\nLần thử: {checked_at}"
-                gr.Warning(_error_text(err))
+                _ui_notice(gr.Warning, _error_text(err))
                 metrics = tuple(
                     f"**{title}**\n\n## —\n\nKhông tải được\n\nLần thử: {checked_at}"
                     for title in ("Người dùng", "Hội thoại", "Đăng nhập lỗi", "Từ chối quyền")
@@ -3766,14 +3851,14 @@ def build_ui(
 
         def set_role(token, user_id, role, password="", code=""):
             if not user_id:
-                gr.Warning("Chọn một người dùng trước.")
+                _ui_notice(gr.Warning, "Chọn một người dùng trước.")
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
             _with_step_up(
                 token, password, code,
                 lambda: _api(token, "PATCH", f"/api/admin/users/{user_id}/role", {"role": role}),
                 "Đổi vai trò",
             )
-            gr.Info(f"Đã đổi vai trò thành {role}.")
+            _ui_notice(gr.Info, f"Đã đổi vai trò thành {role}.")
             return refresh_admin(token, keep=user_id)
 
         btn_set_role.click(
@@ -3783,14 +3868,14 @@ def build_ui(
 
         def set_status(token, user_id, active, password="", code=""):
             if not user_id:
-                gr.Warning("Chọn một người dùng trước.")
+                _ui_notice(gr.Warning, "Chọn một người dùng trước.")
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
             _with_step_up(
                 token, password, code,
                 lambda: _api(token, "PATCH", f"/api/admin/users/{user_id}/status", {"is_active": active}),
                 "Mở khóa" if active else "Khóa",
             )
-            gr.Info("Đã mở khóa tài khoản." if active else "Đã khóa tài khoản.")
+            _ui_notice(gr.Info, "Đã mở khóa tài khoản." if active else "Đã khóa tài khoản.")
             return refresh_admin(token, keep=user_id)
 
         btn_lock.click(
@@ -3806,13 +3891,13 @@ def build_ui(
 
         def delete_user(token, user_id, password="", code=""):
             if not user_id:
-                gr.Warning("Chọn một người dùng trước.")
+                _ui_notice(gr.Warning, "Chọn một người dùng trước.")
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
             _with_step_up(
                 token, password, code,
                 lambda: _api(token, "DELETE", f"/api/admin/users/{user_id}"), "Xóa tài khoản",
             )
-            gr.Info("Đã xóa tài khoản cùng toàn bộ dữ liệu của người đó.")
+            _ui_notice(gr.Info, "Đã xóa tài khoản cùng toàn bộ dữ liệu của người đó.")
             return refresh_admin(token)
 
         btn_del_user.click(
@@ -3823,10 +3908,10 @@ def build_ui(
         def create_user(token, username, password, role, admin_password="", code=""):
             username = (username or "").strip()
             if not 3 <= len(username) <= 32:
-                gr.Warning("Tên đăng nhập phải từ 3 đến 32 ký tự.")
+                _ui_notice(gr.Warning, "Tên đăng nhập phải từ 3 đến 32 ký tự.")
                 return tuple(gr.skip() for _ in range(len(ADMIN_OUTS) + 2))
             if len(password or "") < PASSWORD_MIN:
-                gr.Warning(f"Mật khẩu phải có ít nhất {PASSWORD_MIN} ký tự.")
+                _ui_notice(gr.Warning, f"Mật khẩu phải có ít nhất {PASSWORD_MIN} ký tự.")
                 return tuple(gr.skip() for _ in range(len(ADMIN_OUTS) + 2))
             _with_step_up(
                 token, admin_password, code,
@@ -3836,7 +3921,7 @@ def build_ui(
                 ),
                 "Tạo",
             )
-            gr.Info("Đã tạo tài khoản mới.")
+            _ui_notice(gr.Info, "Đã tạo tài khoản mới.")
             return refresh_admin(token) + ("", "")
 
         btn_cu.click(
@@ -3847,8 +3932,16 @@ def build_ui(
 
         # ---- nhật ký ----
         def load_audit(token, limit):
-            rows = _api(token, "GET", "/api/admin/audit", params={"limit": str(int(limit))})
-            return _table_html(AUDIT_HEADERS, [
+            checked_at = time.strftime("%d/%m/%Y %H:%M:%S UTC", time.gmtime())
+            try:
+                rows = _api(token, "GET", "/api/admin/audit", params={"limit": str(int(limit))})
+            except gr.Error as err:
+                _ui_notice(gr.Warning, _error_text(err))
+                return (
+                    "**Không tải được nhật ký kiểm toán.** "
+                    f"{_safe_markdown_text(_error_text(err))}\n\nLần thử: {checked_at}"
+                )
+            table = _table_html(AUDIT_HEADERS, [
                 [
                     row["id"],
                     row["event_type"],
@@ -3864,6 +3957,7 @@ def build_ui(
                 ]
                 for row in rows
             ])
+            return f"Cập nhật: {checked_at}\n\n{table}"
 
         btn_audit.click(_guard(load_audit, 1), [st_token, sl_audit], [df_audit])
         mod_tab.select(_guard(load_audit, 1), [st_token, sl_audit], [df_audit], show_progress="hidden")
@@ -3952,6 +4046,12 @@ def build_ui(
                 checkpoint = (
                     "**Giới hạn bảo vệ: chưa có neo WORM bên ngoài.** "
                     "Chuỗi nội bộ không đủ để loại trừ việc xóa phần đuôi nhật ký."
+                )
+            elif data.get("verification_scope_changed") is True:
+                checkpoint = (
+                    "**Nhật ký đã thay đổi trong lúc xác minh.** "
+                    "Kết quả chuỗi và checkpoint thuộc hai thời điểm khác nhau; "
+                    "hãy chạy xác minh lại để kết luận toàn vẹn đầy đủ."
                 )
             elif (
                 data.get("chain_intact") is True
@@ -4047,13 +4147,13 @@ def build_ui(
         def unblock_ip(token, ip, password="", code=""):
             ip = (ip or "").strip()
             if not ip:
-                gr.Warning("Nhập địa chỉ IP cần gỡ chặn.")
+                _ui_notice(gr.Warning, "Nhập địa chỉ IP cần gỡ chặn.")
                 return gr.skip(), gr.skip(), gr.skip()
             _with_step_up(
                 token, password, code,
                 lambda: _api(token, "DELETE", f"/api/admin/ids/blocklist/{ip}"), "Gỡ chặn",
             )
-            gr.Info(f"Đã gỡ chặn {ip}.")
+            _ui_notice(gr.Info, f"Đã gỡ chặn {ip}.")
             metric, table = security_snapshot(
                 lambda: blocklist_rows(token), "Nguồn bị chặn", BLOCKLIST_HEADERS,
                 "Đang hiệu lực", admin_only=True,
@@ -4074,7 +4174,7 @@ def build_ui(
                     status = "Cần vai trò admin"
                 else:
                     status = "Không tải được"
-                    gr.Warning(_error_text(err))
+                    _ui_notice(gr.Warning, _error_text(err))
                 metric = f"**{title}**\n\n## —\n\n{status} · {detail}\n\nLần thử: {checked_at}"
                 diagnostic = _safe_markdown_text(_error_text(err))
                 table = f"**{status}.** {diagnostic}\n\nLần thử: {checked_at}"
@@ -4148,4 +4248,5 @@ def build_ui(
         demo, retained_events=retained_events, result_ttl_seconds=result_ttl_seconds,
         state_capacity=state_capacity,
     )
+    _install_session_result_guard(demo, st_token, st_mfa)
     return demo

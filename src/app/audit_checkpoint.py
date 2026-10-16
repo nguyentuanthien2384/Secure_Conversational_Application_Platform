@@ -27,7 +27,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.app.audit_chain import canonical_datetime
+from src.app.audit_chain import canonical_datetime, valid_sha256_digest
 from src.app.db import utcnow
 from src.app.models import AuditCheckpoint, AuditEvent
 from src.app.secret_files import SecretFileTooLarge, read_secret_text
@@ -56,7 +56,8 @@ def derive_checkpoint_key(secret_key: str) -> bytes:
 def canonical_checkpoint(
     *, checkpoint_id: str, last_event_id: int, root_hash: str, created_at: datetime
 ) -> bytes:
-    if last_event_id < 1 or len(root_hash) != 64:
+    if (not isinstance(last_event_id, int) or last_event_id < 1
+        or not valid_sha256_digest(root_hash)):
         raise ValueError("Audit checkpoint fields are invalid.")
     payload = {
         "format": "scap-audit-checkpoint-v1",
@@ -88,6 +89,7 @@ class CheckpointVerification:
     fresh: bool = False
     fully_anchored: bool = False
     reason: str | None = None
+    root_hash: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -100,6 +102,7 @@ class CheckpointVerification:
             "checkpoint_fresh": self.fresh,
             "checkpoint_fully_anchored": self.fully_anchored,
             "checkpoint_reason": self.reason,
+            "checkpoint_root_hash": self.root_hash,
         }
 
 
@@ -228,9 +231,17 @@ class AuditCheckpointService:
         )
 
     def _anchor(self, db: Session) -> AuditCheckpoint | None:
+        # A newer anchor must never conceal evidence already held by an older
+        # checkpoint (for example deletion of its anchored audit tail). This
+        # guard applies to request-time, manual, readiness and maintenance paths.
+        previous = self.verify_latest(db)
+        if previous.present and not previous.intact:
+            raise AuditCheckpointError("The existing audit checkpoint is not intact.")
         latest_event = db.scalar(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1))
         if latest_event is None or not latest_event.entry_hash:
             return None
+        if not valid_sha256_digest(latest_event.entry_hash):
+            raise AuditCheckpointError("The latest audit event hash is invalid.")
         # Cache scalar values before a commit/rollback can expire ORM state.
         # This keeps the concurrent-insert recovery path deterministic on every
         # SQLAlchemy backend, including PostgreSQL deployments.
@@ -417,6 +428,12 @@ class AuditCheckpointService:
                 unanchored_events=unanchored_events,
                 reason="anchored_event_missing",
             )
+        if not valid_sha256_digest(checkpoint.root_hash):
+            return CheckpointVerification(
+                present=True, intact=False, externally_delivered=delivered,
+                last_event_id=checkpoint.last_event_id, latest_event_id=latest_event_id,
+                unanchored_events=unanchored_events, reason="checkpoint_root_mismatch",
+            )
         payload = canonical_checkpoint(
             checkpoint_id=checkpoint.id,
             last_event_id=checkpoint.last_event_id,
@@ -424,7 +441,8 @@ class AuditCheckpointService:
             created_at=checkpoint.created_at,
         )
         expected = sign_checkpoint(self.key, payload)
-        if not secrets.compare_digest(expected, checkpoint.signature):
+        if (not valid_sha256_digest(checkpoint.signature)
+            or not secrets.compare_digest(expected, checkpoint.signature)):
             return CheckpointVerification(
                 present=True,
                 intact=False,
@@ -434,7 +452,7 @@ class AuditCheckpointService:
                 unanchored_events=unanchored_events,
                 reason="checkpoint_signature_mismatch",
             )
-        if not event.entry_hash or not secrets.compare_digest(
+        if not valid_sha256_digest(event.entry_hash) or not secrets.compare_digest(
             event.entry_hash,
             checkpoint.root_hash,
         ):
@@ -458,4 +476,5 @@ class AuditCheckpointService:
             unanchored_events=unanchored_events,
             fresh=fresh,
             fully_anchored=fully_anchored,
+            root_hash=checkpoint.root_hash,
         )

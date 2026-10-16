@@ -243,6 +243,10 @@ Khi nâng cấp bản có IDS lưu bền, cần chạy service `migrate` bằng 
 
 Tab Quản trị/Bảo mật đọc API của chính bản đang chạy. Các worker dùng cùng database sẽ thấy cùng trạng thái IDS/IPS; local và VPS dùng hai database riêng thì số liệu của chúng độc lập. Lịch sử IDS vận hành giữ tối đa 500 dấu hiệu, giao diện lấy 100 dấu hiệu gần nhất; audit có vòng đời riêng. Lỗi tải hiển thị trạng thái chưa xác định, thao tác nhạy cảm yêu cầu xác thực lại, và kết quả chuỗi audit phân biệt với bằng chứng checkpoint WORM.
 
+Các thao tác đổi mật khẩu, MFA, email, thêm/xóa passkey, step-up, thu hồi thiết bị và đăng xuất toàn bộ kiểm tra lại phiên trước khi thay đổi, rồi lưu thay đổi thành công cùng audit trong một giao dịch. Thư và thông báo được gửi sau commit. Giao diện loại bỏ kết quả và thông báo của callback thuộc lần đăng nhập đã kết thúc, để dữ liệu cũ không trở lại sau đăng xuất hoặc đổi tài khoản.
+
+Hệ thống từ chối tạo checkpoint mới khi checkpoint hiện hữu không còn toàn vẹn. Kết quả đủ bằng chứng WORM chỉ được trả khi ID/hash cuối của chuỗi vừa xác minh khớp phạm vi checkpoint; nếu có ghi mới trong lúc kiểm tra, giao diện yêu cầu xác minh lại.
+
 ### Production và VPS demo
 
 [docker-compose.yml](docker-compose.yml) có `db`, `redis`, `migrate`, `app`, `caddy`. PostgreSQL/Redis nằm trong mạng backend; Caddy publish 80/443 và terminate HTTPS. Production yêu cầu domain/DNS đúng, bí mật riêng, `BASE_IMAGE` pin digest SHA-256, docs/seed/bootstrap password tắt và tài khoản database runtime không sở hữu schema.

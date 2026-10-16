@@ -25,6 +25,7 @@ from src.app.audit_chain import verify_chain
 from src.app.db import Database
 from src.app.ids import Detection, PersistentIntrusionState
 from src.app.models import AuditEvent, IntrusionSource, User
+from tests import test_account_transactions as account_regressions
 from tests import test_admin_transactions as admin_regressions
 from tests import test_ids_runtime as ids_regressions
 from tests.test_privileged_step_up import ADMIN_PASSWORD, auth, create_account, login
@@ -147,6 +148,24 @@ test_postgres_apps_share_ids_and_unblock = (
 test_postgres_unblock_audit_rollback = ids_regressions.test_unblock_is_rolled_back_with_failed_admin_audit
 test_postgres_ids_storage_off_async_loop = ids_regressions.test_ids_storage_does_not_run_on_the_async_request_loop
 test_postgres_ids_storage_failure_closed = ids_regressions.test_unavailable_ids_store_fails_closed_without_leaking_database_error
+
+test_postgres_account_mutation_audit_rollback = (
+    account_regressions.test_account_mutation_and_one_time_proofs_roll_back_with_failed_audit
+)
+test_postgres_account_mutation_rechecks_bearer = (
+    account_regressions.test_account_mutation_rejects_logout_after_dependency_authentication
+)
+test_postgres_passkey_mutation_rechecks_session_and_step_up = (
+    account_regressions.test_passkey_registration_rechecks_current_session_and_step_up
+)
+
+
+@pytest.fixture
+def mail(app):
+    recorder = account_regressions.Recorder()
+    app.state.mailer.transport = recorder
+    app.state.mailer.background = False
+    return recorder
 
 
 def test_postgres_runtime_and_auditor_keep_least_privilege(client, app):
