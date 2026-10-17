@@ -243,9 +243,11 @@ Khi nâng cấp bản có IDS lưu bền, cần chạy service `migrate` bằng 
 
 Tab Quản trị/Bảo mật đọc API của chính bản đang chạy. Các worker dùng cùng database sẽ thấy cùng trạng thái IDS/IPS; local và VPS dùng hai database riêng thì số liệu của chúng độc lập. Lịch sử IDS vận hành giữ tối đa 500 dấu hiệu, giao diện lấy 100 dấu hiệu gần nhất; audit có vòng đời riêng. Lỗi tải hiển thị trạng thái chưa xác định, thao tác nhạy cảm yêu cầu xác thực lại, và kết quả chuỗi audit phân biệt với bằng chứng checkpoint WORM.
 
-Các thao tác đổi mật khẩu, MFA, email, thêm/xóa passkey, step-up, thu hồi thiết bị và đăng xuất toàn bộ kiểm tra lại phiên trước khi thay đổi, rồi lưu thay đổi thành công cùng audit trong một giao dịch. Thư và thông báo được gửi sau commit. Giao diện loại bỏ kết quả và thông báo của callback thuộc lần đăng nhập đã kết thúc, để dữ liệu cũ không trở lại sau đăng xuất hoặc đổi tài khoản.
+Các thao tác đổi mật khẩu, MFA, email, thêm/xóa passkey, step-up, thu hồi thiết bị, đăng xuất và consent kiểm tra lại phiên trước khi thay đổi, rồi lưu thay đổi thành công cùng audit trong một giao dịch. Đăng ký, cấp/đổi token và đăng nhập cũng lưu các bằng chứng audit bắt buộc cùng trạng thái; lỗi ghi audit không để lại phiên hay tài khoản thành công một phần. Thông báo bảo mật được gửi sau commit; lỗi tra địa chỉ nhận hoặc dọn bộ đếm Redis sau commit không làm mất phản hồi thành công hay recovery code. Việc gửi mã xác minh và kiểm tra hạn mức bắt buộc vẫn phải thành công.
 
-Hệ thống từ chối tạo checkpoint mới khi checkpoint hiện hữu không còn toàn vẹn. Kết quả đủ bằng chứng WORM chỉ được trả khi ID/hash cuối của chuỗi vừa xác minh khớp phạm vi checkpoint; nếu có ghi mới trong lúc kiểm tra, giao diện yêu cầu xác minh lại.
+Mỗi request bị IDS phát hiện lưu dấu hiệu, điểm nguồn, lệnh chặn và toàn bộ audit tương ứng trong cùng giao dịch. Lỗi lưu bằng chứng trả lỗi dịch vụ và rollback thay đổi mới; lệnh chặn đã có vẫn giữ hiệu lực. Callback Gradio được gắn với phiên ngay lúc vào hàng đợi và kiểm tra lại trước khi chạy, để công việc của tài khoản cũ không chạy bằng tài khoản vừa đăng nhập. Giao diện cũng loại bỏ kết quả và thông báo của callback thuộc lần đăng nhập đã kết thúc.
+
+Hệ thống kiểm tra cả checkpoint mới nhất và các checkpoint cũ còn lưu, rồi từ chối tạo checkpoint mới nếu phát hiện bằng chứng bị sửa hoặc mất sự kiện đã neo. Kết quả đủ bằng chứng WORM chỉ được trả khi ID/hash cuối của chuỗi vừa xác minh khớp phạm vi checkpoint; nếu có ghi mới trong lúc kiểm tra, giao diện yêu cầu xác minh lại.
 
 ### Production và VPS demo
 
@@ -314,7 +316,7 @@ node --test tests/login_credentials.test.cjs
 
 Các test bao phủ xác thực/ownership/RBAC, race condition, crypto/AAD, DLP, passkey/email, token reuse, audit/WORM, E2EE relay, retention, UI callback, quyền lưu trữ và giới hạn tài nguyên. Xem [tests/](tests/) để chọn phạm vi phù hợp khi sửa mã nguồn.
 
-Kiểm thử PostgreSQL tùy chọn trong `tests/test_postgres_security_integration.py` dùng biến `SCAP_TEST_POSTGRES_URL`. Chỉ trỏ biến này tới cluster thử nghiệm mới trên loopback, database quản trị `scap_security_tests`, chưa có role `scap_app`/`scap_auditor`. Fixture tạo/xóa database ngẫu nhiên riêng từng test và hai role thử nghiệm, không dùng database local/VPS đang vận hành. Khi không đặt biến, nhóm test này được bỏ qua.
+Kiểm thử PostgreSQL trong `tests/test_postgres_security_integration.py` dùng biến `SCAP_TEST_POSTGRES_URL`. Chỉ trỏ biến này tới cluster thử nghiệm mới trên loopback, database quản trị `scap_security_tests`, chưa có role `scap_app`/`scap_auditor`. Fixture tạo/xóa database ngẫu nhiên riêng từng test và hai role thử nghiệm, không dùng database local/VPS đang vận hành. Khi không đặt biến, nhóm test này được bỏ qua; CI cấp cluster PostgreSQL tạm riêng và chạy nhóm này bằng quyền runtime tối thiểu, ngoài bộ test mặc định.
 
 Kiểm chứng tải/diễn tập khôi phục dựng môi trường tạm riêng, không dùng DB local hay AI trả phí:
 

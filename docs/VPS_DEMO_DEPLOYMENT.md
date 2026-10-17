@@ -125,14 +125,19 @@ cd /root/scap && bash deploy/update.sh
 tra cấu hình, build image (lần đầu vài phút; JobFind vẫn chạy bình thường) rồi gọi
 [remote-deploy.sh](../deploy/remote-deploy.sh):
 
-1. chạy `migrate → app → caddy` của SCAP;
+1. chạy `migrate → app → caddy` của SCAP, đối chiếu content ID image của mọi
+   container `app`/`migrate` với image vừa triển khai, yêu cầu migration kết thúc
+   với mã 0 và app đang chạy;
 2. kiểm tra mạng, volume và dòng `import` của Caddy JobFind đã sẵn sàng;
 3. kiểm tra cú pháp site SCAP ([shared-proxy-site.caddy](../deploy/shared-proxy-site.caddy))
    bằng Caddy **trước khi** chạm vào JobFind;
 4. ghi `scap.caddy` vào volume và `caddy reload` Caddy JobFind (không khởi động
    lại; reload lỗi thì gỡ file ra để JobFind giữ nguyên);
-5. chờ `https://scap.thiennt.id.vn/api/health`; Caddy JobFind tự xin chứng chỉ
-   Let's Encrypt cho `scap.thiennt.id.vn`;
+5. chờ tất cả container app có Docker healthcheck `healthy` (kiểm tra readiness
+   nội bộ), đồng thời `https://scap.thiennt.id.vn/api/health` thành công với chứng
+   chỉ TLS hợp lệ; Caddy JobFind tự xin chứng chỉ Let's Encrypt cho domain này.
+   Script trả mã lỗi nếu hết lượt chờ, image không khớp hoặc migration thất bại;
+   `/api/ready` vẫn chỉ dùng nội bộ và bị Caddy chặn từ Internet;
 6. cài cron sao lưu PostgreSQL lúc 03:00 hằng ngày.
 
 **Bước 6 — tạo tài khoản quản trị** (nhập mật khẩu 15–128 ký tự hai lần, không hiển thị):

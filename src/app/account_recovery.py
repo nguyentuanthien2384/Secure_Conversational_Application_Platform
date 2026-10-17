@@ -16,10 +16,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from src.app.mailer import Mailer, MailUnavailable
@@ -28,6 +30,7 @@ from src.app.models import AccountEmail, AccountRecoveryCode
 CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 CODE_LENGTH = 10
 MAX_CODE_ATTEMPTS = 5
+logger = logging.getLogger("secure_chat.account_recovery")
 
 
 def derive_recovery_code_key(secret_key: str) -> bytes:
@@ -225,13 +228,24 @@ def notify(
     device: str | None = None,
     to: str | None = None,
 ) -> bool:
-    """Send a security notice to the verified address (or ``to``); never raises."""
+    """Send an optional notice without disturbing the completed operation.
+
+    Recipient lookup gets its own transaction: a failed PostgreSQL query must
+    not poison or expire the caller's already committed response objects.
+    Verification/reset proof delivery through send_code remains mandatory.
+    """
     if not mailer.enabled:
         return False
     address = to
     if address is None:
-        record = verified_email(db, user_id)
-        address = record.email if record is not None else None
+        try:
+            with Session(bind=db.get_bind()) as notice_db:
+                record = verified_email(notice_db, user_id)
+                address = record.email if record is not None else None
+        except SQLAlchemyError:
+            # Query text, addresses and exception messages may contain secrets.
+            logger.warning("Security notice unavailable (scope=recipient_lookup).")
+            return False
     if not address:
         return False
     subject, template = NOTICES[kind]
@@ -244,5 +258,6 @@ def notify(
     try:
         mailer.send(address, subject, body + _FOOTER, template=kind)
     except MailUnavailable:
+        logger.warning("Security notice unavailable (scope=delivery).")
         return False
     return True

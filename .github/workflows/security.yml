@@ -19,6 +19,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_DB: scap_security_tests
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d scap_security_tests"
+          --health-interval 5s --health-timeout 5s --health-retries 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,6 +46,10 @@ jobs:
       - run: uv lock --check
       - run: uv sync --frozen --group dev
       - run: uv run python -m pytest --cov=src.app --cov-report=xml
+      - name: Verify PostgreSQL transactions with runtime least-privilege grants
+        env:
+          SCAP_TEST_POSTGRES_URL: postgresql+psycopg://postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/scap_security_tests
+        run: uv run --frozen python -m pytest tests/test_postgres_security_integration.py --junitxml=reports/postgres-security.xml
       - run: node --test tests/login_credentials.test.cjs
       - name: Validate security controls and correlated detection evidence offline
         if: ${{ !cancelled() }}
@@ -53,6 +68,7 @@ jobs:
             coverage.xml
             reports-bandit.json
             reports-pip-audit.json
+            reports/postgres-security.xml
             reports/security-validation/security-validation.json
             reports/security-validation/security-validation.junit.xml
 

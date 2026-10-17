@@ -21,15 +21,17 @@ from psycopg import sql
 from sqlalchemy import event, select, text
 from sqlalchemy.engine import URL, make_url
 
-from src.app.audit_chain import verify_chain
+from src.app.audit_chain import append_lock, seal_event, verify_chain
+from src.app.audit_checkpoint import AuditCheckpointError, canonical_checkpoint, sign_checkpoint
 from src.app.db import Database
 from src.app.ids import Detection, PersistentIntrusionState
-from src.app.models import AuditEvent, IntrusionSource, User
+from src.app.models import AuditCheckpoint, AuditEvent, IntrusionSource, User
 from tests import test_account_transactions as account_regressions
 from tests import test_admin_transactions as admin_regressions
 from tests import test_auth_completion_transactions as auth_completion
 from tests import test_ids_request_transactions as ids_transactions
 from tests import test_ids_runtime as ids_regressions
+from tests import test_postcommit_notifications as postcommit_notifications
 from tests.test_privileged_step_up import ADMIN_PASSWORD, auth, create_account, login
 
 pytestmark = pytest.mark.skipif(
@@ -169,6 +171,28 @@ test_postgres_ids_request_audit_rollback = ids_transactions.test_ids_request_rol
 test_postgres_ids_request_batch_success = ids_transactions.test_ids_request_commits_multiple_signatures_one_ban_and_ordered_seals
 test_postgres_concurrent_ids_request_ban = ids_transactions.test_concurrent_ids_requests_make_one_audited_ban_without_bypassing_it
 
+test_postgres_postcommit_login_notice_lookup_failure = (
+    postcommit_notifications.test_completed_login_returns_its_single_session_when_notice_lookup_fails
+)
+test_postgres_postcommit_account_notice_lookup_failure = (
+    postcommit_notifications.test_completed_account_change_keeps_response_when_notice_lookup_fails
+)
+test_postgres_postcommit_notice_session_isolation = (
+    postcommit_notifications.test_notice_lookup_uses_a_separate_short_lived_session
+)
+test_postgres_postcommit_notice_and_proof_delivery = (
+    postcommit_notifications.test_notice_delivery_failure_is_optional_but_proof_delivery_still_propagates
+)
+test_postgres_postcommit_activation_cleanup_failure = (
+    postcommit_notifications.test_mfa_activation_returns_usable_recovery_codes_when_throttle_cleanup_fails
+)
+test_postgres_postcommit_security_cleanup_failure = (
+    postcommit_notifications.test_completed_security_change_survives_optional_throttle_cleanup_failure
+)
+test_postgres_precommit_cleanup_failure_remains_closed = (
+    postcommit_notifications.test_precommit_throttle_failure_still_rejects_without_issuing_session
+)
+
 
 @pytest.fixture
 def mail(app):
@@ -197,6 +221,62 @@ def test_postgres_runtime_and_auditor_keep_least_privilege(client, app):
             "FROM pg_roles WHERE rolname = current_user"
         )).one()
         assert not any((superuser, create_db, create_role, bypass_rls))
+
+
+@pytest.mark.parametrize("damage", ["deleted_tail", "signature", "root_hash"])
+def test_postgres_runtime_checks_superseded_checkpoint_evidence(app, settings, _postgres_cluster, damage):
+    """Historical verification joins run with the real append-only grants."""
+    database = app.state.database
+    service = app.state.audit_checkpoint_service
+    for _ in range(2):
+        with database.session_factory() as db:
+            row = AuditEvent(event_type="test.pg.history", outcome="success", details_json="{}")
+            with append_lock(db):
+                seal_event(db, row, app.state.audit_key)
+                db.add(row)
+                db.commit()
+            old = service.anchor(db)
+            old_id, old_event_id = old.id, old.last_event_id
+    # Simulate a SQL attacker through the isolated fixture's schema owner,
+    # never by weakening the actual runtime grants under test.
+    owner_url = _postgres_cluster.administrative_url.set(database=make_url(settings.database_url).database)
+    owner = Database(owner_url.render_as_string(hide_password=False))
+    try:
+        with owner.session_factory() as db:
+            if damage == "deleted_tail":
+                db.delete(db.get(AuditEvent, old_event_id))
+            else:
+                setattr(db.get(AuditCheckpoint, old_id), damage, "f" * 64)
+            db.commit()
+    finally:
+        owner.engine.dispose()
+    with database.session_factory() as db:
+        row = AuditEvent(event_type="test.pg.history.new", outcome="success", details_json="{}")
+        with append_lock(db):
+            seal_event(db, row, app.state.audit_key)
+            db.add(row)
+            db.commit()
+        checkpoint_id = str(uuid.uuid4())
+        payload = canonical_checkpoint(
+            checkpoint_id=checkpoint_id, last_event_id=row.id,
+            root_hash=row.entry_hash, created_at=row.created_at,
+        )
+        # Model a valid checkpoint from an older app which already superseded
+        # the damage; current anchoring must refuse to conceal it further.
+        db.add(AuditCheckpoint(
+            id=checkpoint_id, last_event_id=row.id, root_hash=row.entry_hash,
+            signature=sign_checkpoint(service.key, payload), created_at=row.created_at,
+            signer_uri="hmac-sha256://scap/audit-checkpoint-v1", signer_version="v1",
+            delivered_at=row.created_at, external_receipt="sha256:" + "a" * 64,
+        ))
+        db.commit()
+        assert verify_chain(db, app.state.audit_key).intact
+        verdict = service.verify_latest(db)
+        assert not verdict.intact and not verdict.fully_anchored
+        assert verdict.failed_checkpoint_id == old_id
+        assert verdict.failed_checkpoint_event_id == old_event_id
+        with pytest.raises(AuditCheckpointError):
+            service.anchor(db)
 
 
 def test_postgres_opposite_admin_demotions_serialize_without_deadlock(client, app):

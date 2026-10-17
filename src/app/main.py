@@ -1710,13 +1710,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ip=client_ip(request), device=describe_user_agent(client_user_agent(request)),
         )
 
+    def reset_limiter_after_commit(
+        limiter: SlidingWindowRateLimiter | RedisSlidingWindowRateLimiter, key: str,
+    ) -> None:
+        """An optional Redis cleanup cannot hide a committed security response.
+
+        Keeping the old budget is conservative. All admission checks and
+        pre-commit resets still fail closed when their dependency is unavailable.
+        """
+        try:
+            limiter.reset(key)
+        except RedisError:
+            emit_security_event(
+                "auth.cleanup.unavailable", outcome="failure",
+                details={"scope": "postcommit_rate_limit"},
+            )
+
     def clear_account_login_throttle(username: str, ip: str) -> None:
         """After a proven password reset, lift the per-account login budgets.
 
         The per-IP budget stays: it limits a source, not an account.
         """
-        login_limiter.reset(f"login:account:{username}")
-        login_limiter.reset(f"login:account-familiar:{username}:{ip}")
+        reset_limiter_after_commit(login_limiter, f"login:account:{username}")
+        reset_limiter_after_commit(login_limiter, f"login:account-familiar:{username}:{ip}")
 
     def require_recent_step_up(
         credentials: HTTPAuthorizationCredentials,
@@ -2485,7 +2501,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         record_audit(
             db, request, "auth.mfa.enabled", actor_id=user.id, target_type="user", target_id=user.id
         )
-        mfa_limiter.reset(f"mfa-activate:{user.id}")
+        reset_limiter_after_commit(mfa_limiter, f"mfa-activate:{user.id}")
         return MfaActivateResponse(recovery_codes=plain_codes)
 
     @app.post("/api/auth/mfa/disable", status_code=204)
@@ -2640,7 +2656,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             target_type="user",
             target_id=user.id,
         )
-        mfa_limiter.reset(f"mfa-disable:{user.id}")
+        reset_limiter_after_commit(mfa_limiter, f"mfa-disable:{user.id}")
         notify(
             db, mailer, user_id=user.id, username=user.username, kind="mfa_disabled",
             ip=client_ip(request),
@@ -2717,7 +2733,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             target_id=auth_session.jti,
             details={"method": "recovery_code" if used_recovery else "password_mfa"},
         )
-        password_change_limiter.reset(f"step-up:{user.id}")
+        reset_limiter_after_commit(password_change_limiter, f"step-up:{user.id}")
         return StepUpResponse(
             verified_at=verified_at,
             valid_for_seconds=settings.step_up_minutes * 60,
