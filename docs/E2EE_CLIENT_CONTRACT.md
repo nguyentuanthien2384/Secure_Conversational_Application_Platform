@@ -4,6 +4,13 @@
 `src/app/e2ee.py` chỉ canonicalize/validate public proof và opaque envelope. Nó
 không triển khai Double Ratchet, MLS, X3DH, sinh khóa riêng, mã hóa hay giải mã.
 
+Client terminal 1:1 đã triển khai tại `clients/e2ee_client.py` và
+`clients/private_chat.py`, dùng Olm của `vodozemac==0.10.0`. Chạy thử hai client
+qua HTTP thật bằng `uv run --frozen --extra e2ee-client python -m scripts.demo_e2ee --check`.
+Kho client dùng AES-GCM/Scrypt, khóa liên tiến trình, ghi nguyên tử, outbox
+bền vững và cursor lưu cùng ratchet. Bearer và mật khẩu SCAP không lưu vào kho.
+Đây là tích hợp tham chiếu của SCAP, chưa phải kết quả kiểm toán độc lập.
+
 ## Yêu cầu client
 
 Client phải dùng thư viện đã được kiểm toán, còn được duy trì, cho Signal-style
@@ -35,6 +42,26 @@ Gradio hiện tại không phải E2EE client và không được gắn nhãn Pr
 Server chỉ trả fingerprint, trạng thái trust và public bundle. Thu hồi thiết bị
 qua `DELETE /api/e2ee/devices/{device_id}` cần step-up và làm tăng routing epoch
 của các nhóm liên quan; client phải phát MLS remove/commit tương ứng.
+
+### Bổ sung prekey và xoay signed prekey
+
+`POST /api/e2ee/devices/{device_id}/prekeys` cần step-up, challenge mới và chữ
+ký identity. Payload gồm `challenge_id`, `challenge`, `one_time_prekeys`,
+`signed_prekey`, `signed_prekey_signature`, `update_signature`; hai trường
+signed prekey cùng có hoặc cùng vắng mặt. Ký canonical JSON schema
+`scap.e2ee.prekey-update` của `{account_id, device_id, challenge,
+one_time_prekeys, signed_prekey, signed_prekey_signature}`; trường tùy chọn
+vắng mặt được ký dưới dạng `null`. Dùng `canonical_json_bytes` trong
+`src/app/e2ee.py` như `PrivateClient.refill` để tạo đúng dữ liệu ký.
+
+Server giữ tối đa 100 prekey chưa dùng và 10.000 public prekey đã từng tải
+lên mỗi thiết bị, cấm tái tải key đã tiêu thụ. Thay đổi key, tiêu thụ challenge
+và audit bắt buộc cùng transaction. Client phải lưu private prekey trước khi
+gửi public key; lệnh `refill` trong client tham chiếu thực hiện việc này.
+Nếu server đã nhận key nhưng phản hồi bị mất, client giữ batch đang chờ trên
+đĩa và dùng challenge mới để thử lại; chỉ phản hồi chính xác về key đã đăng
+ký của batch đã gửi mới được coi là xác nhận. Không tái kích hoạt prekey đã
+tiêu thụ và không coi lỗi quota, challenge hay lỗi khác là thành công.
 
 ## Thiết lập 1:1
 
@@ -79,6 +106,13 @@ header 16 KiB, ciphertext 1 MiB, số envelope mỗi session và unique replay k
 trên sender + recipient + client message ID. Client vẫn phải xác thực ciphertext
 và replay theo protocol; server-side guard chỉ là defense in depth.
 
+Phân trang nhận dùng `after=<created_at>&after_id=<envelope-uuid>` từ bản ghi
+cuối đã xác thực và lưu thành công, với thứ tự `(created_at, id)`. Chỉ dùng
+thời điểm có thể trùng và bị từ chối với 409 ở ranh giới không duy nhất;
+`after_id` không có `after` bị từ chối với 422. API
+`GET /api/sessions/{id}/e2ee/state` cho active member đọc session ID, epoch và
+owner để gửi đúng routing state, không mở quyền đọc plaintext.
+
 ## Điều cấm ở API
 
 Payload có trường lạ bị từ chối; đặc biệt không có trường plaintext, private
@@ -96,7 +130,8 @@ tin cậy.
 Phải có known-answer/interoperability vectors, test mất gói/out-of-order,
 skipped-key bounds, replay, identity change, multi-device fanout, add/remove MLS,
 concurrent commit, backup/restore secure storage và memory/log inspection. Cần
-review mật mã độc lập/pentest trước khi tuyên bố E2EE production. Repository này
-chỉ cung cấp server boundary và test của boundary; chưa thay thế audit thư viện
-client.
+review mật mã độc lập/pentest trước khi tuyên bố E2EE production. Repository
+cung cấp server boundary, client Olm 1:1 và test gửi/nhận, tamper/replay,
+durable outbox, mất kết nối, khóa kho và prekey. Chưa có client MLS, bộ vector
+liên thông với ứng dụng bên ngoài hoặc kiểm toán độc lập cho tích hợp SCAP.
 

@@ -324,6 +324,12 @@ lọc an toàn; HTML thô và ảnh từ nguồn không tin cậy không đượ
 Tính chính xác phụ thuộc model và nguồn thông tin; API key chỉ cấp quyền truy
 cập, không bảo đảm mọi câu trả lời đúng hoặc giống ứng dụng Gemini.
 
+Chính sách consent mặc định hiện là `2026-10`, nêu rõ tin hiện tại và phạm vi
+lịch sử được gửi sau DLP. Nếu `deploy/.env.vps` còn đặt
+`AI_CONSENT_VERSION=2026-09`, cập nhật thành `2026-10` rồi recreate app trong
+lần nâng cấp này để yêu cầu người dùng đồng ý lại. Tương tự với `.env` local.
+Không dùng lại phiên bản consent cũ khi tăng phạm vi dữ liệu gửi đi.
+
 #### Tra cứu Internet có nguồn (mặc định tắt)
 
 `GEMINI_WEB_SEARCH_ENABLED=false` giữ tra cứu tắt để ưu tiên quota miễn phí.

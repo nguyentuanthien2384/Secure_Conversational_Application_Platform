@@ -323,6 +323,23 @@ def test_new_sensitive_state_is_reset_on_logout(demo, api):
         assert updates[component._id] == ""
 
 
+def test_external_ai_consent_discloses_history_scope_before_both_consent_paths(demo):
+    consent = next(item for item in demo.blocks.values()
+                   if isinstance(item, gr.Checkbox) and item.info == gradio_ui.AI_CONSENT_SCOPE)
+    assert "lịch sử" in consent.label
+    for notice in (consent.info, gradio_ui.CONSENT_NOTICE):
+        assert "tin nhắn hiện tại" in notice
+        assert "mặc định 16" in notice and "tối đa 40 tin lịch sử" in notice
+        assert "AI bên ngoài" in notice and "DLP" in notice
+
+
+def test_private_e2ee_ui_points_to_independent_clients_without_fetching_plaintext(api):
+    result = gradio_ui._chat_history("A", "private", {"security_mode": "private_e2ee"})
+    assert not api.calls
+    assert "client Olm độc lập" in result[0]["content"]
+    assert "python -m scripts.demo_e2ee --check" in result[0]["content"]
+
+
 def test_paging_and_local_search_through_real_authenticated_api(demo, client, app, monkeypatch):
     """Cross the UI/HTTP/database boundary using disposable, encrypted test rows."""
     token = register_and_login(client, "ui-page-review")

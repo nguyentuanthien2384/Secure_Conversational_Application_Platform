@@ -47,9 +47,10 @@ quét. Chuẩn hoá chỉ dùng để phát hiện, không sửa dữ liệu ngh
 Middleware quét đường dẫn ASGI đầy đủ, trước khi cắt metadata lưu nhật ký.
 Ký tự `#` mã hoá trong path không còn làm mất phần dữ liệu cần kiểm tra.
 Trạng thái IPS có giới hạn số nguồn, dọn nguồn hết hạn và đặt lại điểm sau khi
-gỡ chặn. Danh sách chặn vẫn thuộc từng tiến trình; triển khai nhiều instance cần
-đưa quyết định chặn ra edge hoặc xây dựng kho trạng thái chung. Khi bộ nhớ đã đủ
-10.000 nguồn đều đang bị chặn, nguồn mới chỉ được ghi vào lịch sử có giới hạn.
+gỡ chặn. Runtime lưu dấu hiệu và danh sách chặn trong database dùng chung giữa
+các worker, giữ qua lần khởi động lại. Mỗi request lưu dấu hiệu, quyết định chặn
+và toàn bộ audit tương ứng trong cùng giao dịch. Lịch sử vận hành giữ tối đa
+500 dấu hiệu; UI lấy 100 gần nhất. Local/VPS dùng database riêng có số liệu riêng.
 
 ### Bằng chứng xác thực và nhật ký SIEM
 

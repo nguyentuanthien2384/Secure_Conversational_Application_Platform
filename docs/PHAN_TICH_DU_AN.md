@@ -1,6 +1,6 @@
 # 🛡️ Phân tích dự án SCAP — Hiểu từ gốc rễ
 
-> **Cập nhật lần cuối:** 2026-09-28
+> **Cập nhật lần cuối:** 2026-10-17
 >
 > Tài liệu này mô tả tổng quan kiến trúc, tính năng và cách các thành phần liên kết.
 > Khi sửa hoặc phát triển thêm, hãy cập nhật tài liệu này cho phù hợp.
@@ -148,7 +148,7 @@ tất cả nằm trong phòng bảo mật có khóa chủ (KEK).
 - Policy hỗ trợ: `allow` / `redact` / `confirm` / `block` / `local-only`
 - Dữ liệu user được bọc trong `UNTRUSTED_USER_DATA_JSON` → giảm prompt injection
 - Chỉ gọi AI ngoài khi user bật **consent** (`PATCH /api/auth/ai-consent`)
-- Context chỉ lấy tối đa 8 message sau thời điểm consent
+- Context lấy tối đa `AI_HISTORY_MESSAGES` message sau thời điểm consent: mặc định 16, cấu hình 2–40; consent có phiên bản và phải được xác nhận lại khi chính sách đổi.
 
 **Ví dụ thực tế:** Bộ phận kiểm duyệt thư — trước khi thư ra khỏi công ty,
 mọi thông tin mật đều bị bôi đen.

@@ -1507,7 +1507,9 @@ def _chat_history(token, session_id, session=None):
                 "role": "assistant",
                 "content": (
                     "🔐 Phiên này ở chế độ Private E2EE. Gradio không giữ khóa riêng; "
-                    "hãy dùng client Double Ratchet/MLS đã được kiểm toán."
+                    "gửi và đọc tin bằng client Olm độc lập. Để diễn tập hai client với "
+                    "dữ liệu tạm, chạy trong thư mục dự án: "
+                    "`uv run --frozen --extra e2ee-client python -m scripts.demo_e2ee --check`."
                 ),
             }
         ]
@@ -1538,10 +1540,14 @@ def _devices_snapshot(token):
     return table, revoke
 
 
+AI_CONSENT_SCOPE = (
+    "Sau khi bạn đồng ý, tin nhắn hiện tại và một phần lịch sử hội thoại "
+    "(mặc định 16, tối đa 40 tin lịch sử theo cấu hình) được gửi tới AI bên ngoài. "
+    "Nội dung đi qua lớp DLP để che hoặc chặn dữ liệu nhạy cảm trước khi gửi."
+)
 CONSENT_NOTICE = (
     "⚠️ **Tin nhắn chưa được gửi.** Bấm **Đồng ý và gửi** bên dưới "
-    "để lưu lựa chọn cho tài khoản này. Trước khi gửi tới AI bên ngoài, "
-    "nội dung vẫn được lớp DLP kiểm tra và che dữ liệu nhạy cảm."
+    "để lưu lựa chọn cho tài khoản này. " + AI_CONSENT_SCOPE
 )
 ACTIVITY_PLACEHOLDER = "_Hoạt động bảo mật sẽ hiển thị sau khi đăng nhập._"
 EMAIL_PLACEHOLDER = "_Thông tin email khôi phục sẽ hiển thị sau khi đăng nhập._"
@@ -2245,7 +2251,8 @@ def build_ui(
                     )
                     md_profile = gr.Markdown("")
                     chk_consent = gr.Checkbox(
-                        label="Cho phép gửi nội dung (đã lọc thông tin nhạy cảm) tới AI bên ngoài"
+                        label="Cho phép gửi tin nhắn và lịch sử tới AI bên ngoài",
+                        info=AI_CONSENT_SCOPE,
                     )
                     with gr.Accordion("Đổi mật khẩu", open=False):
                         tb_pw_cur = gr.Textbox(

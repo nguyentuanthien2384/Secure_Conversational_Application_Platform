@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -44,11 +45,20 @@ except ImportError:
 
 MAX_VAULT_BYTES = 2 * 1024 * 1024
 MAX_CLIENT_SESSIONS = 256
+RECEIVE_PAGE_SIZE = 100
 _AAD = b"scap.e2ee-client-vault.v1"
 
 
 class ClientError(RuntimeError):
     """A fixed, user-facing failure; never includes a bearer or private key."""
+
+
+class ClientPersistenceError(ClientError):
+    """Stop using mutable ratchets until the durable vault is reopened."""
+
+
+_RESTART_MESSAGE = "Client state could not be saved; close and reopen this profile before continuing."
+_RECEIVE_MESSAGE = "Receiving stopped; earlier messages are returned. Retry after checking the next ciphertext or connection."
 
 
 def _require_olm():
@@ -99,12 +109,35 @@ class EncryptedVault:
         self._passphrase = passphrase.encode("utf-8")
         self.key = b""
         self.salt = b""
+        self.failed = False
+
+    def _acquire_lock(self):
+        # The inode remains in place: deleting a lock file could let a third
+        # process lock a replacement while a second process holds the old one.
+        with private_directory_scope(self.directory):
+            try:
+                with create_private_file(self.lock_path):
+                    pass
+            except FileExistsError:
+                pass
+            check_private_file(self.lock_path)
+            lock = read_regular_file(self.lock_path)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                lock.close()
+                raise ClientError("This client profile is already open; do not run two writers.") from None
+            self._lock = lock
 
     def __enter__(self):
-        try:
-            self._lock = create_private_file(self.lock_path)
-        except FileExistsError as exc:
-            raise ClientError("This client profile is already open; do not run two writers.") from exc
+        self._acquire_lock()
         try:
             if self.path.exists():
                 check_private_file(self.path)
@@ -113,7 +146,7 @@ class EncryptedVault:
                 if len(raw) > MAX_VAULT_BYTES:
                     raise ClientError("Client vault exceeds its size budget.")
                 document = json.loads(raw)
-                if document.get("version") != 1:
+                if not isinstance(document, dict) or document.get("version") != 1:
                     raise ClientError("Unsupported client vault format.")
                 self.salt = decode_base64_strict(document["salt"], field="salt", exact_bytes=16)
                 self._derive_key()
@@ -140,6 +173,17 @@ class EncryptedVault:
         self.key = Scrypt(salt=self.salt, length=32, n=2**15, r=8, p=1).derive(self._passphrase)
 
     def save(self):
+        if self.failed:
+            raise ClientPersistenceError(_RESTART_MESSAGE)
+        try:
+            self._write()
+        except Exception:
+            # Any serialization, size-budget, encryption or filesystem failure
+            # leaves mutable in-memory ratchets unsuitable for another action.
+            self.failed = True
+            raise ClientPersistenceError(_RESTART_MESSAGE) from None
+
+    def _write(self):
         if self._lock is None:
             raise ClientError("Client vault is not locked.")
         payload = json.dumps(self.state, separators=(",", ":"), ensure_ascii=False).encode()
@@ -166,7 +210,6 @@ class EncryptedVault:
         if self._lock is not None:
             self._lock.close()
             self._lock = None
-            self.lock_path.unlink(missing_ok=True)
         self.key = b""
 
 
@@ -176,6 +219,7 @@ class PrivateClient:
     def __init__(self, api, token: str, vault: EncryptedVault, *, server: str):
         _require_olm()
         self.api, self.token, self.vault = api, token, vault
+        self.last_receive_error = None
         self.server = checked_server(server)
         self.me = self.request("GET", "/api/auth/me")
         state = vault.state
@@ -197,16 +241,36 @@ class PrivateClient:
         return safety_fingerprint(self.identity)
 
     def request(self, method, path, **kwargs):
-        response = self.api.request(method, path, headers={"Authorization": f"Bearer {self.token}"}, **kwargs)
+        response = self._request_response(method, path, **kwargs)
         if response.status_code >= 400:
             raise ClientError(f"SCAP request rejected (HTTP {response.status_code}); authenticate/step up or check policy.")
         return response.json() if response.content else None
 
+    def _request_response(self, method, path, **kwargs):
+        self._require_healthy()
+        return self.api.request(method, path, headers={"Authorization": f"Bearer {self.token}"}, **kwargs)
+
     def _save(self):
-        self.vault.state["account"] = self.account.pickle(self.vault.key)
-        self.vault.save()
+        self._require_healthy()
+        try:
+            self.vault.state["account"] = self.account.pickle(self.vault.key)
+            self.vault.save()
+        except Exception:
+            self.vault.failed = True
+            raise ClientPersistenceError(_RESTART_MESSAGE) from None
+
+    @property
+    def requires_restart(self):
+        return self.vault.failed
+
+    def _require_healthy(self):
+        if self.vault.failed:
+            raise ClientPersistenceError(_RESTART_MESSAGE)
+        if self.vault._lock is None:
+            raise ClientError("Client vault is closed.")
 
     def registration_offer(self, display_name="Private client"):
+        self._require_healthy()
         challenge = self.request("POST", "/api/e2ee/devices/challenge")
         if not self.account.one_time_keys:
             self.account.generate_one_time_keys(20)
@@ -228,6 +292,10 @@ class PrivateClient:
         return offer
 
     def approve(self, offer):
+        self._require_healthy()
+        if (not isinstance(offer, dict)
+                or any(not isinstance(offer.get(field), str) for field in ("device_id", "identity_key", "challenge"))):
+            raise ClientError("Invalid device approval offer.")
         statement = build_device_approval_message(
             account_id=self.me["id"], approver_device_id=self.device_id,
             new_device_id=offer["device_id"], new_device_public_key_b64=offer["identity_key"],
@@ -237,6 +305,9 @@ class PrivateClient:
                 "approval_signature": _public_url(self.account.sign(statement).to_base64())}
 
     def register_device(self, *, approval=None):
+        self._require_healthy()
+        if approval is not None and not isinstance(approval, dict):
+            raise ClientError("Invalid device approval.")
         existing = next((item for item in self.request("GET", "/api/e2ee/devices")
                          if item["id"] == self.device_id), None)
         if existing is not None:
@@ -257,32 +328,69 @@ class PrivateClient:
         return result
 
     def refill(self, count=20):
+        self._require_healthy()
         if not 1 <= count <= 100:
             raise ClientError("Prekey count must be between 1 and 100.")
         challenge = self.request("POST", "/api/e2ee/devices/challenge")
-        if not self.account.one_time_keys:
-            self.account.generate_one_time_keys(count)
-        prekeys = [_public_url(key.to_base64()) for key in self.account.one_time_keys.values()]
+        pending = self.vault.state.get("prekey_upload")
+        retrying = isinstance(pending, dict) and pending.get("attempted") is True
+        if pending:
+            prekeys = pending["one_time_prekeys"]
+        else:
+            if not self.account.one_time_keys:
+                self.account.generate_one_time_keys(count)
+            prekeys = [_public_url(key.to_base64()) for key in self.account.one_time_keys.values()]
+            pending = {"one_time_prekeys": prekeys, "attempted": True}
+            self.vault.state["prekey_upload"] = pending
         public = {"account_id": self.me["id"], "device_id": self.device_id,
                   "challenge": challenge["challenge"], "one_time_prekeys": prekeys,
                   "signed_prekey": None, "signed_prekey_signature": None}
         self._save()  # Persist the matching private prekeys before uploading.
-        result = self.request("POST", f"/api/e2ee/devices/{self.device_id}/prekeys", json={
+        response = self._request_response("POST", f"/api/e2ee/devices/{self.device_id}/prekeys", json={
             "challenge_id": challenge["id"], "challenge": challenge["challenge"],
             "one_time_prekeys": prekeys,
             "update_signature": _public_url(self.account.sign(canonical_json_bytes(
                 public, schema="scap.e2ee.prekey-update")).to_base64()),
         })
+        if response.status_code >= 400:
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = None
+            already_uploaded = (retrying and response.status_code == 422 and isinstance(detail, dict)
+                                and detail.get("detail") == "Không được sử dụng lại one-time prekey.")
+            if not already_uploaded:
+                raise ClientError(f"Prekey upload remains pending (HTTP {response.status_code}); authenticate/step up or retry.")
+            # The relay atomically inserts the whole unique batch. Only its
+            # exact duplicate-key verdict on a durable retry acknowledges the
+            # previous attempt. Consumed keys stay consumed on the server;
+            # marking published retains our private keys for inbound sessions.
+            result = {"device_id": self.device_id, "added": 0, "already_uploaded": True}
+        else:
+            result = response.json()
         self.account.mark_keys_as_published()
+        self.vault.state.pop("prekey_upload", None)
         self._save()
         return result
 
     def pin_peer(self, username, fingerprint, device_id=None):
+        self._require_healthy()
         expected = re.sub(r"\s", "", fingerprint).upper()
         if not re.fullmatch(r"[0-9A-F]{64}", expected):
             raise ClientError("Verify the full 64-hex fingerprint through another channel first.")
         params = {"device_id": device_id} if device_id else {}
         bundle = self.request("GET", f"/api/e2ee/users/{username}/prekey-bundle", params=params)
+        if (not isinstance(bundle, dict)
+                or any(not isinstance(bundle.get(field), str) for field in (
+                    "device_id", "identity_key", "signed_prekey", "signed_prekey_signature"))):
+            raise ClientError("Invalid peer prekey bundle.")
+        if device_id is not None and bundle["device_id"] != device_id:
+            raise ClientError("Peer bundle does not match the requested device.")
+        try:
+            if str(uuid.UUID(bundle["device_id"])) != bundle["device_id"]:
+                raise ValueError
+        except ValueError:
+            raise ClientError("Invalid peer device identity.") from None
         actual = safety_fingerprint(bundle["identity_key"])
         if actual.replace(" ", "") != expected:
             raise ClientError("Fingerprint mismatch; do not trust this device.")
@@ -296,12 +404,14 @@ class PrivateClient:
             raise ClientError("Peer identity changed; review it in a new client profile.")
         if len(peers) >= MAX_CLIENT_SESSIONS and bundle["device_id"] not in peers:
             raise ClientError("Client peer budget exhausted.")
+        bundle["fingerprint"] = actual  # This label is derived from the verified key, never from relay metadata.
         bundle["username"] = username
         peers[bundle["device_id"]] = bundle
         self._save()
         return bundle
 
     def new_conversation(self, peer_username, title="Private conversation"):
+        self._require_healthy()
         row = self.request("POST", "/api/sessions", json={
             "title": title, "security_mode": "private_e2ee", "data_classification": "e2ee_private",
         })
@@ -309,6 +419,7 @@ class PrivateClient:
         return row["id"]
 
     def prepare(self, conversation, peer_device, text):
+        self._require_healthy()
         if not isinstance(text, str) or not text or len(text) > 8_000:
             raise ClientError("Message must contain 1–8000 characters.")
         state = self.vault.state
@@ -324,7 +435,7 @@ class PrivateClient:
             ratchet = olm.Session.from_pickle(state["sessions"][ratchet_id], self.vault.key)
         else:
             if not peer.get("one_time_prekey"):
-                peer = self.pin_peer(peer["username"], peer["fingerprint"], peer_device)
+                peer = self.pin_peer(peer["username"], safety_fingerprint(peer["identity_key"]), peer_device)
             if not peer.get("one_time_prekey"):
                 raise ClientError("Peer prekeys are exhausted; ask the peer to refill.")
             ratchet = self.account.create_outbound_session(
@@ -355,12 +466,15 @@ class PrivateClient:
         return envelope
 
     def flush(self):
+        self._require_healthy()
         pending = self.vault.state["outbox"]
         if not pending:
             return None
         response = self.api.post(f"/api/sessions/{pending['conversation']}/e2ee/envelopes",
                                  headers={"Authorization": f"Bearer {self.token}"}, json=pending["envelope"])
-        duplicate = response.status_code == 409 and response.json().get("detail") == "Bản mã trùng hoặc đã được phát lại."
+        acknowledgement = response.json() if response.status_code == 409 else None
+        duplicate = (isinstance(acknowledgement, dict)
+                     and acknowledgement.get("detail") == "Bản mã trùng hoặc đã được phát lại.")
         if response.status_code != 201 and not duplicate:
             raise ClientError(f"Ciphertext remains in the local outbox (HTTP {response.status_code}); use retry.")
         self.vault.state["outbox"] = {}
@@ -372,6 +486,13 @@ class PrivateClient:
         return self.flush()
 
     def decrypt(self, conversation, envelope, *, persist=True):
+        self._require_healthy()
+        if not isinstance(envelope, dict):
+            raise ClientError("Invalid ciphertext envelope.")
+        required = {"sender_device_id", "recipient_device_id", "protocol", "header", "ciphertext", "client_message_id"}
+        if (not required <= envelope.keys() or any(not isinstance(envelope[field], str) for field in required)
+                or type(envelope.get("group_epoch")) is not int or envelope["group_epoch"] < 0):
+            raise ClientError("Invalid ciphertext envelope.")
         state = self.vault.state
         sender = envelope["sender_device_id"]
         peer = state["peers"].get(sender)
@@ -379,7 +500,13 @@ class PrivateClient:
             raise ClientError("Unverified sender; pin this device before receiving.")
         if envelope.get("recipient_device_id") != self.device_id or envelope.get("protocol") != "double-ratchet":
             raise ClientError("Ciphertext is addressed to a different client/protocol.")
-        header = json.loads(decode_base64_strict(envelope["header"], field="header", max_bytes=1024))
+        try:
+            header = json.loads(decode_base64_strict(envelope["header"], field="header", max_bytes=1024))
+        except (ValueError, TypeError):
+            raise ClientError("Invalid ciphertext header.") from None
+        if (not isinstance(header, dict) or not isinstance(header.get("ratchet_id"), str)
+                or not header["ratchet_id"] or len(header["ratchet_id"]) > 256):
+            raise ClientError("Invalid ciphertext header.")
         if header.get("schema") != "scap.olm.v1" or header.get("curve_key") != peer["signed_prekey"]:
             raise ClientError("Sender key does not match the verified peer.")
         ciphertext = decode_base64_strict(envelope["ciphertext"], field="ciphertext", max_bytes=65536)
@@ -399,7 +526,12 @@ class PrivateClient:
             ratchet, plaintext = account.create_inbound_session(_native_key(peer["signed_prekey"]), message.to_pre_key())
         if ratchet.session_id != header["ratchet_id"]:
             raise ClientError("Ratchet identity mismatch.")
-        bound = json.loads(plaintext)
+        try:
+            bound = json.loads(plaintext)
+        except (ValueError, TypeError):
+            raise ClientError("Invalid authenticated message.") from None
+        if not isinstance(bound, dict) or not isinstance(bound.get("payload"), dict):
+            raise ClientError("Invalid authenticated message.")
         expected = {"session_id": conversation, "sender_device_id": sender,
                     "recipient_device_id": self.device_id, "epoch": envelope["group_epoch"],
                     "client_message_id": envelope["client_message_id"]}
@@ -417,18 +549,33 @@ class PrivateClient:
         return body["text"]
 
     def receive(self, conversation):
+        self._require_healthy()
+        self.last_receive_error = None
         received = []
-        for _ in range(100):
-            cursor = self.vault.state["cursors"].get(conversation, {})
-            params = {"recipient_device_id": self.device_id, "limit": 100, **cursor}
-            envelopes = self.request("GET", f"/api/sessions/{conversation}/e2ee/envelopes", params=params)
-            if not envelopes:
-                break
-            for envelope in envelopes:
-                text = self.decrypt(conversation, envelope, persist=False)
-                self.vault.state["cursors"][conversation] = {"after": envelope["created_at"], "after_id": envelope["id"]}
-                self._save()
-                received.append({"sender_device": envelope["sender_device_id"], "text": text})
-            if len(envelopes) < 100:
-                break
+        try:
+            for _ in range(100):
+                cursor = self.vault.state["cursors"].get(conversation, {})
+                params = {"recipient_device_id": self.device_id, "limit": RECEIVE_PAGE_SIZE, **cursor}
+                envelopes = self.request("GET", f"/api/sessions/{conversation}/e2ee/envelopes", params=params)
+                if not isinstance(envelopes, list) or len(envelopes) > RECEIVE_PAGE_SIZE:
+                    raise ClientError("Invalid ciphertext page.")
+                if not envelopes:
+                    break
+                for envelope in envelopes:
+                    if (not isinstance(envelope, dict)
+                            or any(not isinstance(envelope.get(field), str) or not envelope[field]
+                                   for field in ("created_at", "id"))):
+                        raise ClientError("Invalid ciphertext cursor.")
+                    text = self.decrypt(conversation, envelope, persist=False)
+                    self.vault.state["cursors"][conversation] = {"after": envelope["created_at"], "after_id": envelope["id"]}
+                    self._save()
+                    received.append({"sender_device": envelope["sender_device_id"], "text": text})
+                if len(envelopes) < RECEIVE_PAGE_SIZE:
+                    break
+        except (ClientError, ValueError, KeyError, TypeError, OSError, httpx.HTTPError):
+            self.last_receive_error = _RESTART_MESSAGE if self.requires_restart else _RECEIVE_MESSAGE
+            if not received:
+                raise
+            # Cursor/ratchets of earlier messages are durable. Return their
+            # plaintext even if a later envelope or page fails, never discard it.
         return received

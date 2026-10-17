@@ -269,7 +269,10 @@ phải cảnh báo nếu checkpoint im lặng quá SLA.
 ## DLP và AI
 
 Consent có timestamp và policy version; đổi `AI_CONSENT_VERSION` buộc người dùng
-đồng ý lại. Chỉ tối đa tám message sau thời điểm consent được giải mã làm context.
+đồng ý lại. Chỉ tối đa `AI_HISTORY_MESSAGES` message sau thời điểm consent được
+giải mã làm context: mặc định 16, cấu hình 2–40. Chính sách mặc định `2026-10`
+cập nhật phạm vi này; deployment đặt policy version riêng phải đổi version khi
+thay đổi thông báo/phạm vi dữ liệu được phép gửi.
 Detector chuẩn hóa Unicode và phát hiện secret/JWT/Bearer/private key/API key,
 email, điện thoại, thẻ Luhn, CCCD, mã số thuế, dữ liệu sức khỏe và từ điển nội
 bộ. Audit chỉ ghi category/count, không ghi mẫu dữ liệu.

@@ -50,7 +50,7 @@ Từ đăng nhập, phân quyền và kiểm soát dữ liệu đến mã hóa, 
 - **Giám sát:** IDS/IPS chữ ký và tương quan bất thường, audit HMAC chain, checkpoint ngoài hệ thống, sự kiện JSON cho SIEM, dashboard ngân sách tài nguyên.
 - **Triển khai:** demo tạm trên laptop, local có dữ liệu lâu dài, Docker với PostgreSQL/Redis/Caddy, hồ sơ VPS nhỏ và high-security.
 
-Repository có **server relay ciphertext cho Private E2EE**. Client Double Ratchet/MLS hoàn chỉnh và kiểm toán độc lập còn là yêu cầu riêng; xem [giới hạn](#gioi-han) trước khi dùng cho dữ liệu nhạy cảm.
+Repository có **Private E2EE 1:1 chạy được bằng hai client terminal riêng**, dùng Olm/Double Ratchet qua `vodozemac`. Khóa riêng và trạng thái ratchet nằm trong kho mã hóa của từng client; server chỉ chuyển ciphertext. Gradio phục vụ chat AI/mã hóa phía máy chủ. Xem [demo E2EE](docs/DEMO_SCRIPT.md#demo-private-e2ee-voi-hai-client) và [giới hạn](#gioi-han) về MLS, tương thích và kiểm toán độc lập.
 
 <a id="chay-demo"></a>
 ## Chạy từ bản clone trên GitHub
@@ -90,6 +90,15 @@ uv run --frozen python -m scripts.demo_local --port 8080
 Launcher bỏ qua `.env`, chỉ lắng nghe loopback và ép AI ngoại tuyến. Nó không sửa database local đang có. Mã xác minh email/đặt lại mật khẩu demo nằm trong file `.eml` tại thư mục outbox được in ra lúc khởi động.
 
 Hướng dẫn từng bước: [HUONG_DAN_CHAY.md](HUONG_DAN_CHAY.md). Kịch bản trình bày 6/12 phút: [DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md).
+
+### 3. Demo Private E2EE với hai client
+
+```powershell
+uv sync --frozen --group dev --extra e2ee-client
+uv run --frozen --extra e2ee-client python -m scripts.demo_e2ee --check
+```
+
+Runner mở server loopback tạm trong tiến trình riêng, đăng ký hai client, đối chiếu fingerprint, gửi/giải mã hai chiều, bổ sung prekey và kiểm tra export của server chỉ chứa ciphertext. Kết quả nằm trong `reports/e2ee-demo/`; runner dọn dữ liệu tạm khi xong. Để tự nhập tin nhắn, giữ `scripts.demo_local` chạy rồi mở hai terminal theo [kịch bản E2EE](docs/DEMO_SCRIPT.md#demo-private-e2ee-voi-hai-client).
 
 <a id="tai-khoan-demo"></a>
 ## Tài khoản và kịch bản demo
@@ -133,7 +142,7 @@ Trang xác thực có ba luồng **Đăng nhập**, **Tạo tài khoản**, **Qu
 
 - **Trò chuyện:** chọn hội thoại bằng một lần bấm ở thanh bên; tạo nhanh với mặc định Secure/Internal, hoặc mở **Thiết lập hội thoại mới** để đặt tiêu đề/chế độ/phân loại. Khung trống có hướng dẫn bắt đầu; gửi bằng Enter, sao chép phản hồi, tìm trong hội thoại. Đổi tên/xuất/xóa nằm trong nhóm quản lý hội thoại.
 - **Dữ liệu mã hóa:** phần giới thiệu giải thích bản mã thật đã lưu, gồm ciphertext, nonce và phiên bản khóa.
-- **Tìm kiếm:** tìm nội dung trong các hội thoại thuộc sở hữu tài khoản hiện tại.
+- **Tìm kiếm:** tìm toàn bộ hội thoại thuộc sở hữu tài khoản hiện tại, có phân trang và số kết quả; tìm trong hội thoại hiện tại không thay khung chat.
 - **Tài khoản:** đổi mật khẩu; TOTP/QR/recovery code; đồng thuận AI; thiết bị; email khôi phục; passkey; hoạt động bảo mật.
 - **Quản trị — admin:** thống kê người dùng/hội thoại, dashboard khả dụng, tạo tài khoản, đổi vai trò và khóa/mở khóa/xóa tài khoản.
 - **Nhật ký kiểm toán — moderator/admin:** giới thiệu phạm vi và xem các sự kiện audit gần nhất.
@@ -158,7 +167,7 @@ Quyền ở giao diện được kiểm tra lại tại API. Admin vẫn chỉ �
 
 - **`secure`:** server xử lý plaintext khi được phép; lưu tin nhắn bằng envelope encryption; AI ngoài cần consent và vượt chính sách DLP.
 - **`confidential`:** áp dụng DLP/xác nhận nghiêm ngặt hơn khi gửi nội dung ra AI ngoài; các kiểm soát MFA/step-up phụ thuộc hồ sơ triển khai.
-- **`private_e2ee`:** server chỉ tiếp nhận public key/prekey và opaque ciphertext qua API riêng. Server không có plaintext để chat AI, tìm kiếm nội dung hoặc DLP. Cần client E2EE tương thích.
+- **`private_e2ee`:** server chỉ tiếp nhận public key/prekey và opaque ciphertext qua API riêng. Server không có plaintext để chat AI, tìm kiếm nội dung hoặc DLP. Client terminal Olm trong `clients/` cung cấp demo 1:1 tương thích.
 
 UI chat hiện cho tạo **Secure** và **Confidential**. Private E2EE sử dụng [hợp đồng client và API](docs/E2EE_CLIENT_CONTRACT.md), không phải nút bật E2EE hoàn chỉnh trong Gradio.
 
@@ -239,6 +248,11 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml logs --tail=100
 
 Overlay local bật docs/seed và tắt Caddy. Khác launcher demo tạm, PostgreSQL trong Docker dùng volume và giữ dữ liệu qua các lần khởi động.
 
+Với AWS/GCP KMS, cài đúng SDK qua `uv sync --frozen --extra aws-kms` hoặc
+`--extra gcp-kms`. Compose truyền `KEY_PROVIDER` thành build argument
+`KMS_PROFILE` cho cả app và migration, để image chứa đúng SDK. Quyền workload
+identity/IAM và key thật vẫn phải được cấu hình theo môi trường triển khai.
+
 Khi nâng cấp bản có IDS lưu bền, cần chạy service `migrate` bằng image mới trước khi khởi động app mới; Compose đã đặt app phụ thuộc migration thành công. Hai bảng `intrusion_detections` và `intrusion_sources` được tạo bằng tài khoản schema owner, rồi cấp quyền cho runtime. Không dùng tài khoản runtime để tự tạo bảng. Local dùng SQLite được nâng schema khi khởi động.
 
 Tab Quản trị/Bảo mật đọc API của chính bản đang chạy. Các worker dùng cùng database sẽ thấy cùng trạng thái IDS/IPS; local và VPS dùng hai database riêng thì số liệu của chúng độc lập. Lịch sử IDS vận hành giữ tối đa 500 dấu hiệu, giao diện lấy 100 dấu hiệu gần nhất; audit có vòng đời riêng. Lỗi tải hiển thị trạng thái chưa xác định, thao tác nhạy cảm yêu cầu xác thực lại, và kết quả chuỗi audit phân biệt với bằng chứng checkpoint WORM.
@@ -284,11 +298,13 @@ Trong development, schema đầy đủ có tại `/docs`, `/redoc` và `/openapi
 - **Xác thực, prefix `/api/auth`:** `register`, `login`, `mfa/*`, `me`, `refresh`, `logout`, `logout-all`, `step-up` và `sessions`.
 - **Bảo vệ tài khoản, prefix `/api/auth`:** `password`, `ai-consent`, `security-activity`, `email`, `password-reset/*` và `passkeys/*`.
 - **Hội thoại:** `/api/sessions`, `/api/sessions/{id}`; dưới mỗi hội thoại có `messages`, `ciphertexts`, `security`, `export`, `export-ticket`; tìm kiếm `/api/search/messages`.
-- **Private E2EE:** `/api/e2ee/devices`, `/api/e2ee/users/{username}/prekey-bundle`, `/api/sessions/{id}/e2ee/members` và `/api/sessions/{id}/e2ee/envelopes`.
+- **Private E2EE:** `/api/e2ee/devices`, `/api/e2ee/devices/{id}/prekeys`, `/api/e2ee/users/{username}/prekey-bundle`, `/api/sessions/{id}/e2ee/state`, `members` và `envelopes`.
 - **Quản trị/giám sát, prefix `/api/admin`:** `users`, `stats`, `availability`, `audit`, `audit/verify`, `audit/checkpoint`, `ids/*`, `security-alerts`, `security/maintenance`.
 - **Tình trạng:** `/api/health` là liveness tối giản; `/api/ready` kiểm tra DB và checkpoint WORM mới nhất trong high profile.
 
 Gửi access token bằng header `Authorization: Bearer <token>`. API export stream trực tiếp; vé tải dùng một lần, có hạn 60 giây và gắn phiên đăng nhập. Không chia sẻ token hoặc đường dẫn vé tải.
+
+Danh sách có phân trang qua `/api/sessions/page`, `/api/sessions/{id}/messages/page`, `/api/search/messages/page` và `/api/admin/users/page`. Response gồm `items`, `total`, `offset`, `limit`, `has_more`, `next_offset`. Các thay đổi dữ liệu và audit bắt buộc cùng transaction; thao tác nhạy cảm kiểm tra lại đúng bearer hiện tại trước khi ghi. Cursor E2EE gồm thời điểm và ID để không bỏ sót hai bản ghi trùng thời gian.
 
 Nguồn đối chiếu route/schema: [main.py](src/app/main.py), [account_routes.py](src/app/account_routes.py), [schemas.py](src/app/schemas.py).
 
@@ -299,11 +315,11 @@ Nguồn đối chiếu route/schema: [main.py](src/app/main.py), [account_routes
 
 ```bash
 uv lock --check
-uv sync --frozen --group dev
+uv sync --frozen --group dev --all-extras
 uv run --frozen python -m pytest --cov=src.app --cov-report=term-missing
-uv run --frozen ruff check src tests scripts
-uv run --frozen bandit -r src/app -ll -ii
-uv export --frozen --no-dev --no-emit-project --output-file requirements-audit.txt
+uv run --frozen ruff check src clients tests scripts
+uv run --frozen bandit -r src/app clients -ll -ii
+uv export --frozen --no-dev --all-extras --no-emit-project --output-file requirements-audit.txt
 uv run --frozen pip-audit -r requirements-audit.txt
 uv run --frozen python -m scripts.validate_security --output-dir reports/security-validation
 ```
@@ -442,7 +458,7 @@ Sau khi clone, tạo lại môi trường bằng `uv sync --frozen --group dev` 
 ### Giới hạn cần hiểu
 
 - `secure`/`confidential` mã hóa **khi lưu trữ**; server xử lý plaintext theo policy. Chúng không đồng nghĩa E2EE.
-- Private E2EE chưa có client Double Ratchet/MLS đã kiểm toán, interop vectors và pentest độc lập. Server boundary không đủ để tuyên bố E2EE production.
+- Client Private E2EE 1:1 đã có luồng gửi/nhận, pin fingerprint, kho mã hóa, outbox bền vững và bổ sung prekey. Chưa có client nhóm MLS, kiểm chứng tương thích với client bên ngoài hoặc audit/pentest độc lập cho tích hợp SCAP; demo không phải chứng nhận E2EE production. Không phục hồi bản sao ratchet cũ để tiếp tục gửi tin.
 - JWT/audit signing secret ở web process; WORM giúp phát hiện rollback sau checkpoint nhưng full host compromise vẫn có rủi ro.
 - DLP/IDS là phòng thủ chiều sâu, có thể có false positive/false negative; signature IDS không thay thế truy vấn tham số hóa và authorization.
 - CSP vẫn cần allowance cho CSS runtime của Gradio; phải kiểm tra tương thích khi nâng thư viện.

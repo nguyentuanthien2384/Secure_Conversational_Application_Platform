@@ -301,7 +301,7 @@ class Settings:
     max_messages_per_session: int = 10_000
     confidential_retention_days: int = 7
     secure_retention_days: int = 90
-    ai_consent_version: str = "2026-09"
+    ai_consent_version: str = "2026-10"
     dlp_custom_terms: tuple[str, ...] = ()
     csp_report_only: bool = True
     gradio_max_file_size: str = "5mb"
@@ -740,7 +740,7 @@ class Settings:
             max_messages_per_session=numeric_limits["MAX_MESSAGES_PER_SESSION"],
             confidential_retention_days=numeric_limits["CONFIDENTIAL_RETENTION_DAYS"],
             secure_retention_days=numeric_limits["SECURE_RETENTION_DAYS"],
-            ai_consent_version=os.getenv("AI_CONSENT_VERSION", "2026-09").strip() or "2026-09",
+            ai_consent_version=os.getenv("AI_CONSENT_VERSION", "2026-10").strip() or "2026-10",
             dlp_custom_terms=_csv_env("DLP_CUSTOM_TERMS"),
             csp_report_only=_bool_env("CSP_REPORT_ONLY", True),
             gradio_max_file_size=os.getenv("GRADIO_MAX_FILE_SIZE", "5mb").strip() or "5mb",

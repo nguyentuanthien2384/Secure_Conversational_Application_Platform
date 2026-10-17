@@ -439,7 +439,12 @@ class AwsKmsKeyProvider:
             raise KeyProviderError("AWS KMS data-key generation failed.") from exc
         if len(plaintext) != 32:
             raise KeyProviderError("AWS KMS returned an invalid DEK length.")
-        return GeneratedDek(plaintext, wrapped, self._kek_uri, str(result.get("KeyId", "current")))
+        return GeneratedDek(
+            plaintext_dek=plaintext,
+            wrapped_dek=wrapped,
+            kek_uri=self._kek_uri,
+            kek_version=str(result.get("KeyId", "current")),
+        )
 
     def unwrap_dek(
         self,
@@ -527,7 +532,12 @@ class GcpKmsKeyProvider:
     def generate_wrapped_dek(self, *, context: dict[str, str]) -> GeneratedDek:
         plaintext = secrets.token_bytes(32)
         wrapped = self._wrap(plaintext, context)
-        return GeneratedDek(plaintext, wrapped.wrapped_dek, wrapped.kek_uri, wrapped.kek_version)
+        return GeneratedDek(
+            plaintext_dek=plaintext,
+            wrapped_dek=wrapped.wrapped_dek,
+            kek_uri=wrapped.kek_uri,
+            kek_version=wrapped.kek_version,
+        )
 
     def unwrap_dek(
         self,

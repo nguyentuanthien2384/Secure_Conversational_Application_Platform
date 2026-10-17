@@ -7,12 +7,19 @@ import getpass
 import json
 import re
 import shlex
+import unicodedata
 import warnings
 from pathlib import Path
 
 import httpx
 
-from clients.e2ee_client import ClientError, EncryptedVault, PrivateClient, checked_server
+from clients.e2ee_client import (
+    ClientError,
+    ClientPersistenceError,
+    EncryptedVault,
+    PrivateClient,
+    checked_server,
+)
 from src.app.e2ee import safety_fingerprint
 
 
@@ -23,6 +30,23 @@ def hidden(prompt):
             return getpass.getpass(prompt)
         except (getpass.GetPassWarning, EOFError) as exc:
             raise ClientError("Use an interactive terminal with hidden password input.") from exc
+
+
+def terminal_json(value):
+    """Render one JSON value without giving peer text terminal controls.
+
+    Preserve normal Unicode text, including Vietnamese. JSON itself escapes
+    C0 controls, but its Unicode mode leaves C1 controls, bidi directives and
+    lone surrogates literal. Escape those after serialization as valid JSON;
+    the displayed sender/field boundaries must remain visible and printable.
+    """
+    rendered = json.dumps(value, ensure_ascii=False)
+    return "".join(
+        json.dumps(character, ensure_ascii=True)[1:-1]
+        if unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        else character
+        for character in rendered
+    )
 
 
 def _authenticate(api, username):
@@ -71,41 +95,44 @@ def interact(client):
             if command == "help":
                 print(HELP)
             elif command == "fingerprint":
-                print(json.dumps({"device_id": client.device_id, "fingerprint": client.fingerprint}, ensure_ascii=False))
+                print(terminal_json({"device_id": client.device_id, "fingerprint": client.fingerprint}))
             elif command == "register":
-                print(json.dumps(client.register_device(), ensure_ascii=False))
+                print(terminal_json(client.register_device()))
             elif command == "offer":
-                print(json.dumps(client.registration_offer(), ensure_ascii=False))
+                print(terminal_json(client.registration_offer()))
             elif command == "approve":
                 offer = json.loads(input("Offer công khai từ thiết bị mới (JSON): "))
                 print("Fingerprint thiết bị mới:", safety_fingerprint(offer["identity_key"]))
                 if input("Nhập APPROVE và device UUID để xác nhận: ") != f"APPROVE {offer['device_id']}":
                     raise ClientError("Device approval cancelled.")
-                print(json.dumps(client.approve(offer), ensure_ascii=False))
+                print(terminal_json(client.approve(offer)))
             elif command == "register-approved":
                 approval = json.loads(input("Approval công khai từ thiết bị đang trusted (JSON): "))
-                print(json.dumps(client.register_device(approval=approval), ensure_ascii=False))
+                print(terminal_json(client.register_device(approval=approval)))
             elif command == "pin" and len(args) == 1:
                 fingerprint = input("Fingerprint đầy đủ đã đối chiếu qua kênh khác: ")
                 device = input("Device UUID người nhận (Enter để lấy thiết bị đầu tiên): ").strip()
                 peer = client.pin_peer(args[0], fingerprint, device or None)
-                print(json.dumps({"verified_device": peer["device_id"], "fingerprint": peer["fingerprint"]}))
+                print(terminal_json({"verified_device": peer["device_id"], "fingerprint": peer["fingerprint"]}))
             elif command == "peers":
-                print(json.dumps([{key: peer[key] for key in ("username", "device_id", "fingerprint")}
-                                  for peer in client.vault.state["peers"].values()], ensure_ascii=False))
+                print(terminal_json([{key: peer[key] for key in ("username", "device_id", "fingerprint")}
+                                     for peer in client.vault.state["peers"].values()]))
             elif command == "new" and len(args) == 1:
-                print("Session UUID:", client.new_conversation(args[0]))
+                print("Session UUID:", terminal_json(client.new_conversation(args[0])))
             elif command == "send" and len(args) == 2:
                 text = input("Tin nhắn (không lưu trong argv): ")
-                print(json.dumps(client.send(args[0], args[1], text)))
+                print(terminal_json(client.send(args[0], args[1], text)))
             elif command == "receive" and len(args) == 1:
                 for message in client.receive(args[0]):
-                    # JSON escapes terminal control characters in peer text.
-                    print(json.dumps(message, ensure_ascii=False))
+                    print(terminal_json(message))
+                if client.last_receive_error:
+                    print("Đã dừng nhận. Các tin ở trên đã được nhận; kiểm tra bản mã tiếp theo hoặc kết nối trước khi thử lại.")
+                if client.requires_restart:
+                    raise ClientPersistenceError("Client profile must be reopened.")
             elif command == "retry":
-                print(json.dumps(client.flush()))
+                print(terminal_json(client.flush()))
             elif command == "refill" and len(args) <= 1:
-                print(json.dumps(client.refill(int(args[0]) if args else 20)))
+                print(terminal_json(client.refill(int(args[0]) if args else 20)))
             elif command == "stepup":
                 client.request("POST", "/api/auth/step-up", json={"password": hidden("Mật khẩu: "),
                                                                   "code": hidden("TOTP (Enter nếu không dùng): ") or None})
@@ -115,6 +142,9 @@ def interact(client):
                 print("Đã đăng nhập lại; khóa client không đổi.")
             else:
                 print("Lệnh không hợp lệ. Gõ help.")
+        except ClientPersistenceError:
+            print("Không lưu được trạng thái mã hóa. Đã đóng client; hãy mở lại profile trước khi tiếp tục.")
+            raise
         except (ClientError, ValueError, KeyError, httpx.HTTPError):
             print("Không hoàn tất thao tác. Kiểm tra lệnh, phiên/step-up, fingerprint, prekey hoặc outbox; không tự xóa profile.")
 
@@ -137,6 +167,8 @@ def main(argv=None):
             with httpx.Client(base_url=server, timeout=15, trust_env=False, follow_redirects=False) as api:
                 token = _authenticate(api, args.username)
                 interact(PrivateClient(api, token, vault, server=server))
+    except ClientPersistenceError:
+        return 1
     except (ClientError, OSError, ValueError, httpx.HTTPError):
         print("Không mở được client. Kiểm tra server HTTPS/loopback, kho private, dependency và đăng nhập.")
         return 1

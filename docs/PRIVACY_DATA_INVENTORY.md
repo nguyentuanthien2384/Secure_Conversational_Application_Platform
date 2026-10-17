@@ -41,8 +41,11 @@ và thời hạn theo môi trường thật trước production.
 
 - External AI mặc định cần consent có version/timestamp; Private E2EE và dữ liệu
   `highly_confidential` không được gửi cloud AI.
-- Khi được phép, chỉ message hiện tại và tối đa tám message sau thời điểm consent
-  đi qua DLP; secret/identifier bị block hoặc redact theo classification.
+- Khi được phép, message hiện tại và tối đa `AI_HISTORY_MESSAGES` message sau
+  thời điểm consent đi qua DLP; mặc định 16, cấu hình trong khoảng 2–40. Secret/
+  identifier bị block hoặc redact theo classification. Policy mặc định `2026-10`
+  yêu cầu người dùng có consent phiên bản cũ đồng ý lại; deployment đang đặt
+  `AI_CONSENT_VERSION` riêng phải cập nhật phiên bản khi đổi phạm vi xử lý.
 - Audit chỉ giữ category/action/provider và opaque ID, không giữ matched value,
   prompt hay response plaintext.
 - Differential privacy chỉ phù hợp cho thống kê tổng hợp đã được phê duyệt; nó

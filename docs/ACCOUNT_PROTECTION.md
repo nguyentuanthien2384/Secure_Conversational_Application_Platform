@@ -169,7 +169,7 @@ với đúng tài khoản. UI lưu token này trong cookie `scap_device` (HttpOn
 | Passkey làm yếu tố thứ hai và cho bước xác thực lại (step-up) | Chưa có — step-up vẫn dùng mật khẩu + TOTP |
 | Thông báo đẩy (push) / SMS | Chưa có — chỉ email và cảnh báo trong ứng dụng |
 | Đánh giá rủi ro theo vị trí địa lý (impossible travel) | Chưa có — cần cơ sở dữ liệu GeoIP |
-| CSP không `unsafe-inline` | Chưa có — giới hạn của Gradio (README §14) |
+| CSP không `unsafe-inline` | Script đã dùng nonce, chặn inline handler; CSS runtime Gradio vẫn cần allowance riêng |
 
 ## 11. Kiểm chứng
 

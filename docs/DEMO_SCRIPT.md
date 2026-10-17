@@ -216,6 +216,75 @@ kiểm tra engine IDS nội bộ; nó không phải một lần pentest từ bê
 5. Một video 6 phút quay trước để dự phòng. Không quay QR, khóa MFA, mã khôi
    phục, token hoặc dữ liệu cá nhân thật.
 
+<a id="demo-private-e2ee-voi-hai-client"></a>
+## Demo Private E2EE với hai client
+
+Đây là luồng 1:1 riêng dùng Olm/Double Ratchet qua `vodozemac`, không gọi AI.
+Hai client giữ khóa riêng, pin fingerprint và giải mã tại máy của mình.
+Server là tiến trình riêng, chỉ nhận public material và ciphertext. Không dùng
+dữ liệu nhạy cảm thật trong buổi demo.
+
+### Diễn tập tự động trước buổi phỏng vấn
+
+```powershell
+uv sync --frozen --group dev --extra e2ee-client
+uv run --frozen --extra e2ee-client python -m scripts.demo_e2ee --check --output-dir reports/e2ee-rehearsal
+```
+
+Runner tạo server và hai kho client tạm, kiểm tra gửi/nhận hai chiều, export
+ciphertext, cursor và refill prekey, rồi dọn môi trường thử. JSON kết quả nằm
+trong thư mục đã chọn. Lệnh không kết nối server local/VPS đang vận hành.
+
+### Thao tác trực tiếp trong khoảng 4 phút
+
+Giữ launcher `uv run --frozen python -m scripts.demo_local` chạy. Mở hai
+terminal khác nhau, mỗi terminal dùng một profile riêng:
+
+```powershell
+# Terminal A
+uv run --frozen --extra e2ee-client python -m clients.private_chat --username demo.user --profile client_data/interview-alice
+
+# Terminal B
+uv run --frozen --extra e2ee-client python -m clients.private_chat --username demo.mod --profile client_data/interview-bob
+```
+
+Nhập mật khẩu kho client riêng, ít nhất 16 byte; sau đó nhập mật khẩu SCAP
+`Phenikaa-Vault#2026-Lab`. Các mật khẩu được nhập ẩn. Kho giữ khóa và trạng thái
+được mã hóa; bearer chỉ nằm trong bộ nhớ tiến trình.
+
+1. Trên cả hai terminal gõ `register`, rồi `fingerprint`. Ghi nhận Device UUID
+   và **toàn bộ fingerprint** của mỗi bên, đối chiếu trực tiếp hoặc qua kênh
+   độc lập. Fingerprint và Device UUID là dữ liệu công khai.
+2. A gõ `pin demo.mod`, nhập fingerprint và Device UUID của B. B gõ
+   `pin demo.user`, nhập fingerprint và Device UUID của A. Không tự chấp nhận
+   fingerprint mới khi danh tính thay đổi.
+3. A gõ `new demo.mod`; lấy Session UUID được trả về.
+4. A gõ `send <session-uuid> <device-uuid-của-B>`, nhập một câu hỏi ở prompt
+   kế tiếp. B gõ `receive <session-uuid>` để giải mã cục bộ.
+5. B gõ `send <session-uuid> <device-uuid-của-A>`, nhập câu trả lời. A gõ
+   `receive <session-uuid>`. Gõ lại `receive` phải không phát lại tin đã nhận.
+6. Gõ `refill 20` để minh họa bổ sung public prekey có chữ ký sở hữu thiết bị.
+   Nếu step-up đã hết hạn, gõ `stepup` rồi thử lại. Nếu mất phản hồi, gõ lại
+   `refill`; client giữ batch public key đang chờ để xác nhận an toàn. Gõ
+   `quit` khi xong.
+
+`send` ghi ratchet và ciphertext đang chờ xuống kho trước khi gửi HTTP. Nếu
+mất mạng, `retry` gửi lại đúng ciphertext đó; không tạo tin mới để thay thế.
+Client từ chối mở cùng một profile ở hai tiến trình. Nếu không lưu được trạng
+thái, client đóng và yêu cầu mở lại profile; không tiếp tục dùng ratchet chỉ
+còn trong RAM. Khi một đợt nhận bị dừng, các tin hợp lệ trước đó vẫn được hiển
+thị và tin lỗi chưa được đánh dấu đã nhận.
+
+Muốn mở lại, dùng cùng profile, tài khoản và server. Launcher demo mới có DB
+và account ID mới nên cần **profile demo mới**; không dùng lại profile đã gắn
+với lượt demo trước. Không sao chép, chia sẻ hoặc phục hồi ratchet cũ để tiếp
+tục gửi. `client_data/` đã bị loại khỏi Git và Docker build context.
+
+**Nói:** “Tôi dùng thư viện Olm thay vì tự viết ratchet. Test chứng minh hai
+client SCAP gửi/nhận được và server export chỉ có ciphertext. Tích hợp này
+chưa được audit độc lập; client nhóm MLS và kiểm chứng tương thích với ứng
+dụng bên ngoài là phạm vi phát triển tiếp.”
+
 ## Các câu hỏi nên trả lời rõ
 
 - **“AI này có trả lời thông minh không?”** Bot hiện tại là mô phỏng ngoại

@@ -18,7 +18,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     services:
       postgres:
         image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
@@ -73,6 +73,7 @@ jobs:
             reports/postgres-security.xml
             reports/security-validation/security-validation.json
             reports/security-validation/security-validation.junit.xml
+            reports/e2ee-demo/e2ee-demo.json
 
   private-storage-windows:
     runs-on: windows-latest
@@ -90,7 +91,7 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen --group dev --extra e2ee-client
       - name: Verify real Windows ACLs, private setup and encrypted backups
-        run: uv run python -m pytest tests/test_private_storage.py tests/test_secret_files.py tests/test_local_storage.py tests/test_mailer_capacity.py tests/test_secure_backup.py tests/test_e2ee_client.py -q --junitxml=reports/windows-private-storage.xml
+        run: uv run python -m pytest tests/test_private_storage.py tests/test_secret_files.py tests/test_local_storage.py tests/test_mailer_capacity.py tests/test_secure_backup.py tests/test_e2ee_client.py tests/test_e2ee_client_resilience.py tests/test_private_chat_terminal_output.py -q --junitxml=reports/windows-private-storage.xml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
