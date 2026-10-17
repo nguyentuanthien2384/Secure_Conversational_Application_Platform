@@ -550,7 +550,7 @@ class WebAuthnChallenge(Base):
     __tablename__ = "webauthn_challenges"
     __table_args__ = (
         CheckConstraint(
-            "purpose IN ('register', 'authenticate')", name="ck_webauthn_challenge_purpose"
+            "purpose IN ('register', 'authenticate', 'step_up')", name="ck_webauthn_challenge_purpose"
         ),
     )
 
@@ -558,8 +558,64 @@ class WebAuthnChallenge(Base):
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True
     )
+    auth_session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("auth_sessions.jti", ondelete="CASCADE"), nullable=True
+    )
     purpose: Mapped[str] = mapped_column(String(16), nullable=False)
     challenge: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class SecurityPushSubscription(Base):
+    """Opt-in Web Push capability, encrypted under the account's wrapped DEK."""
+
+    __tablename__ = "security_push_subscriptions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    endpoint_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    subscription_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    subscription_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class SecurityPhone(Base):
+    """A verified SMS alert destination; never used as an authentication factor."""
+
+    __tablename__ = "security_phones"
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    phone_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    phone_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SecurityPhoneChallenge(Base):
+    """Session-bound SMS possession proof, five guesses and a five-minute TTL."""
+
+    __tablename__ = "security_phone_challenges"
+    __table_args__ = (
+        Index("ix_security_phone_target_created", "phone_hash", "created_at"),
+        CheckConstraint("attempts >= 0 AND attempts <= 5", name="ck_security_phone_attempts"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    auth_session_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    phone_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    phone_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    phone_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

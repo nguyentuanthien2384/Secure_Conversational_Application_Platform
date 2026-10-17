@@ -104,7 +104,9 @@
     const done = "#btn-passkey-register-done";
     const marker = document.querySelector("#passkey-bridge [data-scap-passkey-request]");
     const nonce = marker?.getAttribute("data-scap-passkey-request") || "";
-    if (!NONCE.test(nonce)) return deliver(done, {mode: "create", error: "not_prepared"});
+    if (!NONCE.test(nonce) || marker?.getAttribute("data-scap-passkey-mode") !== "create") {
+      return deliver(done, {mode: "create", error: "not_prepared"});
+    }
     if (!supported()) return deliver(done, {mode: "create", nonce, error: "unsupported"});
     try {
       const encoded = marker.getAttribute("data-scap-passkey-options") || "";
@@ -126,8 +128,37 @@
     }
   }
 
+  async function stepUp() {
+    const mode = "step-up";
+    const done = "#btn-passkey-step-up-done";
+    const marker = document.querySelector("#passkey-bridge [data-scap-passkey-request]");
+    const nonce = marker?.getAttribute("data-scap-passkey-request") || "";
+    if (!NONCE.test(nonce) || marker?.getAttribute("data-scap-passkey-mode") !== mode) {
+      return deliver(done, {mode, error: "not_prepared"});
+    }
+    if (!supported()) return deliver(done, {mode, nonce, error: "unsupported"});
+    try {
+      const encoded = marker.getAttribute("data-scap-passkey-options") || "";
+      const publicKey = JSON.parse(new TextDecoder().decode(toBuffer(encoded)));
+      if (wrongHost(publicKey.rpId)) {
+        return deliver(done, {mode, nonce, error: "wrong_host", rp_id: publicKey.rpId});
+      }
+      const credential = await navigator.credentials.get({
+        publicKey: {
+          ...publicKey,
+          challenge: toBuffer(publicKey.challenge),
+          allowCredentials: descriptors(publicKey.allowCredentials),
+        },
+      });
+      deliver(done, {mode, nonce, credential: serialize(credential)});
+    } catch (error) {
+      deliver(done, {mode, nonce, error: failure(error)});
+    }
+  }
+
   document.addEventListener("click", (event) => {
     if (event.target.closest?.("#btn-passkey-login")) void signIn();
     else if (event.target.closest?.("#btn-passkey-create")) void register();
+    else if (event.target.closest?.("#btn-passkey-step-up")) void stepUp();
   }, true);
 })();

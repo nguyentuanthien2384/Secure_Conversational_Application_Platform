@@ -183,6 +183,10 @@ class PasskeyAuthenticationVerify(BaseModel):
     credential: dict
 
 
+class PasskeyStepUpVerify(PasskeyAuthenticationVerify):
+    """A WebAuthn assertion bound to the authenticated bearer session."""
+
+
 class PasskeyResponse(BaseModel):
     id: str
     name: str

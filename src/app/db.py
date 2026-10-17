@@ -354,6 +354,65 @@ class Database:
                     )
                 )
 
+        self._upgrade_passkey_step_up()
+
+    def _upgrade_passkey_step_up(self) -> None:
+        """Keep short-lived ceremonies while adding exact-session step-up binding."""
+        inspector = inspect(self.engine)
+        columns = {column["name"] for column in inspector.get_columns("webauthn_challenges")}
+        checks = inspector.get_check_constraints("webauthn_challenges")
+        old_purpose = any(
+            check.get("name") == "ck_webauthn_challenge_purpose"
+            and "step_up" not in check.get("sqltext", "")
+            for check in checks
+        )
+        if "auth_session_id" in columns and not old_purpose:
+            return
+        with self.engine.begin() as connection:
+            if self.engine.dialect.name == "sqlite" and old_purpose:
+                # SQLite cannot replace CHECK constraints in place. Explicitly
+                # begin before DDL as its legacy driver otherwise autocommits it.
+                if not connection.connection.driver_connection.in_transaction:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                connection.exec_driver_sql("""
+                    CREATE TABLE webauthn_challenges_step_up_upgrade (
+                        id VARCHAR(36) NOT NULL PRIMARY KEY,
+                        user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+                        auth_session_id VARCHAR(36) REFERENCES auth_sessions(jti) ON DELETE CASCADE,
+                        purpose VARCHAR(16) NOT NULL,
+                        challenge VARCHAR(128) NOT NULL,
+                        expires_at DATETIME NOT NULL,
+                        consumed_at DATETIME,
+                        created_at DATETIME NOT NULL,
+                        CONSTRAINT ck_webauthn_challenge_purpose
+                        CHECK (purpose IN ('register', 'authenticate', 'step_up'))
+                    )
+                """)
+                source_session = "auth_session_id" if "auth_session_id" in columns else "NULL"
+                connection.exec_driver_sql(
+                    "INSERT INTO webauthn_challenges_step_up_upgrade "
+                    "(id, user_id, auth_session_id, purpose, challenge, expires_at, consumed_at, created_at) "
+                    "SELECT id, user_id, " + source_session + ", purpose, challenge, expires_at, consumed_at, created_at "
+                    "FROM webauthn_challenges"
+                )
+                connection.exec_driver_sql("DROP TABLE webauthn_challenges")
+                connection.exec_driver_sql("ALTER TABLE webauthn_challenges_step_up_upgrade RENAME TO webauthn_challenges")
+                connection.exec_driver_sql("CREATE INDEX ix_webauthn_challenges_user_id ON webauthn_challenges(user_id)")
+            else:
+                if "auth_session_id" not in columns:
+                    connection.execute(text(
+                        "ALTER TABLE webauthn_challenges ADD COLUMN auth_session_id VARCHAR(36) "
+                        "REFERENCES auth_sessions(jti) ON DELETE CASCADE"
+                    ))
+                if old_purpose:
+                    connection.execute(text(
+                        "ALTER TABLE webauthn_challenges DROP CONSTRAINT ck_webauthn_challenge_purpose"
+                    ))
+                    connection.execute(text(
+                        "ALTER TABLE webauthn_challenges ADD CONSTRAINT ck_webauthn_challenge_purpose "
+                        "CHECK (purpose IN ('register', 'authenticate', 'step_up'))"
+                    ))
+
     def assert_schema_ready(self) -> None:
         """Fail closed when the runtime account sees an incomplete schema.
 
@@ -400,6 +459,7 @@ class Database:
                 "encryption_scheme",
             },
             "e2ee_envelopes": {"replay_key"},
+            "webauthn_challenges": {"auth_session_id"},
             "intrusion_detections": {"payload_json"},
             "intrusion_sources": {"score_times_json", "last_seen_at", "blocked_until"},
         }

@@ -128,10 +128,14 @@ class PasskeyService:
 
     # ── challenges ──────────────────────────────────────────────────────────
 
-    def _new_challenge(self, db: Session, purpose: str, user_id: str | None, now: datetime) -> tuple[str, bytes]:
+    def _new_challenge(
+        self, db: Session, purpose: str, user_id: str | None, now: datetime,
+        *, auth_session_id: str | None = None,
+    ) -> tuple[str, bytes]:
         challenge = secrets.token_bytes(32)
         row = WebAuthnChallenge(
             user_id=user_id,
+            auth_session_id=auth_session_id,
             purpose=purpose,
             challenge=bytes_to_base64url(challenge),
             expires_at=now + timedelta(seconds=CHALLENGE_SECONDS),
@@ -141,15 +145,20 @@ class PasskeyService:
         return row.id, challenge
 
     def _consume_challenge(
-        self, db: Session, challenge_id: str, purpose: str, user_id: str | None, now: datetime
+        self, db: Session, challenge_id: str, purpose: str, user_id: str | None, now: datetime,
+        *, auth_session_id: str | None = None,
     ) -> bytes:
         row = db.get(WebAuthnChallenge, challenge_id) if isinstance(challenge_id, str) else None
-        if row is None or row.purpose != purpose or row.user_id != user_id:
+        if (row is None or row.purpose != purpose or row.user_id != user_id
+                or row.auth_session_id != auth_session_id):
             raise PasskeyError("unknown_challenge")
         consumed = db.execute(
             update(WebAuthnChallenge)
             .where(
                 WebAuthnChallenge.id == challenge_id,
+                WebAuthnChallenge.purpose == purpose,
+                WebAuthnChallenge.user_id == user_id,
+                WebAuthnChallenge.auth_session_id == auth_session_id,
                 WebAuthnChallenge.consumed_at.is_(None),
                 WebAuthnChallenge.expires_at > now,
             )
@@ -255,11 +264,61 @@ class PasskeyService:
         self, db: Session, *, challenge_id: str, credential: Any, now: datetime
     ) -> WebAuthnCredential:
         challenge = self._consume_challenge(db, challenge_id, "authenticate", None, now)
+        return self._verify_assertion(db, challenge=challenge, credential=credential, now=now)
+
+    # ── session-bound step-up ───────────────────────────────────────────────
+
+    def step_up_options(
+        self, db: Session, *, user_id: str, auth_session_id: str, now: datetime,
+    ) -> CeremonyOptions:
+        """Only this account's keys can reauthenticate this exact bearer.
+
+        Callers hold User -> AuthSession locks throughout the ceremony setup.
+        The browser gets public options, never the session identifier or token.
+        """
+        existing = list(db.scalars(select(WebAuthnCredential).where(
+            WebAuthnCredential.user_id == user_id,
+        ).order_by(WebAuthnCredential.created_at, WebAuthnCredential.id)))
+        if not existing:
+            raise PasskeyError("no_passkeys", user_id)
+        challenge_id, challenge = self._new_challenge(
+            db, "step_up", user_id, now, auth_session_id=auth_session_id,
+        )
+        options = generate_authentication_options(
+            rp_id=self.rp_id, challenge=challenge, timeout=CHALLENGE_SECONDS * 1000,
+            user_verification=UserVerificationRequirement.REQUIRED,
+            allow_credentials=[PublicKeyCredentialDescriptor(
+                id=base64url_to_bytes(item.credential_id),
+            ) for item in existing],
+        )
+        return CeremonyOptions(challenge_id, json.loads(options_to_json(options)))
+
+    def verify_step_up(
+        self, db: Session, *, user_id: str, auth_session_id: str,
+        challenge_id: str, credential: Any, now: datetime,
+    ) -> WebAuthnCredential:
+        challenge = self._consume_challenge(
+            db, challenge_id, "step_up", user_id, now, auth_session_id=auth_session_id,
+        )
+        return self._verify_assertion(
+            db, challenge=challenge, credential=credential, now=now,
+            expected_user_id=user_id,
+        )
+
+    def _verify_assertion(
+        self, db: Session, *, challenge: bytes, credential: Any, now: datetime,
+        expected_user_id: str | None = None,
+    ) -> WebAuthnCredential:
         payload = _parse_credential(credential)
         raw_id = payload.get("rawId") or payload.get("id")
         if not isinstance(raw_id, str) or len(raw_id) > 1400:
             raise PasskeyError("malformed_credential")
-        stored = db.scalar(select(WebAuthnCredential).where(WebAuthnCredential.credential_id == raw_id))
+        statement = select(WebAuthnCredential).where(WebAuthnCredential.credential_id == raw_id)
+        if expected_user_id is not None:
+            # Lock order: User -> AuthSession -> credential. Re-read the counter
+            # after waiting, including when a Session already cached this row.
+            statement = statement.where(WebAuthnCredential.user_id == expected_user_id).with_for_update()
+        stored = db.scalar(statement.execution_options(populate_existing=True))
         if stored is None:
             raise PasskeyError("unknown_credential")
         user_handle = payload.get("response", {}).get("userHandle")

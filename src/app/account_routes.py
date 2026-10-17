@@ -39,9 +39,11 @@ from src.app.schemas import (
     PasskeyCeremonyResponse,
     PasskeyRegistrationVerify,
     PasskeyResponse,
+    PasskeyStepUpVerify,
     PasswordResetConfirm,
     PasswordResetRequest,
     RecoveryCodeRequest,
+    StepUpResponse,
     TokenResponse,
 )
 from src.app.security import PasswordService
@@ -405,6 +407,55 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
         return Response(status_code=204)
 
     # ───────────────────────── passkeys ─────────────────────────
+
+    @app.post("/api/auth/passkeys/step-up/options", response_model=PasskeyCeremonyResponse)
+    def passkey_step_up_options(
+        request: Request, credentials: Credentials, user: CurrentUser, db: DB,
+    ):
+        throttle(db, request, f"passkey-step-up:{user.id}", 10, 300, "auth.step_up", user.id)
+        auth_session = ctx.lock_account_mutation(credentials, user, db)
+        try:
+            options = ctx.passkeys.step_up_options(
+                db, user_id=user.id, auth_session_id=auth_session.jti, now=utcnow(),
+            )
+        except PasskeyError as exc:
+            raise HTTPException(
+                status_code=409, detail="Tài khoản chưa đăng ký passkey; hãy xác thực lại bằng mật khẩu/MFA.",
+            ) from exc
+        db.commit()
+        return PasskeyCeremonyResponse(challenge_id=options.challenge_id, public_key=options.public_key)
+
+    @app.post("/api/auth/passkeys/step-up/verify", response_model=StepUpResponse)
+    def passkey_step_up_verify(
+        payload: PasskeyStepUpVerify, request: Request,
+        credentials: Credentials, user: CurrentUser, db: DB,
+    ):
+        throttle(db, request, f"passkey-step-up-verify:{user.id}", 10, 300, "auth.step_up", user.id)
+        # current_user committed activity before entering this handler. Logout,
+        # suspension or refresh in between must invalidate this exact request.
+        auth_session = ctx.lock_account_mutation(credentials, user, db)
+        verified_at = utcnow()
+        try:
+            credential = ctx.passkeys.verify_step_up(
+                db, user_id=user.id, auth_session_id=auth_session.jti,
+                challenge_id=payload.challenge_id, credential=payload.credential, now=verified_at,
+            )
+        except PasskeyError as exc:
+            # Consume a failed proof together with its required audit. If audit
+            # persistence fails, neither challenge nor step-up state can commit.
+            record_audit(
+                db, request, "auth.step_up", actor_id=user.id, outcome="failure",
+                target_type="auth_session", target_id=auth_session.jti,
+                details={"method": "passkey", "reason": exc.reason},
+            )
+            raise HTTPException(status_code=401, detail="Không xác thực được passkey.") from exc
+        auth_session.last_step_up_at = verified_at
+        record_audit(
+            db, request, "auth.step_up", actor_id=user.id,
+            target_type="auth_session", target_id=auth_session.jti,
+            details={"method": "passkey", "passkey": credential.id},
+        )
+        return StepUpResponse(verified_at=verified_at, valid_for_seconds=settings.step_up_minutes * 60)
 
     @app.get("/api/auth/passkeys", response_model=list[PasskeyResponse])
     def list_passkeys(user: CurrentUser, db: DB):
