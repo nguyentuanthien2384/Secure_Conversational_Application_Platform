@@ -56,6 +56,7 @@ ACCOUNT_EVENT_LABELS: dict[str, str] = {
     "auth.mfa.verify": "Xác minh 2FA khi đăng nhập",
     "auth.passkey.login": "Đăng nhập bằng passkey",
     NEW_DEVICE_EVENT: "Đăng nhập từ thiết bị mới",
+    "auth.login.impossible_travel": "Đăng nhập xa bất thường — vị trí IP ước lượng",
     TOKEN_REUSE_EVENT: "Token cũ bị dùng lại — đã đăng xuất thiết bị đó",
     "auth.mfa.enabled": "Bật xác thực hai lớp",
     "auth.mfa.disable": "Yêu cầu tắt xác thực hai lớp",
@@ -265,7 +266,7 @@ def _as_utc(value: datetime) -> datetime:
 def _severity(event: AuditEvent, by_administrator: bool) -> str:
     if event.event_type == TOKEN_REUSE_EVENT:
         return "critical"
-    if event.event_type in (NEW_DEVICE_EVENT, "auth.password_reset", "account.email.remove") or (
+    if event.event_type in (NEW_DEVICE_EVENT, "auth.login.impossible_travel", "auth.password_reset", "account.email.remove") or (
         by_administrator
     ):
         return "warning"

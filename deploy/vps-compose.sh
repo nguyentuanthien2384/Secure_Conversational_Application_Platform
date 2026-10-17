@@ -16,4 +16,8 @@ mode=$({ grep -m1 '^SCAP_EDGE_MODE=' deploy/.env.vps || true; } | cut -d= -f2-)
 if [ "$mode" = shared-proxy ]; then
   files+=(-f docker-compose.shared-proxy.yml)
 fi
+security_files=$({ grep -m1 '^SCAP_SECURITY_FILES_DIR=' deploy/.env.vps || true; } | cut -d= -f2-)
+if [ -n "$security_files" ]; then
+  files+=(-f docker-compose.security-channels.yml)
+fi
 exec docker compose --env-file deploy/.env.vps -p scap-vps-demo "${files[@]}" "$@"

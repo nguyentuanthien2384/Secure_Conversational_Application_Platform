@@ -36,6 +36,7 @@ _HEAD_ASSETS = (
     "/api/ui-session/bridge.js",
     "/api/ui-session/login-credentials.js",
     "/api/ui-session/passkey.js",
+    "/api/ui-session/security-push.js",
 )
 
 

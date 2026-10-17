@@ -12,7 +12,9 @@ from dotenv import load_dotenv
 from sqlalchemy.engine import make_url
 
 from src.app.host_security import effective_allowed_hosts, normalize_allowed_hosts
+from src.app.notification_config import NotificationSettings
 from src.app.secret_files import SecretFileTooLarge, read_secret_text
+from src.app.sign_in_risk import SignInRiskSettings
 
 AVAILABILITY_ENV_LIMITS = {
     "REQUEST_MAX_CONCURRENT": (32, 1, 512),
@@ -289,6 +291,8 @@ class Settings:
     token_reuse_grace_seconds: int = 30
     # Lifetime of the signed browser-recognition cookie (OWASP device cookies).
     device_token_days: int = 365
+    sign_in_risk: SignInRiskSettings = field(default_factory=SignInRiskSettings)
+    notification_settings: NotificationSettings = field(default_factory=NotificationSettings)
     # Security email. Direct construction (tests) defaults to disabled;
     # from_env() defaults to a local outbox outside production.
     mail_backend: str = "disabled"
@@ -690,6 +694,8 @@ class Settings:
         return cls(
             **availability_limits,
             environment=environment,
+            sign_in_risk=SignInRiskSettings.from_env(),
+            notification_settings=NotificationSettings.from_env(environment=environment),
             database_url=database_url,
             secret_key=secret_key,
             master_encryption_key=master_key,

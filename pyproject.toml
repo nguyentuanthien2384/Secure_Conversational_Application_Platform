@@ -30,6 +30,8 @@ dependencies = [
 aws-kms = ["boto3>=1.40.0,<2.0.0"]
 gcp-kms = ["google-cloud-kms>=3.5.0,<4.0.0"]
 e2ee-client = ["httpx>=0.28.1,<1.0.0", "vodozemac==0.10.0"]
+geoip = ["maxminddb>=3.2.0,<4.0.0"]
+web-push = ["pywebpush>=2.0.0,<3.0.0"]
 
 [dependency-groups]
 dev = [

@@ -505,7 +505,6 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
                 credential=payload.credential, name=name, now=utcnow(),
             )
         except PasskeyError as exc:
-            db.commit()  # the challenge stays consumed
             record_audit(
                 db, request, "auth.passkey.add", actor_id=user.id, outcome="failure",
                 details={"reason": exc.reason},
@@ -556,20 +555,25 @@ def register_account_routes(app: FastAPI, ctx: AccountRouteContext) -> None:
         ip = client_ip(request)
         throttle(db, request, f"passkey-auth-verify:ip:{ip}", 10, 300, "auth.passkey.login")
         denied = HTTPException(status_code=401, detail="Không xác thực được passkey.")
+        # Locate the candidate without trusting it, then serialize with account
+        # suspension, passkey removal and step-up before locking the credential.
+        # Verifying first would allow concurrent counter updates to move back.
+        candidate_id = ctx.passkeys.authentication_user_id(db, payload.credential)
+        user = db.get(User, candidate_id) if candidate_id else None
+        if user is not None:
+            user = ctx.lock_user_row(db, user, require_active=False)
         try:
             row = ctx.passkeys.verify_authentication(
-                db, challenge_id=payload.challenge_id, credential=payload.credential, now=utcnow()
+                db, challenge_id=payload.challenge_id, credential=payload.credential, now=utcnow(),
+                expected_user_id=user.id if user is not None else None,
             )
         except PasskeyError as exc:
-            db.commit()  # the challenge stays consumed
             record_audit(
                 db, request, "auth.passkey.login", actor_id=exc.user_id, outcome="failure",
                 details={"reason": exc.reason},
             )
             raise denied from exc
-        user = db.get(User, row.user_id)
         if user is None or not user.is_active:
-            db.commit()
             record_audit(
                 db, request, "auth.passkey.login", actor_id=row.user_id, outcome="denied",
                 details={"reason": "inactive_account"},

@@ -31,9 +31,9 @@ COPY pyproject.toml uv.lock README.md ./
 # uv chỉ cần lúc build; runtime gọi thẳng /app/.venv/bin. Gỡ nó khỏi image cuối
 # để bản Rust nhúng trong uv không thành bề mặt tấn công/lỗ hổng bị quét thấy.
 RUN case "$KMS_PROFILE" in \
-        local|vault) uv sync --no-dev --frozen ;; \
-        aws-kms) uv sync --no-dev --frozen --extra aws-kms ;; \
-        gcp-kms) uv sync --no-dev --frozen --extra gcp-kms ;; \
+        local|vault) uv sync --no-dev --frozen --extra geoip --extra web-push ;; \
+        aws-kms) uv sync --no-dev --frozen --extra aws-kms --extra geoip --extra web-push ;; \
+        gcp-kms) uv sync --no-dev --frozen --extra gcp-kms --extra geoip --extra web-push ;; \
         *) echo >&2 'KMS_PROFILE must be local, vault, aws-kms, or gcp-kms'; exit 1 ;; \
     esac \
     && pip uninstall --yes uv

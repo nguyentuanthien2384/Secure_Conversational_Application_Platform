@@ -128,7 +128,9 @@ CUSTOM_CSS = """
 
 footer { display: none !important; }
 #session-bridge, #login-ready, #passkey-bridge, #passkey-result,
-#btn-passkey-login-done, #btn-passkey-register-done { display: none !important; }
+#btn-passkey-login-done, #btn-passkey-register-done,
+#btn-passkey-step-up-done { display: none !important; }
+#security-push-bridge, #security-push-result, #btn-security-push-done { display: none !important; }
 #scap-session-warning { padding: 12px; color: var(--scap-warn-fg); background: var(--scap-warn-bg); }
 
 /* ── Khung ngoài: một workspace full-width duy nhất cho mọi tab ─────────
@@ -1555,7 +1557,7 @@ _PASSKEY_ERRORS = {
     "NotAllowedError": "Đã hủy hoặc hết thời gian xác nhận passkey trên thiết bị.",
     "InvalidStateError": "Thiết bị này đã có passkey cho tài khoản.",
     "unsupported": "Trình duyệt hoặc thiết bị này không hỗ trợ passkey.",
-    "not_prepared": "Hãy bấm “Thêm passkey” trước.",
+    "not_prepared": "Yêu cầu passkey chưa sẵn sàng; hãy chuẩn bị lại.",
     "http_429": "Thử passkey quá nhiều lần; vui lòng đợi rồi thử lại.",
 }
 
@@ -1593,7 +1595,7 @@ def _passkey_payload(raw, mode):
         return {"error": "not_prepared"}
     try:
         payload = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return {"error": "malformed"}
     if not isinstance(payload, dict) or payload.get("mode") != mode:
         return {"error": "malformed"}
@@ -1845,6 +1847,13 @@ def build_ui(
             "Lưu passkey", elem_id="btn-passkey-register-done"
         )
         st_passkey = gr.State({})
+        btn_passkey_step_up_done = gr.Button("Hoàn tất xác thực lại", elem_id="btn-passkey-step-up-done")
+        st_passkey_step_up = gr.State({})
+        push_bridge = _static_html("", elem_id="security-push-bridge")
+        tb_push_result = gr.Textbox(label="Kết quả đăng ký Push", elem_id="security-push-result", container=False)
+        btn_push_done = gr.Button("Lưu đăng ký Push", elem_id="btn-security-push-done")
+        st_push = gr.State({})
+        st_phone_proof = gr.State({})
         # Đã hiện cảnh báo "sắp hết phiên" chưa — để chỉ nhắc một lần cho mỗi
         # phiên thay vì ở mọi lần tick trong suốt hai phút cuối.
         st_warned = gr.State(False)
@@ -2338,6 +2347,12 @@ def build_ui(
                                 type="password", max_length=128,
                             )
                             tb_acct_code = gr.Textbox(label="Mã 2FA (nếu đã bật)", max_length=32)
+                        btn_passkey_step_up_prepare = gr.Button("Xác thực lại bằng passkey", size="sm")
+                        md_passkey_step_up_hint = gr.Markdown("", visible=False)
+                        btn_passkey_step_up = gr.Button(
+                            "Xác nhận passkey trên thiết bị", elem_id="btn-passkey-step-up",
+                            visible=False, size="sm", variant="primary",
+                        )
                         md_email_state = gr.Markdown(EMAIL_PLACEHOLDER)
                         with gr.Row():
                             tb_email_new = gr.Textbox(
@@ -2377,6 +2392,30 @@ def build_ui(
                             btn_passkey_remove = gr.Button(
                                 "Xóa passkey", size="sm", variant="stop", scale=1
                             )
+                    with gr.Accordion("Thông báo bảo mật qua Push / SMS", open=False):
+                        gr.Markdown(
+                            "Đăng ký nhận cảnh báo khi tài khoản có thay đổi nhạy cảm. "
+                            "Push cần quyền thông báo của trình duyệt; SMS cần xác minh số điện thoại "
+                            "và có thể phát sinh phí nhà cung cấp. Các kênh này không dùng để đăng nhập hoặc khôi phục mật khẩu."
+                        )
+                        md_notifications = gr.Markdown("Bấm **Làm mới kênh thông báo** để kiểm tra cấu hình.")
+                        btn_notifications_refresh = gr.Button("Làm mới kênh thông báo", size="sm")
+                        btn_push_prepare = gr.Button("Chuẩn bị bật Push trên trình duyệt này", size="sm")
+                        gr.Markdown(
+                            "Nếu trình duyệt còn đăng ký Push với tài khoản khác, gỡ đăng ký trên "
+                            "trình duyệt này rồi chuẩn bị bật Push lại cho tài khoản hiện tại."
+                        )
+                        btn_push_local_remove = gr.Button("Gỡ đăng ký Push trên trình duyệt này", size="sm")
+                        btn_push_enable = gr.Button("Cho phép và bật thông báo Push", visible=False,
+                                                    elem_id="btn-security-push-enable", size="sm")
+                        btn_push_disable = gr.Button("Tắt Push của tài khoản trên mọi trình duyệt", size="sm")
+                        with gr.Row():
+                            tb_alert_phone = gr.Textbox(label="Số điện thoại quốc tế (ví dụ +84…)", max_length=16)
+                            btn_phone_request = gr.Button("Gửi mã xác minh số điện thoại", size="sm")
+                        with gr.Row():
+                            tb_alert_code = gr.Textbox(label="Mã 8 số nhận qua SMS", max_length=8)
+                            btn_phone_verify = gr.Button("Xác minh và bật SMS", size="sm")
+                        btn_phone_remove = gr.Button("Tắt SMS và gỡ số điện thoại", size="sm")
                     with gr.Accordion("Hoạt động bảo mật gần đây", open=True):
                         md_activity = gr.Markdown(ACTIVITY_PLACEHOLDER)
                         df_activity = _data_table(ACTIVITY_HEADERS, elem_id="activity-table")
@@ -2385,6 +2424,8 @@ def build_ui(
                             "Thao tác của quản trị viên được ghi nhận nhưng ẩn địa chỉ của họ."
                         )
                         btn_activity_refresh = gr.Button("Làm mới hoạt động", size="sm")
+                        md_geoip_status = gr.Markdown("")
+                        btn_geoip_status = gr.Button("Kiểm tra đánh giá vị trí đăng nhập", size="sm")
 
                 # ---------- QUẢN TRỊ ----------
                 with gr.Tab("Quản trị", visible=False) as adm_tab:
@@ -2654,6 +2695,14 @@ def build_ui(
             (passkey_bridge, ""),
             (tb_passkey_result, ""),
             (st_passkey, {}),
+            (st_passkey_step_up, {}),
+            (md_passkey_step_up_hint, gr.update(value="", visible=False)),
+            (btn_passkey_step_up, gr.update(visible=False)),
+            (md_geoip_status, ""),
+            (push_bridge, ""), (tb_push_result, ""), (st_push, {}), (st_phone_proof, {}),
+            (btn_push_enable, gr.update(visible=False)),
+            (md_notifications, "Bấm **Làm mới kênh thông báo** để kiểm tra cấu hình."),
+            (tb_alert_phone, ""), (tb_alert_code, ""),
             (md_passkey_hint, gr.update(value="", visible=False)),
             (btn_passkey_create, gr.update(visible=False)),
             (df_passkeys, _table_html(PASSKEY_HEADERS, [])),
@@ -3895,6 +3944,182 @@ def build_ui(
             _guard(remove_email, 3), [st_token, tb_acct_pw, tb_acct_code],
             [md_email_state, tb_acct_pw, tb_acct_code],
         )
+
+        def prepare_passkey_step_up(token):
+            options = _api(token, "POST", "/api/auth/passkeys/step-up/options")
+            nonce = secrets.token_hex(16)
+            encoded = base64.urlsafe_b64encode(json.dumps(
+                options["public_key"], separators=(",", ":"),
+            ).encode()).decode("ascii").rstrip("=")
+            markup = (
+                f'<span data-scap-passkey-request="{nonce}" data-scap-passkey-mode="step-up" '
+                f'data-scap-passkey-options="{encoded}"></span>'
+            )
+            state = {"challenge_id": options["challenge_id"], "nonce": nonce, "account": _token_digest(token)}
+            return (markup, state, gr.update(value=(
+                "Bấm **Xác nhận passkey trên thiết bị** và xác minh bằng PIN/vân tay. "
+                "Yêu cầu gắn với phiên hiện tại, có hạn 3 phút và chỉ được thử một lần."
+            ), visible=True), gr.update(visible=True), "", "", "")
+
+        btn_passkey_step_up_prepare.click(
+            _guard(prepare_passkey_step_up, 7), [st_token],
+            [passkey_bridge, st_passkey_step_up, md_passkey_step_up_hint, btn_passkey_step_up,
+             tb_passkey_result, tb_acct_pw, tb_acct_code], api_name=False,
+        )
+
+        def finish_passkey_step_up(token, result, state):
+            payload = _passkey_payload(result, "step-up")
+            closed = ("", {}, gr.update(value="", visible=False), gr.update(visible=False), "")
+            if (not state or state.get("account") != _token_digest(token)
+                    or payload.get("nonce") != state.get("nonce")):
+                _ui_notice(gr.Warning, "Yêu cầu xác thực lại đã hết hạn; hãy chuẩn bị passkey lại.")
+                return closed
+            if "error" in payload:
+                _ui_notice(gr.Warning, _passkey_error_message(payload))
+                return closed
+            try:
+                _api(token, "POST", "/api/auth/passkeys/step-up/verify", {
+                    "challenge_id": state["challenge_id"], "credential": payload.get("credential"),
+                })
+            except gr.Error:
+                _ui_notice(gr.Warning, "Passkey chưa được chấp nhận. Hãy chuẩn bị yêu cầu mới để thử lại.")
+                return closed
+            _ui_notice(gr.Info, "Đã xác thực lại bằng passkey. Bạn có thể thực hiện lại thao tác nhạy cảm.")
+            return closed
+
+        btn_passkey_step_up_done.click(
+            _guard(finish_passkey_step_up, 5), [st_token, tb_passkey_result, st_passkey_step_up],
+            [passkey_bridge, st_passkey_step_up, md_passkey_step_up_hint, btn_passkey_step_up,
+             tb_passkey_result], api_name=False,
+        )
+
+        def load_geoip_status(token):
+            status = _api(token, "GET", "/api/auth/sign-in-risk/status")
+            if status.get("backend") == "disabled":
+                return "GeoIP đang tắt. Cần cấu hình cơ sở dữ liệu City cục bộ để đánh giá vị trí."
+            if not status.get("available"):
+                return "GeoIP hiện không khả dụng; chưa thể kết luận về vị trí đăng nhập."
+            return ("GeoIP dùng cơ sở dữ liệu cục bộ. Cảnh báo chỉ dựa trên vị trí IP ước lượng, "
+                    "có thể sai khi dùng VPN và không tự khóa tài khoản.")
+
+        btn_geoip_status.click(_guard(load_geoip_status, 1), [st_token], [md_geoip_status], api_name=False)
+
+        def notification_markdown(status):
+            labels = {"disabled": "Đang tắt", "outbox": "Demo outbox — chưa gửi ra dịch vụ thật",
+                      "webpush": "Web Push đã cấu hình", "twilio": "SMS đã cấu hình"}
+            push, sms = status.get("push", {}), status.get("sms", {})
+            phone = sms.get("phone") or "Chưa có số đã xác minh"
+            if not re.fullmatch(r"[•*]{4}[0-9]{4}", phone):
+                phone = "Chưa có số đã xác minh"
+            count = len(push.get("subscriptions", []))
+            return (f"**Push:** {labels.get(push.get('mode'), 'Chưa xác định')} · {count} đăng ký.\n\n"
+                    f"**SMS:** {labels.get(sms.get('mode'), 'Chưa xác định')} · {phone}.")
+
+        def notifications_snapshot(token):
+            return notification_markdown(_api(token, "GET", "/api/auth/notifications/status"))
+
+        btn_notifications_refresh.click(_guard(notifications_snapshot, 1), [st_token], [md_notifications], api_name=False)
+
+        def prepare_push(token):
+            status = _api(token, "GET", "/api/auth/notifications/status")
+            key = status.get("push", {}).get("application_server_key") or ""
+            if not status.get("push", {}).get("available") or not re.fullmatch(r"[A-Za-z0-9_-]{87}", key):
+                raise gr.Error("Web Push chưa được cấu hình. Hãy kiểm tra trạng thái kênh thông báo.")
+            nonce = secrets.token_hex(16)
+            marker = (f'<span data-scap-push-request="{nonce}" data-scap-push-key="{key}" '
+                      'data-scap-push-action="subscribe"></span>')
+            return (marker, {"nonce": nonce, "account": _token_digest(token), "action": "subscribe"},
+                    gr.update(value="Cho phép và bật thông báo Push", visible=True), "", notification_markdown(status))
+
+        btn_push_prepare.click(_guard(prepare_push, 5), [st_token],
+                               [push_bridge, st_push, btn_push_enable, tb_push_result, md_notifications], api_name=False)
+
+        def prepare_push_local_remove(token):
+            nonce = secrets.token_hex(16)
+            marker = (f'<span data-scap-push-request="{nonce}" '
+                      'data-scap-push-action="unsubscribe_browser"></span>')
+            return (marker, {"nonce": nonce, "account": _token_digest(token), "action": "unsubscribe_browser"},
+                    gr.update(value="Xác nhận gỡ Push trên trình duyệt này", visible=True), "",
+                    "Bấm **Xác nhận gỡ Push trên trình duyệt này** để dừng nhận Push trên trình duyệt này. "
+                    "Sau đó bạn có thể chuẩn bị bật Push cho tài khoản hiện tại.")
+
+        btn_push_local_remove.click(_guard(prepare_push_local_remove, 5), [st_token],
+                                    [push_bridge, st_push, btn_push_enable, tb_push_result, md_notifications], api_name=False)
+
+        def finish_push(token, raw, state, password, code):
+            closed = ("", {}, gr.update(value="Cho phép và bật thông báo Push", visible=False), "", "", "")
+            try:
+                payload = json.loads(raw) if isinstance(raw, str) and len(raw) <= 8000 else {}
+            except (ValueError, RecursionError):
+                payload = {}
+            if (not isinstance(payload, dict) or not state or state.get("account") != _token_digest(token)
+                    or payload.get("nonce") != state.get("nonce")):
+                _ui_notice(gr.Warning, "Yêu cầu Push đã hết hạn; hãy chuẩn bị lại.")
+                return closed + (gr.skip(),)
+            if "error" in payload:
+                _ui_notice(gr.Warning, "Chưa hoàn tất được yêu cầu Push. Kiểm tra HTTPS và quyền thông báo trên trình duyệt.")
+                return closed + (gr.skip(),)
+            if state.get("action") == "unsubscribe_browser":
+                if (payload.get("action") != "unsubscribe_browser"
+                        or payload.get("status") not in ("removed", "absent")):
+                    _ui_notice(gr.Warning, "Chưa xác nhận được việc gỡ Push. Hãy chuẩn bị yêu cầu mới.")
+                    return closed + (gr.skip(),)
+                _ui_notice(gr.Info, "Trình duyệt đã gỡ đăng ký Push. Bạn có thể chuẩn bị bật Push cho tài khoản hiện tại.")
+                return closed + ("Đã gỡ đăng ký Push trên trình duyệt này. Bấm **Chuẩn bị bật Push trên trình duyệt này** để đăng ký lại.",)
+            if payload.get("action") == "unsubscribe_browser":
+                _ui_notice(gr.Warning, "Yêu cầu Push không khớp; hãy chuẩn bị lại.")
+                return closed + (gr.skip(),)
+            try:
+                _with_step_up(token, password, code,
+                              lambda: _api(token, "POST", "/api/auth/notifications/push", payload.get("subscription")), "Bật Push")
+            except gr.Error as error:
+                if getattr(error, "status_code", None) != 409:
+                    raise
+                _ui_notice(gr.Warning,
+                           "Đăng ký Push bị trùng hoặc đã đạt giới hạn. Nếu trình duyệt đang gắn tài khoản khác, "
+                           "hãy bấm “Gỡ đăng ký Push trên trình duyệt này”, xác nhận rồi chuẩn bị bật Push lại.")
+                return closed + (gr.skip(),)
+            _ui_notice(gr.Info, "Đã lưu đăng ký Push. Xem trạng thái kênh để phân biệt demo và dịch vụ thật.")
+            return closed + (notifications_snapshot(token),)
+
+        btn_push_done.click(_guard(finish_push, 7), [st_token, tb_push_result, st_push, tb_acct_pw, tb_acct_code],
+                            [push_bridge, st_push, btn_push_enable, tb_push_result, tb_acct_pw, tb_acct_code,
+                             md_notifications], api_name=False)
+
+        def disable_push(token, password, code):
+            _with_step_up(token, password, code, lambda: _api(token, "DELETE", "/api/auth/notifications/push"), "Tắt Push")
+            return notifications_snapshot(token), "", ""
+
+        btn_push_disable.click(_guard(disable_push, 3), [st_token, tb_acct_pw, tb_acct_code],
+                               [md_notifications, tb_acct_pw, tb_acct_code], api_name=False)
+
+        def request_phone(token, phone, password, code):
+            response = _with_step_up(token, password, code,
+                                     lambda: _api(token, "POST", "/api/auth/notifications/phone/request", {"phone": (phone or "").strip()}),
+                                     "Gửi mã xác minh số điện thoại")
+            delivery = "Mã được ghi vào outbox demo, chưa gửi SMS thật." if response.get("delivery") == "demo_outbox" else "Nhà cung cấp đã chấp nhận yêu cầu gửi mã."
+            return (notifications_snapshot(token) + "\n\n" + delivery,
+                    {"challenge_id": response["challenge_id"], "account": _token_digest(token)}, "", "", "")
+
+        btn_phone_request.click(_guard(request_phone, 5), [st_token, tb_alert_phone, tb_acct_pw, tb_acct_code],
+                                [md_notifications, st_phone_proof, tb_alert_code, tb_acct_pw, tb_acct_code], api_name=False)
+
+        def verify_phone(token, proof, state):
+            if not state or state.get("account") != _token_digest(token):
+                raise gr.Error("Yêu cầu xác minh đã hết hạn; hãy gửi mã mới.")
+            response = _api(token, "POST", "/api/auth/notifications/phone/verify",
+                            {"challenge_id": state["challenge_id"], "code": (proof or "").strip()})
+            return notification_markdown(response), {}, "", ""
+
+        btn_phone_verify.click(_guard(verify_phone, 4), [st_token, tb_alert_code, st_phone_proof],
+                               [md_notifications, st_phone_proof, tb_alert_code, tb_alert_phone], api_name=False)
+
+        def remove_phone(token, password, code):
+            _with_step_up(token, password, code, lambda: _api(token, "DELETE", "/api/auth/notifications/phone"), "Tắt SMS")
+            return notifications_snapshot(token), {}, "", "", "", ""
+
+        btn_phone_remove.click(_guard(remove_phone, 6), [st_token, tb_acct_pw, tb_acct_code],
+                               [md_notifications, st_phone_proof, tb_alert_phone, tb_alert_code, tb_acct_pw, tb_acct_code], api_name=False)
 
         # ---- passkey: thêm / xóa ----
         def prepare_passkey(token, name, password, code):

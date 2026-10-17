@@ -36,6 +36,9 @@ if [ -f scap-deploy.tar ]; then
   (umask 022 && tar -xf scap-deploy.tar --no-same-owner)
   chmod -R u=rwX,go=rX docker-compose.yml docker-compose.vps-demo.yml docker-compose.shared-proxy.yml \
     Caddyfile Caddyfile.shared-proxy deploy/shared-proxy-site.caddy scripts src
+  if [ -f docker-compose.security-channels.yml ]; then
+    chmod u=rw,go=r docker-compose.security-channels.yml
+  fi
   rm -f scap-deploy.tar
 fi
 

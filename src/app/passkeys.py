@@ -260,11 +260,36 @@ class PasskeyService:
         )
         return CeremonyOptions(challenge_id, json.loads(options_to_json(options)))
 
+    def authentication_user_id(self, db: Session, credential: Any) -> str | None:
+        """Find the candidate owner to lock; this does not verify an assertion.
+
+        The public credential ID is untrusted. The route must lock that User
+        and pass its ID back to verification, which re-reads the credential.
+        Invalid input still reaches verification so its challenge is consumed.
+        """
+        try:
+            payload = _parse_credential(credential)
+        except PasskeyError:
+            return None
+        raw_id = payload.get("rawId") or payload.get("id")
+        if not isinstance(raw_id, str) or len(raw_id) > 1400:
+            return None
+        return db.scalar(select(WebAuthnCredential.user_id).where(
+            WebAuthnCredential.credential_id == raw_id,
+        ))
+
     def verify_authentication(
-        self, db: Session, *, challenge_id: str, credential: Any, now: datetime
+        self, db: Session, *, challenge_id: str, credential: Any, now: datetime,
+        expected_user_id: str | None,
     ) -> WebAuthnCredential:
         challenge = self._consume_challenge(db, challenge_id, "authenticate", None, now)
-        return self._verify_assertion(db, challenge=challenge, credential=credential, now=now)
+        if expected_user_id is None:
+            _parse_credential(credential)
+            raise PasskeyError("unknown_credential")
+        return self._verify_assertion(
+            db, challenge=challenge, credential=credential, now=now,
+            expected_user_id=expected_user_id,
+        )
 
     # ── session-bound step-up ───────────────────────────────────────────────
 

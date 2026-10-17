@@ -113,6 +113,7 @@ from src.app.models import (
     SecureMessage,
     User,
 )
+from src.app.notification_routes import NotificationRouteContext, register_notification_routes
 from src.app.passkeys import PasskeyService
 from src.app.request_limits import RequestLimitsMiddleware
 from src.app.retention import enforce_retention
@@ -168,6 +169,7 @@ from src.app.security import (
     TotpService,
     generate_recovery_code,
 )
+from src.app.security_notifications import SecurityNotifications
 from src.app.services import (
     AIProviderBusy,
     AIProviderError,
@@ -176,6 +178,7 @@ from src.app.services import (
     DLPPolicyViolation,
 )
 from src.app.siem import configure_siem_logging, emit_security_event
+from src.app.sign_in_risk import TRAVEL_EVENT, SignInRiskService
 from src.app.ui_session import BrowserSessionStore, register_ui_session_routes
 
 logger = logging.getLogger("secure_chat")
@@ -361,6 +364,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         raise ValueError("Security duration and rate-limit settings must be positive integers.")
     database = Database(settings.database_url, runtime_limits=True)
+    if (settings.environment not in {"development", "test"}
+            and "outbox" in {settings.notification_settings.push_backend, settings.notification_settings.sms_backend}):
+        raise ValueError("Notification outbox is restricted to development/test.")
     password_service = BoundedPasswordService(settings.password_max_concurrent)
     availability_monitor = AvailabilityMonitor()
     request_capacity = CapacityBudget(settings.request_max_concurrent)
@@ -372,6 +378,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     token_service = TokenService(settings.secret_key, settings.access_token_minutes)
     crypto_service, key_provider, envelope_crypto_service = _build_crypto_services(settings)
+    sign_in_risk = SignInRiskService(settings.sign_in_risk)
     limiter_type = RedisSlidingWindowRateLimiter if settings.redis_url else SlidingWindowRateLimiter
     limiter_args = (settings.redis_url,) if settings.redis_url else ()
     login_limiter = limiter_type(*limiter_args)
@@ -388,6 +395,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     device_tokens = DeviceTokenService(settings.secret_key, settings.device_token_days)
     mailer = build_mailer(settings)
+    notifications = SecurityNotifications(
+        settings.notification_settings, database.session_factory, envelope_crypto_service,
+        derive_recovery_code_key(settings.secret_key), limiter=recovery_limiter,
+    )
+    mailer.security_notifications = notifications
     passkey_service = PasskeyService(
         settings.webauthn_rp_id, settings.webauthn_rp_name, settings.webauthn_origins
     )
@@ -438,6 +450,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database.assert_schema_ready()
         else:
             database.create_all()
+        notifications.start()
         # A high-security instance must prove both the existing local chain and
         # the external append-only sink before it begins serving requests. The
         # startup event gives a brand-new database a real signed document to
@@ -536,7 +549,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             await maintenance.stop()
+            await anyio.to_thread.run_sync(notifications.close)
             await anyio.to_thread.run_sync(mailer.close)
+            sign_in_risk.close()
             envelope_crypto_service.clear_cache()
             database.engine.dispose()
 
@@ -566,8 +581,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ui_client_context_key = derive_ui_client_context_key(settings.secret_key)
     app.state.ui_client_context_key = ui_client_context_key
     app.state.mailer = mailer
+    app.state.notifications = notifications
     app.state.device_tokens = device_tokens
     app.state.passkeys = passkey_service
+    app.state.sign_in_risk = sign_in_risk
     app.state.audit_checkpoint_service = audit_checkpoint_service
     app.state.security_maintenance = maintenance
     app.state.availability_monitor = availability_monitor
@@ -1667,6 +1684,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         Issues the session and a browser-recognition token, records the
         sign-in with its source classification, and raises new-device alerts.
         """
+        travel = sign_in_risk.assess(db, user.id, ip, utcnow())
         token = issue_access_session(db, request, user, ip, mark_step_up=True)
         device_id = device_id or DeviceTokenService.new_device_id()
         events = [{
@@ -1691,11 +1709,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "known_network": source.known_ip,
                 },
             })
+        if travel is not None:
+            events.append({"event_type": TRAVEL_EVENT, "actor_id": user.id,
+                           "target_type": "user", "target_id": user.id, "details": travel})
         # The factor claim, credential rehash, bearer and both required audit
         # entries commit together. A failed secondary alert must not consume a
         # one-time proof or leave a live bearer the client never received.
         record_audits(db, request, events)
         alert_new_device_sign_in(db, request, user, source)
+        if travel is not None:
+            notify(db, mailer, user_id=user.id, username=user.username,
+                   kind="impossible_travel", ip=ip)
         return TokenResponse(
             access_token=token,
             expires_in=settings.access_token_minutes * 60,
@@ -3069,6 +3093,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 is_current=session.jti == current_jti,
             ))
         return active
+
+    @app.get("/api/auth/sign-in-risk/status")
+    def sign_in_risk_status(user: Annotated[User, Depends(current_user)]):
+        return sign_in_risk.status()
 
     @app.get("/api/auth/security-activity", response_model=SecurityActivityResponse)
     def security_activity(
@@ -5464,6 +5492,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return Response(status_code=204)
 
+    register_notification_routes(app, NotificationRouteContext(
+        get_db=get_db, current_user=current_user, bearer=bearer,
+        lock_account_mutation=lock_account_mutation, limiter=recovery_limiter,
+        notifications=notifications, recovery_key=derive_recovery_code_key(settings.secret_key),
+        crypto=envelope_crypto_service,
+    ))
+
     register_account_routes(
         app,
         AccountRouteContext(
@@ -5555,6 +5590,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             '<script src="/api/ui-session/bridge.js" defer></script>'
             '<script src="/api/ui-session/login-credentials.js" defer></script>'
             '<script src="/api/ui-session/passkey.js" defer></script>'
+            '<script src="/api/ui-session/security-push.js" defer></script>'
         ),
         auth_dependency=gradio_auth_dependency,
         blocked_paths=["/app/.env", "/run/secrets", "/proc", "/sys", "/etc"],

@@ -46,7 +46,7 @@ $RemoteCompose = "bash scap-vps/vps-compose.sh"
 $SshArgs = @("-p", "$Port")
 # Script van hanh dat o ~/scap-vps; cau hinh di trong goi tar.
 $RemoteScripts = @("deploy/remote-deploy.sh", "deploy/vps-compose.sh", "deploy/backup.sh", "deploy/restore.sh")
-$BundleFiles = @("docker-compose.yml", "docker-compose.vps-demo.yml", "docker-compose.shared-proxy.yml",
+$BundleFiles = @("docker-compose.yml", "docker-compose.vps-demo.yml", "docker-compose.shared-proxy.yml", "docker-compose.security-channels.yml",
                  "Caddyfile", "Caddyfile.shared-proxy", "deploy/shared-proxy-site.caddy", "scripts", "src")
 # Image nen duoc ghim theo digest; tag phai khop docs/VPS_DEMO_DEPLOYMENT.md.
 $BaseImages = [ordered]@{
@@ -206,7 +206,7 @@ try {
             if (-not $SkipBuild) { Assert-Docker }
             Assert-LineEndings ($RemoteScripts + @("Caddyfile", "Caddyfile.shared-proxy",
                                   "docker-compose.yml", "docker-compose.vps-demo.yml",
-                                  "docker-compose.shared-proxy.yml", "deploy/shared-proxy-site.caddy",
+                                  "docker-compose.shared-proxy.yml", "docker-compose.security-channels.yml", "deploy/shared-proxy-site.caddy",
                                   "scripts/init_db_roles.sh", "scripts/db_least_privilege.sql"))
 
             Step "Kiem tra deploy/.env.vps"

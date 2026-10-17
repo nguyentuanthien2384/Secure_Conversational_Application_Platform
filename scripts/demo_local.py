@@ -29,6 +29,7 @@ import uvicorn
 from src.app.audit_chain import derive_audit_key
 from src.app.config import Settings
 from src.app.demo_seed import DEMO_PASSPHRASE, DEMO_USERS, seed_demo_data
+from src.app.notification_config import NotificationSettings
 
 
 def demo_settings(directory: Path, port: int) -> Settings:
@@ -51,6 +52,10 @@ def demo_settings(directory: Path, port: int) -> Settings:
         # temporary directory, so the demo needs no mail server.
         mail_backend="outbox",
         mail_outbox_dir=str(directory / "outbox"),
+        notification_settings=NotificationSettings(
+            push_backend="outbox", sms_backend="outbox",
+            outbox_dir=str(directory / "security-notification-outbox"),
+        ),
         # Browsers accept passkeys for a domain, never for an IP address.
         webauthn_rp_id="localhost",
         webauthn_origins=(f"http://localhost:{port}",),
@@ -206,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Dữ liệu mẫu và cảnh báo được dựng cho buổi demo; AI trả lời mô phỏng.")
                 print(f"Passkey cần mở bằng tên miền: http://localhost:{args.port}")
                 print(f"Email xác minh/đặt lại mật khẩu (.eml) được ghi vào: {Path(temporary) / 'outbox'}")
+                print(f"Mã xác minh SMS demo (.eml), chưa gửi thật: {Path(temporary) / 'security-notification-outbox'}")
                 print("Ctrl+C để dừng. Lần chạy tiếp theo tạo dữ liệu mới; dữ liệu hiện có của bạn được giữ nguyên.")
                 config = uvicorn.Config(app, host="127.0.0.1", port=args.port,
                                         access_log=False, proxy_headers=False, log_level="warning", log_config=None,

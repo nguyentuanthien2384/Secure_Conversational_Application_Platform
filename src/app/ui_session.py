@@ -266,6 +266,21 @@ def register_ui_session_routes(
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
+    @app.get("/api/ui-session/security-push.js", include_in_schema=False)
+    def security_push_script():
+        return FileResponse(
+            _PASSKEY_PATH.with_name("security_push.js"), media_type="text/javascript",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/security-push-worker.js", include_in_schema=False)
+    def security_push_worker():
+        return FileResponse(
+            _PASSKEY_PATH.with_name("security_push_worker.js"), media_type="text/javascript",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                     "Service-Worker-Allowed": "/"},
+        )
+
     @app.post("/api/ui-session/attach", include_in_schema=False)
     async def attach(request: Request):
         if denied(request):

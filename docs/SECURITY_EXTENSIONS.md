@@ -1,0 +1,130 @@
+# Passkey step-up, Push/SMS, GeoIP và nhóm MLS
+
+Các phần mở rộng này dùng chung quyền sở hữu, kiểm tra phiên, audit và giới hạn
+tài nguyên của SCAP. Gói local demo dùng dữ liệu tạm; việc bật nhà cung cấp thật
+cần cấu hình riêng và không tự gửi thông báo khi chỉ cài dependency.
+
+## Chạy và kiểm tra local
+
+```powershell
+uv sync --frozen --group dev --all-extras
+uv run --frozen python -m scripts.demo_local --check
+uv run --frozen python -m scripts.demo_local
+```
+
+Trong **Tài khoản**, thêm passkey rồi dùng **Xác thực lại bằng passkey**. Chuẩn
+bị yêu cầu trước, bấm xác nhận trên thiết bị sau để giữ yêu cầu có thao tác trực
+tiếp của người dùng. Dùng `http://localhost:8000` cho WebAuthn, hoặc HTTPS với
+đúng RP ID/origin đã cấu hình. Passkey phải thực hiện xác minh người dùng (UV).
+
+**Thông báo bảo mật qua Push / SMS** cho biết từng kênh đang tắt, dùng outbox
+hay có nhà cung cấp. Launcher demo bật outbox: mã xác minh SMS nằm trong `.eml`
+tại thư mục `security-notification-outbox` được in trong terminal. Không có SMS
+thật được gửi. Mã 8 số hết hạn sau 5 phút, chỉ dùng một lần và gắn đúng phiên.
+
+Push cần HTTPS/localhost, trình duyệt hỗ trợ Push API và quyền do người dùng
+bấm cấp. Nếu cùng trình duyệt đã gắn với tài khoản khác, dùng thao tác gỡ đăng
+ký trên trình duyệt rồi đăng ký lại. Không tự cấp quyền hoặc chuyển subscription
+từ tài khoản khác ở phía server. Service worker không cache tài nguyên hay API.
+
+## Bật Web Push thật
+
+```powershell
+uv run --frozen python -m scripts.generate_vapid_key --output local_data/push/vapid.pem
+```
+
+Công cụ chỉ in public key, không in private key, và từ chối ghi đè key cũ.
+Cấu hình `.env` cho local có lưu dữ liệu:
+
+```dotenv
+PUSH_BACKEND=webpush
+VAPID_PRIVATE_KEY_FILE=local_data/push/vapid.pem
+VAPID_SUBJECT=mailto:security@example.com
+```
+
+Dùng địa chỉ liên hệ thật thay địa chỉ mẫu. Cặp VAPID phải giữ ổn định qua các
+lần deploy; đổi public key có thể yêu cầu trình duyệt đăng ký lại. Mỗi tài khoản
+có tối đa 8 subscription. Endpoint chỉ được chấp nhận cho các dịch vụ Push được
+hỗ trợ; kết nối kiểm tra địa chỉ DNS công khai, ghim IP, xác minh TLS với SNI gốc,
+không theo redirect hoặc proxy môi trường. Payload chỉ chứa cảnh báo cố định.
+
+## Bật SMS thật
+
+```dotenv
+SMS_BACKEND=twilio
+TWILIO_ACCOUNT_SID=AC<account-sid>
+TWILIO_AUTH_TOKEN_FILE=local_data/sms/twilio-token
+TWILIO_FROM=+<so-gui-da-duoc-nha-cung-cap-cap>
+```
+
+Tạo token file riêng tư, không đưa vào Git hoặc build context. Tài khoản Twilio,
+sender và quyền gửi tới quốc gia đích phải có sẵn; phí và hạn chế trial thuộc
+nhà cung cấp. Chỉ số E.164 đã chứng minh sở hữu mới nhận cảnh báo. SMS không
+được dùng để bỏ qua MFA hoặc khôi phục tài khoản. Provider accepted chỉ xác nhận
+dịch vụ chấp nhận yêu cầu, chưa xác nhận người nhận đã nhận hay đọc SMS.
+
+Các kênh tùy chọn được xếp hàng sau commit. Lỗi gửi không đảo ngược thao tác tài
+khoản đã hoàn tất. Hàng đợi, worker, timeout và tần suất gửi đều có giới hạn.
+Chế độ `outbox` bị từ chối ngoài development/test. Khi khôi phục PostgreSQL,
+quarantine gỡ các địa chỉ thông báo và challenge để người dùng đã rà soát đăng
+ký lại, tránh khôi phục nhầm kênh cũ.
+
+## Bật cảnh báo di chuyển bất thường
+
+```dotenv
+GEOIP_BACKEND=maxmind
+GEOIP_DATABASE_FILE=local_data/geoip/GeoLite2-City.mmdb
+GEOIP_MAX_DATABASE_AGE_DAYS=90
+GEOIP_HISTORY_HOURS=24
+GEOIP_MIN_DISTANCE_KM=500
+GEOIP_MAX_SPEED_KMH=900
+```
+
+Cung cấp MaxMind City MMDB hợp lệ và mới theo giấy phép của nhà cung cấp.
+Ứng dụng không tải database hoặc gửi IP tới dịch vụ tra cứu bên ngoài. File
+test trong `tests/fixtures/maxmind` là dữ liệu tổng hợp của upstream, không dùng
+làm dữ liệu định vị production. Theo dõi tuổi database và cập nhật bằng quy
+trình của nhà cung cấp, rồi khởi động lại ứng dụng để nạp bản mới.
+
+So sánh chỉ dùng đăng nhập đã hoàn tất của cùng tài khoản. Khoảng cách trừ bán
+kính sai số của cả hai vị trí; chỉ phát cảnh báo khi vượt cả ngưỡng khoảng cách
+và tốc độ. Không lưu tọa độ vào audit, không tự khóa tài khoản. VPN/mạng di động
+có thể tạo cảnh báo nhầm. Feed thiếu, hỏng hoặc quá hạn hiển thị chưa khả dụng.
+Kiểm tra trạng thái trong **Tài khoản → Hoạt động bảo mật gần đây**.
+
+## Đóng gói cho Docker/VPS
+
+Image app và migration đã chứa SDK cho Push và GeoIP. Đặt các file cần dùng vào
+một thư mục riêng tư đã tồn tại trên máy chủ: `vapid.pem`, `twilio-token`,
+`GeoLite2-City.mmdb`; chỉ cần file tương ứng với kênh được bật. File bí mật phải
+đọc được bởi UID app trong container và không cấp quyền đọc công khai.
+
+Đặt `SCAP_SECURITY_FILES_DIR` thành đường dẫn tuyệt đối của thư mục đó trong
+`deploy/.env.vps`. `deploy/vps-compose.sh` tự thêm overlay
+`docker-compose.security-channels.yml`, mount chỉ đọc vào `/run/scap-security`
+và không tự tạo thư mục host còn thiếu. Các biến backend và thông tin public
+provider vẫn nằm trong env file; private key/token chỉ đọc từ file. Với Docker
+không dùng wrapper VPS, thêm `-f docker-compose.security-channels.yml` khi gọi
+Compose. Không đưa thư mục chứa key hoặc MMDB vào archive triển khai.
+
+## Demo nhóm MLS
+
+```powershell
+docker build -t scap-mls-client:local clients/mls_native
+uv run --frozen --extra e2ee-client python -m scripts.demo_mls --check
+```
+
+Demo dùng OpenMLS 0.9.1 với Cargo.lock, ba client riêng và server loopback tạm.
+Nó kiểm tra Commit/Welcome, gửi nhóm, loại một thành viên, thay epoch và từ chối
+giải mã tin mới bằng toàn bộ private state cũ của người đã bị loại. Cùng lúc,
+server export chỉ chứa ciphertext. Hướng dẫn nhập tin trực tiếp và trao đổi
+KeyPackage public có chữ ký nằm trong [native MLS client](../clients/mls_native/README.md).
+
+Client hiện hỗ trợ nhóm do owner quản lý, một thiết bị mỗi tài khoản. Mọi
+thành viên phải đối chiếu fingerprint và pin roster. Native helper giữ mạng,
+mount và container log ở trạng thái tắt; private state đi qua pipe và chỉ được
+lưu trong kho client mã hóa. Hệ điều hành và Docker daemon vẫn thuộc môi trường
+client cần tin cậy. Không phục hồi ratchet cũ để tiếp tục gửi.
+
+Các test và demo không thay thế kiểm toán độc lập cho tích hợp SCAP, kiểm chứng
+tương thích với client MLS khác hoặc kiểm tra nhà cung cấp/hạ tầng thật.

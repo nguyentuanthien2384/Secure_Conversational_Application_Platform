@@ -26,6 +26,9 @@ from src.app.models import (
     E2eeDeviceChallenge,
     E2eePreKey,
     MfaRecoveryCode,
+    SecurityPhone,
+    SecurityPhoneChallenge,
+    SecurityPushSubscription,
     User,
     WebAuthnChallenge,
 )
@@ -61,7 +64,11 @@ def quarantine(db: Session) -> dict[str, int]:
         ).rowcount
     counts["challenges_removed"] = sum(
         db.execute(delete(model).execution_options(synchronize_session=False)).rowcount
-        for model in (WebAuthnChallenge, E2eeDeviceChallenge)
+        for model in (WebAuthnChallenge, E2eeDeviceChallenge, SecurityPhoneChallenge)
+    )
+    counts["notification_destinations_removed"] = sum(
+        db.execute(delete(model).execution_options(synchronize_session=False)).rowcount
+        for model in (SecurityPhone, SecurityPushSubscription)
     )
     db.commit()
     return counts

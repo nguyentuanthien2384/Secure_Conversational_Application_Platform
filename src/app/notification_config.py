@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -35,7 +36,9 @@ class NotificationSettings:
             raise RuntimeError("SMS_BACKEND phải là disabled, twilio hoặc outbox.")
         if environment not in {"development", "test"} and "outbox" in {push, sms}:
             raise RuntimeError("Outbox thông báo chỉ dành cho development/test, không gửi thật.")
-        private = public = subject = token = sid = sender = ""
+        private = public = subject = sid = sender = ""
+        # No credential is configured while the provider is disabled.
+        token = ""  # nosec B105
         if push == "webpush":
             path = os.getenv("VAPID_PRIVATE_KEY_FILE", "").strip()
             if not path:
@@ -54,7 +57,7 @@ class NotificationSettings:
                 public = base64.urlsafe_b64encode(key.public_key().public_bytes(
                     serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
                 )).decode("ascii").rstrip("=")
-            except (OSError, ValueError, UnicodeError):
+            except (OSError, TypeError, ValueError, UnicodeError, UnsupportedAlgorithm):
                 raise RuntimeError("Khóa VAPID phải là PEM P-256 hợp lệ trong secret file.") from None
             subject = os.getenv("VAPID_SUBJECT", "").strip()
             if not re.fullmatch(r"mailto:[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", subject):

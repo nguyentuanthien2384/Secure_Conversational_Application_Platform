@@ -1,0 +1,7 @@
+{
+  "sha256": "7ECD1A263834096E3948B459713102EF350412A9F18367B4A88EFEC018153004",
+  "commit": "0ee49278e35fd7bdf341ac236edbba20de1aceb9",
+  "repository": "https://github.com/maxmind/MaxMind-DB",
+  "path": "test-data/GeoIP2-City-Test.mmdb",
+  "purpose": "Upstream synthetic test database, never production geolocation data"
+}

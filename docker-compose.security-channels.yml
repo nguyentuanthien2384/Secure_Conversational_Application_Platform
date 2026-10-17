@@ -1,0 +1,18 @@
+# Optional, read-only operator files for GeoIP / Web Push / SMS.
+# Include only when SCAP_SECURITY_FILES_DIR names an existing private folder.
+services:
+  app:
+    environment:
+      GEOIP_BACKEND: ${GEOIP_BACKEND:-disabled}
+      GEOIP_DATABASE_FILE: /run/scap-security/GeoLite2-City.mmdb
+      PUSH_BACKEND: ${PUSH_BACKEND:-disabled}
+      VAPID_PRIVATE_KEY_FILE: /run/scap-security/vapid.pem
+      SMS_BACKEND: ${SMS_BACKEND:-disabled}
+      TWILIO_AUTH_TOKEN_FILE: /run/scap-security/twilio-token
+    volumes:
+      - type: bind
+        source: ${SCAP_SECURITY_FILES_DIR:?set an existing private security-files directory}
+        target: /run/scap-security
+        read_only: true
+        bind:
+          create_host_path: false

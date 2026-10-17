@@ -166,12 +166,28 @@ với đúng tài khoản. UI lưu token này trong cookie `scap_device` (HttpOn
 
 | Tính năng | Trạng thái |
 | :--- | :--- |
-| Passkey làm yếu tố thứ hai và cho bước xác thực lại (step-up) | Chưa có — step-up vẫn dùng mật khẩu + TOTP |
-| Thông báo đẩy (push) / SMS | Chưa có — chỉ email và cảnh báo trong ứng dụng |
-| Đánh giá rủi ro theo vị trí địa lý (impossible travel) | Chưa có — cần cơ sở dữ liệu GeoIP |
+| Passkey cho bước xác thực lại (step-up) | Có — UV bắt buộc, challenge 180 giây dùng một lần, gắn đúng tài khoản và JTI; mật khẩu + TOTP vẫn là lựa chọn khác |
+| Thông báo đẩy (push) / SMS | Có — tự nguyện đăng ký, subscription/số điện thoại mã hóa, SMS phải xác minh; mặc định tắt; outbox demo không gửi thật |
+| Đánh giá rủi ro theo vị trí địa lý (impossible travel) | Có — adapter MaxMind City cục bộ, trừ bán kính sai số, chỉ cảnh báo; cần cơ sở dữ liệu mới và extra geoip |
 | CSP không `unsafe-inline` | Script đã dùng nonce, chặn inline handler; CSS runtime Gradio vẫn cần allowance riêng |
 
 ## 11. Kiểm chứng
+
+Passkey step-up nằm trong **Tài khoản → Email khôi phục & passkey**: chuẩn bị
+yêu cầu, rồi bấm xác nhận trên thiết bị để trình duyệt thực hiện UV. Thành công
+chỉ nâng quyền xác thực lại cho phiên tương ứng; assertion không dùng làm một
+phiên đăng nhập mới. Lỗi hoặc hủy yêu cầu cần chuẩn bị challenge mới.
+
+Push/SMS nằm trong **Tài khoản → Thông báo bảo mật qua Push / SMS**. Các kênh
+này chỉ nhận cảnh báo cố định, không chứa nội dung chat, token hoặc mã khôi phục;
+SMS cảnh báo không phải yếu tố đăng nhập/khôi phục tài khoản. Mã xác minh số
+điện thoại có hạn 5 phút, tối đa 5 lần thử và bị giới hạn gửi theo tài khoản,
+số nhận và toàn hệ thống. Chỉ số đã xác minh mới nhận cảnh báo.
+
+GeoIP không tự khóa tài khoản và không kết luận người dùng đang ở một thành phố
+cụ thể. VPN, mạng di động và độ chính xác dữ liệu có thể tạo cảnh báo nhầm.
+Feed hết hạn hoặc không khả dụng được hiển thị là chưa xác định. Xem
+[cấu hình các phần mở rộng](SECURITY_EXTENSIONS.md) để bật dịch vụ thật.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests/test_account_protection.py tests/test_passkeys.py tests/test_account_recovery.py tests/test_token_reuse_and_devices.py tests/test_account_ui.py

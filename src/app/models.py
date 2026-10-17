@@ -610,7 +610,9 @@ class SecurityPhoneChallenge(Base):
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    auth_session_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    auth_session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("auth_sessions.jti", ondelete="CASCADE"), nullable=False
+    )
     phone_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     phone_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
     phone_nonce: Mapped[str] = mapped_column(String(64), nullable=False)

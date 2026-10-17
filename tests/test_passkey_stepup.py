@@ -13,7 +13,7 @@ from sqlalchemy.exc import OperationalError
 
 from src.app.audit_chain import verify_chain
 from src.app.db import utcnow
-from src.app.models import AuditEvent, AuthSession, WebAuthnChallenge, WebAuthnCredential
+from src.app.models import AuditEvent, AuthSession, User, WebAuthnChallenge, WebAuthnCredential
 from tests.conftest import register_and_login
 from tests.test_passkeys import PASSWORD, auth, register_passkey
 from tests.webauthn_soft import SoftAuthenticator, b64url, unb64url
@@ -241,6 +241,13 @@ def test_step_up_and_challenge_counter_audit_are_one_transaction(client, app, va
 @pytest.mark.parametrize("stage", ["options", "verify"])
 def test_inflight_ceremony_rechecks_exact_bearer_after_revocation(client, app, transition, stage):
     token, device, _jti = setup_key(client, app)
+    revoker = token
+    if transition == "logout-all":
+        # Logout-all itself needs fresh authentication. Use a separate fresh
+        # session while leaving the target bearer awaiting reauthentication.
+        revoker = client.post("/api/auth/login", json={
+            "username": "passkey-reauth", "password": PASSWORD,
+        }).json()["access_token"]
     path = OPTIONS if stage == "options" else VERIFY
     body = None
     if stage == "verify":
@@ -264,7 +271,7 @@ def test_inflight_ceremony_rechecks_exact_bearer_after_revocation(client, app, t
             pending = executor.submit(client.post, path, headers=auth(token), json=body)
             try:
                 assert reached.wait(15)
-                response = client.post(f"/api/auth/{transition}", headers=auth(token))
+                response = client.post(f"/api/auth/{transition}", headers=auth(revoker))
                 assert response.status_code in {200, 204}, response.text
                 before = security_snapshot(app)
             finally:
@@ -306,3 +313,124 @@ def test_step_up_counter_regression_is_rejected(client, app):
         assert db.scalars(select(WebAuthnCredential)).one().sign_count == 3
         audited = list(db.scalars(select(AuditEvent).where(AuditEvent.event_type == "auth.step_up")))
         assert json.loads(audited[-1].details_json)["reason"] == "sign_count_regression"
+
+
+def test_concurrent_login_and_step_up_never_move_a_credential_counter_backwards(client, app, monkeypatch):
+    """On PostgreSQL, distinct challenge rows must still serialize on User.
+
+    The lower-counter login pauses during real signature verification. An
+    unlocked step-up could commit counter 3 before the stale login writes 2.
+    SQLite's writer lock additionally serializes the same public workflow.
+    """
+    from src.app import passkeys
+
+    token, device, _jti = setup_key(client, app)
+    login = client.post("/api/auth/passkeys/authentication/options").json()
+    login_credential = device.assert_(login["public_key"], sign_count=2)
+    step_up = begin(client, token)
+    step_up_credential = device.assert_(step_up["public_key"], sign_count=3)
+    reached, release, higher_entered = threading.Event(), threading.Event(), threading.Event()
+    original = passkeys.verify_authentication_response
+
+    def pause_lower_counter(**kwargs):
+        data = unb64url(kwargs["credential"]["response"]["authenticatorData"])
+        counter = int.from_bytes(data[33:37], "big")
+        if counter == 2:
+            reached.set()
+            assert release.wait(15)
+        elif counter == 3:
+            higher_entered.set()
+        return original(**kwargs)
+
+    monkeypatch.setattr(passkeys, "verify_authentication_response", pause_lower_counter)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        lower = executor.submit(client.post, "/api/auth/passkeys/authentication/verify", json={
+            "challenge_id": login["challenge_id"], "credential": login_credential,
+        })
+        try:
+            assert reached.wait(15)
+            higher = executor.submit(verify, client, token, step_up, step_up_credential)
+            # Give an unlocked PostgreSQL contender the chance to expose a lost
+            # update. The correct implementation waits for the User lock.
+            higher_entered.wait(0.5)
+        finally:
+            release.set()
+        lower_response, higher_response = lower.result(timeout=15), higher.result(timeout=15)
+    assert lower_response.status_code == 200, lower_response.text
+    assert higher_response.status_code == 200, higher_response.text
+    with app.state.database.session_factory() as db:
+        assert db.scalars(select(WebAuthnCredential)).one().sign_count == 3
+        assert verify_chain(db, app.state.audit_key).intact
+
+
+@pytest.mark.parametrize("transition", ["suspend", "remove_key"])
+def test_passwordless_login_rechecks_account_and_credential_after_candidate_lookup(client, app, monkeypatch, transition):
+    token, device, _jti = setup_key(client, app)
+    options = client.post("/api/auth/passkeys/authentication/options").json()
+    credential = device.assert_(options["public_key"])
+    reached, release = threading.Event(), threading.Event()
+    original = app.state.passkeys.authentication_user_id
+
+    def pause_lookup(db, payload):
+        owner = original(db, payload)
+        reached.set()
+        assert release.wait(15)
+        return owner
+
+    monkeypatch.setattr(app.state.passkeys, "authentication_user_id", pause_lookup)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(client.post, "/api/auth/passkeys/authentication/verify", json={
+            "challenge_id": options["challenge_id"], "credential": credential,
+        })
+        try:
+            assert reached.wait(15)
+            with app.state.database.session_factory() as db:
+                row = db.scalars(select(WebAuthnCredential)).one()
+                if transition == "suspend":
+                    db.get(User, row.user_id).is_active = False
+                else:
+                    db.delete(row)
+                db.commit()
+        finally:
+            release.set()
+        response = pending.result(timeout=15)
+    assert response.status_code == 401, response.text
+    with app.state.database.session_factory() as db:
+        assert len(list(db.scalars(select(AuthSession)))) == 1
+        assert db.get(WebAuthnChallenge, options["challenge_id"]).consumed_at is not None
+
+
+@pytest.mark.parametrize("ceremony,valid", [("login", True), ("login", False), ("register", False)])
+def test_passwordless_and_failed_registration_proofs_roll_back_with_failed_audit(client, app, ceremony, valid):
+    token = register_and_login(client, "passkey-login-atomic")
+    device = SoftAuthenticator()
+    if ceremony == "login":
+        assert register_passkey(client, token, device).status_code == 201
+        options = client.post("/api/auth/passkeys/authentication/options").json()
+        credential = device.assert_(options["public_key"], uv=valid)
+        path, headers, event_type = "/api/auth/passkeys/authentication/verify", {}, "auth.passkey.login"
+    else:
+        options = client.post("/api/auth/passkeys/registration/options", headers=auth(token)).json()
+        credential = device.register(options["public_key"], uv=False)
+        path, headers, event_type = "/api/auth/passkeys/registration/verify", auth(token), "auth.passkey.add"
+    body = {"challenge_id": options["challenge_id"], "credential": credential}
+    before = security_snapshot(app)
+    failures = []
+
+    def reject_audit(_conn, _cursor, statement, _params, context, _many):
+        if (statement.lstrip().lower().startswith("insert into audit_events")
+                and any(item.get("event_type") == event_type for item in context.compiled_parameters)):
+            failures.append(True)
+            raise OperationalError("simulated audit failure", None, RuntimeError("test"))
+
+    event.listen(app.state.database.engine, "before_cursor_execute", reject_audit)
+    try:
+        response = client.post(path, headers=headers, json=body)
+    finally:
+        event.remove(app.state.database.engine, "before_cursor_execute", reject_audit)
+    assert failures == [True]
+    assert response.status_code == 503, response.text
+    assert security_snapshot(app) == before
+    retry = client.post(path, headers=headers, json=body)
+    expected = 200 if valid else (401 if ceremony == "login" else 400)
+    assert retry.status_code == expected, retry.text

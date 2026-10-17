@@ -171,6 +171,12 @@ def send_code(mailer: Mailer, to: str, *, purpose: str, username: str, code: str
 
 
 NOTICES = {
+    "impossible_travel": (
+        "Đăng nhập từ vị trí cách xa trong thời gian ngắn",
+        "Tài khoản {username} có lần đăng nhập lúc {when} (UTC) từ IP {ip} với tín hiệu "
+        "vị trí khác xa lần trước. Vị trí IP chỉ là ước lượng và VPN có thể gây cảnh báo nhầm. "
+        "Hãy kiểm tra Hoạt động bảo mật; nếu không phải bạn, thu hồi phiên và đổi mật khẩu.",
+    ),
     "new_device": (
         "Đăng nhập từ thiết bị mới",
         "Tài khoản {username} vừa đăng nhập từ một thiết bị chưa từng thấy.\n"
@@ -234,8 +240,15 @@ def notify(
     not poison or expire the caller's already committed response objects.
     Verification/reset proof delivery through send_code remains mandatory.
     """
+    queued = False
+    fanout = getattr(mailer, "security_notifications", None)
+    if fanout is not None:
+        try:
+            queued = fanout.notify(user_id=user_id, kind=kind)
+        except Exception:
+            logger.warning("Security notice unavailable (scope=optional_channels).")
     if not mailer.enabled:
-        return False
+        return queued
     address = to
     if address is None:
         try:
