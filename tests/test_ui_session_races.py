@@ -42,8 +42,11 @@ def fake_api(token, method, path, body=None, **kwargs):
             "mfa_enabled": False, "created_at": "2026-10-15T00:00:00Z",
             "ai_data_consent": False,
         }
-    if path == "/api/sessions":
-        return [{"id": "conversation-" + token, "title": "Conversation", "security_mode": "secure"}]
+    if path == "/api/sessions/page":
+        return {"items": [{"id": "conversation-" + token, "title": "Conversation", "security_mode": "secure"}],
+                "total": 1, "offset": 0, "limit": 100, "has_more": False, "next_offset": None}
+    if path.startswith("/api/sessions/"):
+        return {"id": path.rsplit("/", 1)[-1], "title": "Conversation", "security_mode": "secure"}
     if path in ("/api/auth/sessions", "/api/admin/security-alerts"):
         return []
     if path == "/api/admin/stats":
@@ -58,11 +61,12 @@ def test_old_admin_refresh_cannot_repopulate_tables_after_logout(demo, monkeypat
     started, release = threading.Event(), threading.Event()
 
     def api(token, method, path, *args, **kwargs):
-        if path == "/api/admin/users":
+        if path == "/api/admin/users/page":
             started.set()
             assert release.wait(10)
-            return [{"id": "old-user", "username": "OLD ADMIN ACCOUNT", "role": "admin",
-                     "is_active": True, "mfa_enabled": True, "created_at": "2026-10-15T00:00:00Z"}]
+            return {"items": [{"id": "old-user", "username": "OLD ADMIN ACCOUNT", "role": "admin",
+                               "is_active": True, "mfa_enabled": True, "created_at": "2026-10-15T00:00:00Z"}],
+                    "total": 1, "offset": 0, "limit": 100, "has_more": False, "next_offset": None}
         return fake_api(token, method, path, *args, **kwargs)
 
     monkeypatch.setattr(gradio_ui, "_api", api)

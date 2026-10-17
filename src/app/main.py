@@ -18,8 +18,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security.utils import get_authorization_scheme_param
 from redis.exceptions import RedisError
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as DatabasePoolTimeout
 from sqlalchemy.orm import Session
@@ -63,6 +64,7 @@ from src.app.e2ee import (
     PROTOCOL_DOUBLE_RATCHET,
     PROTOCOL_MLS,
     E2EEValidationError,
+    canonical_json_bytes,
     decode_base64_strict,
     encode_base64url,
     safety_fingerprint,
@@ -126,6 +128,7 @@ from src.app.schemas import (
     E2eeEnvelopeSend,
     E2eeMemberUpdate,
     E2eePreKeyBundleResponse,
+    E2eePreKeyUpdateRequest,
     ExportTicketResponse,
     LoginRequest,
     MessageResponse,
@@ -136,6 +139,7 @@ from src.app.schemas import (
     MfaDisableRequest,
     MfaEnrollResponse,
     MfaVerifyRequest,
+    PageResponse,
     PasswordChangeRequest,
     RawMessageResponse,
     RegisterRequest,
@@ -1163,25 +1167,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: User,
         db: Session,
         request: Request,
+        *,
+        parent_locked: bool = False,
     ) -> None:
         expires_at = chat_session.retention_expires_at
         if expires_at is not None and as_utc(expires_at) > utcnow():
             return
+        # On-access deletion is a mutation too. Export capabilities already
+        # hold their parent User/AuthSession locks; ordinary requests recheck
+        # their own bearer before acquiring the conversation writer lock.
+        if not parent_locked:
+            lock_request_mutation(request, user, db)
+        if lock_chat_session_row(db, chat_session) is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
+        if chat_session.retention_expires_at is not None and as_utc(chat_session.retention_expires_at) > utcnow():
+            return
         session_id = chat_session.id
         security_mode = chat_session.security_mode
         db.delete(chat_session)
-        db.commit()
-        # The cache may still contain a plaintext DEK for the deleted row.
-        envelope_crypto_service.clear_cache()
-        record_audit(
-            db,
-            request,
-            "chat.session.retention_expired",
-            actor_id=user.id,
-            target_type="chat_session",
-            target_id=session_id,
-            details={"security_mode": security_mode, "deleted_on_access": True},
-        )
+        try:
+            record_audit(
+                db, request, "chat.session.retention_expired", actor_id=user.id,
+                target_type="chat_session", target_id=session_id,
+                details={"security_mode": security_mode, "deleted_on_access": True},
+            )
+        finally:
+            envelope_crypto_service.clear_cache()
         raise HTTPException(status_code=404, detail="Không tìm thấy phiên hội thoại.")
 
     def audit_access_denial(
@@ -1393,6 +1404,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         *,
         for_update: bool = False,
         account_locked: bool = False,
+        step_up: bool = False,
     ) -> ChatSession:
         chat_session = chat_service.get_owned_session(db, user, session_id)
         if chat_session is None:
@@ -1416,7 +1428,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for_update
             or (settings.security_profile == "high" and session_is_sensitive(chat_session))
         )
-        if must_lock_user and lock_user_row(db, user) is None:
+        if for_update:
+            lock_request_mutation(request, user, db, step_up=step_up)
+        elif must_lock_user and lock_user_row(db, user) is None:
             record_audit(
                 db,
                 request,
@@ -1467,18 +1481,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Suspension/deletion lock the same account first, then every affected
         # conversation. Whichever transaction wins defines a clean boundary:
         # the request either completes before revocation or sees it afterwards.
-        if lock_user_row(db, user) is None:
-            record_audit(
-                db,
-                request,
-                "authorization.denied",
-                actor_id=user.id,
-                target_type="e2ee_session",
-                target_id=session_id,
-                outcome="denied",
-                details={"reason": "account_state_changed"},
-            )
-            raise HTTPException(status_code=404, detail="Không tìm thấy phiên E2EE.")
+        lock_request_mutation(request, user, db)
         chat_session = db.get(ChatSession, session_id)
         if (
             chat_session is None
@@ -1799,6 +1802,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if step_up:
             require_recent_step_up(credentials, user, db)
         return session
+
+    def lock_request_mutation(
+        request: Request, user: User, db: Session, *, step_up: bool = False,
+    ) -> AuthSession:
+        """Bind a data mutation to the same bearer checked by its dependency.
+
+        Reuse FastAPI's header parser and the account mutation guard so data
+        routes keep User -> AuthSession -> ChatSession locks through audit.
+        """
+        scheme, token = get_authorization_scheme_param(request.headers.get("Authorization"))
+        if scheme.lower() != "bearer" or not token:
+            raise HTTPException(status_code=401, detail="Yêu cầu xác thực.", headers=INVALID_TOKEN_CHALLENGE)
+        return lock_account_mutation(
+            HTTPAuthorizationCredentials(scheme=scheme, credentials=token), user, db, step_up=step_up,
+        )
 
     def lock_admin_mutation(
         credentials: HTTPAuthorizationCredentials,
@@ -3138,6 +3156,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "categories": title_findings,
                 },
             )
+        # Serialize the per-owner quota check with creation and revalidate the
+        # exact bearer after any metadata/password work has completed.
+        lock_request_mutation(request, user, db)
         if settings.security_profile == "high" and payload.security_mode in {
             "confidential",
             "private_e2ee",
@@ -3212,8 +3233,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     status_code=503,
                     detail="Không thể khởi tạo khóa hội thoại an toàn.",
                 ) from exc
-        db.commit()
-        db.refresh(row)
         record_audit(
             db,
             request,
@@ -3242,6 +3261,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.security_profile == "high" and not user.mfa_enabled:
             stmt = stmt.where(~sensitive_session_clause())
         return list(db.scalars(stmt))
+
+    def page_result(items, total: int, offset: int, limit: int):
+        has_more = offset + len(items) < total
+        return {"items": items, "total": total, "offset": offset, "limit": limit,
+                "has_more": has_more, "next_offset": offset + len(items) if has_more else None}
+
+    @app.get("/api/sessions/page", response_model=PageResponse[SessionResponse])
+    def list_sessions_page(
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ):
+        conditions = [ChatSession.owner_id == user.id, retained_session_clause()]
+        if settings.security_profile == "high" and not user.mfa_enabled:
+            conditions.append(~sensitive_session_clause())
+        total = db.scalar(select(func.count()).select_from(ChatSession).where(*conditions)) or 0
+        rows = list(db.scalars(select(ChatSession).where(*conditions)
+                               .order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
+                               .offset(offset).limit(limit)))
+        return page_result(rows, total, offset, limit)
 
     @app.get("/api/sessions/{session_id}", response_model=SessionResponse)
     def get_session_endpoint(
@@ -3273,8 +3313,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         row = require_owned_session(session_id, user, db, request, for_update=True)
         row.title = payload.title
         row.updated_at = utcnow()
-        db.commit()
-        db.refresh(row)
         record_audit(
             db,
             request,
@@ -3301,7 +3339,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # The lock is acquired before checking content. Plaintext and E2EE send
         # paths take the same lock, so a trust-boundary transition can never
         # observe an empty conversation and then race a concurrent insert.
-        row = require_owned_session(session_id, user, db, request, for_update=True)
+        row = require_owned_session(session_id, user, db, request, for_update=True, step_up=True)
         if (
             settings.security_profile == "high"
             and payload.security_mode in {"confidential", "private_e2ee"}
@@ -3340,7 +3378,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         joined_epoch=1,
                     )
                 )
-        elif mode_changed:
+        elif mode_changed and row.security_mode == "private_e2ee":
             for member in list(row.members):
                 db.delete(member)
             row.current_crypto_epoch = 0
@@ -3366,8 +3404,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else policy_deadline
         )
         row.updated_at = policy_updated_at
-        db.commit()
-        db.refresh(row)
         record_audit(
             db,
             request,
@@ -3391,22 +3427,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, user, db)
-        row = require_owned_session(session_id, user, db, request, for_update=True)
+        row = require_owned_session(session_id, user, db, request, for_update=True, step_up=True)
         # Zeroize cached plaintext key material on both sides of the cascade.
         envelope_crypto_service.clear_cache()
         try:
             db.delete(row)
-            db.commit()
+            record_audit(
+                db, request, "chat.session.delete", actor_id=user.id,
+                target_type="chat_session", target_id=session_id,
+            )
         finally:
             envelope_crypto_service.clear_cache()
-        record_audit(
-            db,
-            request,
-            "chat.session.delete",
-            actor_id=user.id,
-            target_type="chat_session",
-            target_id=session_id,
-        )
         return Response(status_code=204)
 
     def stream_session_export(db: Session, row: ChatSession) -> Iterator[bytes]:
@@ -3516,7 +3547,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, user, db)
-        row = require_owned_session(session_id, user, db, request, for_update=True)
+        row = require_owned_session(session_id, user, db, request, for_update=True, step_up=True)
         record_audit(
             db,
             request,
@@ -3540,8 +3571,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         """Issue a 60-second one-use browser download capability after step-up."""
-        auth_session = require_recent_step_up(credentials, user, db)
-        row = require_owned_session(session_id, user, db, request)
+        auth_session = lock_account_mutation(credentials, user, db, step_up=True)
+        row = require_owned_session(session_id, user, db, request, for_update=True, step_up=True)
         ticket = token_service.issue_export_ticket(
             user.id,
             row.id,
@@ -3612,7 +3643,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if row is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy dữ liệu xuất.")
-        reject_expired_session(row, user, db, request)
+        reject_expired_session(row, user, db, request, parent_locked=True)
         if (
             settings.security_profile == "high"
             and session_is_sensitive(row)
@@ -3659,6 +3690,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=409,
                 detail="Dùng API bản mã E2EE cho phiên Private E2EE.",
             ) from exc
+
+    @app.get("/api/sessions/{session_id}/messages/page", response_model=PageResponse[MessageResponse])
+    def get_message_page(
+        session_id: str, request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        query: Annotated[str | None, Query(min_length=1, max_length=120)] = None,
+    ):
+        row = require_owned_session(session_id, user, db, request)
+        if row.security_mode == "private_e2ee":
+            raise HTTPException(status_code=403, detail="Private E2EE không có plaintext để tìm kiếm.")
+        if query is None:
+            total = db.scalar(select(func.count()).select_from(SecureMessage)
+                              .where(SecureMessage.session_id == row.id)) or 0
+            messages = chat_service.list_messages(db, row, limit=limit, offset=offset)
+        else:
+            messages, total = chat_service.search_message_page(db, row, query=query, offset=offset, limit=limit)
+        record_audit(
+            db, request, "chat.message.search" if query is not None else "chat.message.list",
+            actor_id=user.id, target_type="chat_session", target_id=row.id,
+            details={"results": len(messages), "query_length": len(query) if query else 0},
+        )
+        return page_result(messages, total, offset, limit)
 
     @app.get("/api/sessions/{session_id}/ciphertexts", response_model=list[RawMessageResponse])
     def get_ciphertexts_endpoint(
@@ -3823,30 +3879,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={"Retry-After": str(exc.retry_after) if isinstance(exc, AIProviderBusy) else "30"},
             ) from exc
         row.updated_at = utcnow()
-        db.commit()
-        record_audit(
-            db,
-            request,
-            "chat.message.send",
-            actor_id=user.id,
-            target_type="chat_session",
-            target_id=session_id,
-            details={
+        events = [{
+            "event_type": "chat.message.send", "actor_id": user.id,
+            "target_type": "chat_session", "target_id": session_id,
+            "details": {
                 "content_length": len(payload.content),
                 "dlp_redacted": dlp_redacted,
             },
-        )
+        }]
         if dlp_redacted:
             # Sự kiện riêng để SIEM/IDS đếm được số lần DLP phải can thiệp.
-            record_audit(
-                db,
-                request,
-                "dlp.redacted",
-                actor_id=user.id,
-                target_type="chat_session",
-                target_id=session_id,
-                details={"categories": dlp_redacted},
-            )
+            events.append({
+                "event_type": "dlp.redacted", "actor_id": user.id,
+                "target_type": "chat_session", "target_id": session_id,
+                "details": {"categories": dlp_redacted},
+            })
+        record_audits(db, request, events)
         return MessageResponse(
             id=assistant_row.id,
             session_id=session_id,
@@ -3866,7 +3914,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         """Answer a public query without storing it or loading chat history."""
-        row = require_owned_session(session_id, user, db, request)
+        row = require_owned_session(session_id, user, db, request, for_update=True)
 
         def audit_search(outcome: str, details: dict):
             record_audit(
@@ -3984,6 +4032,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return results
 
+    @app.get("/api/search/messages/page", response_model=PageResponse[dict])
+    def global_search_page(
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+        q: Annotated[str, Query(min_length=1, max_length=120)],
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ):
+        conditions = [ChatSession.owner_id == user.id, retained_session_clause(),
+                      ChatSession.security_mode != "private_e2ee"]
+        if settings.security_profile == "high" and not user.mfa_enabled:
+            conditions.append(~sensitive_session_clause())
+        statement = (select(ChatSession).where(*conditions)
+                     .order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
+                     .execution_options(yield_per=50))
+        results, total = [], 0
+        with db.scalars(statement) as sessions:
+            for row in sessions:
+                matches, count = chat_service.search_message_page(
+                    db, row, query=q, offset=max(0, offset - total),
+                    limit=max(0, limit - len(results)),
+                )
+                for message in matches:
+                    results.append({"session_id": row.id, "session_title": row.title,
+                                    "message_id": message["id"], "role": message["role"],
+                                    "content": message["content"], "created_at": message["created_at"].isoformat()})
+                total += count
+        record_audit(db, request, "chat.message.search", actor_id=user.id,
+                     details={"query_length": len(q), "results": len(results)})
+        return page_result(results, total, offset, limit)
+
     # ------------------------------------------------------------------
     # Private E2EE control plane. The server stores public identity material,
     # one-time prekeys, membership metadata and opaque ciphertext only. Double
@@ -3997,7 +4077,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, user, db)
+        lock_account_mutation(credentials, user, db, step_up=True)
         raw_challenge = secrets.token_urlsafe(32)
         challenge_bytes = decode_base64_strict(
             raw_challenge,
@@ -4012,8 +4092,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             expires_at=expires_at,
         )
         db.add(challenge)
-        db.commit()
-        db.refresh(challenge)
+        db.flush()
         record_audit(
             db,
             request,
@@ -4037,7 +4116,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, user, db)
+        lock_account_mutation(credentials, user, db, step_up=True)
         _, display_findings = chat_service.ai.redact_with_configured_policy(payload.display_name)
         if display_findings:
             raise HTTPException(
@@ -4232,14 +4311,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for prekey in prekeys
         )
         try:
-            db.commit()
-            db.refresh(device)
+            db.flush()
         except IntegrityError as exc:
             db.rollback()
             consumed = db.get(E2eeDeviceChallenge, payload.challenge_id)
             if consumed is not None and consumed.consumed_at is None:
                 consumed.consumed_at = now
-                db.commit()
+            record_audit(
+                db, request, "e2ee.device.register", actor_id=user.id,
+                outcome="denied", details={"reason": "duplicate_public_material"},
+            )
             raise HTTPException(status_code=409, detail="Khóa hoặc thiết bị đã tồn tại.") from exc
         record_audit(
             db,
@@ -4255,6 +4336,79 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
         return device
+
+    @app.post("/api/e2ee/devices/{device_id}/prekeys")
+    def update_e2ee_prekeys(
+        device_id: str, payload: E2eePreKeyUpdateRequest, request: Request,
+        credentials: Annotated[HTTPAuthorizationCredentials, Security(bearer)],
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        lock_account_mutation(credentials, user, db, step_up=True)
+        device = db.scalar(select(E2eeDevice).where(
+            E2eeDevice.id == device_id, E2eeDevice.user_id == user.id,
+            E2eeDevice.trust_state == "trusted",
+        ).with_for_update())
+        if device is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị tin cậy.")
+        now = utcnow()
+        try:
+            challenge_bytes = decode_base64_strict(payload.challenge, field="challenge", exact_bytes=32)
+        except E2EEValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        claimed = db.execute(update(E2eeDeviceChallenge).where(
+            E2eeDeviceChallenge.id == payload.challenge_id,
+            E2eeDeviceChallenge.user_id == user.id,
+            E2eeDeviceChallenge.challenge_hash == hashlib.sha256(challenge_bytes).hexdigest(),
+            E2eeDeviceChallenge.consumed_at.is_(None), E2eeDeviceChallenge.expires_at > now,
+        ).values(consumed_at=now).execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Challenge không hợp lệ hoặc đã sử dụng.")
+
+        def reject_update(reason: str, detail: str, code: int = 422):
+            record_audit(db, request, "e2ee.prekey.update", actor_id=user.id,
+                         target_type="e2ee_device", target_id=device.id, outcome="denied",
+                         details={"reason": reason})
+            raise HTTPException(status_code=code, detail=detail)
+
+        statement = canonical_json_bytes({
+            "account_id": user.id, "device_id": device.id, "challenge": payload.challenge,
+            "one_time_prekeys": payload.one_time_prekeys, "signed_prekey": payload.signed_prekey,
+            "signed_prekey_signature": payload.signed_prekey_signature,
+        }, schema="scap.e2ee.prekey-update")
+        if not verify_ed25519_signature(device.identity_key_b64, payload.update_signature, statement):
+            reject_update("invalid_update_proof", "Chữ ký cập nhật prekey không hợp lệ.")
+        try:
+            keys = [encode_base64url(decode_base64_strict(item, field="one_time_prekey", exact_bytes=32))
+                    for item in payload.one_time_prekeys]
+            signed_bytes = (decode_base64_strict(payload.signed_prekey, field="signed_prekey", exact_bytes=32)
+                            if payload.signed_prekey is not None else None)
+        except E2EEValidationError:
+            reject_update("invalid_public_material", "Prekey công khai không hợp lệ.")
+        if len(set(keys)) != len(keys) or (keys and db.scalar(select(E2eePreKey.id).where(
+            E2eePreKey.device_id == device.id, E2eePreKey.public_key_b64.in_(keys),
+        ).limit(1)) is not None):
+            reject_update("reused_prekey", "Không được sử dụng lại one-time prekey.")
+        if signed_bytes is not None and not verify_ed25519_signature(
+            device.identity_key_b64, payload.signed_prekey_signature, signed_bytes,
+        ):
+            reject_update("invalid_signed_prekey", "Chữ ký signed prekey không hợp lệ.")
+        available = db.scalar(select(func.count()).select_from(E2eePreKey).where(
+            E2eePreKey.device_id == device.id, E2eePreKey.consumed_at.is_(None),
+        )) or 0
+        historical = db.scalar(select(func.count()).select_from(E2eePreKey)
+                               .where(E2eePreKey.device_id == device.id)) or 0
+        if available + len(keys) > 100 or historical + len(keys) > 10_000:
+            reject_update("prekey_capacity", "Thiết bị đã đạt giới hạn lưu prekey.", 409)
+        db.add_all(E2eePreKey(device_id=device.id, key_id=str(uuid.uuid4()), public_key_b64=key) for key in keys)
+        if signed_bytes is not None:
+            device.signed_prekey_b64 = encode_base64url(signed_bytes)
+            device.signed_prekey_signature_b64 = payload.signed_prekey_signature
+        record_audit(db, request, "e2ee.prekey.update", actor_id=user.id,
+                     target_type="e2ee_device", target_id=device.id,
+                     details={"added": len(keys), "signed_prekey_rotated": signed_bytes is not None})
+        return {"device_id": device.id, "added": len(keys), "available": available + len(keys),
+                "signed_prekey_rotated": signed_bytes is not None}
 
     @app.get("/api/e2ee/devices", response_model=list[E2eeDeviceResponse])
     def list_e2ee_devices(
@@ -4277,9 +4431,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[User, Depends(current_user)],
         db: Annotated[Session, Depends(get_db)],
     ):
-        require_recent_step_up(credentials, user, db)
-        if lock_user_row(db, user) is None:
-            raise HTTPException(status_code=401, detail="Tài khoản không hợp lệ.")
+        lock_account_mutation(credentials, user, db, step_up=True)
         device = db.scalar(
             select(E2eeDevice)
             .where(E2eeDevice.id == device_id, E2eeDevice.user_id == user.id)
@@ -4343,7 +4495,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             if still_active is not None and session.security_mode == "private_e2ee":
                 session.current_crypto_epoch += 1
-        db.commit()
         record_audit(
             db,
             request,
@@ -4376,6 +4527,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Tần suất lấy prekey quá cao.",
                 headers={"Retry-After": str(retry_after)},
             )
+        lock_request_mutation(request, requester, db)
         target = db.scalar(
             select(User).where(User.username == username.strip().lower(), User.is_active.is_(True))
         )
@@ -4387,7 +4539,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if device_id:
             device_stmt = device_stmt.where(E2eeDevice.id == device_id)
-        device = db.scalar(device_stmt.order_by(E2eeDevice.created_at.asc()).limit(1))
+        device = db.scalar(device_stmt.order_by(E2eeDevice.created_at.asc()).limit(1).with_for_update())
         if device is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy prekey bundle.")
         prekey: E2eePreKey | None = None
@@ -4421,7 +4573,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 prekey = candidate
                 break
             db.rollback()
-        db.commit()
+            lock_request_mutation(request, requester, db)
         record_audit(
             db,
             request,
@@ -4442,6 +4594,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             one_time_prekey_id=prekey.key_id if prekey is not None else None,
             one_time_prekey=prekey.public_key_b64 if prekey is not None else None,
         )
+
+    @app.get("/api/sessions/{session_id}/e2ee/state")
+    def e2ee_session_state(
+        session_id: str, request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        row, _member = require_private_member_session(session_id, user, db, request)
+        return {"session_id": row.id, "epoch": row.current_crypto_epoch, "owner_id": row.owner_id}
 
     @app.get("/api/sessions/{session_id}/e2ee/members")
     def list_e2ee_members(
@@ -4492,6 +4653,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for account in accounts:
             if lock_user_row(db, account) is None:
                 raise HTTPException(status_code=404, detail="Không tìm thấy người dùng.")
+        lock_account_mutation(credentials, owner, db, step_up=True)
         row = require_owned_session(
             session_id,
             owner,
@@ -4524,7 +4686,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             membership.removed_epoch = None
             membership.removed_at = None
             membership.joined_at = utcnow()
-        db.commit()
         record_audit(
             db,
             request,
@@ -4546,7 +4707,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         require_recent_step_up(credentials, owner, db)
-        row = require_owned_session(session_id, owner, db, request, for_update=True)
+        row = require_owned_session(session_id, owner, db, request, for_update=True, step_up=True)
         if row.security_mode != "private_e2ee":
             raise HTTPException(status_code=409, detail="Phiên này không ở chế độ Private E2EE.")
         target = db.scalar(select(User).where(User.username == username.strip().lower()))
@@ -4564,7 +4725,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         row.current_crypto_epoch += 1
         membership.removed_epoch = row.current_crypto_epoch
         membership.removed_at = utcnow()
-        db.commit()
         record_audit(
             db,
             request,
@@ -4706,8 +4866,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.add(stored)
         row.updated_at = utcnow()
         try:
-            db.commit()
-            db.refresh(stored)
+            db.flush()
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(
@@ -4741,6 +4900,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
         recipient_device_id: Annotated[str, Query(min_length=36, max_length=36)],
         after: Annotated[datetime | None, Query()] = None,
+        after_id: Annotated[str | None, Query(min_length=36, max_length=36)] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 100,
     ):
         row, membership = require_private_member_session(session_id, user, db, request)
@@ -4769,8 +4929,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .order_by(E2eeEnvelope.created_at.asc(), E2eeEnvelope.id.asc())
             .limit(limit)
         )
+        if after_id is not None and after is None:
+            raise HTTPException(status_code=422, detail="after_id cần đi cùng timestamp after.")
         if after is not None:
-            stmt = stmt.where(E2eeEnvelope.created_at > after)
+            after = as_utc(after)
+            if after_id is not None:
+                try:
+                    if str(uuid.UUID(after_id)) != after_id:
+                        raise ValueError("noncanonical UUID")
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail="after_id phải là UUID canonical.") from exc
+                stmt = stmt.where(or_(
+                    E2eeEnvelope.created_at > after,
+                    and_(E2eeEnvelope.created_at == after, E2eeEnvelope.id > after_id),
+                ))
+            else:
+                tied = list(db.scalars(stmt.where(E2eeEnvelope.created_at == after).limit(2)))
+                if len(tied) > 1:
+                    raise HTTPException(status_code=409, detail="Timestamp có nhiều bản mã; hãy gửi thêm after_id.")
+                stmt = stmt.where(E2eeEnvelope.created_at > after)
         return [e2ee_envelope_response(item) for item in db.scalars(stmt)]
 
     @app.get("/api/admin/audit", response_model=list[AuditResponse])
@@ -4788,6 +4965,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         return list(db.scalars(select(User).order_by(User.created_at.desc()).limit(500)))
+
+    @app.get("/api/admin/users/page", response_model=PageResponse[UserResponse])
+    def admin_user_page(
+        _: Annotated[User, Depends(admin_user)],
+        db: Annotated[Session, Depends(get_db)],
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ):
+        total = db.scalar(select(func.count()).select_from(User)) or 0
+        users = list(db.scalars(select(User).order_by(User.created_at.asc(), User.id.asc())
+                                .offset(offset).limit(limit)))
+        return page_result(users, total, offset, limit)
 
     def availability_snapshot():
         snapshot = {

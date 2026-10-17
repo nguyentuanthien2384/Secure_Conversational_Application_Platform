@@ -57,6 +57,7 @@ SESSION_CLEAR_MARKUP = '<span data-scap-session-clear="1"></span>'
 SESSION_TICK_SECONDS = 10
 # Ngưỡng nhắc trước khi phiên hết hạn (giây).
 WARN_BEFORE_EXPIRY = 120
+MAX_UI_SEARCH_ROWS = 500
 
 # Vùng lịch sử co theo chiều cao màn hình để ô soạn và nút Gửi luôn ở gần nội
 # dung. Giới hạn dưới vẫn đủ đọc hội thoại; giới hạn trên tránh khoảng trắng lớn
@@ -1090,7 +1091,9 @@ def _install_session_result_guard(demo, token_component, mfa_component):
     def stale(observation):
         state = observation["state"]
         return (observation["stale"] or state._scap_auth_generation != observation["generation"]
-                or tuple(state[item] for item in identity_ids) != observation["identity"])
+                or tuple(state[item] for item in identity_ids) != observation["identity"]
+                or tuple(state[item] for item in observation.get("scope_ids", ()))
+                != observation.get("scope", ()))
 
     def skipped_result(block_fn):
         return {
@@ -1123,6 +1126,8 @@ def _install_session_result_guard(demo, token_component, mfa_component):
                 "state": state, "generation": state._scap_auth_generation,
                 "identity": tuple(state[item] for item in identity_ids),
                 "identity_ids": identity_ids, "stale": False,
+                "scope_ids": getattr(block_fn, "_scap_scope_ids", ()),
+                "scope": tuple(state[item] for item in getattr(block_fn, "_scap_scope_ids", ())),
             }
         handle = _UI_RESULT_SESSION.set(observation)
         try:
@@ -1183,8 +1188,50 @@ def _session_choices(token):
     icons = {"secure": "🔒", "confidential": "🛡️", "private_e2ee": "🔐"}
     return [
         (f"{icons.get(row.get('security_mode'), '🔒')}  {row['title']}", row["id"])
-        for row in _api(token, "GET", "/api/sessions")
+        for row in _read_page(token, "/api/sessions/page")["items"]
     ]
+
+
+def _read_page(token, path, *, offset=0, limit=100, params=None):
+    """Read the explicit paging contract, never infer a total from a page size."""
+    page = _api(token, "GET", path, params={
+        **(params or {}), "offset": offset, "limit": limit,
+    })
+    if (not isinstance(page, dict) or not isinstance(page.get("items"), list)
+        or type(page.get("total")) is not int or page["total"] < 0
+        or type(page.get("has_more")) is not bool):
+        raise gr.Error("Máy chủ chưa trả được thông tin phân trang hợp lệ. Hãy làm mới.")
+    next_offset = page.get("next_offset")
+    if page["has_more"] and (type(next_offset) is not int or next_offset <= offset):
+        raise gr.Error("Máy chủ chưa trả được vị trí tải tiếp hợp lệ. Hãy làm mới.")
+    return page
+
+
+def _page_state(token, page, *, previous=None, **scope):
+    previous = previous or {}
+    matches = previous.get("account") == _token_digest(token) and all(
+        previous.get(key) == value for key, value in scope.items()
+    )
+    items = list(previous.get("items", [])) if matches else []
+    by_id = {item.get("id", item.get("message_id")): item for item in items}
+    for item in page["items"]:
+        by_id[item.get("id", item.get("message_id"))] = item
+    return {
+        "account": _token_digest(token), "items": list(by_id.values()),
+        "total": page["total"], "next_offset": page.get("next_offset"),
+        "has_more": page["has_more"], **scope,
+    }
+
+
+def _page_summary(state, noun):
+    count = len(state.get("items", []))
+    if state.get("has_more"):
+        more = " · Còn kết quả, bấm **Tải thêm**."
+    elif count != state.get("total", count):
+        more = " · Danh sách đã thay đổi; hãy làm mới để đối chiếu lại."
+    else:
+        more = " · Đã tải hết."
+    return f"Đang hiển thị **{count}/{state.get('total', count)}** {noun}{more}"
 
 
 # Dùng chung cho dropdown "Thiết lập hội thoại mới" và dòng chế độ đã khóa.
@@ -1995,6 +2042,11 @@ def build_ui(
                                 elem_id="session-list",
                                 container=False,
                             )
+                            st_session_page = gr.State({})
+                            md_session_page = gr.Markdown("", elem_id="sessions-page-status")
+                            btn_sessions_more = gr.Button(
+                                "Tải thêm hội thoại", visible=False, size="sm",
+                            )
                             # Chế độ của hội thoại đang chọn chỉ hiển thị, không
                             # chỉnh được; dropdown bên dưới chỉ dành cho hội thoại mới.
                             md_session_policy = gr.Markdown("", elem_id="session-policy")
@@ -2090,6 +2142,24 @@ def build_ui(
                                 allow_file_downloads=False,
                                 latex_delimiters=CHAT_LATEX_DELIMITERS,
                             )
+                            with gr.Accordion("Tìm trong hội thoại này", open=False):
+                                with gr.Row():
+                                    tb_session_query = gr.Textbox(
+                                        label="Từ khóa trong hội thoại đang mở", max_lines=1,
+                                        max_length=120, scale=4, elem_id="session-search-query",
+                                    )
+                                    btn_session_search = gr.Button("Tìm trong hội thoại", scale=1)
+                                    btn_session_search_clear = gr.Button("Xóa kết quả tìm", scale=1)
+                                md_session_search = gr.Markdown("", visible=False)
+                                st_session_search_page = gr.State({})
+                                st_session_view = gr.State(None)
+                                st_session_search_generation = gr.State(0)
+                                df_session_search = _data_table(
+                                    SEARCH_HEADERS, elem_id="session-search-table",
+                                )
+                                btn_session_search_more = gr.Button(
+                                    "Tải thêm kết quả trong hội thoại", visible=False, size="sm",
+                                )
                             with gr.Row(elem_id="chat-composer"):
                                 tb_msg = gr.Textbox(
                                     label="Tin nhắn",
@@ -2162,6 +2232,9 @@ def build_ui(
                         )
                         btn_gsearch = gr.Button("Tìm kiếm", variant="primary", scale=1)
                     df_gsearch = _data_table(SEARCH_HEADERS, elem_id="global-search-table")
+                    st_search_page = gr.State({})
+                    md_search_page = gr.Markdown("", elem_id="global-search-page-status")
+                    btn_search_more = gr.Button("Tải thêm kết quả", visible=False, size="sm")
 
                 # ---------- TÀI KHOẢN ----------
                 with gr.Tab("Tài khoản"):
@@ -2328,6 +2401,9 @@ def build_ui(
                     df_users = _data_table(
                         USER_HEADERS, elem_id="users-table", elem_classes=["dashboard-table"]
                     )
+                    st_users_page = gr.State({})
+                    md_users_page = gr.Markdown("", elem_id="users-page-status")
+                    btn_users_more = gr.Button("Tải thêm tài khoản", visible=False, size="sm")
                     gr.Markdown(
                         "Khi cần xác thực lại, nhập mật khẩu của bạn và mã 2FA (nếu đã bật) "
                         "trước khi thực hiện thao tác quản trị. Thông tin này được xóa sau thao tác."
@@ -2354,6 +2430,18 @@ def build_ui(
                         btn_lock = gr.Button("Khóa", size="sm")
                         btn_unlock = gr.Button("Mở khóa", size="sm")
                         btn_del_user = gr.Button("Xóa tài khoản", variant="stop", size="sm")
+                    st_delete_user_target = gr.State({})
+                    with gr.Column(visible=False, elem_id="account-delete-confirm") as grp_user_delete:
+                        md_user_delete = gr.Markdown("", elem_id="account-delete-notice")
+                        tb_user_delete_name = gr.Textbox(
+                            label="Nhập đúng tên đăng nhập để xác nhận xóa", max_length=32,
+                            elem_id="account-delete-name",
+                        )
+                        with gr.Row():
+                            btn_user_delete_confirm = gr.Button(
+                                "Xác nhận xóa tài khoản vĩnh viễn", variant="stop", size="sm",
+                            )
+                            btn_user_delete_cancel = gr.Button("Hủy xóa tài khoản", size="sm")
                     with gr.Accordion("Tạo tài khoản mới", open=False):
                         with gr.Row():
                             tb_cu_name = gr.Textbox(label="Tên đăng nhập", max_length=32)
@@ -2489,6 +2577,9 @@ def build_ui(
             df_devices,
             dd_revoke,
             timer,
+            st_session_page,
+            md_session_page,
+            btn_sessions_more,
         ]
         # Chỉ ẩn app_sec không xóa dữ liệu khỏi trình duyệt. Mọi dữ liệu theo
         # tài khoản, bản nháp, thông tin xác thực và URL tải xuống phải được
@@ -2516,6 +2607,23 @@ def build_ui(
             (grp_delete_auth, gr.update(visible=False)),
             (tb_delete_password, ""),
             (tb_delete_code, ""),
+            (st_delete_user_target, {}),
+            (grp_user_delete, gr.update(visible=False)),
+            (md_user_delete, ""),
+            (tb_user_delete_name, ""),
+            (st_users_page, {}),
+            (md_users_page, ""),
+            (btn_users_more, gr.update(visible=False)),
+            (st_search_page, {}),
+            (md_search_page, ""),
+            (btn_search_more, gr.update(visible=False)),
+            (tb_session_query, ""),
+            (md_session_search, gr.update(value="", visible=False)),
+            (st_session_search_page, {}),
+            (st_session_view, None),
+            (st_session_search_generation, 0),
+            (df_session_search, _table_html(SEARCH_HEADERS, [])),
+            (btn_session_search_more, gr.update(visible=False)),
             (file_export, gr.update(value="", visible=False)),
             (tb_msg, ""),
             (cb_web_search, gr.update(value=False)),
@@ -2616,6 +2724,9 @@ def build_ui(
                 _table_html(DEVICE_HEADERS, []),  # df_devices
                 gr.update(choices=[], value=None),
                 gr.Timer(active=False),
+                {},
+                "",
+                gr.update(visible=False),
             ) + tuple(
                 value.copy() if isinstance(value, (dict, list)) else value
                 for _, value in EXTRA_RESET
@@ -2685,7 +2796,7 @@ def build_ui(
                 return tuple(gr.skip() for _ in STAGE2)
             me = _api(token, "GET", "/api/auth/me")
             role = me["role"]
-            choices = _session_choices(token)
+            page_state, choices = session_page_snapshot(token)
             selected = choices[0][1] if choices else None
             devices, revoke = _devices_snapshot(token)
             mfa_on = me["mfa_enabled"]
@@ -2715,6 +2826,9 @@ def build_ui(
                 gr.update(choices=revoke, value=None),
                 # Đặt lại cả chu kỳ: tick có thể đã rút ngắn nó ở phiên trước.
                 gr.Timer(value=SESSION_TICK_SECONDS, active=True),
+                page_state,
+                _page_summary(page_state, "hội thoại"),
+                gr.update(visible=page_state["has_more"]),
             )
 
         def remember_session(token, exp):
@@ -3060,25 +3174,64 @@ def build_ui(
         ))
 
         # ---- trò chuyện ----
+        SESSION_PAGE_OUTS = [st_session_page, md_session_page, btn_sessions_more]
+
+        def session_page_snapshot(token, selected=None, previous=None):
+            append = bool(previous and previous.get("account") == _token_digest(token)
+                          and previous.get("has_more"))
+            offset = previous["next_offset"] if append else 0
+            page = _read_page(token, "/api/sessions/page", offset=offset)
+            state = _page_state(token, page, previous=previous if append else None)
+            # A selected older conversation remains reachable after a mutation
+            # refresh, even when its updated_at is outside the first page.
+            if selected and selected not in {item["id"] for item in state["items"]}:
+                try:
+                    item = _api(token, "GET", f"/api/sessions/{selected}")
+                except gr.Error as err:
+                    if getattr(err, "status_code", None) != 404:
+                        raise
+                else:
+                    state["items"].append(item)
+            icons = {"secure": "🔒", "confidential": "🛡️", "private_e2ee": "🔐"}
+            choices = [
+                (f"{icons.get(item.get('security_mode'), '🔒')}  {item['title']}", item["id"])
+                for item in state["items"]
+            ]
+            return state, choices
+
         def refresh_sessions(token, selected=None):
-            choices = _session_choices(token)
+            state, choices = session_page_snapshot(token, selected)
             ids = {value for _, value in choices}
             selected = selected if selected in ids else (choices[0][1] if choices else None)
             return (
                 gr.update(choices=choices, value=selected),
                 gr.update(choices=choices, value=selected),
                 _chat_history(token, selected),
+                state, _page_summary(state, "hội thoại"), gr.update(visible=state["has_more"]),
             )
 
         btn_refresh.click(
-            _guard(refresh_sessions, 3), [st_token, dd_session], [dd_session, dd_cipher, chatbot]
+            _guard(refresh_sessions, 6), [st_token, dd_session],
+            [dd_session, dd_cipher, chatbot, *SESSION_PAGE_OUTS],
+        )
+
+        def load_more_sessions(token, selected, previous):
+            if (not previous or previous.get("account") != _token_digest(token)
+                or not previous.get("has_more")):
+                return refresh_sessions(token, selected)
+            state, choices = session_page_snapshot(token, selected, previous)
+            return (gr.update(choices=choices, value=selected), gr.update(choices=choices, value=selected),
+                    gr.skip(), state, _page_summary(state, "hội thoại"),
+                    gr.update(visible=state["has_more"]))
+
+        btn_sessions_more.click(
+            _guard(load_more_sessions, 6), [st_token, dd_session, st_session_page],
+            [dd_session, dd_cipher, chatbot, *SESSION_PAGE_OUTS], trigger_mode="once",
         )
 
         def _session_title(token, session_id):
             if session_id:
-                for label, value in _session_choices(token):
-                    if value == session_id:
-                        return label.lstrip("🔒🛡️🔐 ").strip()
+                return _api(token, "GET", f"/api/sessions/{session_id}").get("title") or ""
             return ""
 
         # Thông báo consent/DLP thuộc về lượt gửi trước; giữ lại khi đã sang
@@ -3124,32 +3277,32 @@ def build_ui(
                 },
             )
             _ui_notice(gr.Info, "Đã tạo hội thoại.")
-            dd1, dd2, history = refresh_sessions(token, created["id"])
+            dd1, dd2, history, *paging = refresh_sessions(token, created["id"])
             # Ô "Đổi tên" phải theo hội thoại vừa chọn, nếu không bấm "Lưu tên
             # mới" sẽ chép tên hội thoại cũ sang hội thoại mới.
             return (dd1, dd2, history, "", _session_title(token, created["id"]),
-                    *NOTICE_HIDDEN, *SEARCH_HIDDEN)
+                    *NOTICE_HIDDEN, *SEARCH_HIDDEN, *paging)
 
         btn_create.click(
-            _guard(create_session, 9),
+            _guard(create_session, 12),
             [st_token, tb_new_title, dd_new_security, dd_new_class],
             [dd_session, dd_cipher, chatbot, tb_new_title, tb_rename, md_chat_notice, btn_consent_send,
-             md_search_answer, md_search_suggestions],
+             md_search_answer, md_search_suggestions, *SESSION_PAGE_OUTS],
         )
 
         def rename_session(token, session_id, title):
             if not session_id or not (title or "").strip():
                 _ui_notice(gr.Warning, "Chọn hội thoại và nhập tiêu đề mới.")
-                return gr.skip(), gr.skip(), gr.skip()
+                return tuple(gr.skip() for _ in range(6))
             _api(token, "PATCH", f"/api/sessions/{session_id}", {"title": title.strip()})
             _ui_notice(gr.Info, "Đã đổi tên hội thoại.")
-            dd1, dd2, _ = refresh_sessions(token, session_id)
-            return dd1, dd2, ""
+            dd1, dd2, _, *paging = refresh_sessions(token, session_id)
+            return dd1, dd2, "", *paging
 
         btn_rename.click(
-            _guard(rename_session, 3),
+            _guard(rename_session, 6),
             [st_token, dd_session, tb_rename],
-            [dd_session, dd_cipher, tb_rename],
+            [dd_session, dd_cipher, tb_rename, *SESSION_PAGE_OUTS],
         )
 
         DELETE_HIDDEN = ("", gr.update(visible=False), "", gr.update(visible=False), "", "")
@@ -3159,7 +3312,7 @@ def build_ui(
                              _table_html(CIPHER_HEADERS, []), _table_html(SEARCH_HEADERS, []))
         DELETE_OUTS = [dd_session, dd_cipher, chatbot, tb_rename, md_chat_notice, btn_consent_send,
                        md_search_answer, md_search_suggestions, *DELETE_CONFIRM_OUTS,
-                       file_export, tb_msg, df_cipher, df_gsearch]
+                       file_export, tb_msg, df_cipher, df_gsearch, *SESSION_PAGE_OUTS]
 
         def cancel_delete_session():
             return DELETE_HIDDEN
@@ -3194,7 +3347,7 @@ def build_ui(
             if not pending_id or session_id != pending_id:
                 _ui_notice(gr.Warning, "Hội thoại đã thay đổi. Chọn lại hội thoại và xác nhận xóa.")
                 return (*(gr.skip() for _ in range(8)), *DELETE_HIDDEN,
-                        *(gr.skip() for _ in range(len(DELETE_VIEW_RESET))))
+                        *(gr.skip() for _ in range(len(DELETE_VIEW_RESET) + 3)))
             try:
                 try:
                     _api(token, "DELETE", f"/api/sessions/{pending_id}")
@@ -3206,7 +3359,7 @@ def build_ui(
                             *(gr.skip() for _ in range(8)), pending_id, gr.update(visible=True),
                             "**Cần xác thực lại để xóa vĩnh viễn.**\n\n"
                             "Nhập mật khẩu và mã 2FA (nếu đã bật), rồi bấm xác nhận xóa lần nữa.",
-                            gr.update(visible=True), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET))),
+                            gr.update(visible=True), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET) + 3)),
                         )
                     _api(token, "POST", "/api/auth/step-up", {
                         "password": password, "code": (code or "").strip() or None,
@@ -3218,11 +3371,11 @@ def build_ui(
                 return (
                     *(gr.skip() for _ in range(8)), pending_id, gr.update(visible=True),
                     "⚠️ **Chưa xóa được hội thoại.** " + _safe_markdown_text(_error_text(err)),
-                    gr.skip(), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET))),
+                    gr.skip(), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET) + 3)),
                 )
             _ui_notice(gr.Info, "Đã xóa vĩnh viễn hội thoại và toàn bộ tin nhắn.")
             try:
-                dd1, dd2, history = refresh_sessions(token)
+                dd1, dd2, history, *paging = refresh_sessions(token)
                 title = _session_title(token, dd1["value"])
             except gr.Error:
                 # The DELETE succeeded. Never leave deleted plaintext selected
@@ -3232,10 +3385,10 @@ def build_ui(
                     empty, empty, [], "",
                     gr.update(value="Đã xóa hội thoại. Bấm **Làm mới** để tải lại danh sách.", visible=True),
                     gr.update(visible=False), *SEARCH_HIDDEN, *DELETE_HIDDEN,
-                    *DELETE_VIEW_RESET,
+                    *DELETE_VIEW_RESET, {}, "", gr.update(visible=False),
                 )
             return (dd1, dd2, history, title, *NOTICE_HIDDEN, *SEARCH_HIDDEN,
-                    *DELETE_HIDDEN, *DELETE_VIEW_RESET)
+                    *DELETE_HIDDEN, *DELETE_VIEW_RESET, *paging)
 
         btn_delete_confirm.click(
             _guard(delete_session, len(DELETE_OUTS)),
@@ -3286,7 +3439,8 @@ def build_ui(
         def _send_chat_message(token, session_id, message, confirm_external=False, use_web_search=False):
             message = (message or "").strip()
             if not message:
-                return gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False)
+                return (gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False),
+                        gr.skip(), gr.skip(), gr.skip())
             created_session = False
             try:
                 if use_web_search and not gemini_web_search_enabled:
@@ -3331,9 +3485,11 @@ def build_ui(
                 # Keep every refusal beside the composer. A toast disappears
                 # quickly on mobile, making a failed send look like lost text.
                 selection = (gr.skip(), gr.skip(), gr.skip())
+                paging = (gr.skip(), gr.skip(), gr.skip())
                 if created_session:
                     try:
-                        selection = refresh_sessions(token, session_id)
+                        refreshed = refresh_sessions(token, session_id)
+                        selection, paging = refreshed[:3], refreshed[3:]
                     except gr.Error:
                         # The session was definitely created, even if the next
                         # read is unavailable. Keep it selected for the retry.
@@ -3345,7 +3501,7 @@ def build_ui(
                 # ngay cạnh ô nhập và giữ nguyên nội dung để họ có thể gửi lại sau.
                 if EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err):
                     notice = gr.update(value=CONSENT_NOTICE, visible=True)
-                    return (*selection, gr.skip(), notice, gr.update(visible=True))
+                    return (*selection, gr.skip(), notice, gr.update(visible=True), *paging)
                 notice = gr.update(
                     value=(
                         "⚠️ **Chưa nhận được phản hồi.** " + _safe_markdown_text(_error_text(err))
@@ -3353,9 +3509,9 @@ def build_ui(
                     ),
                     visible=True,
                 )
-                return (*selection, gr.skip(), notice, gr.update(visible=False))
+                return (*selection, gr.skip(), notice, gr.update(visible=False), *paging)
             try:
-                dd1, dd2, history = refresh_sessions(token, session_id)
+                dd1, dd2, history, *paging = refresh_sessions(token, session_id)
             except gr.Error as err:
                 # The POST succeeded. Keep that success distinct from a failed
                 # history read so retrying does not send the same text twice.
@@ -3374,6 +3530,7 @@ def build_ui(
                         visible=True,
                     ),
                     gr.update(visible=False),
+                    gr.skip(), gr.skip(), gr.skip(),
                 )
             # Nếu DLP đã che dữ liệu nhạy cảm, nói rõ cho người dùng biết đã che
             # NHÓM nào — không bao giờ hiện lại giá trị gốc.
@@ -3389,15 +3546,16 @@ def build_ui(
                 )
             else:
                 banner = gr.update(value="", visible=False)
-            return dd1, dd2, history, "", banner, gr.update(visible=False)
+            return dd1, dd2, history, "", banner, gr.update(visible=False), *paging
 
         def send_message(token, session_id, message, confirm_external=False, use_web_search=False):
             if not use_web_search:
-                return (*_send_chat_message(token, session_id, message, confirm_external),
-                        *SEARCH_HIDDEN)
+                sent = _send_chat_message(token, session_id, message, confirm_external)
+                return (*sent[:6], *SEARCH_HIDDEN, *sent[6:])
             message = (message or "").strip()
             if not message:
-                return (gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN, *SEARCH_HIDDEN)
+                return (gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN, *SEARCH_HIDDEN,
+                        gr.skip(), gr.skip(), gr.skip())
             try:
                 if not gemini_web_search_enabled:
                     raise gr.Error("Máy chủ chưa bật tra cứu Internet. Bỏ chọn tra cứu để gửi tin nhắn.")
@@ -3426,15 +3584,17 @@ def build_ui(
                     ), visible=True,
                 )
                 return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), notice,
-                        gr.update(visible=needs_consent), *SEARCH_HIDDEN)
+                        gr.update(visible=needs_consent), *SEARCH_HIDDEN,
+                        gr.skip(), gr.skip(), gr.skip())
             return (
                 gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN,
                 gr.update(value=answer, visible=True),
                 gr.update(value=marker, visible=bool(marker)),
+                gr.skip(), gr.skip(), gr.skip(),
             )
 
         SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_chat_notice, btn_consent_send,
-                     md_search_answer, md_search_suggestions]
+                     md_search_answer, md_search_suggestions, *SESSION_PAGE_OUTS]
         def submit_chat_message(token, session_id, message, use_web_search=False):
             # Bấm Gửi chính là xác nhận gửi tin nhắn này tới AI bên ngoài (dòng
             # chế độ hội thoại nói rõ điều đó), nên hội thoại Internal/Confidential
@@ -3446,7 +3606,7 @@ def build_ui(
         # run while mobile Chrome was still waiting for the first response.
         gr.on(
             triggers=[btn_send.click, tb_msg.submit],
-            fn=_guard(submit_chat_message, 8),
+            fn=_guard(submit_chat_message, len(SEND_OUTS)),
             inputs=[st_token, dd_session, tb_msg, cb_web_search],
             outputs=SEND_OUTS,
             trigger_mode="once",
@@ -3467,13 +3627,14 @@ def build_ui(
                     gr.update(value="", visible=False),
                     gr.update(visible=False),
                     *SEARCH_HIDDEN,
+                    gr.skip(), gr.skip(), gr.skip(),
                 )
             if not _api(token, "GET", "/api/auth/me").get("ai_data_consent"):
                 _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
             return send_message(token, session_id, message, True, use_web_search)
 
         btn_consent_send.click(
-            _guard(consent_and_resend, 8), [st_token, dd_session, tb_msg, cb_web_search], SEND_OUTS
+            _guard(consent_and_resend, len(SEND_OUTS)), [st_token, dd_session, tb_msg, cb_web_search], SEND_OUTS
         )
         cb_web_search.input(lambda _selected: SEARCH_HIDDEN, [cb_web_search],
                             [md_search_answer, md_search_suggestions], api_name=False)
@@ -3501,28 +3662,97 @@ def build_ui(
         btn_cipher.click(_guard(load_cipher, 1), [st_token, dd_cipher], [df_cipher])
 
         # ---- tìm kiếm toàn cục ----
-        def global_search(token, query):
+        SEARCH_PAGE_OUTS = [df_gsearch, st_search_page, md_search_page, btn_search_more]
+        SESSION_SEARCH_OUTS = [df_session_search, st_session_search_page,
+                               md_session_search, btn_session_search_more]
+
+        def search_page(token, query, previous=None, session_id=None):
             query = (query or "").strip()
             if not query:
                 _ui_notice(gr.Warning, "Nhập từ khóa trước.")
-                return gr.skip()
-            rows = _api(token, "GET", "/api/search/messages", params={"q": query})
-            _ui_notice(gr.Info,
-                f"Tìm thấy {len(rows)} tin nhắn "
-                f"trong {len({r['session_id'] for r in rows})} hội thoại."
+                return _table_html(SEARCH_HEADERS, []), {}, "", gr.update(visible=False)
+            valid_previous = (
+                previous and previous.get("account") == _token_digest(token)
+                and previous.get("query") == query and previous.get("session_id") == session_id
+                and previous.get("has_more")
             )
-            return _table_html(SEARCH_HEADERS, [
+            offset = previous["next_offset"] if valid_previous else 0
+            path = (f"/api/sessions/{session_id}/messages/page" if session_id
+                    else "/api/search/messages/page")
+            try:
+                page = _read_page(token, path, offset=offset, limit=50,
+                                  params={"query" if session_id else "q": query})
+            except gr.Error as err:
+                message = "**Chưa tìm được nội dung.** " + _safe_markdown_text(_error_text(err))
+                return message, {}, gr.update(value=message, visible=True), gr.update(visible=False)
+            state = _page_state(token, page, previous=previous if valid_previous else None,
+                                query=query, session_id=session_id)
+            # The table contains previews; never retain every full plaintext
+            # hit while paging through a large account's history.
+            state["items"] = [
+                {**item, "content": item["content"][:201]}
+                for item in state["items"][-MAX_UI_SEARCH_ROWS:]
+            ]
+            table = _table_html(SEARCH_HEADERS, [
                 [
-                    row["session_title"],
+                    row.get("session_title") or "Hội thoại đang mở",
                     ("Bạn" if row["role"] == "user" else "Trợ lý"),
                     row["content"][:200] + ("…" if len(row["content"]) > 200 else ""),
                     _fmt(row["created_at"]),
                 ]
-                for row in rows
+                for row in state["items"]
             ])
+            end = offset + len(page["items"])
+            start = max(0, end - len(state["items"]))
+            shown = f"{start + 1}–{end}" if state["items"] else "0"
+            status = (f"Từ khóa: **{_safe_markdown_text(query)}** · Đang hiển thị "
+                      f"**{shown}/{state['total']}** tin nhắn.")
+            status += " Còn kết quả; bấm **Tải thêm**." if state["has_more"] else " Đã đến cuối kết quả."
+            if start:
+                status += f" Chỉ giữ {MAX_UI_SEARCH_ROWS} kết quả gần nhất trên giao diện; tìm lại để xem từ đầu."
+            return table, state, gr.update(value=status, visible=True), gr.update(visible=state["has_more"])
 
-        btn_gsearch.click(_guard(global_search, 1), [st_token, tb_gq], [df_gsearch])
-        tb_gq.submit(_guard(global_search, 1), [st_token, tb_gq], [df_gsearch])
+        def global_search(token, query):
+            return search_page(token, query)
+
+        btn_gsearch.click(_guard(global_search, 4), [st_token, tb_gq], SEARCH_PAGE_OUTS)
+        tb_gq.submit(_guard(global_search, 4), [st_token, tb_gq], SEARCH_PAGE_OUTS)
+        btn_search_more.click(_guard(search_page, 4), [st_token, tb_gq, st_search_page],
+                              SEARCH_PAGE_OUTS, trigger_mode="once")
+
+        def find_in_session(token, session_id, query, view_id=None, generation=0):
+            if not session_id:
+                message = "Chọn hội thoại trước khi tìm nội dung."
+                return (_table_html(SEARCH_HEADERS, []), {},
+                        gr.update(value=message, visible=True), gr.update(visible=False))
+            if view_id is not None and view_id != session_id:
+                return tuple(gr.skip() for _ in SESSION_SEARCH_OUTS)
+            return search_page(token, query, session_id=session_id)
+
+        def load_more_session_search(token, session_id, query, previous, view_id=None, generation=0):
+            if view_id is not None and view_id != session_id:
+                return tuple(gr.skip() for _ in SESSION_SEARCH_OUTS)
+            return search_page(token, query, previous, session_id) if session_id else find_in_session(token, session_id, query)
+
+        gr.on([btn_session_search.click, tb_session_query.submit],
+              _guard(find_in_session, 4), [st_token, dd_session, tb_session_query,
+                                          st_session_view, st_session_search_generation],
+              SESSION_SEARCH_OUTS, trigger_mode="once")
+        btn_session_search_more.click(
+            _guard(load_more_session_search, 4), [st_token, dd_session, tb_session_query,
+                                                  st_session_search_page, st_session_view,
+                                                  st_session_search_generation],
+            SESSION_SEARCH_OUTS, trigger_mode="once",
+        )
+
+        def clear_session_search(selected, generation):
+            return ("", _table_html(SEARCH_HEADERS, []), {},
+                    gr.update(value="", visible=False), gr.update(visible=False), selected, generation + 1)
+
+        for trigger in (btn_session_search_clear.click, dd_session.change):
+            trigger(clear_session_search, [dd_session, st_session_search_generation],
+                    [tb_session_query, *SESSION_SEARCH_OUTS, st_session_view, st_session_search_generation],
+                    api_name=False, queue=False, show_progress="hidden")
 
         # ---- tài khoản ----
         def set_consent(token, consent):
@@ -3768,7 +3998,27 @@ def build_ui(
         btn_logout_all.click(_guard(logout_all, len(RESET_OUTS)), [st_token], RESET_OUTS)
 
         # ---- quản trị ----
-        def admin_snapshot(token, keep=None):
+        def users_page_snapshot(token, keep=None, previous=None, keep_record=None):
+            append = bool(previous and previous.get("account") == _token_digest(token)
+                          and previous.get("has_more"))
+            page = _read_page(token, "/api/admin/users/page",
+                              offset=previous["next_offset"] if append else 0)
+            state = _page_state(token, page, previous=previous if append else None)
+            if (isinstance(keep_record, dict) and keep_record.get("id") == keep
+                and keep not in {item["id"] for item in state["items"]}):
+                state["items"].append(keep_record)
+            users = state["items"]
+            table = _table_html(USER_HEADERS, [
+                [u["username"], u["role"], "Hoạt động" if u["is_active"] else "Đã khóa",
+                 "Bật" if u["mfa_enabled"] else "—", _fmt(u["created_at"])]
+                for u in users
+            ])
+            choices = [(f"{u['username']} ({u['role']})", u["id"]) for u in users]
+            selected = keep if keep in {u["id"] for u in users} else None
+            return (table, gr.update(choices=choices, value=selected), state,
+                    _page_summary(state, "tài khoản"), gr.update(visible=state["has_more"]))
+
+        def admin_snapshot(token, keep=None, keep_record=None):
             stats = _api(token, "GET", "/api/admin/stats")
             metrics = (
                 f"**Người dùng**\n\n## {stats['total_users']}\n\nĐang hoạt động {stats['active_users']}",
@@ -3848,26 +4098,12 @@ def build_ui(
                     "Tài nguyên hiện tại tính cả yêu cầu đang lấy số liệu; "
                     "cảnh báo HTTP tự hết khi cửa sổ quan sát trôi qua."
                 )
-            users = _api(token, "GET", "/api/admin/users")
-            table = _table_html(USER_HEADERS, [
-                [
-                    u["username"],
-                    u["role"],
-                    ("Hoạt động" if u["is_active"] else "Đã khóa"),
-                    ("Bật" if u["mfa_enabled"] else "—"),
-                    _fmt(u["created_at"]),
-                ]
-                for u in users
-            ])
-            choices = [(f"{u['username']} ({u['role']})", u["id"]) for u in users]
-            # Keep the account the admin is working on (e.g. lock, then unlock);
-            # clearing it made the next button answer "Chọn một người dùng trước.".
-            selected = keep if keep in {u["id"] for u in users} else None
-            return (*metrics, stats_md, alerts_md, table, gr.update(choices=choices, value=selected))
+            return (*metrics, stats_md, alerts_md,
+                    *users_page_snapshot(token, keep, keep_record=keep_record))
 
-        def refresh_admin(token, keep=None):
+        def refresh_admin(token, keep=None, keep_record=None):
             try:
-                return admin_snapshot(token, keep)
+                return admin_snapshot(token, keep, keep_record)
             except gr.Error as err:
                 # A failed multi-API refresh cannot leave an older observation
                 # looking current, or retain an account choice no longer read.
@@ -3879,7 +4115,8 @@ def build_ui(
                     f"**{title}**\n\n## —\n\nKhông tải được\n\nLần thử: {checked_at}"
                     for title in ("Người dùng", "Hội thoại", "Đăng nhập lỗi", "Từ chối quyền")
                 )
-                return (*metrics, message, message, message, gr.update(choices=[], value=None))
+                return (*metrics, message, message, message, gr.update(choices=[], value=None),
+                        {}, message, gr.update(visible=False))
 
         ADMIN_OUTS = [
             md_metric_users,
@@ -3890,11 +4127,19 @@ def build_ui(
             md_alerts,
             df_users,
             dd_user_pick,
+            st_users_page,
+            md_users_page,
+            btn_users_more,
         ]
-        btn_adm_refresh.click(_guard(refresh_admin, 8), [st_token], ADMIN_OUTS)
+        btn_adm_refresh.click(_guard(refresh_admin, len(ADMIN_OUTS)), [st_token], ADMIN_OUTS)
         # Mở tab là điều hướng: số liệu cũ ở lại tới khi số liệu mới về, không
         # phủ lớp "processing" lên từng thẻ.
-        adm_tab.select(_guard(refresh_admin, 8), [st_token], ADMIN_OUTS, show_progress="hidden")
+        adm_tab.select(_guard(refresh_admin, len(ADMIN_OUTS)), [st_token], ADMIN_OUTS, show_progress="hidden")
+        btn_users_more.click(
+            _guard(users_page_snapshot, 5), [st_token, dd_user_pick, st_users_page],
+            [df_users, dd_user_pick, st_users_page, md_users_page, btn_users_more],
+            trigger_mode="once",
+        )
 
         def clear_admin_credentials():
             return "", "", ""
@@ -3905,13 +4150,13 @@ def build_ui(
             if not user_id:
                 _ui_notice(gr.Warning, "Chọn một người dùng trước.")
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
-            _with_step_up(
+            updated = _with_step_up(
                 token, password, code,
                 lambda: _api(token, "PATCH", f"/api/admin/users/{user_id}/role", {"role": role}),
                 "Đổi vai trò",
             )
             _ui_notice(gr.Info, f"Đã đổi vai trò thành {role}.")
-            return refresh_admin(token, keep=user_id)
+            return refresh_admin(token, keep=user_id, keep_record=updated)
 
         btn_set_role.click(
             _guard(set_role, len(ADMIN_OUTS)),
@@ -3922,13 +4167,13 @@ def build_ui(
             if not user_id:
                 _ui_notice(gr.Warning, "Chọn một người dùng trước.")
                 return tuple(gr.skip() for _ in ADMIN_OUTS)
-            _with_step_up(
+            updated = _with_step_up(
                 token, password, code,
                 lambda: _api(token, "PATCH", f"/api/admin/users/{user_id}/status", {"is_active": active}),
                 "Mở khóa" if active else "Khóa",
             )
             _ui_notice(gr.Info, "Đã mở khóa tài khoản." if active else "Đã khóa tài khoản.")
-            return refresh_admin(token, keep=user_id)
+            return refresh_admin(token, keep=user_id, keep_record=updated)
 
         btn_lock.click(
             _guard(lambda tk, uid, pw="", code="": set_status(tk, uid, False, pw, code), len(ADMIN_OUTS)),
@@ -3941,21 +4186,68 @@ def build_ui(
             ADMIN_OUTS,
         ).then(clear_admin_credentials, [], ADMIN_SECRET_OUTS, show_progress="hidden")
 
-        def delete_user(token, user_id, password="", code=""):
-            if not user_id:
-                _ui_notice(gr.Warning, "Chọn một người dùng trước.")
-                return tuple(gr.skip() for _ in ADMIN_OUTS)
-            _with_step_up(
-                token, password, code,
-                lambda: _api(token, "DELETE", f"/api/admin/users/{user_id}"), "Xóa tài khoản",
+        USER_DELETE_OUTS = [st_delete_user_target, grp_user_delete, md_user_delete,
+                            tb_user_delete_name, tb_admin_pw, tb_admin_code]
+        USER_DELETE_HIDDEN = ({}, gr.update(visible=False), "", "", "", "")
+
+        def cancel_delete_user():
+            return USER_DELETE_HIDDEN
+
+        def request_delete_user(token, user_id, page_state):
+            valid = page_state and page_state.get("account") == _token_digest(token)
+            target = next((item for item in page_state.get("items", []) if item["id"] == user_id), None) if valid else None
+            if not target:
+                _ui_notice(gr.Warning, "Làm mới danh sách và chọn lại tài khoản cần xóa.")
+                return USER_DELETE_HIDDEN
+            username = target["username"]
+            return (
+                {"id": user_id, "username": username, "account": _token_digest(token)},
+                gr.update(visible=True),
+                f"**Xóa vĩnh viễn tài khoản “{_safe_markdown_text(username)}”?**\n\n"
+                "Các hội thoại, tin nhắn, phiên đăng nhập và thông tin bảo vệ tài khoản "
+                "của người này sẽ bị xóa. Không thể hoàn tác trong ứng dụng. "
+                "Nhập đúng tên đăng nhập bên dưới; mật khẩu/mã 2FA quản trị viên vẫn được yêu cầu khi cần xác thực lại.",
+                "", "", "",
             )
-            _ui_notice(gr.Info, "Đã xóa tài khoản cùng toàn bộ dữ liệu của người đó.")
-            return refresh_admin(token)
 
         btn_del_user.click(
-            _guard(delete_user, len(ADMIN_OUTS)),
-            [st_token, dd_user_pick, tb_admin_pw, tb_admin_code], ADMIN_OUTS,
-        ).then(clear_admin_credentials, [], ADMIN_SECRET_OUTS, show_progress="hidden")
+            _guard(request_delete_user, len(USER_DELETE_OUTS)),
+            [st_token, dd_user_pick, st_users_page], USER_DELETE_OUTS, trigger_mode="once",
+        )
+        btn_user_delete_cancel.click(cancel_delete_user, None, USER_DELETE_OUTS, api_name=False)
+        dd_user_pick.input(cancel_delete_user, None, USER_DELETE_OUTS, queue=False,
+                           api_name=False, show_progress="hidden")
+        for trigger in (btn_adm_refresh.click, adm_tab.select, btn_set_role.click,
+                        btn_lock.click, btn_unlock.click):
+            trigger(cancel_delete_user, None, USER_DELETE_OUTS, queue=False,
+                    api_name=False, show_progress="hidden")
+
+        def delete_user(token, user_id, pending, typed_name, password="", code=""):
+            skip_admin = tuple(gr.skip() for _ in ADMIN_OUTS)
+            if (not pending or pending.get("id") != user_id
+                or pending.get("account") != _token_digest(token)):
+                _ui_notice(gr.Warning, "Tài khoản hoặc phiên đã thay đổi. Hãy xác nhận lại mục cần xóa.")
+                return (*skip_admin, *USER_DELETE_HIDDEN)
+            if (typed_name or "").strip() != pending.get("username"):
+                return (*skip_admin, pending, gr.update(visible=True),
+                        "**Chưa xóa tài khoản.** Nhập đúng tên đăng nhập đã chọn để xác nhận.", "", "", "")
+            try:
+                _with_step_up(
+                    token, password, code,
+                    lambda: _api(token, "DELETE", f"/api/admin/users/{pending['id']}"), "Xóa tài khoản",
+                )
+            except gr.Error as err:
+                return (*skip_admin, pending, gr.update(visible=True),
+                        "**Chưa xóa được tài khoản.** " + _safe_markdown_text(_error_text(err)),
+                        "", "", "")
+            _ui_notice(gr.Info, "Đã xóa tài khoản cùng toàn bộ dữ liệu của người đó.")
+            return (*refresh_admin(token), *USER_DELETE_HIDDEN)
+
+        btn_user_delete_confirm.click(
+            _guard(delete_user, len(ADMIN_OUTS) + len(USER_DELETE_OUTS)),
+            [st_token, dd_user_pick, st_delete_user_target, tb_user_delete_name, tb_admin_pw, tb_admin_code],
+            [*ADMIN_OUTS, *USER_DELETE_OUTS], trigger_mode="once",
+        )
 
         def create_user(token, username, password, role, admin_password="", code=""):
             username = (username or "").strip()
@@ -4298,6 +4590,8 @@ def build_ui(
     # login, reset, admin actions — as a ready-made map for bots.
     for fn in demo.fns.values():
         fn.api_visibility = "private"
+        if fn.fn is not None and fn.fn.__name__ in {"find_in_session", "load_more_session_search"}:
+            fn._scap_scope_ids = (st_session_search_generation._id,)
     demo.config = demo.get_config_file()
     demo.queue(
         max_size=queue_max_size,

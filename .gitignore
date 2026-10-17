@@ -82,6 +82,7 @@ cython_debug/
 
 # Private local data, mail containing one-time codes and database sidecars
 local_data/
+client_data/
 mail_outbox/
 *.db
 *.db-journal

@@ -75,6 +75,11 @@ def _button_event(demo, label):
     return _event_for(demo, button)
 
 
+def _page(items):
+    return {"items": items, "total": len(items), "offset": 0, "limit": 100,
+            "has_more": False, "next_offset": None}
+
+
 def test_login_click_and_enter_share_authentication_and_workspace_chain(runtime_demo, monkeypatch):
     from src.app import gradio_ui
 
@@ -151,19 +156,22 @@ def test_admin_actions_keep_the_selected_account_selected(runtime_demo, monkeypa
              "recent_login_failures": 0, "recent_auth_denials": 0, "availability": None}
 
     def fake_api(token, method, path, *args, **kwargs):
-        return {"/api/admin/stats": stats, "/api/admin/users": users}.get(path, [])
+        return {"/api/admin/stats": stats, "/api/admin/users/page": _page(users)}.get(path, [])
 
     monkeypatch.setattr(gradio_ui, "_api", fake_api)
     monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
     for label in ("Khóa", "Mở khóa"):
         callback, dependency = _button_event(runtime_demo, label)
         result = callback.fn("token", "user-1")
-        assert result[-1]["value"] == "user-1", label
+        assert result[7]["value"] == "user-1", label
     callback, _ = _button_event(runtime_demo, "Đổi vai trò")
-    assert callback.fn("token", "user-2", "moderator")[-1]["value"] == "user-2"
-    callback, _ = _button_event(runtime_demo, "Xóa tài khoản")
+    assert callback.fn("token", "user-2", "moderator")[7]["value"] == "user-2"
+    callback, _ = _button_event(runtime_demo, "Xác nhận xóa tài khoản vĩnh viễn")
     users.pop(1)
-    assert callback.fn("token", "user-1")[-1]["value"] is None
+    from src.app.gradio_ui import _token_digest
+
+    pending = {"id": "user-1", "username": "lab.1", "account": _token_digest("token")}
+    assert callback.fn("token", "user-1", pending, "lab.1")[7]["value"] is None
 
 
 def test_mfa_activation_keeps_recovery_codes_on_screen_and_requires_a_fresh_login(runtime_demo, monkeypatch):
@@ -377,8 +385,8 @@ def test_switching_conversation_programmatically_clears_notices_and_rename(runti
     def api(token, method, path, body=None, **kwargs):
         if (method, path) == ("POST", "/api/sessions"):
             return {"id": "new", "title": body["title"]}
-        if (method, path) == ("GET", "/api/sessions"):
-            return sessions if action == "create" else sessions[1:]
+        if (method, path) == ("GET", "/api/sessions/page"):
+            return _page(sessions if action == "create" else sessions[1:])
         if path.endswith("/messages"):
             return []
         if method == "GET":
@@ -396,7 +404,7 @@ def test_switching_conversation_programmatically_clears_notices_and_rename(runti
         result = callback.fn("token", "new", "new")
         expected_title = "Ôn tập"
     outputs = {runtime_demo.blocks[item].elem_id or getattr(runtime_demo.blocks[item], "label", None)
-               or runtime_demo.blocks[item].value: value
+               or (runtime_demo.blocks[item].value if isinstance(runtime_demo.blocks[item].value, str) else item): value
                for item, value in zip(dependency["outputs"], result, strict=True)}
     assert outputs["chat-notice"] == gr.update(value="", visible=False)
     assert outputs["Đồng ý và gửi"] == gr.update(visible=False)
@@ -488,7 +496,7 @@ def test_refused_admin_action_keeps_the_admin_panel_usable(runtime_demo, monkeyp
     monkeypatch.setattr(gradio_ui, "_api", refuse)
     monkeypatch.setattr(gr, "Warning", lambda *args, **kwargs: None)
     for label, args in (("Khóa", ("token", "self")), ("Mở khóa", ("token", "self")),
-                        ("Đổi vai trò", ("token", "self", "user")), ("Xóa tài khoản", ("token", "self")),
+                        ("Đổi vai trò", ("token", "self", "user")),
                         ("Tạo", ("token", "taken", "Long-enough-password-1", "user"))):
         callback, dependency = _button_event(runtime_demo, label)
         result = callback.fn(*args)
@@ -607,7 +615,7 @@ def test_tables_render_untrusted_values_as_inert_text():
 def test_read_only_tables_do_not_use_the_slow_dataframe(runtime_demo):
     assert not any(isinstance(component, gr.Dataframe) for component in runtime_demo.blocks.values())
     tables = [component for component in runtime_demo.blocks.values() if _is_table(component)]
-    assert len(tables) == 10
+    assert len(tables) == 11
     assert all(table.latex_delimiters == [] for table in tables)
 
 
@@ -798,8 +806,8 @@ class _SearchApi:
             "id": "public-session", "title": "Nội dung công khai", "security_mode": "secure",
             "data_classification": self.data_class,
         }
-        if path == "/api/sessions":
-            return [session]
+        if path == "/api/sessions/page":
+            return _page([session])
         if method == "GET" and path.endswith("/messages"):
             return []
         if method == "GET" and path == "/api/sessions/public-session":
@@ -922,8 +930,8 @@ def test_failed_send_keeps_composer_and_displays_persistent_error(
             return {"id": "new", "title": body["title"]}
         if method == "POST" and path.endswith("/messages"):
             raise gr.Error("AI tạm thời không khả dụng. Thử lại sau 30 giây.")
-        if path == "/api/sessions":
-            return [{"id": "new", "title": "Cuộc hội thoại mới", "security_mode": "secure"}]
+        if path == "/api/sessions/page":
+            return _page([{"id": "new", "title": "Cuộc hội thoại mới", "security_mode": "secure"}])
         if path.endswith("/messages"):
             return []
         return {"id": path.rsplit("/", 1)[-1], "security_mode": "secure"}
@@ -952,7 +960,7 @@ def test_successful_send_with_failed_history_read_does_not_invite_duplicate_retr
     def api(token, method, path, body=None, **kwargs):
         if method == "POST":
             return {"content": "trả lời", "dlp_redacted": []}
-        if path == "/api/sessions":
+        if path == "/api/sessions/page":
             raise gr.Error("Máy chủ tạm thời bận.")
         return {"security_mode": "secure"}
 

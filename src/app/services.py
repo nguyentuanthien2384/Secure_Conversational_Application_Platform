@@ -526,6 +526,30 @@ class ChatService:
             message for message in messages if normalized_query in message["content"].casefold()
         ]
 
+    def search_message_page(
+        self, db: Session, chat_session: ChatSession, *, query: str,
+        offset: int, limit: int,
+    ) -> tuple[list[dict], int]:
+        """Count exact plaintext matches while retaining at most one small page.
+
+        Ciphertext cannot be searched in SQL. Visit bounded database pages,
+        rather than decrypting an entire conversation into an unbounded list.
+        Only matches in the requested result window survive the scan.
+        """
+        selected, total, page_offset = [], 0, 0
+        normalized = query.casefold()
+        while True:
+            page = self.list_messages(db, chat_session, limit=100, offset=page_offset)
+            for message in page:
+                if normalized in message["content"].casefold():
+                    if offset <= total < offset + limit:
+                        selected.append(message)
+                    total += 1
+            if len(page) < 100:
+                break
+            page_offset += len(page)
+        return selected, total
+
     def recent_messages(
         self,
         db: Session,

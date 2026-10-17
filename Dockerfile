@@ -6,6 +6,7 @@ FROM ${BASE_IMAGE} AS runtime
 
 ARG BASE_IMAGE
 ARG REQUIRE_BASE_IMAGE_DIGEST=false
+ARG KMS_PROFILE=local
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -29,7 +30,12 @@ RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
 COPY pyproject.toml uv.lock README.md ./
 # uv chỉ cần lúc build; runtime gọi thẳng /app/.venv/bin. Gỡ nó khỏi image cuối
 # để bản Rust nhúng trong uv không thành bề mặt tấn công/lỗ hổng bị quét thấy.
-RUN uv sync --no-dev --frozen \
+RUN case "$KMS_PROFILE" in \
+        local|vault) uv sync --no-dev --frozen ;; \
+        aws-kms) uv sync --no-dev --frozen --extra aws-kms ;; \
+        gcp-kms) uv sync --no-dev --frozen --extra gcp-kms ;; \
+        *) echo >&2 'KMS_PROFILE must be local, vault, aws-kms, or gcp-kms'; exit 1 ;; \
+    esac \
     && pip uninstall --yes uv
 
 COPY src ./src
@@ -40,6 +46,7 @@ COPY scripts/enforce_retention.py ./scripts/enforce_retention.py
 COPY scripts/migrate_envelope_encryption.py ./scripts/migrate_envelope_encryption.py
 COPY scripts/rewrap_deks.py ./scripts/rewrap_deks.py
 COPY scripts/rotate_database_credentials.py ./scripts/rotate_database_credentials.py
+COPY scripts/quarantine_restored_database.py ./scripts/quarantine_restored_database.py
 COPY scripts/high_security_app_entrypoint.sh ./scripts/high_security_app_entrypoint.sh
 COPY run_app.py ./run_app.py
 RUN chown -R app:app /app

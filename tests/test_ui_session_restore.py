@@ -64,10 +64,10 @@ def ui(app, monkeypatch):
     with TestClient(app, base_url=ORIGIN) as client:
         calls = []
 
-        def api(token, method, path, payload=None):
+        def api(token, method, path, payload=None, *, params=None):
             calls.append((method, path))
             response = client.request(method, path, headers=_headers(token) if token else {},
-                                      json=payload)
+                                      json=payload, params=params)
             if response.status_code >= 400:
                 raise gr.Error(response.json().get("detail", "Request failed"))
             return response.json() if response.content else {}

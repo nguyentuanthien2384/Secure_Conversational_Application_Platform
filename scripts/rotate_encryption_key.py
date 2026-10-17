@@ -20,8 +20,8 @@ Cách dùng:
 4. Sao lưu database, rồi chạy thật:
        uv run python scripts/rotate_encryption_key.py --to-version 2
 
-5. Sau khi mọi bản ghi đã ở version mới, gỡ khóa cũ khỏi ``MASTER_ENCRYPTION_KEYS``
-   và huỷ khóa cũ theo quy trình.
+5. Với envelope DEK, chạy ``python -m scripts.rewrap_deks`` trước; CLI này chỉ
+   tái mã hóa legacy. Giữ các khóa mà backup/snapshot còn cần.
 
 Script chạy theo lô và commit từng lô nên có thể dừng/chạy lại an toàn
 (idempotent): bản ghi đã ở version đích sẽ bị bỏ qua.
@@ -35,11 +35,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import func, or_, select  # noqa: E402
 
 from src.app.config import Settings  # noqa: E402
 from src.app.db import Database  # noqa: E402
-from src.app.models import SecureMessage, User  # noqa: E402
+from src.app.envelope import LEGACY_SCHEME  # noqa: E402
+from src.app.models import ChatSession, SecureMessage, SessionKeyEpoch, User  # noqa: E402
 from src.app.security import CryptoService  # noqa: E402
 
 
@@ -61,7 +62,10 @@ def rotate_messages(
     """Re-encrypt every message not yet on the target key version."""
     rotated = 0
     failed = 0
-    rows = list(db.scalars(select(SecureMessage).where(SecureMessage.key_version != target)))
+    rows = list(db.scalars(select(SecureMessage).where(
+        SecureMessage.encryption_scheme == LEGACY_SCHEME,
+        SecureMessage.key_version != target,
+    )))
     for index, row in enumerate(rows, start=1):
         try:
             plaintext = crypto.decrypt(
@@ -89,7 +93,9 @@ def rotate_mfa_secrets(db, crypto: CryptoService, dry_run: bool) -> tuple[int, i
     """Re-wrap stored TOTP seeds under the new key."""
     rotated = 0
     failed = 0
-    users = list(db.scalars(select(User).where(User.mfa_secret_ciphertext.is_not(None))))
+    users = list(db.scalars(select(User).where(
+        User.mfa_secret_ciphertext.is_not(None), User.secret_wrapped_dek.is_(None),
+    )))
     for user in users:
         context = f"mfa:{user.id}"
         try:
@@ -110,6 +116,27 @@ def rotate_mfa_secrets(db, crypto: CryptoService, dry_run: bool) -> tuple[int, i
     return rotated, failed
 
 
+def unrotated_envelope_dependencies(db, target: int) -> int:
+    """Fail closed on any current/historical/account DEK needing another KEK.
+
+    Message key_version is a DEK epoch for envelope rows, not a KEK version.
+    Empty conversations and account keys without a TOTP seed still matter.
+    """
+    dependencies = 0
+    for model, wrapped, uri, version in (
+        (ChatSession, ChatSession.wrapped_dek, ChatSession.kek_uri, ChatSession.kek_version),
+        (SessionKeyEpoch, SessionKeyEpoch.wrapped_dek,
+         SessionKeyEpoch.kek_uri, SessionKeyEpoch.kek_version),
+        (User, User.secret_wrapped_dek, User.secret_kek_uri, User.secret_kek_version),
+    ):
+        dependencies += db.scalar(select(func.count()).select_from(model).where(
+            wrapped.is_not(None),
+            or_(uri.is_(None), uri != "local://scap/development-kek",
+                version.is_(None), version != str(target)),
+        )) or 0
+    return dependencies
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Xoay vòng khóa mã hóa AES-256-GCM.")
     parser.add_argument(
@@ -121,8 +148,12 @@ def main() -> int:
     parser.add_argument("--batch", type=int, default=200, help="Số bản ghi mỗi lần commit.")
     parser.add_argument("--dry-run", action="store_true", help="Chỉ đếm, không ghi thay đổi.")
     args = parser.parse_args()
+    if args.batch < 1 or args.batch > 5000 or (args.to_version is not None and args.to_version < 1):
+        parser.error("--batch must be 1-5000 and --to-version must be positive")
 
     settings = Settings.from_env()
+    if settings.key_provider != "local":
+        parser.error("Use migrate_envelope_encryption/rewrap_deks for managed key providers.")
     keyring = dict(settings.master_encryption_keys)
     target = args.to_version or settings.active_key_version or (max(keyring) if keyring else 1)
     crypto = build_crypto(settings, target)
@@ -135,13 +166,22 @@ def main() -> int:
         print("!! Hãy chắc chắn bạn đã SAO LƯU database trước khi tiếp tục.\n")
 
     database = Database(settings.database_url)
-    database.create_all()
-    with database.session_factory() as db:
-        print("Đang xoay khóa cho tin nhắn...")
-        msg_ok, msg_fail = rotate_messages(db, crypto, target, args.batch, args.dry_run)
-        print("Đang xoay khóa cho TOTP seed...")
-        mfa_ok, mfa_fail = rotate_mfa_secrets(db, crypto, args.dry_run)
-    database.engine.dispose()
+    try:
+        database.assert_schema_ready()
+        with database.session_factory() as db:
+            if unrotated_envelope_dependencies(db, target):
+                print(
+                    "Envelope DEK còn phụ thuộc KEK khác. Giữ khóa cũ; chạy "
+                    "python -m scripts.rewrap_deks --dry-run rồi python -m scripts.rewrap_deks "
+                    "với ACTIVE_KEY_VERSION đích trước khi xoay legacy.", file=sys.stderr,
+                )
+                return 1
+            print("Đang xoay khóa cho tin nhắn...")
+            msg_ok, msg_fail = rotate_messages(db, crypto, target, args.batch, args.dry_run)
+            print("Đang xoay khóa cho TOTP seed...")
+            mfa_ok, mfa_fail = rotate_mfa_secrets(db, crypto, args.dry_run)
+    finally:
+        database.engine.dispose()
 
     print(f"\nTin nhắn: {msg_ok} thành công, {msg_fail} lỗi")
     print(f"TOTP seed: {mfa_ok} thành công, {mfa_fail} lỗi")
@@ -152,7 +192,7 @@ def main() -> int:
         )
         return 1
     if not args.dry_run:
-        print("\nHoàn tất. Sau khi xác minh, có thể gỡ các khóa cũ khỏi MASTER_ENCRYPTION_KEYS.")
+        print("\nLegacy đã xoay; envelope metadata dùng KEK đích. Giữ khóa cũ cho backup/snapshot còn cần và xác minh phục hồi trước khi loại khóa.")
     return 0
 
 

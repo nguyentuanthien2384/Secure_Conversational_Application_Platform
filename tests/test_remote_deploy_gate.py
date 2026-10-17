@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -47,13 +48,13 @@ def deployment(tmp_path):
     deploy = project / "deploy"
     deploy.mkdir(parents=True)
     (project / ".git").mkdir()
-    for filename in ("remote-deploy.sh", "vps-compose.sh"):
+    for filename in ("remote-deploy.sh", "vps-compose.sh", "restore.sh"):
         shutil.copyfile(ROOT / "deploy" / filename, deploy / filename)
     for filename in ("docker-compose.yml", "docker-compose.vps-demo.yml"):
         (project / filename).write_text("services: {}\n", encoding="utf-8")
     (deploy / ".env.vps").write_text(
         "SCAP_APP_IMAGE=scap-gate:test\nPUBLIC_DOMAIN=gate.invalid\nSCAP_EDGE_MODE=direct\n",
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     mock_bin = tmp_path / "mock-bin"
     mock_bin.mkdir()
@@ -77,7 +78,24 @@ case "$1" in
       case "$1" in --env-file|-p|-f) shift 2 ;; *) break ;; esac
     done
     case "$1" in
-      config|up|logs) exit 0 ;;
+      config|up|logs|stop) exit 0 ;;
+      exec)
+        case "$*" in
+          *pg_isready*) exit "${SCAP_GATE_DB_READY_EXIT:-0}" ;;
+          *to_regclass*) printf '%s\n' t ;;
+          *'SELECT count(*) FROM users WHERE'*) printf '%s\n' "${SCAP_GATE_REVIEWED_ADMINS:-1}" ;;
+          *'SELECT count(*) FROM users'*) printf '%s\n' "${SCAP_GATE_EXISTING_USERS:-0}" ;;
+          *pg_restore*) cat > /dev/null; exit "${SCAP_GATE_RESTORE_EXIT:-0}" ;;
+          *) exit 99 ;;
+        esac
+        ;;
+      run)
+        case "$*" in
+          *'scripts.quarantine_restored_database quarantine'*) exit "${SCAP_GATE_QUARANTINE_EXIT:-0}" ;;
+          *'scripts.quarantine_restored_database activate-reviewed-user'*) exit 0 ;;
+          *) exit "${SCAP_GATE_MIGRATE_EXIT:-0}" ;;
+        esac
+        ;;
       ps)
         if [ "${2:-}" = --all ] && [ "${3:-}" = --quiet ]; then
           [ "${SCAP_GATE_MISSING:-}" != "$4" ] || exit 0
@@ -142,7 +160,9 @@ esac
         wrapper.write_text("#!/bin/bash\nset -eu\n" + content, encoding="utf-8", newline="\n")
         wrapper.chmod(0o700)
 
-    def run(**scenario):
+    def run(*, script="remote-deploy.sh", arguments=(), marker=None, **scenario):
+        if marker is not None:
+            (deploy / ".restore-pending").write_text(marker + "\n", encoding="utf-8", newline="\n")
         environment = os.environ.copy()
         # Clear inherited test knobs; all observable writes stay in this fixture.
         for name in list(environment):
@@ -161,10 +181,11 @@ esac
                 'export PATH="$1:$PATH"; '
                 'for tool in docker curl python3 sleep crontab uname; do '
                 '[ "$(command -v "$tool")" = "$1/$tool" ] || exit 98; '
-                'done; source "$2"',
-                _bash_path(deploy / "remote-deploy.sh"),
+                'done; script=$2; shift 2; source "$script" "$@"',
+                _bash_path(deploy / script),
                 _bash_path(mock_bin),
-                _bash_path(deploy / "remote-deploy.sh"),
+                _bash_path(deploy / script),
+                *arguments,
             ],
             cwd=project,
             env=environment,
@@ -182,6 +203,12 @@ esac
         }
         return result, logs
 
+    archive = project / "backups/20261017T030000Z"
+    archive.mkdir(parents=True)
+    (archive / "postgres.dump").write_bytes(b"isolated mock dump\n")
+    digest = hashlib.sha256((archive / "postgres.dump").read_bytes()).hexdigest()
+    (archive / "SHA256SUMS").write_text(f"{digest}  postgres.dump\n", encoding="utf-8", newline="\n")
+    run.project = project
     return run
 
 
@@ -202,6 +229,13 @@ def test_deploy_accepts_matching_images_completed_migration_and_both_health_chec
     assert "0 3 * * * bash " in logs["cron_content"]
     assert "/deploy/backup.sh >> " in logs["cron_content"]
     assert "image rm" not in logs["docker_log"]
+
+
+def test_deploy_refuses_to_open_an_unreviewed_restored_snapshot(deployment):
+    result, logs = deployment(marker="quarantined")
+    assert result.returncode != 0
+    assert "Snapshot dang offline/quarantine" in result.stderr
+    assert not any(logs.values())
 
 
 @pytest.mark.parametrize("health", ["unhealthy", "starting", "missing", "unknown"])

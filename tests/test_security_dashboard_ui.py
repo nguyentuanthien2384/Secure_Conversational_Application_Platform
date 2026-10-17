@@ -141,7 +141,9 @@ def test_failed_security_requests_stay_unknown_in_cards_and_tables(demo, monkeyp
 @pytest.mark.parametrize("failed_endpoint", ["stats", "security-alerts", "users"])
 def test_admin_refresh_failure_clears_stale_observation_and_account_choice(demo, monkeypatch, failed_endpoint):
     def api(token, method, path, *args, **kwargs):
-        if path == f"/api/admin/{failed_endpoint}":
+        if path == f"/api/admin/{failed_endpoint}" or (
+            failed_endpoint == "users" and path == "/api/admin/users/page"
+        ):
             raise error("<script>unavailable</script>")
         if path.endswith("stats"):
             return {"total_users": 12, "active_users": 10, "total_sessions": 21,
@@ -149,7 +151,7 @@ def test_admin_refresh_failure_clears_stale_observation_and_account_choice(demo,
         return []
     monkeypatch.setattr(gradio_ui, "_api", api)
     result = callback(demo, "refresh_admin")("token", "stale-user")
-    assert len(result) == 8
+    assert len(result) == 11
     for item in result[:7]:
         assert "Không tải được" in item and "Lần thử:" in item
         assert "## 0" not in item and "<script>" not in item
@@ -189,7 +191,9 @@ def test_anomaly_actions_update_card_and_table_together(demo, monkeypatch):
     ("Đổi vai trò", ("u1", "moderator"), "/api/admin/users/u1/role"),
     ("Khóa", ("u1",), "/api/admin/users/u1/status"),
     ("Mở khóa", ("u1",), "/api/admin/users/u1/status"),
-    ("Xóa tài khoản", ("u1",), "/api/admin/users/u1"),
+    ("Xác nhận xóa tài khoản vĩnh viễn", (
+        "u1", {"id": "u1", "username": "target", "account": gradio_ui._token_digest("token")}, "target",
+    ), "/api/admin/users/u1"),
     ("Tạo", ("newuser", "A long password value1!", "user"), "/api/admin/users"),
     ("Gỡ chặn", ("192.0.2.1",), "/api/admin/ids/blocklist/192.0.2.1"),
 ])
@@ -214,6 +218,9 @@ def test_admin_mutations_use_step_up_and_clear_credentials(demo, monkeypatch, la
     assert ("POST", "/api/auth/step-up", {
         "password": "Admin password value1!", "code": "123456",
     }) in calls
+    if label == "Xác nhận xóa tài khoản vĩnh viễn":
+        assert result[-3:] == ("", "", "")
+        return
     cleanup = next(item for item in demo.config["dependencies"]
                    if item["trigger_after"] == dep["id"])
     assert cleanup["trigger_only_on_success"] is False

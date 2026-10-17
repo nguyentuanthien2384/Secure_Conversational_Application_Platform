@@ -4,12 +4,24 @@ import re
 import unicodedata
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 VALID_ROLES = {"user", "moderator", "admin"}
+PageItem = TypeVar("PageItem")
+
+
+class PageResponse(BaseModel, Generic[PageItem]):
+    items: list[PageItem]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+    next_offset: int | None
+
+
 VALID_SECURITY_MODES = {"secure", "confidential", "private_e2ee"}
 VALID_DATA_CLASSES = {
     "public",
@@ -573,6 +585,25 @@ class E2eeDeviceRegisterRequest(BaseModel):
         if canonical != value.lower():
             raise ValueError("Định danh phải là UUID canonical.")
         return canonical
+
+
+class E2eePreKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    challenge_id: str = Field(min_length=36, max_length=36)
+    challenge: str = Field(min_length=22, max_length=96)
+    one_time_prekeys: list[str] = Field(default_factory=list, max_length=100)
+    signed_prekey: str | None = Field(default=None, min_length=40, max_length=64)
+    signed_prekey_signature: str | None = Field(default=None, min_length=80, max_length=128)
+    update_signature: str = Field(min_length=80, max_length=128)
+
+    @model_validator(mode="after")
+    def complete_update(self):
+        if bool(self.signed_prekey) != bool(self.signed_prekey_signature):
+            raise ValueError("Signed prekey và chữ ký phải được cung cấp cùng nhau.")
+        if not self.one_time_prekeys and self.signed_prekey is None:
+            raise ValueError("Cần bổ sung prekey hoặc cập nhật signed prekey.")
+        return self
 
 
 class E2eeDeviceResponse(BaseModel):

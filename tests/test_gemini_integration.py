@@ -167,12 +167,13 @@ class FakeApi:
                        "security_mode": self.mode}
             self.sessions.append(session)
             return session
-        if (method, path) == ("GET", "/api/sessions"):
-            return self.sessions
+        if (method, path) == ("GET", "/api/sessions/page"):
+            return {"items": self.sessions, "total": len(self.sessions), "offset": 0,
+                    "limit": 100, "has_more": False, "next_offset": None}
         if method == "GET" and path.endswith("/messages"):
             return []
         if method == "GET" and path.startswith("/api/sessions/"):
-            return {"security_mode": self.mode}
+            return {"id": path.rsplit("/", 1)[-1], "title": "Conversation", "security_mode": self.mode}
         if method == "POST" and path.endswith("/messages"):
             if not self.consent:
                 raise gr.Error(EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE)

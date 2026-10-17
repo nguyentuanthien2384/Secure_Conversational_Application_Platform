@@ -164,9 +164,9 @@ Trong maintenance workload cô lập (không nhận traffic), tạm nạp key le
 KMS/Vault mới, nhưng đặt `SECURITY_PROFILE=standard` cho riêng job migration:
 
 ```sh
-python scripts/migrate_envelope_encryption.py --dry-run
-python scripts/migrate_envelope_encryption.py --batch-size 100
-python scripts/rewrap_deks.py --dry-run
+python -m scripts.migrate_envelope_encryption --dry-run
+python -m scripts.migrate_envelope_encryption --batch-size 100
+python -m scripts.rewrap_deks --dry-run
 ```
 
 Script giải mã từng dòng trong RAM, mã hóa lại ngay với AAD chứa owner, session,
@@ -178,6 +178,13 @@ Xoay KEK định kỳ hoặc khi nghi lộ bằng provider, sau đó chạy
 `scripts/rewrap_deks.py`. Rewrap chỉ thay ciphertext của DEK; không giải mã lại
 toàn bộ nội dung hội thoại. Sự cố lộ DEK của riêng một phiên cần xoay DEK phiên
 và cân nhắc tái mã hóa dữ liệu, không chỉ rewrap.
+
+CLI `python -m scripts.rotate_encryption_key` chỉ tái mã hóa dữ liệu legacy;
+với provider local phải chạy `python -m scripts.rewrap_deks` để chuyển mọi
+wrapped DEK hiện tại/lịch sử/tài khoản sang `ACTIVE_KEY_VERSION` trước. CLI
+legacy từ chối nếu còn dependency envelope dùng KEK khác, kể cả hội thoại rỗng
+hoặc tài khoản chưa có TOTP seed. Không bỏ khóa mà backup/snapshot còn cần;
+không chạy các job này đồng thời với traffic hoặc tác vụ quản trị khác.
 
 ## Xoay credential PostgreSQL trên volume hiện hữu
 
@@ -191,7 +198,7 @@ DATABASE_PASSWORD_FILE=/run/secrets/current_postgres_password \
 NEW_POSTGRES_PASSWORD_FILE=/run/secrets/new_postgres_password \
 NEW_APP_DB_PASSWORD_FILE=/run/secrets/new_app_db_password \
 NEW_AUDITOR_DB_PASSWORD_FILE=/run/secrets/new_auditor_db_password \
-python scripts/rotate_database_credentials.py
+python -m scripts.rotate_database_credentials
 ```
 
 Các giá trị phải là file một dòng, tối thiểu 32 ký tự. Script tắt statement,
@@ -207,8 +214,8 @@ secret chính, rolling-restart app/migration, kiểm tra cả ba role qua
 Ứng dụng sweep dữ liệu hết hạn lúc khởi động. Scheduler/CronJob phải chạy thêm:
 
 ```sh
-python scripts/enforce_retention.py --dry-run
-python scripts/enforce_retention.py --batch-size 500
+python -m scripts.enforce_retention --dry-run
+python -m scripts.enforce_retention --batch-size 500
 ```
 
 Xóa phiên sẽ xóa ciphertext và mọi wrapped DEK, rồi xóa DEK cache trong tiến

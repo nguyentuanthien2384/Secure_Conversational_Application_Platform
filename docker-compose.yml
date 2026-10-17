@@ -5,6 +5,7 @@ x-app-build: &app-build
     # as an immutable reference; the Dockerfile rejects this fallback tag.
     BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim}
     REQUIRE_BASE_IMAGE_DIGEST: "true"
+    KMS_PROFILE: ${KEY_PROVIDER:-local}
 
 x-default-logging: &default-logging
   driver: json-file

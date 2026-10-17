@@ -223,6 +223,28 @@ người dùng nếu thiếu `--force`. Nội dung tin nhắn trong bản dump �
 khóa trong `deploy/.env.vps`, nên **giữ file đó cùng bản sao lưu** và không để nó
 trong `backups/`. **Không xóa hoặc tạo lại `deploy/.env.vps`.**
 
+Restore thành công **giữ app/caddy offline**. Script chạy migration mới bằng
+image hiện tại, khóa mọi tài khoản, đổi token version, thu hồi toàn bộ phiên,
+tiêu thụ recovery code/MFA backup code/prekey một lần, xóa challenge và nghỉ
+cửa sổ TOTP hiện tại. Ciphertext, wrapped DEK và audit chain được giữ nguyên.
+Các thay đổi sau snapshot không thể suy ra từ backup cũ: phải đối chiếu tài
+khoản/mật khẩu/MFA/email/passkey và E2EE device/member/epoch với nguồn tin cậy,
+kiểm tra giải mã mẫu và audit/checkpoint ngoài trước khi cho phép phục vụ.
+
+Chỉ khi đã đối chiếu một tài khoản, bật riêng tài khoản đó bằng lệnh owner job
+(ví dụ repo git; gói upload dùng `bash restore.sh`):
+
+```bash
+bash deploy/restore.sh --activate-reviewed-user ten.admin
+bash deploy/restore.sh --resume-reviewed
+```
+
+Lệnh resume yêu cầu có admin đã được bật, rồi kiểm tra image thực của app và
+migration, migration exit code, readiness mọi replica và HTTPS như deploy mới.
+Nếu gate thất bại, app/caddy lại bị dừng. Cờ `deploy/.restore-pending` chặn
+deploy thông thường trong suốt quá trình chờ review; không xóa cờ để vượt gate.
+Một restore/migration/quarantine thất bại cũng không tự mở lại traffic.
+
 ### Sự cố thường gặp
 
 | Hiện tượng | Cách xử lý |

@@ -28,7 +28,7 @@ def test_admin_refresh_displays_real_worker_snapshot(client, app, monkeypatch):
     callback = next(fn for fn in demo.fns.values()
                     if fn.fn is not None and fn.fn.__name__ == "refresh_admin")
     output = callback.fn(token)
-    assert len(output) == 8
+    assert len(output) == 11
     assert "Tài nguyên xử lý hiện tại" in output[4]
     assert "Luồng giao diện" in output[4]
     assert "Audit lấy mẫu" in output[4]

@@ -44,19 +44,21 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv lock --check
-      - run: uv sync --frozen --group dev
+      - run: uv sync --frozen --group dev --all-extras
       - run: uv run python -m pytest --cov=src.app --cov-report=xml
       - name: Verify PostgreSQL transactions with runtime least-privilege grants
         env:
           SCAP_TEST_POSTGRES_URL: postgresql+psycopg://postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/scap_security_tests
         run: uv run --frozen python -m pytest tests/test_postgres_security_integration.py --junitxml=reports/postgres-security.xml
       - run: node --test tests/login_credentials.test.cjs
+      - name: Verify the real two-client E2EE demo on an isolated loopback server
+        run: uv run --frozen --extra e2ee-client python -m scripts.demo_e2ee --check
       - name: Validate security controls and correlated detection evidence offline
         if: ${{ !cancelled() }}
         run: uv run python -m scripts.validate_security --output-dir reports/security-validation
-      - run: uv run ruff check src tests scripts
-      - run: uv run bandit -r src/app -ll -ii -f json -o reports-bandit.json
-      - run: uv export --frozen --no-dev --no-emit-project --output-file requirements-audit.txt
+      - run: uv run ruff check src clients tests scripts
+      - run: uv run bandit -r src/app clients -ll -ii -f json -o reports-bandit.json
+      - run: uv export --frozen --no-dev --all-extras --no-emit-project --output-file requirements-audit.txt
       - run: uv run pip-audit -r requirements-audit.txt -f json -o reports-pip-audit.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -86,9 +88,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - run: uv sync --frozen --group dev
+      - run: uv sync --frozen --group dev --extra e2ee-client
       - name: Verify real Windows ACLs, private setup and encrypted backups
-        run: uv run python -m pytest tests/test_private_storage.py tests/test_secret_files.py tests/test_local_storage.py tests/test_mailer_capacity.py tests/test_secure_backup.py -q --junitxml=reports/windows-private-storage.xml
+        run: uv run python -m pytest tests/test_private_storage.py tests/test_secret_files.py tests/test_local_storage.py tests/test_mailer_capacity.py tests/test_secure_backup.py tests/test_e2ee_client.py -q --junitxml=reports/windows-private-storage.xml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

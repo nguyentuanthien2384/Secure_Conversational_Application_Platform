@@ -61,10 +61,11 @@ class _SessionApi:
                 raise gr.Error("Không xác thực được yêu cầu.")
             self.reauthenticated = True
             return {}
-        if method == "GET" and path == "/api/sessions":
+        if method == "GET" and path == "/api/sessions/page":
             if self.failing_refresh and self.deletes:
                 raise gr.Error("Không tải lại được danh sách hội thoại.")
-            return self.sessions
+            return {"items": self.sessions, "total": len(self.sessions), "offset": 0,
+                    "limit": 100, "has_more": False, "next_offset": None}
         if method == "GET" and path.endswith("/messages"):
             return [{"role": "assistant", "content": "Nội dung hội thoại còn lại"}]
         if method == "GET" and path.startswith("/api/sessions/"):

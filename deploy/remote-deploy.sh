@@ -20,6 +20,8 @@ die() { echo "  [X] $*" >&2; exit 1; }
 setting() { { grep -m1 "^$1=" "$ENV_FILE" || true; } | cut -d= -f2-; }
 
 [ -f "$ENV_FILE" ] || die "Thieu $ENV_FILE tren VPS."
+[ ! -f deploy/.restore-pending ] \
+  || die "Snapshot dang offline/quarantine; doi chieu bang restore.sh truoc --resume-reviewed."
 chmod 700 deploy
 chmod 600 "$ENV_FILE"
 # scp từ Windows không giữ bit thực thi; repo git thì để nguyên để git pull không vướng.

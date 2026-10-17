@@ -78,7 +78,7 @@ def test_real_admin_ui_renders_http_window_and_current_capacity_without_secrets(
     finally:
         for _ in range(streams.maximum):
             streams.release()
-    assert len(output) == 8
+    assert len(output) == 11
     assert "Quan sát HTTP gần đây (60 giây)" in output[4]
     assert "Độ trễ đến header" in output[4]
     assert "Cảnh báo vận hành" in output[5]
