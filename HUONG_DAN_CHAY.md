@@ -1,7 +1,7 @@
 # Chạy SCAP để demo đồ án trên máy cá nhân
 
 Bản demo này dùng SQLite, AI ngoại tuyến và dữ liệu mẫu. Không cần máy chủ,
-tên miền, Docker, Gemini API key hay sửa `.env`. Sau khi cài đủ thư viện, có thể
+tên miền, Docker, Claude API key hay sửa `.env`. Sau khi cài đủ thư viện, có thể
 chạy phần demo ứng dụng và kiểm chứng bảo mật mà không cần Internet.
 
 ## 1. Chuẩn bị một lần
@@ -203,3 +203,15 @@ với `scripts.demo_local`, vốn tạo dữ liệu tạm cho mỗi lượt demo
 `run_app.py`, cấu hình `.env` và Docker vẫn phục vụ các cách chạy khác. Với đồ
 án demo trên máy cá nhân, dùng `scripts.demo_local` để có một điểm bắt đầu
 nhất quán và dễ diễn tập lại.
+
+## 8. Dùng Claude thật thay cho AI ngoại tuyến
+
+Mở `.env`, dán key `sk-...` vào `CLAUDE_API_KEY=` rồi chạy `uv run python run_app.py`.
+Các biến còn lại đã điền sẵn theo hướng dẫn của nhà cung cấp cổng:
+`CLAUDE_BASE_URL=https://1gw.gwai.cloud`, `CLAUDE_MODEL=claude-opus-5` (có thể đổi
+sang `claude-sonnet-5` hoặc `claude-haiku-4-5` để trả lời nhanh hơn),
+`CLAUDE_EFFORT_LEVEL=low`, `CLAUDE_TIMEOUT_SECONDS=25`. Ứng dụng chỉ đọc các biến
+`CLAUDE_*` này, không đọc `ANTHROPIC_*` của Claude Code/VSCode. Key Gemini cũ
+không còn được dùng khi đã có `CLAUDE_API_KEY`; tìm kiếm web (Google Search) chỉ
+hoạt động với Gemini nên được ẩn khi dùng Claude. `scripts.demo_local` vẫn luôn
+dùng AI ngoại tuyến.

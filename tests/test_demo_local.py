@@ -30,6 +30,8 @@ def test_fresh_demo_process_ignores_existing_config_and_cleans_temporary_data(tm
         "APP_SECRET_KEY_FILE": str(tmp_path / "must-not-read-secret"),
         "GOOGLE_GENAI_API_KEY_FILE": str(tmp_path / "must-not-read-provider-key"),
         "GOOGLE_GENAI_API_KEY": "never-use-or-print-this-provider-secret",
+        "CLAUDE_API_KEY_FILE": str(tmp_path / "must-not-read-claude-key"),
+        "CLAUDE_API_KEY": "sk-never-use-or-print-this-claude-secret",
         "SELF_BASE_URL": "https://example.invalid/never-use-this-api",
         "PUBLIC_BASE_URL": "https://example.invalid/never-use-this-url",
         "HTTP_PROXY": "http://example.invalid:9999",
@@ -44,6 +46,7 @@ def test_fresh_demo_process_ignores_existing_config_and_cleans_temporary_data(tm
     assert "PASS: sealed audit chain" in result.stdout
     assert "FAIL:" not in result.stdout
     assert "never-use-or-print-this-provider-secret" not in result.stdout + result.stderr
+    assert "never-use-or-print-this-claude-secret" not in result.stdout + result.stderr
     assert sentinel.read_bytes() == untouched
     assert not (tmp_path / "secure_chat.db").exists()
     assert not list(tmp_path.glob("scap-demo-*"))
@@ -58,6 +61,7 @@ def test_demo_enforces_offline_settings_and_restores_process_globals(tmp_path, m
     with demo_application(tmp_path, 8765) as app:
         settings = app.state.settings
         assert settings.google_genai_api_key == ""
+        assert settings.claude_api_key == ""
         assert not settings.redis_url and not settings.audit_worm_endpoint
         assert not settings.password_breach_check
         assert settings.ids_enabled and settings.audit_chain_enabled

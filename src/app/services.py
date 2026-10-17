@@ -191,10 +191,27 @@ class AIService:
         )
         self.dlp = DLPScanner(policy=policy, custom_dictionaries=dictionaries)
         self._client = None
-        if settings.google_genai_api_key:
-            from src.core.ai_core.gemini_ai import GeminiClient
+        # Claude là nhà cung cấp chính; Gemini chỉ còn là đường cũ khi chưa đặt
+        # CLAUDE_API_KEY. Ghi tên model để log lỗi đúng nhà cung cấp đang dùng.
+        self.provider_model = (
+            settings.claude_model if settings.claude_api_key else settings.gemini_model
+        )
+        try:
+            if settings.claude_api_key:
+                from src.core.ai_core.claude_ai import ClaudeClient
 
-            try:
+                self._client = ClaudeClient(
+                    api_key=settings.claude_api_key,
+                    model=settings.claude_model,
+                    base_url=settings.claude_base_url,
+                    timeout_seconds=settings.claude_timeout_seconds,
+                    retry_attempts=2,
+                    max_output_tokens=settings.ai_max_output_tokens,
+                    effort=settings.claude_effort or None,
+                )
+            elif settings.google_genai_api_key:
+                from src.core.ai_core.gemini_ai import GeminiClient
+
                 self._client = GeminiClient(
                     api_key=settings.google_genai_api_key,
                     model=settings.gemini_model,
@@ -202,15 +219,16 @@ class AIService:
                     retry_attempts=2,
                     max_output_tokens=settings.ai_max_output_tokens,
                 )
-            except Exception as exc:  # noqa: BLE001
-                # Key sai định dạng hoặc SDK lỗi: KHÔNG để cả ứng dụng chết vì
-                # một tính năng phụ. Ghi log rồi để `generate()` xử lý — tùy
-                # ALLOW_DEMO_AI mà rơi về chế độ demo hay trả 503.
-                logger.error(
-                    "Không khởi tạo được GeminiClient; tính năng AI suy giảm (error_type=%s).",
-                    type(exc).__name__,
-                )
-                self._client = None
+        except Exception as exc:  # noqa: BLE001
+            # Key sai định dạng hoặc SDK lỗi: KHÔNG để cả ứng dụng chết vì
+            # một tính năng phụ. Ghi log rồi để `generate()` xử lý — tùy
+            # ALLOW_DEMO_AI mà rơi về chế độ demo hay trả 503.
+            logger.error(
+                "Không khởi tạo được client AI (model=%s); tính năng AI suy giảm (error_type=%s).",
+                self.provider_model,
+                type(exc).__name__,
+            )
+            self._client = None
 
     @staticmethod
     def redact_with_report(content: str) -> tuple[str, list[str]]:
@@ -255,6 +273,9 @@ class AIService:
     ) -> tuple[str, list[str]]:
         if use_web_search and not self.settings.gemini_web_search_enabled:
             raise PermissionError("Tìm kiếm web chưa được quản trị viên bật trên server.")
+        if use_web_search and self.settings.claude_api_key:
+            # Google Search grounding và widget gợi ý chỉ có ở Gemini.
+            raise PermissionError("Tìm kiếm web chỉ hỗ trợ với nhà cung cấp Gemini.")
         if use_web_search and DataClass(data_class) is not DataClass.PUBLIC:
             raise PermissionError("Tìm kiếm web chỉ dành cho cuộc trò chuyện phân loại Public.")
         sanitized_current_message, redacted_labels = self.redact_with_configured_policy(
@@ -263,7 +284,7 @@ class AIService:
         if self._client is None:
             if use_web_search or not self.settings.allow_demo_ai:
                 logger.error(
-                    "Chưa cấu hình GOOGLE_GENAI_API_KEY và ALLOW_DEMO_AI=false: "
+                    "Chưa cấu hình CLAUDE_API_KEY và ALLOW_DEMO_AI=false: "
                     "không có đường trả lời nào khả dụng."
                 )
                 raise AIProviderError(AI_UNAVAILABLE_MESSAGE)
@@ -387,19 +408,15 @@ class AIService:
                         "Dùng Markdown vừa đủ để câu trả lời dễ đọc, như tiêu đề, "
                         "danh sách và khối mã khi hữu ích. Không dùng HTML thô hoặc ảnh."
                     ),
-                    # thinking_budget=None => KHÔNG gửi ThinkingConfig. Trước đây chỗ
-                    # này để 0 ("tắt thinking" cho nhanh/rẻ), nhưng thế hệ model mới
-                    # (gemini-flash-lite-latest trở đi) không cho tắt và trả về
-                    # 400 INVALID_ARGUMENT. Bỏ hẳn trường này là cách bền nhất: chạy
-                    # được trên cả model cũ lẫn mới, để Google dùng mặc định của họ.
-                    thinking_budget=None,
-                    # Use the model's sampling defaults; Gemini generations may
-                    # recommend different values for reliable reasoning.
+                    # Không gửi thinking budget: Gemini thế hệ mới từ chối giá trị 0,
+                    # còn Claude điều khiển độ suy nghĩ bằng CLAUDE_EFFORT_LEVEL.
+                    # Use the model's sampling defaults; newer Claude models reject
+                    # non-default temperatures.
                     temperature=None,
                     **({"use_web_search": True} if use_web_search else {}),
                 )
             except Exception as exc:  # noqa: BLE001 - mọi lỗi SDK đều quy về một loại
-                # Bắt rộng là CỐ Ý: SDK google-genai ném nhiều loại exception khác
+                # Bắt rộng là CỐ Ý: SDK anthropic/google-genai ném nhiều loại exception khác
                 # nhau (mạng, 401 key sai, 429 hết quota, 5xx, safety filter) và
                 # thông điệp của chúng thường chứa chi tiết hạ tầng. Ghi đầy đủ vào
                 # log máy chủ, trả cho người dùng một câu chung chung để tránh
@@ -409,7 +426,7 @@ class AIService:
                 # message or traceback.
                 logger.error(
                     "Gọi nhà cung cấp AI thất bại (model=%s, error_type=%s)",
-                    self.settings.gemini_model,
+                    self.provider_model,
                     type(exc).__name__,
                 )
                 raise AIProviderError(AI_UNAVAILABLE_MESSAGE) from exc

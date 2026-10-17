@@ -53,7 +53,8 @@ _FIXED = {
 _EMPTY = (
     "BOOTSTRAP_ADMIN_USERNAME", "BOOTSTRAP_ADMIN_PASSWORD", "APP_SECRET_KEY_FILE",
     "MASTER_ENCRYPTION_KEYS", "ACTIVE_KEY_VERSION", "DATABASE_PASSWORD_FILE",
-    "REDIS_PASSWORD_FILE", "GOOGLE_GENAI_API_KEY_FILE", "VAULT_TOKEN_FILE",
+    "REDIS_PASSWORD_FILE", "GOOGLE_GENAI_API_KEY_FILE", "CLAUDE_API_KEY_FILE",
+    "VAULT_TOKEN_FILE",
     "OIDC_PROXY_SECRET_FILE", "AUDIT_WORM_TOKEN_FILE",
 )
 _IMAGES = ("BASE_IMAGE", "POSTGRES_IMAGE", "REDIS_IMAGE", "CADDY_IMAGE")
@@ -80,6 +81,7 @@ _LIMITS = {
     "GRADIO_STATE_CAPACITY": (1, 256), "UVICORN_LIMIT_CONCURRENCY": (32, 64),
     "UVICORN_BACKLOG": (16, 128), "UVICORN_KEEPALIVE_SECONDS": (1, 10),
     "UVICORN_SHUTDOWN_SECONDS": (10, 60), "GEMINI_TIMEOUT_SECONDS": (5, 25),
+    "CLAUDE_TIMEOUT_SECONDS": (5, 25),
     "MAIL_MAX_PENDING": (1, 16),
 }
 _AI_QUALITY_PROFILES = {
@@ -91,7 +93,7 @@ _AI_QUALITY_PROFILES = {
 }
 # Configurations from earlier versions can keep running before the new optional
 # history field is explicitly added through the balanced quality profile.
-_OPTIONAL_LIMIT_DEFAULTS = {"AI_HISTORY_MESSAGES": "16"}
+_OPTIONAL_LIMIT_DEFAULTS = {"AI_HISTORY_MESSAGES": "16", "CLAUDE_TIMEOUT_SECONDS": "25"}
 
 
 class PreparationError(RuntimeError):
@@ -190,7 +192,7 @@ def initialize(project: str | Path, *, domain: str = "", email: str = "") -> str
         raise PreparationError("Deployment template must contain the safe VPS demo settings.")
     if any(values.get(k) for k in (*_EMPTY, *_IMAGES, *_PASSWORDS,
                                    "APP_SECRET_KEY", "MASTER_ENCRYPTION_KEY",
-                                   "GOOGLE_GENAI_API_KEY", "SMTP_PASSWORD")):
+                                   "GOOGLE_GENAI_API_KEY", "CLAUDE_API_KEY", "SMTP_PASSWORD")):
         raise PreparationError("Deployment template must not contain credentials or image selections.")
     origin = f"https://{domain}" if domain else ""
     replacements = {
@@ -343,8 +345,13 @@ def check(project: str | Path) -> list[str]:
             issues.append(f"{key}: use true or false.")
     if values.get("GEMINI_WEB_SEARCH_ENABLED", "false") not in {"true", "false"}:
         issues.append("GEMINI_WEB_SEARCH_ENABLED: use true or false.")
-    if values.get("ALLOW_DEMO_AI") == "false" and not values.get("GOOGLE_GENAI_API_KEY"):
-        issues.append("GOOGLE_GENAI_API_KEY: required when offline demo AI is disabled.")
+    if values.get("ALLOW_DEMO_AI") == "false" and not (
+        values.get("CLAUDE_API_KEY") or values.get("GOOGLE_GENAI_API_KEY")
+    ):
+        issues.append(
+            "CLAUDE_API_KEY (or legacy GOOGLE_GENAI_API_KEY): "
+            "required when offline demo AI is disabled."
+        )
     for key, (minimum, maximum) in _LIMITS.items():
         try:
             if not minimum <= int(values.get(key, _OPTIONAL_LIMIT_DEFAULTS.get(key, ""))) <= maximum:

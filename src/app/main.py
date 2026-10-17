@@ -5506,7 +5506,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         retained_events=settings.gradio_retained_events,
         result_ttl_seconds=settings.gradio_result_ttl_seconds,
         state_capacity=settings.gradio_state_capacity,
-        gemini_web_search_enabled=settings.gemini_web_search_enabled,
+        # Google Search grounding only exists on Gemini; hide it while Claude is active.
+        gemini_web_search_enabled=(
+            settings.gemini_web_search_enabled and not settings.claude_api_key
+        ),
     )
     gradio_auth_dependency = None
     if settings.gradio_auth_mode == "oidc":

@@ -43,6 +43,7 @@ def demo_settings(directory: Path, port: int) -> Settings:
         seed_demo_data=False,
         docs_enabled=True,
         allow_demo_ai=True,
+        claude_api_key="",
         google_genai_api_key="",
         password_breach_check=False,
         siem_json_logs=False,
