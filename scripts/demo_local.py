@@ -214,7 +214,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Mã xác minh SMS demo (.eml), chưa gửi thật: {Path(temporary) / 'security-notification-outbox'}")
                 print("Ctrl+C để dừng. Lần chạy tiếp theo tạo dữ liệu mới; dữ liệu hiện có của bạn được giữ nguyên.")
                 config = uvicorn.Config(app, host="127.0.0.1", port=args.port,
-                                        access_log=False, proxy_headers=False, log_level="warning", log_config=None,
+                                        access_log=False, proxy_headers=False, server_header=False,
+                                        log_level="warning", log_config=None,
                                         timeout_graceful_shutdown=5,
                                         limit_concurrency=64, backlog=128,
                                         timeout_keep_alive=5,

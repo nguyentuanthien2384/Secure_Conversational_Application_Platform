@@ -242,6 +242,35 @@ def test_real_api_step_up_header_is_retained(monkeypatch):
     assert caught.value.step_up_required is True
 
 
+@pytest.mark.parametrize("challenge,clarified", [
+    ("", True),
+    ('Bearer error="invalid_token"', False),
+])
+def test_wrong_step_up_secret_says_the_action_did_not_run(monkeypatch, challenge, clarified):
+    """A wrong re-auth password is not a lost session, and neither is hidden."""
+    class Client:
+        def post(self, *a, **k):
+            return httpx.Response(401, json={"detail": "Không xác thực được yêu cầu."},
+                                  headers={"WWW-Authenticate": challenge} if challenge else {})
+    monkeypatch.setattr(gradio_ui, "_api_client", lambda: Client())
+    monkeypatch.setattr(gradio_ui, "_SESSION_STORE", None)
+    writes = []
+
+    def action():
+        writes.append("write")
+        raise error("Fresh credentials required", 403, True)
+
+    with pytest.raises(gr.Error) as caught:
+        gradio_ui._with_step_up("token", "wrong password", "", action, "Tạo")
+    assert writes == ["write"], "the write is never retried after a refused step-up"
+    assert caught.value.session_ended is not clarified
+    if clarified:
+        assert "Mật khẩu hoặc mã 2FA để xác thực lại không đúng" in str(caught.value)
+        assert "Chưa thực hiện “Tạo”" in str(caught.value)
+    else:
+        assert "Không xác thực được yêu cầu." in str(caught.value)
+
+
 @pytest.mark.parametrize("status", [403, 503])
 def test_step_up_never_retries_unmarked_api_failure(monkeypatch, status):
     calls = []

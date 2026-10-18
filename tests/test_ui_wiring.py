@@ -544,6 +544,34 @@ def test_admin_create_form_checks_lengths_before_calling_the_api(runtime_demo, m
     assert calls == []
 
 
+def test_step_up_refusal_keeps_the_new_account_password_for_the_retry(runtime_demo, monkeypatch):
+    """"Nhập mật khẩu … rồi bấm Tạo lần nữa" must be possible as instructed.
+
+    The chained clear once wiped the new account's password too, so the retry
+    failed with "Mật khẩu phải có ít nhất 15 ký tự" instead of creating it.
+    """
+    from src.app import gradio_ui
+
+    callback, dependency = _button_event(runtime_demo, "Tạo")
+    _, new_password, _, admin_password, admin_code = dependency["inputs"][1:6]
+    for label in ("Tạo", "Khóa", "Mở khóa", "Đổi vai trò"):
+        _, parent = _button_event(runtime_demo, label)
+        cleared = {output for item in runtime_demo.config["dependencies"]
+                   if item.get("trigger_after") == parent["id"] for output in item["outputs"]}
+        assert {admin_password, admin_code} <= cleared, label
+        assert new_password not in cleared, label
+
+    def step_up_required(*args, **kwargs):
+        error = gr.Error("Cần xác thực lại trước thao tác nhạy cảm.")
+        error.step_up_required = True
+        raise error
+
+    monkeypatch.setattr(gradio_ui, "_api", step_up_required)
+    monkeypatch.setattr(gr, "Warning", lambda *args, **kwargs: None)
+    result = callback.fn("token", "qa.admin", "Long-enough-password-1", "user")
+    assert result[dependency["outputs"].index(new_password)] == gr.skip()
+
+
 def test_moderator_security_refresh_marks_the_admin_only_blocklist_without_a_warning(
     runtime_demo, monkeypatch,
 ):

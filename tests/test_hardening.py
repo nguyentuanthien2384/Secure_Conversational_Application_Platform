@@ -549,6 +549,10 @@ def test_deployment_uses_runtime_database_role_and_rfc9116_expiry():
     assert '"--no-access-log"' in compose
     assert '"--no-access-log"' in local_compose
     assert '"--no-access-log"' in dockerfile
+    # Caddy removes Server; a directly published app must not advertise it.
+    for config in (compose, local_compose, dockerfile):
+        assert '"--no-server-header"' in config
+    assert "server_header=False" in Path("run_app.py").read_text(encoding="utf-8")
     assert "headers={'Host':host}" in dockerfile
     healthcheck = dockerfile.split("HEALTHCHECK", maxsplit=1)[1]
     assert "/api/ready" in healthcheck

@@ -253,6 +253,30 @@ def test_step_up_is_requested_only_when_server_requires_it_and_retries_same_targ
     _assert_confirmation_cleared(_mapped(delete_demo, dependency, result))
 
 
+def test_unmarked_http_failure_mentioning_reauthentication_never_replays_the_delete(
+    delete_demo, monkeypatch,
+):
+    """Only the server's X-Step-Up-Required flag may trigger step-up and a retry."""
+    api = _SessionApi()
+
+    def unavailable(token, method, path, body=None, **kwargs):
+        if method == "DELETE":
+            api.calls.append((method, path, body))
+            error = gr.Error("Không thể xác thực lại lúc này; máy chủ đang quá tải.")
+            error.status_code, error.step_up_required = 503, False
+            raise error
+        return api(token, method, path, body, **kwargs)
+
+    monkeypatch.setattr(gradio_ui, "_api", unavailable)
+    confirm, dependency = _button_event(delete_demo, "Xác nhận xóa vĩnh viễn")
+    result = confirm.fn("token", "first", "first", "entered password", "123456")
+    assert api.deletes == ["/api/sessions/first"], "the unknown-outcome DELETE is not repeated"
+    assert not any(path == "/api/auth/step-up" for _method, path, _body in api.calls)
+    mapped = _mapped(delete_demo, dependency, result)
+    assert "Chưa xóa được" in mapped["session-delete-notice"]
+    assert mapped["session-delete-password"] == mapped["session-delete-code"] == ""
+
+
 def test_failed_reauthentication_preserves_target_and_clears_password_and_code(delete_demo, monkeypatch):
     api = _SessionApi(require_step_up=True, failing_step_up=True)
     monkeypatch.setattr(gradio_ui, "_api", api)

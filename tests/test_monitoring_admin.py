@@ -79,12 +79,13 @@ def test_real_admin_ui_renders_http_window_and_current_capacity_without_secrets(
         for _ in range(streams.maximum):
             streams.release()
     assert len(output) == 11
-    assert "Quan sát HTTP gần đây (60 giây)" in output[4]
+    # Both panels state their scope: one process, not a fleet-wide total.
+    assert "HTTP · tiến trình hiện tại (60 giây)" in output[4]
+    assert "Tài nguyên xử lý · tiến trình hiện tại" in output[4]
+    assert "Bị giới hạn/quá tải (429/503): **20**" in output[4]
     assert "Độ trễ đến header" in output[4]
     assert "Cảnh báo vận hành" in output[5]
     assert "Tỷ lệ lỗi máy chủ" in output[5]
     assert "Các vị trí luồng giao diện đang đầy" in output[5]
-    assert "chưa kết luận có tấn công" in output[5]
-    assert "tính cả yêu cầu đang lấy số liệu" in output[5]
     assert token not in output[4] + output[5]
     assert "operational-admin" not in output[4] + output[5]

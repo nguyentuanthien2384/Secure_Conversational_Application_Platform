@@ -976,11 +976,11 @@ def _api(token, method, path, body=None, *, params=None):
         message = detail or f"HTTP {resp.status_code}"
         # Only the RFC 6750 invalid_token challenge ends the tab's session; a
         # 401 for a wrong step-up password or 2FA code must not sign out.
-        if (
+        session_ended = (
             resp.status_code == 401
-            and tab_token
             and 'error="invalid_token"' in resp.headers.get("WWW-Authenticate", "")
-        ):
+        )
+        if session_ended and tab_token:
             _mark_session_ended(tab_token)
         if resp.status_code in (429, 503):
             retry = resp.headers.get("Retry-After")
@@ -989,6 +989,7 @@ def _api(token, method, path, body=None, *, params=None):
         error = gr.Error(message)
         # Callers that expect a permission boundary (403) can render it quietly.
         error.status_code = resp.status_code
+        error.session_ended = session_ended
         # A rejected precondition is safe to retry once after step-up. Error
         # text alone must never replay an HTTP write whose outcome is unknown.
         error.step_up_required = (
@@ -1561,30 +1562,56 @@ _PASSKEY_ERRORS = {
 }
 
 
+def _needs_step_up(err) -> bool:
+    """True only when the server refused a precondition and asked for step-up."""
+    required = getattr(err, "step_up_required", None)
+    # Compatibility for local callers which synthesize Gradio errors; every
+    # real HTTP error carries the explicit flag set in _api(). Error text of a
+    # real HTTP failure must never replay a write whose outcome is unknown.
+    if required is None:
+        required = (
+            getattr(err, "status_code", None) is None
+            and "xác thực lại" in str(err).lower()
+        )
+    return bool(required)
+
+
+def _step_up(token, password, code, action):
+    """Re-prove password/2FA; a wrong secret says the action did not run."""
+    try:
+        _api(
+            token, "POST", "/api/auth/step-up",
+            {"password": password, "code": (code or "").strip() or None},
+        )
+    except gr.Error as step_err:
+        if (getattr(step_err, "status_code", None) != 401
+                or getattr(step_err, "session_ended", False)):
+            raise
+        # The API deliberately does not say which factor was wrong; say which
+        # fields to re-check and that the action itself did not run.
+        refused = gr.Error(
+            "Mật khẩu hoặc mã 2FA để xác thực lại không đúng. "
+            f"Chưa thực hiện “{action}”."
+        )
+        refused.status_code = 401
+        refused.session_ended = False
+        refused.step_up_required = False
+        raise refused from step_err
+
+
 def _with_step_up(token, password, code, call, action):
     """Run a sensitive call, re-proving password/2FA once if the server asks."""
     try:
         return call()
     except gr.Error as err:
-        required = getattr(err, "step_up_required", None)
-        # Compatibility for local callers which synthesize Gradio errors;
-        # every real HTTP error carries the explicit flag set in _api().
-        if required is None:
-            required = (
-                getattr(err, "status_code", None) is None
-                and "xác thực lại" in str(err).lower()
-            )
-        if not required:
+        if not _needs_step_up(err):
             raise
         if not password:
             raise gr.Error(
                 "Cần xác thực lại. Nhập mật khẩu hiện tại (và mã 2FA nếu đã bật) "
                 f"rồi bấm “{action}” lần nữa."
             ) from err
-        _api(
-            token, "POST", "/api/auth/step-up",
-            {"password": password, "code": (code or "").strip() or None},
-        )
+        _step_up(token, password, code, action)
         return call()
 
 
@@ -3336,7 +3363,7 @@ def build_ui(
                 try:
                     _api(token, "DELETE", f"/api/sessions/{pending_id}")
                 except gr.Error as err:
-                    if "xác thực lại" not in _error_text(err).lower():
+                    if not _needs_step_up(err):
                         raise
                     if not password:
                         return (
@@ -3345,9 +3372,7 @@ def build_ui(
                             "Nhập mật khẩu và mã 2FA (nếu đã bật), rồi bấm xác nhận xóa lần nữa.",
                             gr.update(visible=True), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET) + 3)),
                         )
-                    _api(token, "POST", "/api/auth/step-up", {
-                        "password": password, "code": (code or "").strip() or None,
-                    })
+                    _step_up(token, password, code, "Xóa vĩnh viễn")
                     _api(token, "DELETE", f"/api/sessions/{pending_id}")
             except gr.Error as err:
                 # A persistent error belongs beside this destructive action;
@@ -3388,18 +3413,13 @@ def build_ui(
             try:
                 grant = _api(token, "POST", f"/api/sessions/{session_id}/export-ticket")
             except gr.Error as err:
-                if "xác thực lại" not in str(err).lower():
+                if not _needs_step_up(err):
                     raise
                 if not password:
                     raise gr.Error(
                         "Phiên xác thực lại đã hết hạn. Nhập mật khẩu và mã 2FA rồi bấm Xuất JSON lần nữa."
                     ) from err
-                _api(
-                    token,
-                    "POST",
-                    "/api/auth/step-up",
-                    {"password": password, "code": (code or "").strip() or None},
-                )
+                _step_up(token, password, code, "Xuất JSON")
                 grant = _api(
                     token,
                     "POST",
@@ -3418,7 +3438,7 @@ def build_ui(
             _guard(export_session, 3),
             [st_token, dd_session, tb_export_password, tb_export_code],
             [file_export, tb_export_password, tb_export_code],
-        )
+        ).then(lambda: ("", ""), [], [tb_export_password, tb_export_code], show_progress="hidden")
 
         def _send_chat_message(token, session_id, message, confirm_external=False, use_web_search=False):
             message = (message or "").strip()
@@ -4315,9 +4335,13 @@ def build_ui(
         )
 
         def clear_admin_credentials():
-            return "", "", ""
+            return "", ""
 
-        ADMIN_SECRET_OUTS = [tb_admin_pw, tb_admin_code, tb_cu_pw]
+        # Only the administrator's re-authentication secrets are cleared after
+        # every attempt. The new account's password is cleared by create_user on
+        # success; clearing it on a refused attempt made "enter your password and
+        # press Tạo again" fail with a misleading password-length warning.
+        ADMIN_SECRET_OUTS = [tb_admin_pw, tb_admin_code]
 
         def set_role(token, user_id, role, password="", code=""):
             if not user_id:

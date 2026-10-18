@@ -23,6 +23,9 @@ if __name__ == "__main__":
         # Export tickets are short-lived capabilities embedded in a download
         # path. Structured security events replace raw request-path logging.
         access_log=False,
+        # Caddy strips Server in deployments; direct local runs must not
+        # advertise the server software either.
+        server_header=False,
         # Direct local callers cannot select their rate-limit/audit IP.
         proxy_headers=False,
         limit_concurrency=_server_limit("UVICORN_LIMIT_CONCURRENCY", 64, 1_024),

@@ -115,6 +115,7 @@ def test_ctrl_c_disposes_demo_and_removes_its_temporary_directory(monkeypatch, c
         assert server.config.backlog == 128
         assert server.config.timeout_keep_alive == 5
         assert server.config.proxy_headers is False
+        assert server.config.server_header is False
         raise KeyboardInterrupt
 
     monkeypatch.setattr("scripts.demo_local.demo_application", application)
