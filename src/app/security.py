@@ -280,8 +280,14 @@ class CryptoService:
 
     def decrypt_secret(self, ciphertext_b64: str, nonce_b64: str, context: str) -> str:
         try:
-            ciphertext = base64.urlsafe_b64decode(ciphertext_b64.encode("ascii"))
-            nonce = base64.urlsafe_b64decode(nonce_b64.encode("ascii"))
+            ciphertext = base64.b64decode(
+                ciphertext_b64.encode("ascii"), altchars=b"-_", validate=True
+            )
+            nonce = base64.b64decode(
+                nonce_b64.encode("ascii"), altchars=b"-_", validate=True
+            )
+            if len(nonce) != 12:
+                raise ValueError("Stored AES-GCM nonce must contain 12 bytes.")
         except Exception as exc:
             raise ValueError("Bí mật đã lưu không hợp lệ hoặc đã bị thay đổi.") from exc
         # Account fields carry no version column, so try the active key first and
@@ -324,8 +330,14 @@ class CryptoService:
     ) -> str:
         cipher = self._cipher_for(key_version)
         try:
-            ciphertext = base64.urlsafe_b64decode(ciphertext_b64.encode("ascii"))
-            nonce = base64.urlsafe_b64decode(nonce_b64.encode("ascii"))
+            ciphertext = base64.b64decode(
+                ciphertext_b64.encode("ascii"), altchars=b"-_", validate=True
+            )
+            nonce = base64.b64decode(
+                nonce_b64.encode("ascii"), altchars=b"-_", validate=True
+            )
+            if len(nonce) != 12:
+                raise ValueError("Stored AES-GCM nonce must contain 12 bytes.")
             plaintext = cipher.decrypt(
                 nonce,
                 ciphertext,

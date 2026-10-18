@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.security.utils import get_authorization_scheme_param
 from redis.exceptions import RedisError
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import and_, case, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as DatabasePoolTimeout
 from sqlalchemy.orm import Session
@@ -59,6 +59,7 @@ from src.app.availability import (
 )
 from src.app.browser_security import browser_request_denial
 from src.app.config import AVAILABILITY_ENV_LIMITS, Settings
+from src.app.crypto_info import CryptoRecordCounts, build_crypto_info
 from src.app.db import Database, utcnow
 from src.app.e2ee import (
     PROTOCOL_DOUBLE_RATCHET,
@@ -147,6 +148,7 @@ from src.app.schemas import (
     SecurityActivityResponse,
     SecurityAlertResponse,
     SessionCreate,
+    SessionCryptoInfoResponse,
     SessionResponse,
     SessionSecurityUpdate,
     SessionUpdate,
@@ -3744,6 +3746,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return page_result(messages, total, offset, limit)
 
+    @app.get(
+        "/api/sessions/{session_id}/crypto-info", response_model=SessionCryptoInfoResponse
+    )
+    def get_crypto_info_endpoint(
+        session_id: str,
+        request: Request,
+        user: Annotated[User, Depends(current_user)],
+        db: Annotated[Session, Depends(get_db)],
+    ):
+        row = require_owned_session(session_id, user, db, request)
+        # Aggregate only format labels. Do not load ciphertexts, unwrap a DEK,
+        # contact KMS or decrypt anything to render this metadata view.
+        server_counts = db.execute(
+            select(
+                func.count(),
+                func.count(case((SecureMessage.encryption_scheme == "envelope-v1", 1))),
+                func.count(case((SecureMessage.encryption_scheme == "legacy-v1", 1))),
+            ).where(SecureMessage.session_id == row.id)
+        ).one()
+        e2ee_counts = db.execute(
+            select(
+                func.count(),
+                func.count(case((E2eeEnvelope.protocol == PROTOCOL_DOUBLE_RATCHET, 1))),
+                func.count(case((E2eeEnvelope.protocol == PROTOCOL_MLS, 1))),
+            ).where(E2eeEnvelope.session_id == row.id)
+        ).one()
+        return build_crypto_info(
+            session_id=row.id,
+            security_mode=row.security_mode,
+            current_crypto_epoch=row.current_crypto_epoch,
+            key_provider=settings.key_provider,
+            counts=CryptoRecordCounts(
+                server_total=server_counts[0],
+                envelope=server_counts[1],
+                legacy=server_counts[2],
+                e2ee_total=e2ee_counts[0],
+                double_ratchet=e2ee_counts[1],
+                mls=e2ee_counts[2],
+            ),
+        )
+
     @app.get("/api/sessions/{session_id}/ciphertexts", response_model=list[RawMessageResponse])
     def get_ciphertexts_endpoint(
         session_id: str,
@@ -5591,6 +5634,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             '<script src="/api/ui-session/login-credentials.js" defer></script>'
             '<script src="/api/ui-session/passkey.js" defer></script>'
             '<script src="/api/ui-session/security-push.js" defer></script>'
+            '<script src="/api/ui-session/crypto-workbench-core.js" defer></script>'
+            '<script src="/api/ui-session/crypto-workbench.js" defer></script>'
         ),
         auth_dependency=gradio_auth_dependency,
         blocked_paths=["/app/.env", "/run/secrets", "/proc", "/sys", "/etc"],

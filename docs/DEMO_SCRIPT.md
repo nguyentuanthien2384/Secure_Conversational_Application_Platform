@@ -145,6 +145,61 @@ trình bày lỗi thực tế, không gọi đó là một tình huống thành 
 Kết quả chứng minh các kiểm soát trong phạm vi test; không phải một chứng
 nhận chống được mọi tấn công hoặc đã kiểm thử hạ tầng thật.”
 
+## Tùy chọn: mã hóa/giải mã trong trình duyệt — thêm 2 phút
+
+Phần này độc lập với bản 6 phút, mã hóa lưu trữ của tài khoản và chat E2EE.
+Dùng HTTPS hoặc localhost. Trước khi trình chiếu, tạo mật khẩu sao lưu tạm
+riêng cho dữ liệu giả của lượt demo, dài hơn 16 ký tự, rồi giữ ở nơi riêng để
+nhập lại:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import secrets; print('Demo-' + secrets.token_urlsafe(18))"
+```
+
+1. Mở **Dữ liệu mã hóa → Mã hóa & giải mã trong trình duyệt**. Nhập mật khẩu
+   vừa tạo vào hai ô xác nhận, bấm **Tạo cặp khóa**, rồi **Xuất khóa riêng đã
+   mã hóa**. Giữ tệp bản sao trước khi đổi tab hoặc tải lại. Chỉ trình bày
+   public key và fingerprint, không hiển thị khóa riêng dạng rõ.
+2. Giữ khóa của mình làm người nhận ban đầu. Nhập văn bản giả
+   `Xin chào nhà tuyển dụng, đây là dữ liệu demo SCAP.` và ngữ cảnh công khai
+   `phong-van-demo`. Bấm **Mã hóa văn bản**, giữ lại gói JSON gốc, rồi **Giải
+   mã bằng khóa của bạn**. Kết quả phải khớp nguyên văn; ngữ cảnh vẫn nhìn
+   thấy trong gói nên không chứa bí mật.
+3. Trong gói JSON, chỉ đổi giá trị `context` thành `phong-van-demo-sua`, giữ
+   JSON hợp lệ rồi giải mã lại. Thao tác phải bị từ chối và kết quả bản rõ
+   cũ được xóa. Không mô tả metadata của hội thoại là bằng chứng kiểm tra này.
+4. Tải lại trang hoặc chuyển tab rồi quay lại: khóa và các ô dữ liệu đã được
+   xóa khỏi công cụ. Nếu cần, đăng nhập lại; chọn tệp bản sao khóa riêng đã
+   mã hóa, nhập mật khẩu sao lưu, bấm **Mở bản sao bằng mật khẩu**. Dán lại
+   gói JSON gốc để giải mã thành công.
+
+**Nói:** “Thao tác này chạy trong tab bằng RSA-OAEP và AES-GCM, không gửi
+văn bản hay khóa riêng tới API/AI. Khóa demo độc lập với khóa hội thoại và
+thiết bị Olm/MLS. Mất bản sao hoặc mật khẩu thì không khôi phục được; đây
+không phải cơ chế xác minh danh tính người gửi hay thay thế giao thức chat
+E2EE.” Giới hạn và cách giữ bản sao nằm trong
+[hướng dẫn công cụ trình duyệt](SECURITY_EXTENSIONS.md#crypto-workbench).
+
+### Tùy chọn thêm: mã hóa tệp — 2 phút
+
+Chuẩn bị một tệp thử nhỏ không chứa dữ liệu thật, chẳng hạn `.txt` với dòng
+`Tệp giả cho buổi demo SCAP`. Giữ cặp khóa đã tạo và bản sao khóa riêng ở bước
+trước; thao tác trong cùng tab để tránh khóa bị xóa khi trang bị ẩn.
+
+1. Ở phần **4 · Mã hóa & giải mã tệp**, chọn tệp thử. Đối chiếu tên, số byte
+   và cấu hình AES-256-GCM / nonce 96 bit / thẻ 128 bit / không padding.
+2. Nhập ngữ cảnh công khai `demo-tep`, bấm **Mã hóa & tải tệp .scapenc**.
+   Gói tải xuống dùng tên `scap-encrypted-file.scapenc`; không có tệp tải lên API.
+3. Chọn lại gói vừa tải, bấm **Giải mã & tải tệp .bin**. Đối chiếu tên gốc,
+   SHA-256 và nội dung tệp `scap-restored.bin` với tệp thử. Đổi tên bản tải
+   nếu cần; chỉ mở dữ liệu giả đã tự tạo cho demo.
+4. Đổi tệp đang chọn hoặc đăng xuất: kết quả cũ trên giao diện bị xóa. Các
+   tệp đã tải về máy vẫn còn; nút khóa không xóa tệp trên ổ đĩa.
+
+**Nói:** “Công cụ xử lý cả tệp nhị phân tối đa 5 MiB ở trình duyệt, có khóa và
+nonce mới cho mỗi lần mã hóa. Toàn vẹn được kiểm tra trước khi tải bản rõ,
+nhưng điều đó không chứng minh danh tính người gửi hoặc tệp không chứa mã độc.”
+
 ## Bản 12 phút
 
 Giữ bản 6 phút và thêm ba phần dưới đây. Nếu muốn tự gọi Swagger, diễn tập

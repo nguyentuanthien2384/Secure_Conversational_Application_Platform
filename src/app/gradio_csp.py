@@ -37,6 +37,8 @@ _HEAD_ASSETS = (
     "/api/ui-session/login-credentials.js",
     "/api/ui-session/passkey.js",
     "/api/ui-session/security-push.js",
+    "/api/ui-session/crypto-workbench-core.js",
+    "/api/ui-session/crypto-workbench.js",
 )
 
 

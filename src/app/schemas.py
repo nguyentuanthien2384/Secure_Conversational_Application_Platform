@@ -527,6 +527,45 @@ class RawMessageResponse(BaseModel):
     created_at: datetime
 
 
+class CryptoMessageCounts(BaseModel):
+    """Disjoint counts of stored records, without reading their payloads."""
+
+    total: int = Field(ge=0)
+    envelope: int = Field(ge=0)
+    legacy: int = Field(ge=0)
+    e2ee: int = Field(ge=0)
+    unknown: int = Field(ge=0)
+
+
+class SessionCryptoInfoResponse(BaseModel):
+    """Public encryption metadata; no key material or integrity claim."""
+
+    session_id: str
+    security_mode: Literal["secure", "confidential", "private_e2ee"]
+    algorithm: Literal["AES-256-GCM", "client-controlled-e2ee"]
+    key_bits: Literal[256] | None
+    nonce_bits: Literal[96] | None
+    tag_bits: Literal[128] | None
+    current_crypto_epoch: int = Field(ge=0)
+    key_provider: Literal["local", "vault", "aws-kms", "gcp-kms"] | None
+    message_counts: CryptoMessageCounts
+    e2ee_protocol_counts: dict[Literal["double-ratchet", "mls-rfc9420"], int]
+    aad_fields: list[str]
+    legacy_aad_fields: list[str]
+    integrity_verification: Literal["not_performed"] = "not_performed"
+    notes: list[
+        Literal[
+            "metadata_only_integrity_not_verified",
+            "counts_are_stored_records",
+            "server_can_decrypt_authorized_messages",
+            "client_verifies_e2ee_ciphertexts",
+            "legacy_messages_have_reduced_aad_binding",
+            "unsupported_storage_format_present",
+            "unexpected_ciphertext_storage_for_session_mode",
+        ]
+    ]
+
+
 class AuditResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

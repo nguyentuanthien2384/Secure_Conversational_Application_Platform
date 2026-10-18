@@ -155,7 +155,7 @@ Trang xác thực có ba luồng **Đăng nhập**, **Tạo tài khoản**, **Qu
 ### Không gian làm việc
 
 - **Trò chuyện:** chọn hội thoại bằng một lần bấm ở thanh bên; tạo nhanh với mặc định Secure/Internal, hoặc mở **Thiết lập hội thoại mới** để đặt tiêu đề/chế độ/phân loại. Khung trống có hướng dẫn bắt đầu; gửi bằng Enter, sao chép phản hồi, tìm trong hội thoại. Đổi tên/xuất/xóa nằm trong nhóm quản lý hội thoại.
-- **Dữ liệu mã hóa:** phần giới thiệu giải thích bản mã thật đã lưu, gồm ciphertext, nonce và phiên bản khóa.
+- **Dữ liệu mã hóa:** xem ciphertext, nonce, crypto epoch, thuật toán và nguồn quản lý khóa; chỉ chủ hội thoại được đọc thông số. Công cụ trình duyệt riêng cho phép tạo/nhập/xuất public key, sao lưu private key có mật khẩu và mã hóa/giải mã văn bản hoặc tệp nhị phân tối đa 5 MiB bằng RSA-OAEP 3072 + AES-256-GCM. Tệp được tải thành gói `.scapenc`; sau giải mã, đối chiếu tên gốc/SHA-256 và tải kết quả `.bin`. Khóa và nội dung của công cụ không gửi lên API/AI; dùng HTTPS/localhost và tải bản sao trước khi rời trang. Xem [hướng dẫn](docs/SECURITY_EXTENSIONS.md#crypto-workbench).
 - **Tìm kiếm:** tìm toàn bộ hội thoại thuộc sở hữu tài khoản hiện tại, có phân trang và số kết quả; tìm trong hội thoại hiện tại không thay khung chat.
 - **Tài khoản:** đổi mật khẩu; TOTP/QR/recovery code; đồng thuận AI; thiết bị; email khôi phục; passkey; hoạt động bảo mật.
 - **Quản trị — admin:** thống kê người dùng/hội thoại, dashboard khả dụng, tạo tài khoản, đổi vai trò và khóa/mở khóa/xóa tài khoản.

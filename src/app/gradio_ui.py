@@ -30,6 +30,7 @@ from markdown_it.renderer import RendererHTML
 
 from src.app.account_security import DEVICE_COOKIE_NAME, DEVICE_TOKEN_HEADER
 from src.app.audit import sign_ui_client_context
+from src.app.crypto_workbench_ui import WORKBENCH_CSS, WORKBENCH_HTML
 from src.app.gradio_capacity import install_gradio_capacity
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
 from src.app.ui_session import COOKIE_NAME, BrowserSessionStore, UISessionCapacityError
@@ -1281,8 +1282,7 @@ def _session_policy_markdown(token, session_id):
     mode_label = _SECURITY_MODE_LABELS.get(mode) or _safe_markdown_text(mode)
     class_label = _DATA_CLASS_LABELS.get(data_class) or _safe_markdown_text(data_class)
     return (
-        f"🔒 **Hội thoại đang chọn:** {mode_label} · {class_label}  \n"
-        "Đã khóa khi tạo, không thể đổi. Cần chế độ khác thì tạo hội thoại mới.  \n"
+        f"🔒 **Hội thoại đang chọn:** {mode_label} · {class_label} (không thể đổi)  \n"
         "Bấm **Gửi** là xác nhận gửi tin nhắn tới AI; DLP vẫn che hoặc chặn dữ liệu nhạy cảm."
     )
 
@@ -1443,7 +1443,8 @@ def _safe_markdown_text(value) -> str:
 # chính ~10 giây mỗi lần cập nhật — đó là hiện tượng "bấm sang tab là treo".
 # Mọi bảng ở đây chỉ để đọc, nên máy chủ dựng sẵn HTML (escape từng ô) và
 # gr.Markdown chỉ việc hiển thị: không eval, không reactive theo ô.
-CIPHER_HEADERS = ("#", "Vai trò", "Ciphertext (base64, rút gọn)", "Nonce", "Key ver.", "Thời điểm")
+CUSTOM_CSS += WORKBENCH_CSS
+CIPHER_HEADERS = ("#", "Vai trò", "Ciphertext (base64, rút gọn)", "Nonce", "Phiên bản khóa", "Thời điểm")
 SEARCH_HEADERS = ("Hội thoại", "Vai trò", "Nội dung", "Thời điểm")
 DEVICE_HEADERS = (
     "", "Thiết bị / trình duyệt", "IP", "Đăng nhập lúc", "Hoạt động gần nhất",
@@ -1508,9 +1509,7 @@ def _chat_history(token, session_id, session=None):
             {
                 "role": "assistant",
                 "content": (
-                    "🔐 Phiên này ở chế độ Private E2EE. Gradio không giữ khóa riêng; "
-                    "gửi và đọc tin bằng client Olm độc lập. Để diễn tập hai client với "
-                    "dữ liệu tạm, chạy trong thư mục dự án: "
+                    "🔐 Private E2EE · Dùng client Olm độc lập. "
                     "`uv run --frozen --extra e2ee-client python -m scripts.demo_e2ee --check`."
                 ),
             }
@@ -1636,12 +1635,11 @@ def _email_markdown(data):
     if data.get("email"):
         lines.append(
             f"**Email khôi phục:** {_safe_markdown_text(data['email'])} — đã xác minh "
-            f"{_fmt(data.get('verified_at'))}. Dùng để tự đặt lại mật khẩu và nhận cảnh báo bảo mật."
+            f"{_fmt(data.get('verified_at'))}."
         )
     else:
         lines.append(
-            "**Chưa có email khôi phục.** Thêm email để có thể tự đặt lại mật khẩu "
-            "và nhận cảnh báo khi có đăng nhập lạ."
+            "**Chưa có email khôi phục.**"
         )
     if data.get("pending_email"):
         lines.append(
@@ -1707,7 +1705,6 @@ AUTH_BRAND_HTML = (
     '<div class="auth-brand">'
     '<span class="auth-medallion" role="img" aria-label="Khiên bảo mật SCAP"></span>'
     '<span class="mark-word">SCAP</span>'
-    '<p class="auth-caption">Không gian trò chuyện &amp; quản lý bảo mật</p>'
     "</div>"
 )
 
@@ -1729,9 +1726,6 @@ CHAT_WELCOME_HTML = (
     '<div class="chat-welcome">'
     '<span class="welcome-symbol" aria-hidden="true">✦</span>'
     '<h3>Bắt đầu một cuộc trò chuyện</h3>'
-    '<p>Chọn một hội thoại hoặc bấm <strong>+ Hội thoại mới</strong>. '
-    'Sau đó nhập câu hỏi và nhấn <strong>Gửi</strong>. '
-    'Chọn chế độ bảo mật trong phần thiết lập khi tạo hội thoại mới.</p>'
     '</div>'
 )
 
@@ -1908,10 +1902,6 @@ def build_ui(
                                 interactive=True,
                                 elem_id="chk-remember-login",
                             )
-                            gr.Markdown(
-                                "Chọn **Lưu** khi trình duyệt hỏi để tự điền vào lần sau.",
-                                elem_id="login-save-hint",
-                            )
                             btn_login = gr.Button(
                                 "Đăng nhập", variant="primary", elem_id="btn-login",
                             )
@@ -1969,10 +1959,6 @@ def build_ui(
 
                             re_pass.change(_pw_meter_html, re_pass, html_pw_meter)
                         with gr.Tab("Quên mật khẩu", id="tab_reset"):
-                            gr.Markdown(
-                                "Nhập tên đăng nhập hoặc email khôi phục đã xác minh. "
-                                "Mã đặt lại được gửi tới email đó; xác thực hai lớp vẫn giữ nguyên."
-                            )
                             tb_reset_identifier = gr.Textbox(
                                 label="Tên đăng nhập hoặc email khôi phục",
                                 max_length=254,
@@ -2106,11 +2092,6 @@ def build_ui(
                                     value="internal",
                                     label="Phân loại dữ liệu (cho hội thoại mới)",
                                 )
-                                gr.Markdown(
-                                    "Mặc định: **Secure / Internal**. Chỉ áp dụng cho hội thoại "
-                                    "tạo khi bấm **+ Hội thoại mới**. Hội thoại đã tạo giữ nguyên "
-                                    "chế độ của nó và không thể đổi."
-                                )
                             with gr.Row():
                                 btn_create = gr.Button(
                                     "+ Hội thoại mới", variant="primary", size="sm", scale=3
@@ -2194,10 +2175,7 @@ def build_ui(
                                 interactive=gemini_web_search_enabled,
                                 visible=gemini_web_search_enabled,
                                 elem_id="chat-web-search",
-                                info=(
-                                    "Chỉ dùng trong hội thoại Public. Truy vấn tìm kiếm được gửi tới Google "
-                                    "và có thể tính phí. Tra cứu riêng, không dùng hoặc lưu lịch sử chat."
-                                ),
+                                info="Public · Gửi truy vấn tới Google · Có thể tính phí",
                             )
                             # Thông báo cố định dưới ô nhập, dùng cho consent và DLP.
                             # Không dùng toast vì toast che nội dung hội thoại trên màn hình nhỏ.
@@ -2222,8 +2200,7 @@ def build_ui(
                 # ---------- DỮ LIỆU MÃ HÓA ----------
                 with gr.Tab("Dữ liệu mã hóa"):
                     _static_html(
-                        '<div class="tab-intro"><h3>Dữ liệu mã hóa</h3>'
-                        '<p>Chọn hội thoại để xem bản mã, nonce và phiên bản khóa lưu trên máy chủ.</p></div>'
+                        '<div class="tab-intro"><h3>Dữ liệu mã hóa</h3></div>'
                     )
                     with gr.Row():
                         dd_cipher = _pick_dropdown(
@@ -2233,13 +2210,15 @@ def build_ui(
                     df_cipher = _data_table(
                         CIPHER_HEADERS, elem_id="cipher-table", elem_classes=["mono-df"]
                     )
+                    crypto_info = gr.JSON(label="Thông số mã hóa hội thoại · không chứa khóa", value={})
+                    st_cipher_view = gr.State(None)
+                    st_cipher_generation = gr.State(0)
+                    _static_html(WORKBENCH_HTML, elem_id="crypto-workbench")
 
                 # ---------- TÌM KIẾM ----------
                 with gr.Tab("Tìm kiếm"):
                     _static_html(
-                        '<div class="tab-intro"><h3>Tìm lại nội dung</h3>'
-                        '<p>Tra cứu trong các hội thoại thuộc tài khoản của bạn. '
-                        'Chọn một từ khóa cụ thể để thu hẹp kết quả.</p></div>'
+                        '<div class="tab-intro"><h3>Tìm lại nội dung</h3></div>'
                     )
                     with gr.Row():
                         tb_gq = gr.Textbox(
@@ -2254,9 +2233,7 @@ def build_ui(
                 # ---------- TÀI KHOẢN ----------
                 with gr.Tab("Tài khoản"):
                     _static_html(
-                        '<div class="tab-intro"><h3>Bảo vệ tài khoản của bạn</h3>'
-                        '<p>Quản lý mật khẩu, xác thực hai lớp, passkey, email khôi phục '
-                        'và các thiết bị đã đăng nhập.</p></div>'
+                        '<div class="tab-intro"><h3>Bảo vệ tài khoản của bạn</h3></div>'
                     )
                     md_profile = gr.Markdown("")
                     chk_consent = gr.Checkbox(
@@ -2271,7 +2248,7 @@ def build_ui(
                             label="Mật khẩu mới",
                             type="password",
                             max_length=128,
-                            info=f"Tối thiểu {PASSWORD_MIN} ký tự — đổi xong sẽ cần đăng nhập lại",
+                            info=f"Tối thiểu {PASSWORD_MIN} ký tự · Cần đăng nhập lại sau khi đổi",
                         )
                         btn_pw = gr.Button("Cập nhật mật khẩu", variant="primary", size="sm")
                     with gr.Accordion("Xác thực hai lớp (TOTP)", open=True):
@@ -2299,16 +2276,10 @@ def build_ui(
                                         # Camera iPhone mở QR otpauth:// trong app
                                         # Mật khẩu, nơi mã phải gắn vào một mục đã lưu.
                                         gr.Markdown(
-                                            "**Cách quét:** mở ứng dụng xác thực (Google Authenticator, "
-                                            "Microsoft Authenticator, 2FAS…) → **+** → quét QR.\n\n"
-                                            "**iPhone dùng app Mật khẩu có sẵn:** mã phải gắn vào một mục "
-                                            "mật khẩu đã lưu. Tạo mục cho trang này trước (Mật khẩu → **+** "
-                                            "→ trang web và tên đăng nhập), mở mục đó → **Thiết lập mã xác "
-                                            "minh** → quét QR hoặc nhập khóa thủ công."
+                                            "Quét QR trong ứng dụng xác thực hoặc nhập khóa thủ công."
                                         )
                                         tb_secret = gr.Textbox(
                                             label="Khóa thủ công",
-                                            info="Chỉ dùng khi không quét được QR; sẽ xóa sau khi kích hoạt.",
                                             interactive=False,
                                         )
                                         tb_activate = gr.Textbox(label="Mã 6 số", max_length=8)
@@ -2324,10 +2295,6 @@ def build_ui(
                             btn_disable = gr.Button("Tắt 2FA", variant="stop", size="sm")
                     with gr.Accordion("Thiết bị đang đăng nhập", open=True):
                         df_devices = _data_table(DEVICE_HEADERS, elem_id="devices-table")
-                        gr.Markdown(
-                            "Làm mới danh sách hoặc gia hạn token không kéo dài thời hạn không hoạt động. "
-                            "Các mốc trong bảng được kiểm tra ở máy chủ."
-                        )
                         with gr.Row():
                             dd_revoke = _pick_dropdown(label="Phiên cần thu hồi", choices=[], scale=3)
                             btn_revoke = gr.Button("Thu hồi", size="sm", scale=1)
@@ -2337,10 +2304,6 @@ def build_ui(
                             elem_id="btn-logout-all",
                         )
                     with gr.Accordion("Email khôi phục & passkey", open=True):
-                        gr.Markdown(
-                            "Đổi email khôi phục hoặc passkey là thao tác nhạy cảm. Khi hệ thống "
-                            "báo cần xác thực lại, nhập mật khẩu (và mã 2FA nếu đã bật) rồi bấm lại."
-                        )
                         with gr.Row():
                             tb_acct_pw = gr.Textbox(
                                 label="Mật khẩu hiện tại (khi cần xác thực lại)",
@@ -2368,11 +2331,6 @@ def build_ui(
                         btn_email_remove = gr.Button(
                             "Gỡ email khôi phục", size="sm", variant="stop"
                         )
-                        gr.Markdown(
-                            "**Passkey** cho phép đăng nhập không cần mật khẩu bằng vân tay, khuôn mặt "
-                            "hoặc PIN của thiết bị. Khóa riêng không bao giờ rời thiết bị và passkey "
-                            "chỉ dùng được trên đúng trang này, nên kẻ lừa đảo không thể đánh cắp."
-                        )
                         df_passkeys = _data_table(PASSKEY_HEADERS, elem_id="passkeys-table")
                         with gr.Row():
                             tb_passkey_name = gr.Textbox(
@@ -2394,17 +2352,11 @@ def build_ui(
                             )
                     with gr.Accordion("Thông báo bảo mật qua Push / SMS", open=False):
                         gr.Markdown(
-                            "Đăng ký nhận cảnh báo khi tài khoản có thay đổi nhạy cảm. "
-                            "Push cần quyền thông báo của trình duyệt; SMS cần xác minh số điện thoại "
-                            "và có thể phát sinh phí nhà cung cấp. Các kênh này không dùng để đăng nhập hoặc khôi phục mật khẩu."
+                            "SMS có thể phát sinh phí nhà cung cấp."
                         )
-                        md_notifications = gr.Markdown("Bấm **Làm mới kênh thông báo** để kiểm tra cấu hình.")
+                        md_notifications = gr.Markdown("")
                         btn_notifications_refresh = gr.Button("Làm mới kênh thông báo", size="sm")
                         btn_push_prepare = gr.Button("Chuẩn bị bật Push trên trình duyệt này", size="sm")
-                        gr.Markdown(
-                            "Nếu trình duyệt còn đăng ký Push với tài khoản khác, gỡ đăng ký trên "
-                            "trình duyệt này rồi chuẩn bị bật Push lại cho tài khoản hiện tại."
-                        )
                         btn_push_local_remove = gr.Button("Gỡ đăng ký Push trên trình duyệt này", size="sm")
                         btn_push_enable = gr.Button("Cho phép và bật thông báo Push", visible=False,
                                                     elem_id="btn-security-push-enable", size="sm")
@@ -2419,10 +2371,6 @@ def build_ui(
                     with gr.Accordion("Hoạt động bảo mật gần đây", open=True):
                         md_activity = gr.Markdown(ACTIVITY_PLACEHOLDER)
                         df_activity = _data_table(ACTIVITY_HEADERS, elem_id="activity-table")
-                        gr.Markdown(
-                            "Gồm cả các lần người khác thử đăng nhập vào tài khoản của bạn. "
-                            "Thao tác của quản trị viên được ghi nhận nhưng ẩn địa chỉ của họ."
-                        )
                         btn_activity_refresh = gr.Button("Làm mới hoạt động", size="sm")
                         md_geoip_status = gr.Markdown("")
                         btn_geoip_status = gr.Button("Kiểm tra đánh giá vị trí đăng nhập", size="sm")
@@ -2430,10 +2378,7 @@ def build_ui(
                 # ---------- QUẢN TRỊ ----------
                 with gr.Tab("Quản trị", visible=False) as adm_tab:
                     gr.Markdown(
-                        "<p class=\"dashboard-eyebrow\">Operations overview</p>"
-                        "<h3>Trung tâm vận hành &amp; bảo mật</h3>"
-                        "<p>Theo dõi nhanh tình trạng nền tảng, tín hiệu rủi ro và quản lý tài khoản "
-                        "trong cùng một không gian.</p>",
+                        "<h3>Trung tâm vận hành &amp; bảo mật</h3>",
                         sanitize_html=False,
                         elem_classes="dashboard-hero",
                     )
@@ -2452,10 +2397,6 @@ def build_ui(
                     st_users_page = gr.State({})
                     md_users_page = gr.Markdown("", elem_id="users-page-status")
                     btn_users_more = gr.Button("Tải thêm tài khoản", visible=False, size="sm")
-                    gr.Markdown(
-                        "Khi cần xác thực lại, nhập mật khẩu của bạn và mã 2FA (nếu đã bật) "
-                        "trước khi thực hiện thao tác quản trị. Thông tin này được xóa sau thao tác."
-                    )
                     with gr.Row():
                         tb_admin_pw = gr.Textbox(
                             label="Mật khẩu quản trị viên (khi cần xác thực lại)",
@@ -2504,8 +2445,7 @@ def build_ui(
                 # ---------- NHẬT KÝ ----------
                 with gr.Tab("Nhật ký kiểm toán", visible=False) as mod_tab:
                     _static_html(
-                        '<div class="tab-intro"><h3>Nhật ký kiểm toán</h3>'
-                        '<p>Chọn số dòng và tải nhật ký để xem sự kiện, kết quả và thời điểm.</p></div>'
+                        '<div class="tab-intro"><h3>Nhật ký kiểm toán</h3></div>'
                     )
                     with gr.Row():
                         sl_audit = gr.Slider(10, 500, value=100, step=10, label="Số dòng", scale=3)
@@ -2522,10 +2462,7 @@ def build_ui(
                 # (Bài 1 §Accounting) và theo dõi IDS/IPS (Bài 7 §7.3).
                 with gr.Tab("Bảo mật", visible=False) as sec_tab:
                     gr.Markdown(
-                        "<p class=\"dashboard-eyebrow\">SOC monitoring</p>"
-                        "<h3>Trung tâm giám sát an ninh</h3>"
-                        "<p>Xác minh tính toàn vẹn audit, theo dõi phát hiện IDS/IPS và thực hiện "
-                        "đối soát HIT/MISS theo phạm vi MITRE ATT&amp;CK.</p>",
+                        "<h3>Trung tâm giám sát an ninh</h3>",
                         sanitize_html=False,
                         elem_classes="dashboard-hero",
                     )
@@ -2536,12 +2473,6 @@ def build_ui(
                     btn_sec_all = gr.Button("Làm mới toàn bộ", variant="primary", size="sm")
 
                     with gr.Accordion("1 · Toàn vẹn nhật ký kiểm toán (hash chain)", open=True):
-                        gr.Markdown(
-                            "Mỗi bản ghi cam kết vào bản ghi trước bằng "
-                            "`HMAC-SHA256(khóa, prev_hash ‖ bản_ghi)`. Chuỗi nội bộ kiểm tra "
-                            "nội dung và liên kết các bản ghi còn lưu; phát hiện mất phần đuôi cần "
-                            "checkpoint neo ngoài (WORM). *Chức năng này cần vai trò admin.*"
-                        )
                         btn_sec_verify = gr.Button("Xác minh chuỗi", variant="primary", size="sm")
                         md_sec_verdict = gr.Markdown(
                             "*Chưa xác minh trong phiên làm việc này.*",
@@ -2565,11 +2496,6 @@ def build_ui(
                         )
 
                     with gr.Accordion("4 · Purple Team — kiểm chứng luật phát hiện", open=False):
-                        gr.Markdown(
-                            "Kiểm tra an toàn tại chỗ các luật IDS cho **MITRE ATT&CK T1190** "
-                            "(SQLi, XSS, path traversal, command injection). Không gửi payload "
-                            "ra mạng và không khai thác hệ thống. *Cần vai trò admin.*"
-                        )
                         btn_sec_verify_ids = gr.Button(
                             "Chạy kiểm chứng Hit/Miss", variant="primary", size="sm"
                         )
@@ -2578,7 +2504,6 @@ def build_ui(
                         )
 
                     with gr.Accordion("5 · IPS — nguồn đang bị chặn", open=True):
-                        gr.Markdown("*Xem và gỡ chặn cần vai trò admin.*")
                         df_sec_block = _data_table(
                             BLOCKLIST_HEADERS, elem_id="sec-blocklist-table", elem_classes=["mono-df"]
                         )
@@ -2680,6 +2605,9 @@ def build_ui(
             (md_search_answer, gr.update(value="", visible=False)),
             (md_search_suggestions, gr.update(value="", visible=False)),
             (df_cipher, _table_html(CIPHER_HEADERS, [])),
+            (crypto_info, {}),
+            (st_cipher_view, None),
+            (st_cipher_generation, 0),
             (tb_gq, ""),
             (df_gsearch, _table_html(SEARCH_HEADERS, [])),
             (tb_pw_cur, ""),
@@ -2701,7 +2629,7 @@ def build_ui(
             (md_geoip_status, ""),
             (push_bridge, ""), (tb_push_result, ""), (st_push, {}), (st_phone_proof, {}),
             (btn_push_enable, gr.update(visible=False)),
-            (md_notifications, "Bấm **Làm mới kênh thông báo** để kiểm tra cấu hình."),
+            (md_notifications, ""),
             (tb_alert_phone, ""), (tb_alert_code, ""),
             (md_passkey_hint, gr.update(value="", visible=False)),
             (btn_passkey_create, gr.update(visible=False)),
@@ -3696,7 +3624,9 @@ def build_ui(
                             [md_search_answer, md_search_suggestions], api_name=False)
 
         # ---- dữ liệu mã hóa ----
-        def load_cipher(token, session_id):
+        def load_cipher(token, session_id, view_id=None):
+            if view_id != session_id:
+                return gr.skip()
             if not session_id:
                 _ui_notice(gr.Warning, "Chọn một hội thoại trước.")
                 return gr.skip()
@@ -3709,13 +3639,36 @@ def build_ui(
                     row["role"],
                     row["ciphertext_preview"],
                     row["nonce"],
-                    f"v{row['key_version']}",
+                    (f"Epoch {row['crypto_epoch']} · {row['encryption_scheme']}"
+                     if row.get("encryption_scheme") == "envelope-v1"
+                     else (f"Legacy v{row['key_version']}"
+                           if row.get("encryption_scheme", "legacy-v1") == "legacy-v1"
+                           else "Định dạng không hỗ trợ")),
                     _fmt(row["created_at"]),
                 ]
                 for row in rows
             ])
 
-        btn_cipher.click(_guard(load_cipher, 1), [st_token, dd_cipher], [df_cipher])
+        btn_cipher.click(_guard(load_cipher, 1), [st_token, dd_cipher, st_cipher_view], [df_cipher])
+
+        def load_crypto_info(token, session_id, view_id=None):
+            if view_id != session_id:
+                return gr.skip()
+            if not token or not session_id:
+                return {}
+            return _api(token, "GET", f"/api/sessions/{session_id}/crypto-info")
+
+        btn_cipher.click(_guard(load_crypto_info, 1), [st_token, dd_cipher, st_cipher_view], [crypto_info],
+                         api_visibility="private")
+
+        def clear_crypto_view(session_id, generation):
+            return _table_html(CIPHER_HEADERS, []), {}, session_id, int(generation or 0) + 1
+
+        dd_cipher.change(
+            clear_crypto_view, [dd_cipher, st_cipher_generation],
+            [df_cipher, crypto_info, st_cipher_view, st_cipher_generation], queue=False,
+            trigger_mode="always_last", api_visibility="private",
+        )
 
         # ---- tìm kiếm toàn cục ----
         SEARCH_PAGE_OUTS = [df_gsearch, st_search_page, md_search_page, btn_search_more]
@@ -4258,11 +4211,7 @@ def build_ui(
                 f"**Đăng nhập lỗi**\n\n## {stats['recent_login_failures']}\n\nTrong 60 phút gần nhất",
                 f"**Từ chối quyền**\n\n## {stats['recent_auth_denials']}\n\nTrong 60 phút gần nhất",
             )
-            stats_md = (
-                "**Tóm tắt phiên quan sát** · Các chỉ số được làm mới trực tiếp từ API quản trị. "
-                "Ưu tiên rà soát hai chỉ số cuối khi chuẩn bị trình diễn hoặc báo cáo.\n\n"
-                f"Cập nhật: {time.strftime('%d/%m/%Y %H:%M:%S UTC', time.gmtime())}"
-            )
+            stats_md = f"Cập nhật: {time.strftime('%d/%m/%Y %H:%M:%S UTC', time.gmtime())}"
             availability = stats.get("availability")
             if availability:
                 requests = availability["requests"]
@@ -4270,30 +4219,25 @@ def build_ui(
                 password_ops = availability["password_operations"]
                 rejected = sum(availability["rejections"].values())
                 stats_md += (
-                    "\n\n**Tài nguyên xử lý hiện tại**\n\n"
+                    "\n\n**Tài nguyên xử lý · tiến trình hiện tại**\n\n"
                     f"Yêu cầu: **{requests['active']}/{requests['limit']}** · "
                     f"Luồng giao diện: **{streams['active']}/{streams['limit']}** · "
                     f"Băm mật khẩu: **{password_ops['active']}/{password_ops['limit']}**\n\n"
                     f"Sự kiện giao diện lưu giữ: **{availability['gradio_retained_events']}/"
                     f"{availability['gradio_retained_event_limit']}** · "
-                    f"Lượt từ chối ghi nhận: **{rejected}**\n\n"
-                    "Số liệu của tiến trình hiện tại, đặt lại khi khởi động. "
-                    "Audit lấy mẫu các lần từ chối vô danh lặp lại; "
-                    "số dòng audit không thể hiện toàn bộ số lần bị chặn."
+                    f"Lượt từ chối ghi nhận: **{rejected}**"
                 )
                 recent = availability.get("http_recent")
                 if recent:
                     statuses = recent["status_classes"]
                     stats_md += (
-                        f"\n\n**Quan sát HTTP gần đây ({recent['window_seconds']} giây)**\n\n"
+                        f"\n\n**HTTP · tiến trình hiện tại ({recent['window_seconds']} giây)**\n\n"
                         f"Phản hồi: **{recent['responses']}** · "
                         f"Bị giới hạn/quá tải (429/503): **{recent['throttled_responses']}** · "
                         f"Lỗi máy chủ (5xx): **{statuses['5xx']}** · "
                         f"Ngắt trước phản hồi: **{statuses['unanswered']}**\n\n"
                         f"Độ trễ đến header trung bình: **{recent['average_latency_ms']:.2f} ms** · "
-                        f"Phản hồi chậm hơn 1 giây: **{recent['slow_responses']}**. "
-                        "Đo đến header để luồng giao diện dài không làm sai độ trễ. "
-                        "Cửa sổ dùng ô 1 giây, chỉ quan sát tiến trình hiện tại."
+                        f"Phản hồi chậm hơn 1 giây: **{recent['slow_responses']}**."
                     )
             alerts = _api(
                 token, "GET", "/api/admin/security-alerts", params={"window_minutes": "60"}
@@ -4326,9 +4270,6 @@ def build_ui(
                 alerts_md += (
                     "\n\n**Cảnh báo vận hành (60 giây / tài nguyên hiện tại):**\n"
                     + lines
-                    + "\n\nĐây là dấu hiệu cần rà soát, chưa kết luận có tấn công. "
-                    "Tài nguyên hiện tại tính cả yêu cầu đang lấy số liệu; "
-                    "cảnh báo HTTP tự hết khi cửa sổ quan sát trôi qua."
                 )
             return (*metrics, stats_md, alerts_md,
                     *users_page_snapshot(token, keep, keep_record=keep_record))
@@ -4824,6 +4765,8 @@ def build_ui(
         fn.api_visibility = "private"
         if fn.fn is not None and fn.fn.__name__ in {"find_in_session", "load_more_session_search"}:
             fn._scap_scope_ids = (st_session_search_generation._id,)
+        if fn.fn is not None and fn.fn.__name__ in {"load_cipher", "load_crypto_info"}:
+            fn._scap_scope_ids = (st_cipher_generation._id,)
     demo.config = demo.get_config_file()
     demo.queue(
         max_size=queue_max_size,

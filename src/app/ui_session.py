@@ -273,6 +273,20 @@ def register_ui_session_routes(
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
+    @app.get("/api/ui-session/crypto-workbench-core.js", include_in_schema=False)
+    def crypto_workbench_core_script():
+        return FileResponse(
+            _PASSKEY_PATH.with_name("crypto_workbench_core.js"), media_type="text/javascript",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/api/ui-session/crypto-workbench.js", include_in_schema=False)
+    def crypto_workbench_script():
+        return FileResponse(
+            _PASSKEY_PATH.with_name("crypto_workbench.js"), media_type="text/javascript",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
     @app.get("/security-push-worker.js", include_in_schema=False)
     def security_push_worker():
         return FileResponse(

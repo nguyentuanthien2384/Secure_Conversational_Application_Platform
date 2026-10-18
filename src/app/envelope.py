@@ -93,6 +93,18 @@ def _decode(value: str, label: str) -> bytes:
         raise EnvelopeEncryptionError(f"{label} is not valid base64.") from exc
 
 
+def _decode_aead_payload(ciphertext_b64: str, nonce_b64: str) -> tuple[bytes, bytes]:
+    """Validate the persisted GCM format before requesting a protected DEK."""
+    try:
+        nonce = _decode(nonce_b64, "Encrypted payload nonce")
+        ciphertext = _decode(ciphertext_b64, "Encrypted payload ciphertext")
+    except EnvelopeEncryptionError as exc:
+        raise EnvelopeEncryptionError("Encrypted payload format is invalid.") from exc
+    if len(nonce) != 12 or len(ciphertext) < 16:
+        raise EnvelopeEncryptionError("Encrypted payload format is invalid.")
+    return ciphertext, nonce
+
+
 @dataclass
 class _CachedDek:
     value: bytearray
@@ -298,8 +310,21 @@ class EnvelopeCryptoService:
             epoch_row.epoch,
         )
 
+    @staticmethod
+    def _validate_message_context(session: ChatSession, row: SecureMessage) -> None:
+        # Keep these invariants at the crypto boundary, including for historic
+        # shared-key rows whose AAD predates per-conversation DEKs. A caller
+        # must not be able to select a different session by passing a row.
+        if row.session_id != session.id:
+            raise EnvelopeEncryptionError(
+                "Encrypted message does not belong to the supplied conversation."
+            )
+        if row.encryption_scheme not in {ENVELOPE_SCHEME, LEGACY_SCHEME}:
+            raise EnvelopeEncryptionError("Encrypted message scheme is unsupported.")
+
     def decrypt_message(self, db: Session, session: ChatSession, row: SecureMessage) -> str:
-        if row.encryption_scheme != ENVELOPE_SCHEME:
+        self._validate_message_context(session, row)
+        if row.encryption_scheme == LEGACY_SCHEME:
             if self.legacy_crypto is None:
                 raise EnvelopeEncryptionError("Legacy key material is unavailable.")
             return self.legacy_crypto.decrypt(
@@ -309,6 +334,7 @@ class EnvelopeCryptoService:
                 row.role,
                 row.key_version,
             )
+        ciphertext, nonce = _decode_aead_payload(row.ciphertext, row.nonce)
         dek = self._session_dek(db, session, row.crypto_epoch)
         aad = canonical_message_aad(
             owner_id=session.owner_id,
@@ -320,8 +346,8 @@ class EnvelopeCryptoService:
         )
         try:
             plaintext = AESGCM(dek).decrypt(
-                _decode(row.nonce, "Message nonce"),
-                _decode(row.ciphertext, "Message ciphertext"),
+                nonce,
+                ciphertext,
                 aad,
             )
             return plaintext.decode("utf-8")
@@ -335,6 +361,7 @@ class EnvelopeCryptoService:
         row: SecureMessage,
     ) -> bool:
         """Rewrite one legacy row with a conversation DEK and message-bound AAD."""
+        self._validate_message_context(session, row)
         if row.encryption_scheme == ENVELOPE_SCHEME:
             return False
         if self.legacy_crypto is None:
@@ -540,11 +567,12 @@ class EnvelopeCryptoService:
                 nonce_b64,
                 context=field,
             )
+        ciphertext, nonce = _decode_aead_payload(ciphertext_b64, nonce_b64)
         dek = self._user_dek(user)
         try:
             plaintext = AESGCM(dek).decrypt(
-                _decode(nonce_b64, "Secret nonce"),
-                _decode(ciphertext_b64, "Secret ciphertext"),
+                nonce,
+                ciphertext,
                 canonical_secret_aad(
                     user_id=user.id,
                     field=field,

@@ -128,3 +128,75 @@ client cần tin cậy. Không phục hồi ratchet cũ để tiếp tục gửi
 
 Các test và demo không thay thế kiểm toán độc lập cho tích hợp SCAP, kiểm chứng
 tương thích với client MLS khác hoặc kiểm tra nhà cung cấp/hạ tầng thật.
+
+<a id="crypto-workbench"></a>
+## Công cụ mã hóa/giải mã cục bộ trong trình duyệt
+
+Mở **Dữ liệu mã hóa** trên HTTPS hoặc localhost. Phần **Thông số mã hóa hội
+thoại** đọc metadata của hội thoại thuộc tài khoản: thuật toán lưu trữ, epoch,
+loại provider, trường AAD và số bản ghi theo định dạng. Thao tác này không giải
+mã hoặc kiểm tra tính toàn vẹn ciphertext; `integrity_verification` vẫn là
+`not_performed`. Private E2EE để client xác định bộ mật mã và kiểm tra bản mã,
+không suy ra khóa AES của client từ metadata máy chủ.
+
+Phần **Mã hóa & giải mã trong trình duyệt** là công cụ riêng, sử dụng RSA-OAEP
+3072/SHA-256 để bọc khóa AES-256-GCM ngẫu nhiên cho từng gói văn bản. Nó không
+dùng khóa hội thoại, master key hoặc private state E2EE của tài khoản. Mật khẩu
+bản sao khóa, văn bản gốc và nội dung giải mã là các trường DOM cục bộ, không
+được nối tới callback Gradio, API hoặc AI.
+
+1. Nhập mật khẩu sao lưu riêng ít nhất 16 ký tự và xác nhận để tạo cặp khóa.
+2. Tải **khóa riêng đã mã hóa**, giữ mật khẩu ở nơi riêng biệt. Không có chức
+   năng khôi phục khi mất bản sao hoặc mật khẩu. Private key đang mở không cho
+   xuất dạng rõ; chỉ public key có nút sao chép và xuất PEM.
+3. Nhập public key người nhận và đối chiếu toàn bộ fingerprint SHA-256 qua kênh
+   tin cậy. Nhấn **Dùng public key người nhận**, nhập văn bản rồi mã hóa. Khóa
+   vừa tạo cũng được chọn làm người nhận ban đầu để thử tự mã hóa/giải mã.
+4. Người nhận mở bản sao khóa riêng bằng mật khẩu của mình, dán gói JSON và
+   nhấn giải mã. Trường ngữ cảnh AAD là thông tin công khai trong gói, không
+   điền bí mật vào đó. Gói bị sửa, sai khóa hoặc sai mật khẩu bị từ chối.
+
+Giới hạn là 64 KiB văn bản UTF-8 và 256 byte ngữ cảnh. Khóa và nội dung chỉ ở
+tab hiện tại, không tự lưu vào web storage hoặc database. Công cụ bỏ trạng
+thái và xóa trường hiển thị khi đăng xuất, trang bị ẩn/rời đi, tải lại, sau
+5 phút không thao tác hoặc bấm **Khóa & xóa dữ liệu tại tab**. Lưu bản sao
+trước khi đổi cửa sổ/tab. Việc này không bảo đảm xóa vật lý mọi bản sao trong
+bộ nhớ do trình duyệt quản lý. Gói mã hóa không chứng minh danh tính người
+gửi, không chống phát lại và không có forward secrecy như giao thức Olm/MLS.
+Kiểm tra toàn vẹn phát hiện gói bị sửa nhưng không xác thực ai đã tạo gói.
+Private key không xuất dạng rõ vẫn có thể bị mã độc cùng origin hoặc trình
+duyệt bị xâm nhập dùng để giải mã. Bản sao mã hóa cũng không làm mật khẩu dễ
+đoán trở nên an toàn; chọn mật khẩu sao lưu dài, riêng biệt. Công cụ không
+thay thế giao thức chat E2EE Olm/MLS.
+
+### Mã hóa và giải mã tệp nhị phân
+
+Ở phần **4 · Mã hóa & giải mã tệp**, chọn một tệp gốc tối đa **5 MiB
+(5.242.880 byte)**. Tên và kích thước được hiển thị trước thao tác, chưa phải
+kết quả xác minh. Nhập ngữ cảnh công khai nếu cần, xác nhận public key người
+nhận ở phần 2 rồi bấm **Mã hóa & tải tệp .scapenc**. Mỗi lần mã hóa sinh khóa
+AES 256 bit và nonce 96 bit mới, dùng GCM với thẻ xác thực 128 bit. Cấu hình
+được hiển thị cố định; GCM không dùng padding. Khóa AES không được đưa vào
+ô văn bản hoặc xuất riêng; nó được bọc bằng RSA-OAEP 3072/SHA-256 của người nhận.
+
+Tệp được đọc dưới dạng byte, không chuyển qua UTF-8 và không dùng thành phần
+upload của Gradio. Không có API upload, kho tệp hoặc bước gửi AI trong luồng
+này. Tên gốc, kích thước gốc và SHA-256 nội dung nằm trong phần mã hóa; ngữ
+cảnh AAD, fingerprint người nhận và định dạng gói là thông tin công khai.
+Độ dài gói vẫn cho biết xấp xỉ dung lượng tệp, không có cơ chế che giấu lưu lượng.
+Gói có overhead, giới hạn tối đa **5.246.380 byte**; định dạng này chỉ đọc
+gói `.scapenc` phiên bản 1 của SCAP, không nhập tệp AES/ECB/PKCS5 từ công cụ khác.
+
+Để giải mã, mở khóa riêng ở phần 1, chọn gói `.scapenc` rồi bấm **Giải mã &
+tải tệp .bin**. Công cụ kiểm tra định dạng, toàn vẹn, độ dài và SHA-256 trước
+khi tải bất kỳ kết quả nào. Sai khóa, gói bị sửa/cắt ngắn, sai phiên bản hoặc
+quá giới hạn đều bị từ chối. Không có bản rõ tải xuống khi xác minh thất bại.
+Ngữ cảnh được đọc từ gói đã xác thực, không lấy từ ô ngữ cảnh mã hóa hiện tại.
+
+Kết quả dùng tên cố định **scap-restored.bin** và kiểu
+`application/octet-stream`, không tự mở hoặc xem trước. Đối chiếu tên gốc và
+SHA-256 hiển thị, chỉ đổi tên/mở tệp nếu tin cậy nguồn gửi. Kiểm tra toàn vẹn
+không xác thực người gửi hoặc chứng minh tệp không chứa mã độc. Các bản tải
+xuống nằm ngoài trạng thái tab và không bị xóa bởi nút khóa/đăng xuất; tự quản
+lý các bản rõ đã tải. Buffer tạm được ghi đè theo khả năng của JavaScript,
+không bảo đảm xóa mọi bản sao trong bộ nhớ trình duyệt.

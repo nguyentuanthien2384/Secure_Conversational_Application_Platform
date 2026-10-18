@@ -29,8 +29,9 @@ def test_admin_refresh_displays_real_worker_snapshot(client, app, monkeypatch):
                     if fn.fn is not None and fn.fn.__name__ == "refresh_admin")
     output = callback.fn(token)
     assert len(output) == 11
-    assert "Tài nguyên xử lý hiện tại" in output[4]
+    assert "Tài nguyên xử lý · tiến trình hiện tại" in output[4]
     assert "Luồng giao diện" in output[4]
-    assert "Audit lấy mẫu" in output[4]
+    assert "Lượt từ chối ghi nhận:" in output[4]
+    assert "Audit lấy mẫu" not in output[4]
     assert token not in output[4]
     assert "capacity-ui-admin" not in output[4]
