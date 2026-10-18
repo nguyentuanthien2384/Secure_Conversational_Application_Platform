@@ -176,7 +176,7 @@ def register_notification_routes(app: FastAPI, ctx: NotificationRouteContext) ->
         target_count = db.scalar(select(func.count()).select_from(SecurityPhoneChallenge).where(SecurityPhoneChallenge.phone_hash == digest, SecurityPhoneChallenge.created_at > now - timedelta(hours=1)))
         if hour_count >= 3 or day_count >= 10 or target_count >= 3:
             raise HTTPException(429, "Đã hết lượt xác minh SMS; vui lòng thử lại sau.", headers={"Retry-After": "3600"})
-        db.execute(delete(SecurityPhoneChallenge).where(SecurityPhoneChallenge.user_id == user.id, SecurityPhoneChallenge.created_at < now - timedelta(days=1)))
+        db.execute(delete(SecurityPhoneChallenge).where(SecurityPhoneChallenge.user_id == user.id, SecurityPhoneChallenge.created_at <= now - timedelta(days=2), SecurityPhoneChallenge.expires_at <= now))
         db.execute(update(SecurityPhoneChallenge).where(SecurityPhoneChallenge.user_id == user.id, SecurityPhoneChallenge.consumed_at.is_(None)).values(consumed_at=now))
         challenge_id = str(uuid.uuid4())
         code = f"{secrets.randbelow(100_000_000):08d}"
@@ -228,5 +228,9 @@ def register_notification_routes(app: FastAPI, ctx: NotificationRouteContext) ->
     def remove_phone(request: Request, credentials: Credentials, user: CurrentUser, db: DB):
         ctx.lock_account_mutation(credentials, user, db, step_up=True)
         db.execute(delete(SecurityPhone).where(SecurityPhone.user_id == user.id))
-        db.execute(delete(SecurityPhoneChallenge).where(SecurityPhoneChallenge.user_id == user.id))
+        # Opting out invalidates proofs and removes their encrypted destination,
+        # but must not reset the durable hourly/day SMS issuance budget.
+        db.execute(update(SecurityPhoneChallenge).where(SecurityPhoneChallenge.user_id == user.id).values(
+            consumed_at=utcnow(), phone_ciphertext="", phone_nonce="", code_hash="0" * 64,
+        ))
         record_audit(db, request, "account.notifications.phone.remove", actor_id=user.id)

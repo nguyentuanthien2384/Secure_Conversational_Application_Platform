@@ -5,6 +5,7 @@
 #   .\deploy\deploy.ps1 setup-server -Server root@IP_VPS   # 1 lan: Docker, user deploy, UFW
 #   .\deploy\deploy.ps1 configure -Domain demo.ten-mien.vn -Email ban@ten-mien.vn
 #   .\deploy\deploy.ps1 configure -EdgeMode shared-proxy   # VPS da co app khac giu 80/443
+#   .\deploy\deploy.ps1 package                            # goi source cong khai, khong can VPS/Docker
 #   .\deploy\deploy.ps1 deploy -Server deploy@IP_VPS       # moi lan cap nhat code
 #   .\deploy\deploy.ps1 deploy -Server deploy@IP_VPS -SkipBuild   # chi doi cau hinh
 #   .\deploy\deploy.ps1 admin  -Server deploy@IP_VPS       # tao tai khoan quan tri
@@ -19,7 +20,7 @@
 # =====================================================================
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("setup-server", "configure", "deploy", "admin", "status", "logs", "backup")]
+    [ValidateSet("setup-server", "configure", "package", "deploy", "admin", "status", "logs", "backup")]
     [string]$Action,
     [string]$Server = $env:SCAP_VPS,
     [int]$Port = $(if ($env:SCAP_VPS_PORT) { [int]$env:SCAP_VPS_PORT } else { 22 }),
@@ -30,6 +31,7 @@ param(
     [string]$DeployUser = "deploy",
     [string]$AdminUser = "operator",
     [string]$Platform = "linux/amd64",
+    [string]$Output,
     [switch]$SkipBuild,
     [switch]$Follow
 )
@@ -144,6 +146,15 @@ function Compress-Gzip([string]$Source, [string]$Target) {
 Push-Location $Root
 try {
     switch ($Action) {
+        "package" {
+            Assert-Python
+            Step "Dong goi source cong khai (khong doc .env, khong SSH/Docker/DNS)"
+            $arguments = @("-m", "scripts.package_release", "create", "--project", ".")
+            if ($Output) { $arguments += @("--output", $Output) }
+            Invoke-Checked $Python $arguments "Khong tao duoc goi source"
+            Ok "Goi source va SHA-256 da san sang; cau hinh bi mat duoc cap rieng tren VPS."
+        }
+
         "setup-server" {
             Assert-Server
             Assert-LineEndings @("deploy/server-setup.sh")

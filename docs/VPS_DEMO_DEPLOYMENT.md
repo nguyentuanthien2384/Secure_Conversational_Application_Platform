@@ -16,6 +16,64 @@ Các file được dùng:
 Chuẩn bị này chưa mua dịch vụ, mở cổng hoặc khởi động ứng dụng trên server.
 SQLite, tài khoản mẫu và dữ liệu local hiện tại không được chuyển sang VPS.
 
+## Tạo gói source trước, chưa cần truy cập VPS
+
+Tại thư mục dự án trên Windows:
+
+```powershell
+.\deploy\deploy.ps1 package
+```
+
+Lệnh tạo `deploy/out/scap-source-release.tar.gz` và file `.sha256` đi kèm,
+không cần Docker, tên miền hoặc SSH. Có thể chỉ định tên mới bằng
+`-Output deploy/out/scap-source-demo-2026-10-18.tar.gz`; file có sẵn không bị ghi đè.
+Cách gọi trực tiếp, dùng được cả trên Linux:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.package_release create --project . --output deploy/out/scap-source-release.tar.gz
+```
+
+Gói gồm source hiện tại, lockfile, client E2EE/MLS, test, tài liệu và mẫu cấu hình
+công khai theo allowlist. Không chứa `.env`, `deploy/.env.vps`, dữ liệu local,
+profile/khóa client, outbox, backup, thư mục build Rust hoặc file chứng thực riêng.
+Không cần commit/push trước khi đóng gói. Cùng nội dung source cho cùng checksum;
+manifest bên trong ghi SHA-256 từng file. Đây là **gói source để build**, không
+chứa Docker image đã build, không chứng minh VPS đã sẵn sàng hoặc đã triển khai.
+
+Khi đã có quyền truy cập VPS, gửi hai file bằng SFTP và đối chiếu checksum với
+kết quả trên máy tạo gói qua kênh tin cậy. Trong một thư mục mới trên VPS:
+
+```bash
+sha256sum -c scap-source-release.tar.gz.sha256
+tar -xzf scap-source-release.tar.gz
+cd scap-source
+python3 -m scripts.package_release verify --project .
+```
+
+Checksum phát hiện lỗi hoặc thay đổi so với bản đã đối chiếu; nó không thay thế
+chữ ký hay xác minh nguồn phát hành. Kiểm tra manifest **trước** khi chỉnh source
+hoặc bổ sung cấu hình riêng. Sau đó cấp `deploy/.env.vps` riêng như hướng dẫn bên
+dưới. Chỉ với **CSDL mới** mới dùng `python3 -m scripts.prepare_vps init --project .`;
+VPS đã có dữ liệu phải giữ nguyên các khóa/cấu hình hiện có. Điền tên miền, email,
+image digest, rồi chạy:
+
+```bash
+python3 -m scripts.prepare_vps check --project .
+bash deploy/vps-compose.sh config --quiet
+bash deploy/vps-compose.sh build app
+bash deploy/remote-deploy.sh
+```
+
+Các lệnh triển khai cuối chỉ chạy sau khi người vận hành đã chuẩn bị DNS,
+Docker và cấu hình riêng. `remote-deploy.sh` chạy migration, kiểm tra image,
+readiness và HTTPS như bản deploy thông thường. Bundle không có `.git`, nên
+không dùng `deploy/update.sh`; lần cập nhật tiếp theo nhận gói source mới vào
+thư mục mới, sao lưu DB và giữ cấu hình/khóa hiện hành trước khi build.
+
+Push/SMS/GeoIP mặc định tắt. Khi dùng provider thật, chuẩn bị file bí mật và
+database GeoIP ngoài bundle, đặt `SCAP_SECURITY_FILES_DIR` để wrapper tự thêm
+overlay chỉ đọc. Xem [hướng dẫn các phần bảo mật bổ sung](SECURITY_EXTENSIONS.md).
+
 ## Cách nhanh: deploy bằng Termius hoặc `deploy/deploy.ps1`
 
 Có hai cách: làm hoàn toàn trong **Termius** (VPS tự `git clone` và build, giống

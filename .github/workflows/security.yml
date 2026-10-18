@@ -92,6 +92,35 @@ jobs:
       - run: uv sync --frozen --group dev --extra e2ee-client
       - name: Build the local OpenMLS helper from digest-pinned bases and locked Cargo dependencies
         run: docker build -t scap-mls-client:local clients/mls_native
+      - name: Compile the optional HPKE provider and test its security backport
+        run: |
+          mkdir -p reports
+          docker run --rm --cpus=2 --memory=3g \
+            --mount type=bind,source="$PWD/clients/mls_native",target=/source,readonly \
+            --env CARGO_BUILD_JOBS=2 \
+            --workdir /source/security-regression \
+            rust:1.95-slim@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da6880141f7c0 \
+            cargo test --locked --target-dir /tmp/scap-hpke-tests \
+            2>&1 | tee reports/hpke-provider-regressions.log
+      - name: Audit both Cargo lockfiles against RustSec without advisory exclusions
+        run: |
+          mkdir -p reports
+          audit_archive="$RUNNER_TEMP/cargo-audit-0.22.2.tgz"
+          audit_directory="$RUNNER_TEMP/scap-cargo-audit-0.22.2"
+          curl --fail --show-error --location --connect-timeout 10 --max-time 120 \
+            --retry 2 --retry-max-time 180 \
+            https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
+            --output "$audit_archive"
+          printf '%s  %s\n' ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39 "$audit_archive" \
+            | sha256sum --check --strict
+          mkdir -p "$audit_directory"
+          tar --extract --gzip --file "$audit_archive" --directory "$audit_directory" \
+            --strip-components=1 --no-same-owner --no-same-permissions \
+            cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit
+          "$audit_directory/cargo-audit" audit --file clients/mls_native/Cargo.lock --json \
+            > reports/native-cargo-audit.json
+          "$audit_directory/cargo-audit" audit --file clients/mls_native/security-regression/Cargo.lock --json \
+            > reports/hpke-provider-cargo-audit.json
       - name: Verify real group crypto, removal, persistence and relay tampering
         env:
           SCAP_TEST_MLS_NATIVE: "1"
@@ -106,6 +135,9 @@ jobs:
           path: |
             reports/native-mls-client.xml
             reports/mls-demo/mls-demo.json
+            reports/hpke-provider-regressions.log
+            reports/native-cargo-audit.json
+            reports/hpke-provider-cargo-audit.json
 
   private-storage-windows:
     runs-on: windows-latest

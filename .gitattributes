@@ -8,3 +8,6 @@ Dockerfile text eol=lf
 deploy/*.example text eol=lf
 Caddyfile.* text eol=lf
 *.caddy text eol=lf
+# Preserve registry source bytes so the vendored provenance SHA-256 remains
+# valid after checkout on Windows with core.autocrlf=true.
+clients/mls_native/vendor/** -text

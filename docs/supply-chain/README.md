@@ -81,6 +81,18 @@ gh attestation verify secure-chat-image.tar --repo OWNER/REPOSITORY
 
 This is a baseline for the build artifact, not a registry release or deployment authorization. Before a high-sensitivity production deployment, push an immutable OCI digest through an approved release workflow, sign/attest that registry digest, and make deployment verify the signature, provenance, expected repository and protected ref. Never deploy solely from a mutable tag such as `latest`.
 
+The native MLS helper has a separate digest-pinned Docker build and Cargo.lock.
+Its source contains a manifest-only HPKE 0.7 compatibility backport to
+`libcrux-kem 0.0.10`, resolving RUSTSEC-2026-0330 and RUSTSEC-2026-0331 without
+advisory suppressions. The unchanged upstream Rust source, MPL-2.0 license,
+registry checksum and removal condition are recorded in
+[the backport notes](../../clients/mls_native/vendor/hpke-rs-libcrux/BACKPORT.md).
+The separate provider harness tests malformed hybrid inputs and both HPKE
+provider directions. CI scans both lockfiles. RustSec's informational warning
+for the transitive build dependency `proc-macro-error2` (RUSTSEC-2026-0173)
+remains visible; it reports unmaintained software, not a patched vulnerability.
+Review it with future upstream upgrades rather than suppressing it.
+
 Primary references:
 
 - GitHub secure use reference: <https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions>

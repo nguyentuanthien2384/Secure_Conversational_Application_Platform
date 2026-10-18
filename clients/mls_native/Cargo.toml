@@ -14,6 +14,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 
+# HPKE 0.7 pins an optional vulnerable KEM provider. Preserve its public API
+# while resolving the fixed KEM; see vendor/hpke-rs-libcrux/BACKPORT.md.
+[patch.crates-io]
+hpke-rs-libcrux = { path = "vendor/hpke-rs-libcrux" }
+
 [profile.release]
 strip = true
 panic = "abort"

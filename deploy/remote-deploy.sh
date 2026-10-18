@@ -26,7 +26,7 @@ chmod 700 deploy
 chmod 600 "$ENV_FILE"
 # scp từ Windows không giữ bit thực thi; repo git thì để nguyên để git pull không vướng.
 if [ ! -d .git ]; then
-  chmod u+x remote-deploy.sh vps-compose.sh backup.sh restore.sh
+  chmod u+x "$HERE/remote-deploy.sh" "$HERE/vps-compose.sh" "$HERE/backup.sh" "$HERE/restore.sh"
 fi
 
 if [ -f scap-deploy.tar ]; then

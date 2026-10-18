@@ -18,6 +18,7 @@ from src.app.models import (
     E2eePreKey,
     RevokedToken,
     SecureMessage,
+    SecurityPhoneChallenge,
     WebAuthnChallenge,
 )
 
@@ -35,6 +36,7 @@ class RetentionResult:
     stale_prekeys: int = 0
     expired_recovery_codes: int = 0
     expired_passkey_challenges: int = 0
+    expired_phone_challenges: int = 0
     dry_run: bool = False
 
     def as_dict(self) -> dict[str, int | bool]:
@@ -253,12 +255,29 @@ def enforce_retention(
             select(WebAuthnChallenge).where(WebAuthnChallenge.expires_at <= now).limit(batch_size)
         )
     )
+    # An SMS proof is valid for five minutes, but its issuance must survive
+    # bearer expiry and destination removal for the rolling 24-hour budget.
+    # The extra day avoids erasing quota evidence at its boundary. Sweep in
+    # bounded batches, including consumed and unconsumed expired proofs.
+    expired_phone_challenges = list(
+        db.scalars(
+            select(SecurityPhoneChallenge)
+            .where(
+                SecurityPhoneChallenge.created_at <= now - timedelta(days=2),
+                SecurityPhoneChallenge.expires_at <= now,
+            )
+            .order_by(SecurityPhoneChallenge.created_at.asc(), SecurityPhoneChallenge.id.asc())
+            .limit(batch_size)
+        )
+    )
     if not dry_run:
         for item in sessions:
             db.delete(item)
         for item in expired_recovery_codes:
             db.delete(item)
         for item in expired_passkey_challenges:
+            db.delete(item)
+        for item in expired_phone_challenges:
             db.delete(item)
         for item in expired_challenges:
             db.delete(item)
@@ -281,5 +300,6 @@ def enforce_retention(
         stale_prekeys=len(stale_prekeys),
         expired_recovery_codes=len(expired_recovery_codes),
         expired_passkey_challenges=len(expired_passkey_challenges),
+        expired_phone_challenges=len(expired_phone_challenges),
         dry_run=dry_run,
     )

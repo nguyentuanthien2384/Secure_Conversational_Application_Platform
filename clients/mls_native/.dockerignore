@@ -4,3 +4,5 @@
 !Dockerfile
 !src/
 !src/**
+!vendor/
+!vendor/**

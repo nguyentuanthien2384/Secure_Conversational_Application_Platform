@@ -358,12 +358,32 @@ def test_activity_migration_uses_timezone_aware_type_for_dialect(
     # connection. All columns except the new activity timestamp already exist.
     inspector = Mock()
     inspector.get_columns.side_effect = lambda table: [
-        {"name": column.name}
+        {"name": column.name, "nullable": column.nullable}
         for column in Base.metadata.tables[table].columns
         if not (table == "auth_sessions" and column.name == "last_activity_at")
     ]
-    inspector.get_indexes.return_value = [{"name": "ix_auth_sessions_family_active"}]
+    inspector.get_indexes.side_effect = lambda table: [
+        {"name": index.name} for index in Base.metadata.tables[table].indexes
+    ]
     inspector.get_table_names.return_value = list(Base.metadata.tables)
+    # Other idempotent upgrades inspect the current CHECK/FK definitions too.
+    # Describe the real model here so this isolated dialect check only enters
+    # the deliberately missing activity-column migration branch.
+    inspector.get_check_constraints.side_effect = lambda table: [
+        {"name": constraint.name, "sqltext": str(constraint.sqltext)}
+        for constraint in Base.metadata.tables[table].constraints
+        if hasattr(constraint, "sqltext")
+    ]
+    inspector.get_foreign_keys.side_effect = lambda table: [
+        {
+            "name": constraint.name,
+            "constrained_columns": [column.name for column in constraint.columns],
+            "referred_table": constraint.referred_table.name,
+            "referred_columns": [element.column.name for element in constraint.elements],
+            "options": {"ondelete": constraint.ondelete},
+        }
+        for constraint in Base.metadata.tables[table].foreign_key_constraints
+    ]
     monkeypatch.setattr("src.app.db.inspect", lambda _engine: inspector)
     monkeypatch.setattr(Base.metadata, "create_all", Mock())
     database = Database.__new__(Database)

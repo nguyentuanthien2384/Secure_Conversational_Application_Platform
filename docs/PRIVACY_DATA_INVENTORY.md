@@ -9,7 +9,7 @@ và thời hạn theo môi trường thật trước production.
 
 - Data controller/quyết định mục đích: phải được tổ chức triển khai chỉ định.
 - Processor/subprocessor: nhà vận hành hạ tầng, IdP/OIDC, Vault/KMS, WORM/SIEM,
-  backup và nhà cung cấp AI nếu được bật.
+  backup, nhà cung cấp AI, dịch vụ Web Push và SMS nếu được bật.
 - Data owner: chủ tài khoản và chủ hội thoại; thành viên E2EE chỉ nhận dữ liệu
   theo membership/epoch.
 - Security/Privacy owner: phải được ghi tên trong hồ sơ release và chịu trách
@@ -26,6 +26,26 @@ và thời hạn theo môi trường thật trước production.
   hiện chiếm tài khoản, thu hồi phiên và điều tra sự cố.
 - Public identity key, signed prekey, one-time prekey, device ID/fingerprint:
   thiết lập trust cho client Private E2EE; server không nhận private key.
+- Passkey: credential ID, public key, signature counter và challenge ngắn hạn;
+  không nhận dữ liệu sinh trắc học. Challenge xác thực lại gắn đúng phiên bearer.
+
+### Thông báo và rủi ro đăng nhập
+
+- Đăng ký Push và số điện thoại đã xác minh được mã hóa bằng DEK tài khoản.
+  Hash định tuyến phục vụ chống đăng ký trùng và hạn mức gửi. Người dùng có thể
+  gỡ từng kênh; gỡ số điện thoại vô hiệu hóa mã đang chờ.
+- Mã SMS chỉ giữ HMAC, hết hạn sau 5 phút và tối đa 5 lần thử. Dấu vết cấp mã
+  đủ điều kiện xóa sau 2 ngày để giữ trọn cửa sổ hạn mức 24 giờ khi gỡ số hoặc
+  xóa phiên. Thời điểm xóa thực tế phụ thuộc lịch và batch retention; cần bật
+  sweep định kỳ hoặc lên lịch `python -m scripts.enforce_retention` theo cấu
+  hình triển khai. Không dùng số điện thoại làm yếu tố đăng nhập hoặc khôi
+  phục tài khoản.
+- Provider Push/SMS nhận địa chỉ đích và cảnh báo cố định; SMS xác minh chứa mã
+  một lần. Cảnh báo không kèm username, IP, nội dung chat hoặc khóa. Queue và
+  provider acceptance không chứng minh đã giao hoặc đã đọc thông báo.
+- GeoIP tùy chọn tra IP đăng nhập trong City MMDB local, không gọi API định vị.
+  Audit cảnh báo giữ mã quốc gia, khoảng cách/tốc độ đã làm tròn và thời gian;
+  không giữ tọa độ. Vị trí suy ra chỉ là ước lượng và không tự khóa tài khoản.
 
 ### Nội dung và metadata hội thoại
 
@@ -35,7 +55,8 @@ và thời hạn theo môi trường thật trước production.
   server không nhận plaintext, message key, ratchet state hay MLS secret.
 - Tiêu đề, owner/member ID, mode/classification, timestamp, message index và
   retention deadline: định tuyến, authorization, replay protection và lifecycle.
-- Không thu thập location, contact list, microphone/camera hoặc advertising ID.
+- Không thu thập GPS, danh bạ, microphone/camera hoặc advertising ID. GeoIP tùy
+  chọn suy ra vị trí gần đúng từ IP theo phạm vi đã nêu ở trên.
 
 ### AI và DLP
 

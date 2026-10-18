@@ -599,19 +599,22 @@ class SecurityPhone(Base):
 
 
 class SecurityPhoneChallenge(Base):
-    """Session-bound SMS possession proof, five guesses and a five-minute TTL."""
+    """Session-bound proof whose issuance also records the durable SMS budget."""
 
     __tablename__ = "security_phone_challenges"
     __table_args__ = (
         Index("ix_security_phone_target_created", "phone_hash", "created_at"),
+        Index("ix_security_phone_created", "created_at"),
         CheckConstraint("attempts >= 0 AND attempts <= 5", name="ck_security_phone_attempts"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    auth_session_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("auth_sessions.jti", ondelete="CASCADE"), nullable=False
+    # Expiring a bearer invalidates its proof without erasing the issuance
+    # evidence used by the rolling 24-hour SMS budget.
+    auth_session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("auth_sessions.jti", ondelete="SET NULL"), nullable=True
     )
     phone_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     phone_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)

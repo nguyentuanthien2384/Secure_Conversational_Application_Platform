@@ -131,7 +131,12 @@ Phải có known-answer/interoperability vectors, test mất gói/out-of-order,
 skipped-key bounds, replay, identity change, multi-device fanout, add/remove MLS,
 concurrent commit, backup/restore secure storage và memory/log inspection. Cần
 review mật mã độc lập/pentest trước khi tuyên bố E2EE production. Repository
-cung cấp server boundary, client Olm 1:1 và test gửi/nhận, tamper/replay,
-durable outbox, mất kết nối, khóa kho và prekey. Chưa có client MLS, bộ vector
-liên thông với ứng dụng bên ngoài hoặc kiểm toán độc lập cho tích hợp SCAP.
+cung cấp server boundary, client Olm 1:1, client nhóm OpenMLS và test gửi/nhận,
+tamper/replay, durable outbox, mất kết nối, khóa kho, prekey và loại thành viên
+khỏi epoch mới. Client MLS hiện hỗ trợ nhóm do owner quản lý, một thiết bị mỗi
+tài khoản; các bên pin fingerprint và trao đổi KeyPackage public có chữ ký.
+Welcome được kiểm tra danh tính người tạo bằng giao thức MLS, không chỉ dựa
+vào nhãn relay. Xem [native MLS client](../clients/mls_native/README.md) và
+[demo nhóm](SECURITY_EXTENSIONS.md#demo-nhóm-mls). Chưa có bộ vector liên thông
+với ứng dụng bên ngoài hoặc kiểm toán độc lập cho tích hợp SCAP.
 

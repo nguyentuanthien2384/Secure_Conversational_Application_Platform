@@ -5,8 +5,10 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,13 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from dotenv import dotenv_values
 
 from scripts.generate_vapid_key import generate_vapid_key
+from scripts.package_release import (
+    ARCHIVE_ROOT,
+    MANIFEST,
+    ReleaseError,
+    create_release,
+    verify_release,
+)
 from src.app.notification_config import NotificationSettings
 from src.app.private_storage import check_private_directory, check_private_file
 from tests.test_remote_deploy_gate import deployment as deployment
@@ -161,3 +170,165 @@ def test_templates_disable_channels_and_upload_bundle_includes_the_overlay_only(
     assert "docker-compose.security-channels.yml" in files
     assert "scripts" in files  # Includes generate_vapid_key.py without private outputs.
     assert not any("local_data" in name or "vapid.pem" in name or "security-files" in name for name in files)
+
+
+@pytest.fixture
+def release_project(tmp_path):
+    # Small real files needed to build/run a source release. The independent
+    # end-to-end CLI test below also packages and verifies the whole repository.
+    from scripts.package_release import _REQUIRED
+
+    project = tmp_path / "project"
+    for name in _REQUIRED:
+        path = project / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((ROOT / name).read_bytes())
+    return project
+
+
+def test_source_release_is_deterministic_and_excludes_private_runtime_outputs(release_project, tmp_path):
+    import hashlib
+
+    private_paths = [
+        ".env", "deploy/.env.vps", "deploy/out/private.py", "deploy/secrets/config.py",
+        "src/app/.env", "src/app/credentials.json", "local_data/private.py", "client_data/profile.json",
+        "clients/mls_native/target/private.py", "reports/private.py", "backups/private.py",
+        "src/app/__pycache__/private.py", "src/app/private.pem", "src/app/private.db",
+    ]
+    for name in private_paths:
+        target = release_project / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"SYNTHETIC-PRIVATE-DATA-DO-NOT-PACKAGE")
+    native_source = release_project / "clients/mls_native/src/main.rs"
+    native_source.parent.mkdir(parents=True, exist_ok=True)
+    native_source.write_text("fn main() {}\n", encoding="utf-8")
+    native_license = release_project / "clients/mls_native/vendor/hpke-rs-libcrux/LICENSE-MPL-2.0"
+    native_license.parent.mkdir(parents=True, exist_ok=True)
+    native_license.write_text("SYNTHETIC PUBLIC LICENSE\n", encoding="utf-8")
+    (native_license.parent / "provenance.json").write_text('{"source":"public upstream"}', encoding="utf-8")
+    (native_license.parent / "Cargo.toml.orig").write_text("[package]\n", encoding="utf-8")
+    first = create_release(release_project, tmp_path / "first.tar.gz")
+    second = create_release(release_project, tmp_path / "second.tar.gz")
+    assert first["sha256"] == second["sha256"]
+    archive_bytes = (tmp_path / "first.tar.gz").read_bytes()
+    assert hashlib.sha256(archive_bytes).hexdigest() == first["sha256"]
+    assert (tmp_path / "first.tar.gz.sha256").read_text() == f"{first['sha256']}  first.tar.gz\n"
+    with tarfile.open(tmp_path / "first.tar.gz", "r:gz") as archive:
+        names = archive.getnames()
+        assert len(names) == len(set(names)) == first["files"] + 1
+        assert f"{ARCHIVE_ROOT}/clients/mls_native/src/main.rs" in names
+        assert f"{ARCHIVE_ROOT}/clients/mls_native/vendor/hpke-rs-libcrux/LICENSE-MPL-2.0" in names
+        assert f"{ARCHIVE_ROOT}/clients/mls_native/vendor/hpke-rs-libcrux/provenance.json" in names
+        assert f"{ARCHIVE_ROOT}/clients/mls_native/vendor/hpke-rs-libcrux/Cargo.toml.orig" in names
+        assert not any(f"{ARCHIVE_ROOT}/{name}" in names for name in private_paths)
+        assert all(item.isfile() and not item.issym() and not item.islnk() for item in archive.getmembers())
+        for item in archive.getmembers():
+            assert b"SYNTHETIC-PRIVATE-DATA-DO-NOT-PACKAGE" not in archive.extractfile(item).read()
+
+
+def test_source_release_refuses_overwrite_or_partial_overwrite(release_project, tmp_path):
+    target = tmp_path / "release.tar.gz"
+    create_release(release_project, target)
+    before = target.read_bytes()
+    with pytest.raises(ReleaseError, match="already exists"):
+        create_release(release_project, target)
+    assert target.read_bytes() == before
+    sidecar_only = tmp_path / "sidecar-only.tar.gz.sha256"
+    sidecar_only.write_text("KEEP", encoding="utf-8")
+    with pytest.raises(ReleaseError, match="already exists"):
+        create_release(release_project, tmp_path / "sidecar-only.tar.gz")
+    assert sidecar_only.read_text() == "KEEP"
+    assert not (tmp_path / "sidecar-only.tar.gz").exists()
+
+
+def test_source_release_detects_corruption_and_does_not_need_git_docker_or_application_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("DATABASE_URL", "must-not-be-loaded")
+    monkeypatch.setenv("MASTER_ENCRYPTION_KEY", "must-not-be-loaded")
+    monkeypatch.setenv("PUSH_BACKEND", "invalid")
+    target = tmp_path / "complete-source.tar.gz"
+    created = subprocess.run(
+        [sys.executable, "-m", "scripts.package_release", "create", "--project", str(ROOT), "--output", str(target)],
+        cwd=ROOT, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert created.returncode == 0, created.stderr
+    with tarfile.open(target, "r:gz") as archive:
+        # All archive members are fixed allowlisted regular files. Using data
+        # filtering additionally enforces confinement in this integration test.
+        archive.extractall(tmp_path / "extracted", filter="data")
+    extracted = tmp_path / "extracted" / ARCHIVE_ROOT
+    assert (extracted / "clients/mls_native/src/main.rs").exists()
+    assert (extracted / "src/app/private_storage.py").exists()
+    assert (extracted / "deploy/vps.env.example").exists()
+    assert not (extracted / "deploy/.env.vps").exists() and not (extracted / ".env").exists()
+    verified = subprocess.run(
+        [sys.executable, "-m", "scripts.package_release", "verify", "--project", "."],
+        cwd=extracted, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["verified"] is True
+    with (extracted / "src/app/main.py").open("ab") as modified:
+        modified.write(b"\n# changed after release\n")
+    with pytest.raises(ReleaseError, match="do not match"):
+        verify_release(extracted)
+
+
+@pytest.mark.parametrize("replacement", ["../outside.py", "/outside.py", "src/../outside.py", "src\\outside.py", ".env", "deploy/.env.vps"])
+def test_release_manifest_rejects_traversal_or_private_paths_without_opening_them(release_project, replacement):
+    document = {"schema_version": 1, "archive_root": ARCHIVE_ROOT, "files": [
+        {"path": replacement, "size": 1, "mode": 0o644, "sha256": "0" * 64},
+    ]}
+    (release_project / MANIFEST).write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ReleaseError, match="invalid source entry"):
+        verify_release(release_project)
+
+
+def test_source_release_rejects_linked_source_and_never_emits_an_archive(release_project, tmp_path):
+    linked = release_project / "src/app/linked.py"
+    outside = tmp_path / "outside.py"
+    outside.write_text("PRIVATE", encoding="utf-8")
+    try:
+        linked.symlink_to(outside)
+    except OSError:
+        pytest.skip("Current Windows token cannot create symbolic links")
+    target = tmp_path / "linked-source.tar.gz"
+    with pytest.raises(OSError):
+        create_release(release_project, target)
+    assert not target.exists() and not target.with_name(target.name + ".sha256").exists()
+
+
+def test_powershell_package_action_is_independent_from_remote_deployment_checks():
+    source = (ROOT / "deploy/deploy.ps1").read_text(encoding="utf-8-sig")
+    matched = re.search(r'"package"\s*\{(.*?)\n        \}', source, re.S)
+    assert matched is not None
+    assert "scripts.package_release" in matched[1] and "Assert-Python" in matched[1]
+    assert not any(value in matched[1] for value in ("Assert-Server", "Assert-Docker", "Test-Dns", "prepare_vps", "Get-Setting", "Invoke-Checked ssh"))
+
+
+def test_extracted_source_layout_can_run_remote_acceptance_gate_without_git(deployment):
+    # Source releases preserve deploy/, while the older prebuilt-image upload
+    # layout puts wrappers at the root. Both must reach the same health gates.
+    (deployment.project / ".git").rmdir()
+    (deployment.project / "deploy/backup.sh").write_bytes((ROOT / "deploy/backup.sh").read_bytes())
+    result, logs = deployment()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[OK] App/migration dung image" in result.stdout
+    assert "https://gate.invalid/api/health" in logs["curl_log"]
+    assert "/deploy/backup.sh" in logs["cron_content"]
+
+
+def test_powershell_package_runs_locally_without_remote_or_docker_tools(tmp_path, monkeypatch):
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("PowerShell is unavailable")
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("SCAP_VPS", "this is not a valid SSH target")
+    monkeypatch.setenv("DATABASE_URL", "must-not-be-loaded")
+    target = tmp_path / "powershell-source.tar.gz"
+    result = subprocess.run(
+        [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "deploy/deploy.ps1"),
+         "package", "-Output", str(target)],
+        cwd=ROOT, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert target.exists() and target.with_name(target.name + ".sha256").exists()

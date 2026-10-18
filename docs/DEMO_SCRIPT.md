@@ -282,7 +282,7 @@ tục gửi. `client_data/` đã bị loại khỏi Git và Docker build context
 
 **Nói:** “Tôi dùng thư viện Olm thay vì tự viết ratchet. Test chứng minh hai
 client SCAP gửi/nhận được và server export chỉ có ciphertext. Tích hợp này
-chưa được audit độc lập; client nhóm MLS và kiểm chứng tương thích với ứng
+chưa được audit độc lập; kiểm chứng tương thích với ứng
 dụng bên ngoài là phạm vi phát triển tiếp.”
 
 ## Các câu hỏi nên trả lời rõ
@@ -306,3 +306,32 @@ dụng bên ngoài là phạm vi phát triển tiếp.”
 Nguồn nghiên cứu và giới hạn bốn tính năng nâng cấp nằm tại
 [ADVANCED_SECURITY.md](ADVANCED_SECURITY.md); phạm vi runner nằm tại
 [SECURITY_AUTOMATION.md](SECURITY_AUTOMATION.md).
+
+## Demo nhóm MLS và bảo vệ tài khoản mở rộng
+
+Chuẩn bị native helper trước buổi demo, với Docker Desktop ở chế độ Linux
+containers trên máy client:
+
+```powershell
+docker build -t scap-mls-client:local clients/mls_native
+uv run --frozen --extra e2ee-client python -m scripts.demo_mls --check
+```
+
+Runner dùng ba client và server loopback riêng. Chỉ ra ba bằng chứng trong
+`reports/mls-demo/mls-demo.json`: các thành viên giải mã được tin nhóm, người
+bị loại không thể dùng private state cũ giải mã epoch mới, export của server
+chỉ chứa ciphertext. Để nhập tin trực tiếp, làm theo
+[hướng dẫn terminal MLS](../clients/mls_native/README.md); cần đối chiếu đầy đủ
+fingerprint và trao đổi KeyPackage public có chữ ký. Phạm vi hiện tại là nhóm
+do owner quản lý, một thiết bị mỗi tài khoản.
+
+Trong **Tài khoản**, có thể trình bày xác thực lại bằng passkey và đăng ký số
+điện thoại bằng mã SMS trong outbox demo. Dùng `localhost` cho WebAuthn. Màn
+hình trạng thái cho biết kênh đang tắt, outbox hay provider; không mô tả outbox
+là SMS/Push đã giao tới thiết bị. GeoIP chỉ hoạt động khi có City MMDB hợp lệ,
+mới; thiếu database phải hiện chưa khả dụng. Xem
+[cấu hình và phạm vi kiểm chứng](SECURITY_EXTENSIONS.md).
+
+**Nói:** “Tôi sử dụng thư viện OpenMLS và kiểm tra vòng đời thành viên bằng
+ba client riêng. Đây là kiểm chứng tích hợp trong SCAP; tương thích với client
+bên ngoài và kiểm toán độc lập vẫn cần thực hiện trước khi dùng production.”

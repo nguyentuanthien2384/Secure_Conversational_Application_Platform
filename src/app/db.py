@@ -355,6 +355,103 @@ class Database:
                 )
 
         self._upgrade_passkey_step_up()
+        self._upgrade_phone_challenge_retention()
+
+    def _upgrade_phone_challenge_retention(self) -> None:
+        """Preserve SMS issuance budgets when expired bearer rows are pruned."""
+        inspector = inspect(self.engine)
+        columns = {
+            column["name"]: column
+            for column in inspector.get_columns("security_phone_challenges")
+        }
+        session_keys = [
+            key for key in inspector.get_foreign_keys("security_phone_challenges")
+            if key["constrained_columns"] == ["auth_session_id"]
+        ]
+        ready = (
+            columns["auth_session_id"]["nullable"]
+            and len(session_keys) == 1
+            and session_keys[0]["referred_table"] == "auth_sessions"
+            and session_keys[0]["referred_columns"] == ["jti"]
+            and session_keys[0].get("options", {}).get("ondelete", "").upper() == "SET NULL"
+        )
+        expected_indexes = {
+            "ix_security_phone_created": "created_at",
+            "ix_security_phone_challenges_user_id": "user_id",
+            "ix_security_phone_target_created": "phone_hash,created_at",
+        }
+        existing_indexes = {
+            index["name"] for index in inspector.get_indexes("security_phone_challenges")
+        }
+        if ready and set(expected_indexes) <= existing_indexes:
+            return
+        with self.engine.begin() as connection:
+            if not ready and self.engine.dialect.name == "sqlite":
+                # SQLite cannot change a foreign-key action in place. Keep the
+                # rebuild transactional even with sqlite3's legacy DDL mode.
+                if not connection.connection.driver_connection.in_transaction:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                connection.exec_driver_sql("""
+                    CREATE TABLE security_phone_challenges_retention_upgrade (
+                        id VARCHAR(36) NOT NULL PRIMARY KEY,
+                        user_id VARCHAR(36) NOT NULL,
+                        auth_session_id VARCHAR(36),
+                        phone_hash VARCHAR(64) NOT NULL,
+                        phone_ciphertext TEXT NOT NULL,
+                        phone_nonce VARCHAR(64) NOT NULL,
+                        code_hash VARCHAR(64) NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        expires_at DATETIME NOT NULL,
+                        consumed_at DATETIME,
+                        created_at DATETIME NOT NULL,
+                        CONSTRAINT ck_security_phone_attempts CHECK (attempts >= 0 AND attempts <= 5),
+                        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                        FOREIGN KEY(auth_session_id) REFERENCES auth_sessions(jti) ON DELETE SET NULL
+                    )
+                """)
+                # A partially upgraded database may contain a dangling opaque
+                # session ID. It no longer authorizes a proof, but the issuance
+                # must remain in the quota window.
+                connection.exec_driver_sql("""
+                    INSERT INTO security_phone_challenges_retention_upgrade
+                        (id,user_id,auth_session_id,phone_hash,phone_ciphertext,
+                         phone_nonce,code_hash,attempts,expires_at,consumed_at,created_at)
+                    SELECT id,user_id,
+                           CASE WHEN auth_session_id IN (SELECT jti FROM auth_sessions)
+                                THEN auth_session_id ELSE NULL END,
+                           phone_hash,phone_ciphertext,phone_nonce,code_hash,attempts,
+                           expires_at,consumed_at,created_at
+                    FROM security_phone_challenges
+                """)
+                connection.exec_driver_sql("DROP TABLE security_phone_challenges")
+                connection.exec_driver_sql(
+                    "ALTER TABLE security_phone_challenges_retention_upgrade "
+                    "RENAME TO security_phone_challenges"
+                )
+            elif not ready:
+                quote = self.engine.dialect.identifier_preparer.quote
+                for key in session_keys:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE security_phone_challenges DROP CONSTRAINT " + quote(key["name"])
+                    )
+                connection.exec_driver_sql(
+                    "ALTER TABLE security_phone_challenges ALTER COLUMN auth_session_id DROP NOT NULL"
+                )
+                connection.exec_driver_sql("""
+                    UPDATE security_phone_challenges SET auth_session_id=NULL
+                    WHERE auth_session_id IS NOT NULL
+                      AND auth_session_id NOT IN (SELECT jti FROM auth_sessions)
+                """)
+                connection.exec_driver_sql(
+                    "ALTER TABLE security_phone_challenges ADD CONSTRAINT "
+                    "fk_security_phone_challenges_session_retention "
+                    "FOREIGN KEY(auth_session_id) REFERENCES auth_sessions(jti) ON DELETE SET NULL"
+                )
+            for index_name, indexed_columns in expected_indexes.items():
+                connection.exec_driver_sql(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON security_phone_challenges({indexed_columns})"
+                )
 
     def _upgrade_passkey_step_up(self) -> None:
         """Keep short-lived ceremonies while adding exact-session step-up binding."""
@@ -460,6 +557,7 @@ class Database:
             },
             "e2ee_envelopes": {"replay_key"},
             "webauthn_challenges": {"auth_session_id"},
+            "security_phone_challenges": {"auth_session_id"},
             "intrusion_detections": {"payload_json"},
             "intrusion_sources": {"score_times_json", "last_seen_at", "blocked_until"},
         }
@@ -473,6 +571,24 @@ class Database:
         if incomplete:
             raise RuntimeError(
                 "Database schema chưa được migrate; thiếu cột: " + "; ".join(incomplete)
+            )
+        phone_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("security_phone_challenges")
+        }
+        phone_session_keys = [
+            key for key in inspector.get_foreign_keys("security_phone_challenges")
+            if key["constrained_columns"] == ["auth_session_id"]
+        ]
+        if (
+            not phone_columns["auth_session_id"]["nullable"]
+            or len(phone_session_keys) != 1
+            or phone_session_keys[0]["referred_table"] != "auth_sessions"
+            or phone_session_keys[0]["referred_columns"] != ["jti"]
+            or phone_session_keys[0].get("options", {}).get("ondelete", "").upper() != "SET NULL"
+        ):
+            raise RuntimeError(
+                "Database schema chưa được migrate; cần giữ hạn mức SMS khi hết phiên đăng nhập."
             )
 
     def apply_postgres_least_privilege(self) -> None:

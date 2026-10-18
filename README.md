@@ -44,13 +44,14 @@ Từ đăng nhập, phân quyền và kiểm soát dữ liệu đến mã hóa, 
 **SCAP** là đồ án môn **Bảo mật Ứng dụng và Hệ thống**, xây dựng bằng FastAPI, Gradio 6 và SQLAlchemy. Ứng dụng minh họa các kiểm soát an ninh trong cùng một luồng sử dụng: đăng nhập → tạo hội thoại → kiểm tra dữ liệu → gọi AI → mã hóa lưu trữ → ghi nhật ký kiểm toán.
 
 - **Trò chuyện:** nhiều hội thoại, đổi tên/xóa, tìm kiếm theo quyền sở hữu, xuất JSON và xem bản mã của từng tin nhắn.
-- **Bảo vệ tài khoản:** Argon2id, JWT có phiên phía máy chủ, TOTP/recovery code, passkey WebAuthn, email khôi phục, smart lockout và quản lý thiết bị.
+- **Bảo vệ tài khoản:** Argon2id, JWT có phiên phía máy chủ, TOTP/recovery code, đăng nhập và xác thực lại bằng passkey WebAuthn, email khôi phục, smart lockout và quản lý thiết bị.
+- **Cảnh báo tài khoản:** Web Push, SMS xác minh sở hữu và phát hiện di chuyển bất thường bằng GeoIP local; các nhà cung cấp thật cần cấu hình riêng, demo dùng outbox.
 - **Bảo vệ dữ liệu:** AES-256-GCM, DEK riêng từng hội thoại, AAD ràng buộc từng tin nhắn, adapter Local/Vault Transit/AWS KMS/GCP KMS.
 - **Kiểm soát AI:** Gemini hoặc AI demo, đồng thuận gửi dữ liệu ra bên ngoài, DLP với chính sách cho phép/che/xác nhận/chặn/chỉ xử lý local.
 - **Giám sát:** IDS/IPS chữ ký và tương quan bất thường, audit HMAC chain, checkpoint ngoài hệ thống, sự kiện JSON cho SIEM, dashboard ngân sách tài nguyên.
 - **Triển khai:** demo tạm trên laptop, local có dữ liệu lâu dài, Docker với PostgreSQL/Redis/Caddy, hồ sơ VPS nhỏ và high-security.
 
-Repository có **Private E2EE 1:1 chạy được bằng hai client terminal riêng**, dùng Olm/Double Ratchet qua `vodozemac`. Khóa riêng và trạng thái ratchet nằm trong kho mã hóa của từng client; server chỉ chuyển ciphertext. Gradio phục vụ chat AI/mã hóa phía máy chủ. Xem [demo E2EE](docs/DEMO_SCRIPT.md#demo-private-e2ee-voi-hai-client) và [giới hạn](#gioi-han) về MLS, tương thích và kiểm toán độc lập.
+Repository có **Private E2EE 1:1** dùng Olm/Double Ratchet qua `vodozemac` và **nhóm MLS** dùng OpenMLS qua native helper trong Docker local. Khóa riêng và trạng thái giao thức nằm trong kho mã hóa của từng client terminal; server chỉ chuyển ciphertext. Gradio phục vụ chat AI/mã hóa phía máy chủ. Xem [demo E2EE](docs/DEMO_SCRIPT.md#demo-private-e2ee-voi-hai-client), [client MLS](clients/mls_native/README.md) và [giới hạn](#gioi-han).
 
 <a id="chay-demo"></a>
 ## Chạy từ bản clone trên GitHub
@@ -99,6 +100,19 @@ uv run --frozen --extra e2ee-client python -m scripts.demo_e2ee --check
 ```
 
 Runner mở server loopback tạm trong tiến trình riêng, đăng ký hai client, đối chiếu fingerprint, gửi/giải mã hai chiều, bổ sung prekey và kiểm tra export của server chỉ chứa ciphertext. Kết quả nằm trong `reports/e2ee-demo/`; runner dọn dữ liệu tạm khi xong. Để tự nhập tin nhắn, giữ `scripts.demo_local` chạy rồi mở hai terminal theo [kịch bản E2EE](docs/DEMO_SCRIPT.md#demo-private-e2ee-voi-hai-client).
+
+### 4. Demo nhóm MLS với ba client
+
+Cần Docker Desktop ở chế độ Linux containers trên máy client:
+
+```powershell
+docker build -t scap-mls-client:local clients/mls_native
+uv run --frozen --extra e2ee-client python -m scripts.demo_mls --check
+```
+
+Runner kiểm tra thêm/xóa thành viên, đổi epoch và xác nhận private state cũ của người bị loại không giải mã được tin mới. Kết quả nằm trong `reports/mls-demo/`. Nhóm hiện do owner quản lý, một thiết bị mỗi tài khoản; fingerprint và KeyPackage public phải được đối chiếu. Xem [hướng dẫn MLS](clients/mls_native/README.md).
+
+Để chạy đủ phần mở rộng tùy chọn: `uv sync --frozen --group dev --all-extras`. Cách bật Push/SMS, passkey step-up và GeoIP nằm trong [SECURITY_EXTENSIONS.md](docs/SECURITY_EXTENSIONS.md).
 
 <a id="tai-khoan-demo"></a>
 ## Tài khoản và kịch bản demo
@@ -167,7 +181,7 @@ Quyền ở giao diện được kiểm tra lại tại API. Admin vẫn chỉ �
 
 - **`secure`:** server xử lý plaintext khi được phép; lưu tin nhắn bằng envelope encryption; AI ngoài cần consent và vượt chính sách DLP.
 - **`confidential`:** áp dụng DLP/xác nhận nghiêm ngặt hơn khi gửi nội dung ra AI ngoài; các kiểm soát MFA/step-up phụ thuộc hồ sơ triển khai.
-- **`private_e2ee`:** server chỉ tiếp nhận public key/prekey và opaque ciphertext qua API riêng. Server không có plaintext để chat AI, tìm kiếm nội dung hoặc DLP. Client terminal Olm trong `clients/` cung cấp demo 1:1 tương thích.
+- **`private_e2ee`:** server chỉ tiếp nhận public key/prekey và opaque ciphertext qua API riêng. Server không có plaintext để chat AI, tìm kiếm nội dung hoặc DLP. Client terminal Olm và OpenMLS trong `clients/` cung cấp demo 1:1 và nhóm.
 
 UI chat hiện cho tạo **Secure** và **Confidential**. Private E2EE sử dụng [hợp đồng client và API](docs/E2EE_CLIENT_CONTRACT.md), không phải nút bật E2EE hoàn chỉnh trong Gradio.
 
@@ -257,6 +271,8 @@ Khi nâng cấp bản có IDS lưu bền, cần chạy service `migrate` bằng 
 
 Tab Quản trị/Bảo mật đọc API của chính bản đang chạy. Các worker dùng cùng database sẽ thấy cùng trạng thái IDS/IPS; local và VPS dùng hai database riêng thì số liệu của chúng độc lập. Lịch sử IDS vận hành giữ tối đa 500 dấu hiệu, giao diện lấy 100 dấu hiệu gần nhất; audit có vòng đời riêng. Lỗi tải hiển thị trạng thái chưa xác định, thao tác nhạy cảm yêu cầu xác thực lại, và kết quả chuỗi audit phân biệt với bằng chứng checkpoint WORM.
 
+Bản mở rộng passkey và thông báo cũng cần migration bằng image mới trước khi app khởi động. Migration giữ dữ liệu cũ và giữ dấu vết hạn mức SMS khi phiên đăng nhập hết hạn; runtime từ chối schema chưa nâng cấp. Hướng dẫn cấu hình file bí mật chỉ đọc cho Push/SMS/GeoIP nằm trong [SECURITY_EXTENSIONS.md](docs/SECURITY_EXTENSIONS.md).
+
 Các thao tác đổi mật khẩu, MFA, email, thêm/xóa passkey, step-up, thu hồi thiết bị, đăng xuất và consent kiểm tra lại phiên trước khi thay đổi, rồi lưu thay đổi thành công cùng audit trong một giao dịch. Đăng ký, cấp/đổi token và đăng nhập cũng lưu các bằng chứng audit bắt buộc cùng trạng thái; lỗi ghi audit không để lại phiên hay tài khoản thành công một phần. Thông báo bảo mật được gửi sau commit; lỗi tra địa chỉ nhận hoặc dọn bộ đếm Redis sau commit không làm mất phản hồi thành công hay recovery code. Việc gửi mã xác minh và kiểm tra hạn mức bắt buộc vẫn phải thành công.
 
 Mỗi request bị IDS phát hiện lưu dấu hiệu, điểm nguồn, lệnh chặn và toàn bộ audit tương ứng trong cùng giao dịch. Lỗi lưu bằng chứng trả lỗi dịch vụ và rollback thay đổi mới; lệnh chặn đã có vẫn giữ hiệu lực. Callback Gradio được gắn với phiên ngay lúc vào hàng đợi và kiểm tra lại trước khi chạy, để công việc của tài khoản cũ không chạy bằng tài khoản vừa đăng nhập. Giao diện cũng loại bỏ kết quả và thông báo của callback thuộc lần đăng nhập đã kết thúc.
@@ -264,6 +280,12 @@ Mỗi request bị IDS phát hiện lưu dấu hiệu, điểm nguồn, lệnh c
 Hệ thống kiểm tra cả checkpoint mới nhất và các checkpoint cũ còn lưu, rồi từ chối tạo checkpoint mới nếu phát hiện bằng chứng bị sửa hoặc mất sự kiện đã neo. Kết quả đủ bằng chứng WORM chỉ được trả khi ID/hash cuối của chuỗi vừa xác minh khớp phạm vi checkpoint; nếu có ghi mới trong lúc kiểm tra, giao diện yêu cầu xác minh lại.
 
 ### Production và VPS demo
+
+Để chuẩn bị gói source trước khi có quyền SSH, chạy `.\deploy\deploy.ps1 package`.
+Lệnh tạo `deploy/out/scap-source-release.tar.gz` và checksum, không đọc `.env`,
+không đưa database/khóa/outbox vào archive và không liên hệ VPS. Máy nhận cần
+kiểm tra checksum/manifest rồi tự cấu hình và build image; xem
+[quy trình đóng gói](docs/VPS_DEMO_DEPLOYMENT.md).
 
 [docker-compose.yml](docker-compose.yml) có `db`, `redis`, `migrate`, `app`, `caddy`. PostgreSQL/Redis nằm trong mạng backend; Caddy publish 80/443 và terminate HTTPS. Production yêu cầu domain/DNS đúng, bí mật riêng, `BASE_IMAGE` pin digest SHA-256, docs/seed/bootstrap password tắt và tài khoản database runtime không sở hữu schema.
 
@@ -296,7 +318,7 @@ Thực hiện đầy đủ [HIGH_SECURITY_DEPLOYMENT.md](docs/HIGH_SECURITY_DEPL
 Trong development, schema đầy đủ có tại `/docs`, `/redoc` và `/openapi.json`; production tắt theo cấu hình. Các nhóm endpoint chính:
 
 - **Xác thực, prefix `/api/auth`:** `register`, `login`, `mfa/*`, `me`, `refresh`, `logout`, `logout-all`, `step-up` và `sessions`.
-- **Bảo vệ tài khoản, prefix `/api/auth`:** `password`, `ai-consent`, `security-activity`, `email`, `password-reset/*` và `passkeys/*`.
+- **Bảo vệ tài khoản, prefix `/api/auth`:** `password`, `ai-consent`, `security-activity`, `email`, `password-reset/*`, `passkeys/*` (có step-up), `notifications/*` và `sign-in-risk/status`.
 - **Hội thoại:** `/api/sessions`, `/api/sessions/{id}`; dưới mỗi hội thoại có `messages`, `ciphertexts`, `security`, `export`, `export-ticket`; tìm kiếm `/api/search/messages`.
 - **Private E2EE:** `/api/e2ee/devices`, `/api/e2ee/devices/{id}/prekeys`, `/api/e2ee/users/{username}/prekey-bundle`, `/api/sessions/{id}/e2ee/state`, `members` và `envelopes`.
 - **Quản trị/giám sát, prefix `/api/admin`:** `users`, `stats`, `availability`, `audit`, `audit/verify`, `audit/checkpoint`, `ids/*`, `security-alerts`, `security/maintenance`.
@@ -458,7 +480,7 @@ Sau khi clone, tạo lại môi trường bằng `uv sync --frozen --group dev` 
 ### Giới hạn cần hiểu
 
 - `secure`/`confidential` mã hóa **khi lưu trữ**; server xử lý plaintext theo policy. Chúng không đồng nghĩa E2EE.
-- Client Private E2EE 1:1 đã có luồng gửi/nhận, pin fingerprint, kho mã hóa, outbox bền vững và bổ sung prekey. Chưa có client nhóm MLS, kiểm chứng tương thích với client bên ngoài hoặc audit/pentest độc lập cho tích hợp SCAP; demo không phải chứng nhận E2EE production. Không phục hồi bản sao ratchet cũ để tiếp tục gửi tin.
+- Client Private E2EE 1:1 và nhóm MLS đã có luồng gửi/nhận, pin fingerprint, kho mã hóa và outbox bền vững. MLS hiện giới hạn ở nhóm do owner quản lý, một thiết bị mỗi tài khoản. Chưa có kiểm chứng tương thích với client bên ngoài hoặc audit/pentest độc lập cho tích hợp SCAP; demo không phải chứng nhận E2EE production. Không phục hồi bản sao trạng thái mật mã cũ để tiếp tục gửi tin.
 - JWT/audit signing secret ở web process; WORM giúp phát hiện rollback sau checkpoint nhưng full host compromise vẫn có rủi ro.
 - DLP/IDS là phòng thủ chiều sâu, có thể có false positive/false negative; signature IDS không thay thế truy vấn tham số hóa và authorization.
 - CSP vẫn cần allowance cho CSS runtime của Gradio; phải kiểm tra tương thích khi nâng thư viện.
@@ -470,7 +492,7 @@ Sau khi clone, tạo lại môi trường bằng `uv sync --frozen --group dev` 
 
 - **Chạy và trình bày:** [Hướng dẫn local](HUONG_DAN_CHAY.md), [Docker](HUONG_DAN_DOCKER.md), [kịch bản demo](docs/DEMO_SCRIPT.md), [phân tích dự án](docs/PHAN_TICH_DU_AN.md).
 - **Triển khai/vận hành:** [VPS demo](docs/VPS_DEMO_DEPLOYMENT.md), [high-security](docs/HIGH_SECURITY_DEPLOYMENT.md), [availability/private storage/backup](docs/security/availability.md), [xử lý sự cố](docs/INCIDENT_RESPONSE_HIGH_SECURITY.md), [supply chain](docs/supply-chain/README.md).
-- **Tài khoản và ứng dụng:** [bảo vệ tài khoản](docs/ACCOUNT_PROTECTION.md), [bảo mật nâng cao](docs/ADVANCED_SECURITY.md), [bảo mật và tự động hóa](docs/SECURITY_AUTOMATION.md).
+- **Tài khoản và ứng dụng:** [bảo vệ tài khoản](docs/ACCOUNT_PROTECTION.md), [passkey/Push/SMS/GeoIP/MLS](docs/SECURITY_EXTENSIONS.md), [bảo mật nâng cao](docs/ADVANCED_SECURITY.md), [bảo mật và tự động hóa](docs/SECURITY_AUTOMATION.md).
 - **Ranh giới và quản trị dữ liệu:** [E2EE client contract](docs/E2EE_CLIENT_CONTRACT.md), [data inventory/DPIA baseline](docs/PRIVACY_DATA_INVENTORY.md), [truy vết yêu cầu](docs/SECURITY_REQUIREMENTS_TRACEABILITY.md), [security governance](docs/SECURITY_GOVERNANCE.md).
 - **Đánh giá/chính sách:** [SECURITY.md](SECURITY.md), [SECURITY_REVIEW.md](SECURITY_REVIEW.md), [cách sinh báo cáo](reports/README.md).
 

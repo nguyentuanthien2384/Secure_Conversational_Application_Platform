@@ -14,18 +14,20 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import timedelta
 
 import psycopg
 import pytest
 from psycopg import sql
-from sqlalchemy import event, select, text
+from sqlalchemy import event, inspect, select, text
 from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import OperationalError
 
 from src.app.audit_chain import append_lock, seal_event, verify_chain
 from src.app.audit_checkpoint import AuditCheckpointError, canonical_checkpoint, sign_checkpoint
-from src.app.db import Database
+from src.app.db import Database, utcnow
 from src.app.ids import Detection, PersistentIntrusionState
-from src.app.models import AuditCheckpoint, AuditEvent, IntrusionSource, User
+from src.app.models import AuditCheckpoint, AuditEvent, AuthSession, IntrusionSource, User
 from tests import test_account_transactions as account_regressions
 from tests import test_admin_transactions as admin_regressions
 from tests import test_auth_completion_transactions as auth_completion
@@ -35,9 +37,12 @@ from tests import test_e2ee_prekeys_cursor as prekeys_cursor
 from tests import test_ids_request_transactions as ids_transactions
 from tests import test_ids_runtime as ids_regressions
 from tests import test_passkey_stepup as passkey_stepup
+from tests import test_passkey_stepup_migration as passkey_migration
 from tests import test_postcommit_notifications as postcommit_notifications
 from tests import test_restore_quarantine as restore_quarantine
 from tests import test_security_notifications as notification_regressions
+from tests import test_security_phone_retention as phone_retention
+from tests import test_security_phone_retention_migration as phone_migration
 from tests import test_sign_in_geoip_risk as geoip_regressions
 from tests.test_privileged_step_up import ADMIN_PASSWORD, auth, create_account, login
 
@@ -149,6 +154,192 @@ def settings(settings, _postgres_database, request, tmp_path):
     return configured
 
 
+@pytest.fixture(params=[False, True], ids=["old-schema", "partial-column"])
+def legacy_database(_postgres_database, _postgres_cluster, request):
+    """Exercise owner-run legacy DDL against an isolated PostgreSQL database."""
+    owner_url = _postgres_cluster.administrative_url.set(database=_postgres_database.database)
+    database = Database(owner_url.render_as_string(hide_password=False))
+    with database.session_factory() as db:
+        db.add(User(id="legacy-owner", username="legacy-owner", password_hash="unused"))
+        db.flush()
+        db.add(AuthSession(
+            jti="legacy-jti", user_id="legacy-owner", session_family_id="legacy-jti",
+            expires_at=utcnow() + timedelta(hours=1),
+        ))
+        db.commit()
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE webauthn_challenges")
+        connection.exec_driver_sql("""
+            CREATE TABLE webauthn_challenges (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+                purpose VARCHAR(16) NOT NULL,
+                challenge VARCHAR(128) NOT NULL,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                consumed_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                CONSTRAINT ck_webauthn_challenge_purpose
+                CHECK (purpose IN ('register', 'authenticate'))
+            )
+        """)
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_webauthn_challenges_user_id ON webauthn_challenges(user_id)",
+        )
+        if request.param:
+            connection.exec_driver_sql(
+                "ALTER TABLE webauthn_challenges ADD COLUMN auth_session_id VARCHAR(36) "
+                "REFERENCES auth_sessions(jti) ON DELETE CASCADE",
+            )
+        connection.exec_driver_sql("""
+            INSERT INTO webauthn_challenges
+                (id,user_id,purpose,challenge,expires_at,consumed_at,created_at)
+            VALUES ('legacy-register','legacy-owner','register','registration-proof',
+                    '2026-10-17 12:03:00+00',NULL,'2026-10-17 12:00:00+00'),
+                   ('legacy-authenticate',NULL,'authenticate','authentication-proof',
+                    '2026-10-17 12:03:00+00','2026-10-17 12:01:00+00','2026-10-17 12:00:00+00')
+        """)
+        if request.param:
+            connection.exec_driver_sql(
+                "UPDATE webauthn_challenges SET auth_session_id='legacy-jti' "
+                "WHERE id='legacy-register'",
+            )
+    try:
+        yield database, request.param
+    finally:
+        database.engine.dispose()
+
+
+# These assertions are shared with SQLite, but execute PostgreSQL's ALTER
+# COLUMN/CHECK path and real foreign-key constraints rather than the rebuild.
+test_postgres_passkey_legacy_migration = (
+    passkey_migration.test_upgrade_preserves_legacy_ceremonies_and_is_idempotent
+)
+test_postgres_passkey_legacy_constraints = (
+    passkey_migration.test_migrated_constraints_enforce_purpose_and_session_cascade
+)
+
+
+def test_postgres_failed_passkey_migration_rolls_back_legacy_schema(legacy_database):
+    database, had_column = legacy_database
+    before = passkey_migration.legacy_rows(database)
+
+    def fail_new_constraint(_connection, _cursor, statement, _parameters, _context, _many):
+        if statement.startswith(
+            "ALTER TABLE webauthn_challenges ADD CONSTRAINT ck_webauthn_challenge_purpose",
+        ):
+            raise OperationalError("simulated CHECK migration failure", None, RuntimeError("test"))
+
+    event.listen(database.engine, "before_cursor_execute", fail_new_constraint)
+    try:
+        with pytest.raises(OperationalError):
+            database.create_all()
+    finally:
+        event.remove(database.engine, "before_cursor_execute", fail_new_constraint)
+    assert passkey_migration.legacy_rows(database) == before
+    inspector = inspect(database.engine)
+    assert ("auth_session_id" in {
+        column["name"] for column in inspector.get_columns("webauthn_challenges")
+    }) == had_column
+    assert not any(
+        "step_up" in check["sqltext"]
+        for check in inspector.get_check_constraints("webauthn_challenges")
+    )
+    database.create_all()
+    database.assert_schema_ready()
+    assert passkey_migration.legacy_rows(database) == before
+
+
+@pytest.fixture(params=[True, False], ids=["cascade-fk", "partial-no-fk"])
+def legacy_phone_database(_postgres_database, _postgres_cluster, request):
+    owner_url = _postgres_cluster.administrative_url.set(database=_postgres_database.database)
+    database = Database(owner_url.render_as_string(hide_password=False))
+    with database.session_factory() as db:
+        db.add(User(id="sms-owner", username="sms-owner", password_hash="unused"))
+        db.flush()
+        db.add(AuthSession(
+            jti="sms-session", user_id="sms-owner", session_family_id="sms-session",
+            expires_at=utcnow() + timedelta(hours=1),
+        ))
+        db.commit()
+    session_reference = (
+        " REFERENCES auth_sessions(jti) ON DELETE CASCADE" if request.param else ""
+    )
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE security_phone_challenges")
+        connection.exec_driver_sql("""
+            CREATE TABLE security_phone_challenges (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                auth_session_id VARCHAR(36) NOT NULL""" + session_reference + """,
+                phone_hash VARCHAR(64) NOT NULL, phone_ciphertext TEXT NOT NULL,
+                phone_nonce VARCHAR(64) NOT NULL, code_hash VARCHAR(64) NOT NULL,
+                attempts INTEGER NOT NULL, expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                consumed_at TIMESTAMP WITH TIME ZONE, created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                CONSTRAINT ck_security_phone_attempts CHECK(attempts >= 0 AND attempts <= 5)
+            )
+        """)
+        for proof_id, session_id in [
+            ("legacy-bound", "sms-session"),
+            *(([("legacy-orphan", "missing-session")]) if not request.param else []),
+        ]:
+            connection.execute(text("""
+                INSERT INTO security_phone_challenges
+                    (id,user_id,auth_session_id,phone_hash,phone_ciphertext,phone_nonce,
+                     code_hash,attempts,expires_at,consumed_at,created_at)
+                VALUES (:id,'sms-owner',:session,'target-hash','ciphertext','nonce','code-hash',
+                        2,'2026-10-17 12:05:00+00',NULL,'2026-10-17 12:00:00+00')
+            """), {"id": proof_id, "session": session_id})
+    try:
+        yield database, request.param
+    finally:
+        database.engine.dispose()
+
+
+test_postgres_notification_legacy_migration = (
+    phone_migration.test_sms_upgrade_preserves_rows_indexes_and_is_idempotent
+)
+test_postgres_notification_legacy_constraints = (
+    phone_migration.test_sms_upgrade_nulls_expired_bearer_keeps_user_cascade_and_guess_limit
+)
+
+
+def test_postgres_failed_phone_migration_rolls_back_legacy_schema(legacy_phone_database):
+    database, had_fk = legacy_phone_database
+    before = phone_migration._rows(database)
+
+    def fail_new_constraint(_connection, _cursor, statement, _parameters, _context, _many):
+        if statement.startswith(
+            "ALTER TABLE security_phone_challenges ADD CONSTRAINT "
+            "fk_security_phone_challenges_session_retention",
+        ):
+            raise OperationalError("simulated SMS migration failure", None, RuntimeError("test"))
+
+    event.listen(database.engine, "before_cursor_execute", fail_new_constraint)
+    try:
+        with pytest.raises(OperationalError):
+            database.create_all()
+    finally:
+        event.remove(database.engine, "before_cursor_execute", fail_new_constraint)
+    assert phone_migration._rows(database) == before
+    inspector = inspect(database.engine)
+    assert next(
+        column for column in inspector.get_columns("security_phone_challenges")
+        if column["name"] == "auth_session_id"
+    )["nullable"] is False
+    keys = [
+        key for key in inspector.get_foreign_keys("security_phone_challenges")
+        if key["constrained_columns"] == ["auth_session_id"]
+    ]
+    assert len(keys) == int(had_fk)
+    if had_fk:
+        assert keys[0]["options"]["ondelete"] == "CASCADE"
+    with pytest.raises(RuntimeError, match="SMS"):
+        database.assert_schema_ready()
+    database.create_all()
+    database.assert_schema_ready()
+    assert phone_migration._rows(database) == before
+
+
 # Reuse behavioral regressions with PostgreSQL fixtures and real runtime grants.
 # Parametrization remains attached to the imported test functions.
 paged_data = data_paging.paged_data
@@ -175,6 +366,9 @@ test_postgres_notification_budget = notification_regressions.test_durable_hourly
 test_postgres_notification_failed_provider = notification_regressions.test_failed_provider_never_enables_an_unverified_phone
 test_postgres_notification_audit = notification_regressions.test_registration_and_audit_roll_back_together
 test_postgres_notification_payload = notification_regressions.test_fixed_notice_payloads_fan_out_without_sensitive_context
+test_postgres_notification_expired_bearer_budget = phone_retention.test_sms_daily_budget_survives_expired_bearer_retention
+test_postgres_notification_opt_out_budget = phone_retention.test_sms_opt_out_invalidates_proofs_without_resetting_issuance_budget
+test_postgres_notification_proof_retention = phone_retention.test_sms_proof_retention_keeps_quota_window_and_is_bounded_and_dry_run
 test_postgres_geoip_success = geoip_regressions.test_completed_login_adds_advisory_evidence_and_does_not_leak_coordinates
 test_postgres_geoip_failed_password = geoip_regressions.test_failed_password_is_not_a_travel_observation
 test_postgres_geoip_audit_rollback = geoip_regressions.test_travel_audit_failure_rolls_back_new_bearer_and_login_evidence

@@ -1,0 +1,18 @@
+[package]
+name = "scap-hpke-security-regression"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+
+# This standalone test crate deliberately compiles the optional provider. The
+# production native helper continues to select openmls_rust_crypto unchanged.
+[dev-dependencies]
+hpke-rs = { version = "=0.7.0", features = ["std"] }
+hpke-rs-crypto = { version = "=0.7.0", features = ["std"] }
+hpke-rs-rust-crypto = { version = "=0.7.0", features = ["std"] }
+hpke-rs-libcrux = { version = "=0.7.0", features = ["std"] }
+libcrux-kem = "=0.0.10"
+
+[patch.crates-io]
+hpke-rs-libcrux = { path = "../vendor/hpke-rs-libcrux" }
