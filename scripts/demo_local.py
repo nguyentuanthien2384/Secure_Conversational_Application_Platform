@@ -123,6 +123,8 @@ def demo_application(directory: Path, port: int) -> Iterator[Any]:
                     app.state.crypto_service,
                     audit_key=derive_audit_key(settings.secret_key),
                     refresh_telemetry=True,
+                    secure_retention_days=settings.secure_retention_days,
+                    confidential_retention_days=settings.confidential_retention_days,
                     log=lambda _message: None,
                 )
                 yield app

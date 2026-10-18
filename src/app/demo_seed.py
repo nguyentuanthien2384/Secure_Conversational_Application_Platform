@@ -18,6 +18,7 @@ from sqlalchemy import select
 from src.app.audit_chain import append_lock, derive_audit_key, seal_event
 from src.app.db import Database, utcnow
 from src.app.models import AuditEvent, ChatSession, SecureMessage, User
+from src.app.retention import retention_deadline
 from src.app.security import CryptoService, PasswordService
 
 _AUDIT_KEY_FROM_ENV = object()
@@ -240,6 +241,8 @@ def seed_demo_data(
     audit_key: bytes | None | object = _AUDIT_KEY_FROM_ENV,
     passphrase: str = DEMO_PASSPHRASE,
     sample_alerts: bool = True,
+    secure_retention_days: int = 90,
+    confidential_retention_days: int = 7,
     log=print,
 ) -> None:
     """Nạp dữ liệu demo, có thể làm mới telemetry hiển thị trên dashboard.
@@ -258,6 +261,12 @@ def seed_demo_data(
     (scripts/seed_vps_accounts.py) và không bao giờ được in ra. ``sample_alerts``
     tắt các sự kiện audit giả lập: smart lockout đọc chính bảng audit, nên các lần
     đăng nhập sai mẫu có thể khóa tài khoản demo với người dùng thật.
+
+    Mỗi hội thoại mẫu nhận ngay hạn lưu giữ theo đúng chính sách (truyền
+    ``secure_retention_days``/``confidential_retention_days`` từ cấu hình).
+    Mọi truy vấn coi hạn NULL là chưa được phép đọc, nên seed chạy sau lượt quét
+    retention lúc khởi động (Docker) hoặc từ CLI từng làm hội thoại mẫu biến mất
+    tới lần khởi động kế tiếp.
     """
     if audit_key is _AUDIT_KEY_FROM_ENV:
         audit_key = _seed_audit_key()
@@ -335,6 +344,13 @@ def seed_demo_data(
                 )
                 db.add(session_row)
                 db.flush()
+                # After flush the column defaults (security_mode) are populated.
+                session_row.retention_expires_at = retention_deadline(
+                    session_row,
+                    now=utcnow(),
+                    secure_retention_days=secure_retention_days,
+                    confidential_retention_days=confidential_retention_days,
+                )
                 msg_time = session_row.created_at
                 for message_index, (role, content) in enumerate(turns, start=1):
                     ciphertext, nonce, key_version = crypto_service.encrypt(

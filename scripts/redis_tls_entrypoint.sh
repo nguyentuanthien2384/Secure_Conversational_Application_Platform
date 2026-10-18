@@ -22,8 +22,11 @@ redis_password_hash=$(printf '%s' "$redis_password" | sha256sum | cut -d ' ' -f 
 unset redis_password
 {
   printf '%s\n' 'user default on nopass ~* resetchannels -@all +ping'
+  # Keep in sync with every command the app sends (tests/test_hardening.py):
+  # zpopmax refunds a successful login's rate-limit slot; set NX EX holds the
+  # maintenance cycle/alert claims. Without them each login returned 503.
   printf '%s\n' \
-    "user scap on #$redis_password_hash ~scap:* resetchannels -@all +ping +eval +evalsha +zremrangebyscore +zcard +zrange +zadd +expire +del"
+    "user scap on #$redis_password_hash ~scap:* resetchannels -@all +ping +eval +evalsha +zremrangebyscore +zcard +zrange +zadd +zpopmax +expire +del +set"
 } > "$tls_dir/users.acl"
 chmod 0600 "$tls_dir/users.acl"
 chown -R redis:redis "$tls_dir"

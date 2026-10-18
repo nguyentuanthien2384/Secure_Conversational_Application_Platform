@@ -53,6 +53,7 @@ from src.app.models import (  # noqa: E402
     SecureMessage,
     User,
 )
+from src.app.retention import retention_deadline  # noqa: E402
 from src.app.security import CryptoService, PasswordService, TotpService  # noqa: E402
 
 # Passphrase công khai chỉ dành cho dữ liệu học tập, không bao giờ được seed production.
@@ -324,6 +325,13 @@ def seed_learning_data(
                 )
                 db.add(session_row)
                 db.flush()  # cần id để đưa vào AAD
+                # Hạn NULL bị mọi truy vấn coi là chưa được đọc; đặt ngay theo chính sách.
+                session_row.retention_expires_at = retention_deadline(
+                    session_row,
+                    now=utcnow(),
+                    secure_retention_days=settings.secure_retention_days,
+                    confidential_retention_days=settings.confidential_retention_days,
+                )
                 if owner.username == "learn.mod":
                     idor_target = session_row.id
                 stamp = session_row.created_at

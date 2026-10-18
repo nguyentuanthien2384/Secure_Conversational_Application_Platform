@@ -100,7 +100,10 @@ def seed_vps_accounts(
     )
     try:
         seed_demo_data(database, PasswordService(), crypto, audit_key=key,
-                       passphrase=password, sample_alerts=sample_alerts, log=log)
+                       passphrase=password, sample_alerts=sample_alerts,
+                       secure_retention_days=settings.secure_retention_days,
+                       confidential_retention_days=settings.confidential_retention_days,
+                       log=log)
         roles = dict(ALL_DEMO_USERS)
         details = {
             "source": "one_off_cli",

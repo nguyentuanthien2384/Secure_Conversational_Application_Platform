@@ -601,3 +601,26 @@ def test_gradio_mount_blocks_sensitive_files_and_debug_surfaces():
     assert "enable_monitoring=False" in main_source
     assert "analytics_enabled=False" in ui_source
     assert "delete_cache=(60, 60)" in ui_source
+
+
+def test_high_profile_redis_acl_allows_every_command_the_app_sends():
+    """The reference ACL once lacked ZPOPMAX: every successful login returned 503.
+
+    Commands inside Lua scripts are ACL-checked too, so both the client method
+    calls and the redis.call() names must be covered by the scap user.
+    """
+    import re
+
+    entrypoint = Path("scripts/redis_tls_entrypoint.sh").read_text(encoding="utf-8")
+    acl = re.search(r'"(user scap on [^"]*)"', entrypoint).group(1)
+    allowed = {token[1:].lower() for token in acl.split() if token.startswith("+")}
+    assert "~scap:*" in acl and "-@all" in acl, "the account stays key- and command-scoped"
+    used = set()
+    for module in ("src/app/security.py", "src/app/maintenance.py"):
+        source = Path(module).read_text(encoding="utf-8")
+        used |= {name.lower() for name in re.findall(r"redis\.p?call\('([A-Za-z]+)'", source)}
+        used |= set(re.findall(r"self\._(?:client|redis)\.([a-z_]+)\(", source))
+    not_commands = {"close"}
+    commands = {{"delete": "del"}.get(name, name) for name in used - not_commands}
+    assert {"zpopmax", "set", "eval", "zadd"} <= commands, "scan found the known commands"
+    assert commands <= allowed, sorted(commands - allowed)

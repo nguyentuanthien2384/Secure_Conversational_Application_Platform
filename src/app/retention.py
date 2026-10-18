@@ -43,7 +43,7 @@ class RetentionResult:
         return asdict(self)
 
 
-def _retention_deadline(
+def retention_deadline(
     chat_session: ChatSession,
     *,
     now: datetime,
@@ -92,7 +92,7 @@ def _backfill_retention_deadlines(
         if not rows:
             break
         for row in rows:
-            row.retention_expires_at = _retention_deadline(
+            row.retention_expires_at = retention_deadline(
                 row,
                 now=now,
                 secure_retention_days=secure_retention_days,

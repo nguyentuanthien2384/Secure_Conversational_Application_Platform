@@ -544,6 +544,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 password_service,
                 crypto_service,
                 refresh_telemetry=True,
+                secure_retention_days=settings.secure_retention_days,
+                confidential_retention_days=settings.confidential_retention_days,
                 log=logger.info,
             )
         maintenance.start()

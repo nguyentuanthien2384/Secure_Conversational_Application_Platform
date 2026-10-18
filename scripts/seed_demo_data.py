@@ -46,6 +46,8 @@ if __name__ == "__main__":
         reset="--reset" in sys.argv,
         refresh_telemetry="--refresh-telemetry" in sys.argv,
         audit_key=derive_audit_key(settings.secret_key) if settings.audit_chain_enabled else None,
+        secure_retention_days=settings.secure_retention_days,
+        confidential_retention_days=settings.confidential_retention_days,
     )
     print("\n=== TÀI KHOẢN DEMO ===")
     print(f"Mật khẩu chung : {DEMO_PASSPHRASE}")

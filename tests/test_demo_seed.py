@@ -77,6 +77,31 @@ def test_standard_demo_seed_is_idempotent_sealed_and_has_recent_correlations(
         assert verify_chain(db, key).intact
 
 
+def test_first_boot_seed_after_startup_retention_sweep_is_visible(settings):
+    """Docker seeds inside lifespan, after the startup retention sweep.
+
+    A NULL deadline fails closed on every read, so a fresh compose stack showed
+    0/0 conversations for every demo account until the next restart.
+    """
+    seeded = replace(settings, seed_demo_data=True, retention_sweep_on_startup=True,
+                     secure_retention_days=30)
+    with TestClient(create_app(seeded)) as client:
+        response = client.post("/api/auth/login", json={
+            "username": "demo.user", "password": "Phenikaa-Vault#2026-Lab",
+        })
+        assert response.status_code == 200, response.text
+        headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+        page = client.get("/api/sessions/page", headers=headers).json()
+        assert page["total"] == 4 and len(page["items"]) == 4
+        with client.app.state.database.session_factory() as db:
+            rows = list(db.scalars(select(ChatSession)))
+            assert rows and all(row.retention_expires_at is not None for row in rows)
+            for row in rows:
+                # Derived from creation time, never extended by the seed date.
+                expected = row.created_at + timedelta(days=30)
+                assert abs((row.retention_expires_at - expected).total_seconds()) < 1
+
+
 def test_explicit_none_disables_sealing_without_reading_environment(database, settings, monkeypatch):
     monkeypatch.setattr(Settings, "from_env", lambda: pytest.fail("Unexpected .env read"))
     seed_demo_data(database, PasswordService(), CryptoService(settings.master_encryption_key),
