@@ -149,19 +149,26 @@ def _callback(demo, name):
 class FakeApi:
     """Server semantics that matter here: consent first, then confidential confirmation."""
 
-    def __init__(self, *, consent: bool, mode: str = "secure"):
+    def __init__(self, *, consent: bool, mode: str = "secure", reported_consent=None,
+                 refuse=None):
         self.consent = consent
+        # Consent ghi theo phiên bản chính sách cũ: /me vẫn báo True nhưng máy
+        # chủ không chấp nhận khi gửi tới AI.
+        self.reported_consent = consent if reported_consent is None else reported_consent
         self.mode = mode
+        self.refuse = refuse
         self.sessions: list[dict] = []
         self.sent: list[dict] = []
+        self.calls: list[tuple[str, str]] = []
 
     def __call__(self, _token, method, path, body=None, *, params=None):
         del params
+        self.calls.append((method, path))
         if (method, path) == ("GET", "/api/auth/me"):
-            return {"ai_data_consent": self.consent}
+            return {"ai_data_consent": self.reported_consent}
         if (method, path) == ("PATCH", "/api/auth/ai-consent"):
-            self.consent = body["ai_data_consent"]
-            return {}
+            self.consent = self.reported_consent = body["ai_data_consent"]
+            return {"ai_data_consent": self.consent}
         if (method, path) == ("POST", "/api/sessions"):
             session = {"id": f"s{len(self.sessions) + 1}", "title": body["title"],
                        "security_mode": self.mode}
@@ -175,6 +182,8 @@ class FakeApi:
         if method == "GET" and path.startswith("/api/sessions/"):
             return {"id": path.rsplit("/", 1)[-1], "title": "Conversation", "security_mode": self.mode}
         if method == "POST" and path.endswith("/messages"):
+            if self.refuse:
+                raise gr.Error(self.refuse)
             if not self.consent:
                 raise gr.Error(EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE)
             if self.mode == "confidential" and not body["confirm_external_ai"]:
@@ -184,20 +193,16 @@ class FakeApi:
         raise AssertionError(f"Unexpected API call {method} {path}")
 
 
-def test_consent_retry_reuses_the_auto_created_conversation(demo, monkeypatch):
+def test_first_send_records_consent_in_the_auto_created_conversation(demo, monkeypatch):
     api = FakeApi(consent=False)
     monkeypatch.setattr(gradio_ui, "_api", api)
-    send = _callback(demo, "submit_chat_message")
-    resend = _callback(demo, "consent_and_resend")
 
-    outputs = send("token", None, "Xin chào")
-    assert [session["id"] for session in api.sessions] == ["s1"]
+    outputs = _callback(demo, "submit_chat_message")("token", None, "Xin chào")
+    assert [session["id"] for session in api.sessions] == ["s1"]  # no orphan, no retry
     assert outputs[0]["value"] == "s1"  # the new conversation is now selected
-    assert outputs[4]["value"] == gradio_ui.CONSENT_NOTICE
-
-    resend("token", outputs[0]["value"], "Xin chào")
-    assert [session["id"] for session in api.sessions] == ["s1"]  # no orphan
-    assert len(api.sent) == 1
+    assert api.consent is True and len(api.sent) == 1
+    assert outputs[3] == "" and outputs[4]["visible"] is False
+    assert outputs[5] == gr.update(value=True)  # Account tab checkbox follows
 
 
 def test_send_button_confirms_a_confidential_message_without_a_second_prompt(demo, monkeypatch):
@@ -208,18 +213,36 @@ def test_send_button_confirms_a_confidential_message_without_a_second_prompt(dem
     assert api.sent == [{
         "content": "Kế hoạch nội bộ", "confirm_external_ai": True, "use_web_search": False,
     }]
-    assert outputs[3] == "" and outputs[4]["visible"] is False and outputs[5]["visible"] is False
+    assert ("PATCH", "/api/auth/ai-consent") not in api.calls
+    assert outputs[3] == "" and outputs[4]["visible"] is False and outputs[5] == gr.skip()
 
 
-def test_one_consent_click_sends_even_in_a_confidential_conversation(demo, monkeypatch):
-    api = FakeApi(consent=False, mode="confidential")
+@pytest.mark.parametrize("reported_consent", [False, True])
+def test_send_without_current_consent_needs_no_confirmation_button(
+    demo, monkeypatch, reported_consent,
+):
+    """reported_consent=True: consent ghi theo phiên bản chính sách cũ.
+
+    /me vẫn báo đã đồng ý nên nút "Đồng ý và gửi" cũ bỏ qua bước ghi consent và
+    tin nhắn bị từ chối mãi. Gửi giờ luôn ghi lại consent khi máy chủ đòi.
+    """
+    api = FakeApi(consent=False, mode="confidential", reported_consent=reported_consent)
     monkeypatch.setattr(gradio_ui, "_api", api)
-    send = _callback(demo, "submit_chat_message")
-
-    assert send("token", "s9", "Kế hoạch nội bộ")[4]["value"] == gradio_ui.CONSENT_NOTICE
-    assert api.sent == []  # the account-level consent is still asked for once
-    _callback(demo, "consent_and_resend")("token", "s9", "Kế hoạch nội bộ")
+    outputs = _callback(demo, "submit_chat_message")("token", "s9", "Kế hoạch nội bộ")
     assert api.consent is True
     assert api.sent == [{
         "content": "Kế hoạch nội bộ", "confirm_external_ai": True, "use_web_search": False,
     }]
+    assert outputs[3] == "" and outputs[4]["visible"] is False
+    assert not any(isinstance(item, gr.Button) and item.value == "Đồng ý và gửi"
+                   for item in demo.blocks.values())
+
+
+def test_other_refusals_are_not_retried_as_consent(demo, monkeypatch):
+    api = FakeApi(consent=False, refuse="DLP đã chặn nội dung Highly confidential.")
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    outputs = _callback(demo, "submit_chat_message")("token", "s9", "Bí mật")
+    assert api.calls.count(("POST", "/api/sessions/s9/messages")) == 1
+    assert ("PATCH", "/api/auth/ai-consent") not in api.calls and api.consent is False
+    assert outputs[3] == gr.skip()  # the composer keeps the text
+    assert "DLP đã chặn" in outputs[4]["value"] and outputs[5] == gr.skip()

@@ -51,6 +51,48 @@ def _docx(xml: str | bytes) -> bytes:
     return buffer.getvalue()
 
 
+def _pdf(*pages: str) -> bytes:
+    """PDF tối thiểu hợp lệ, mỗi trang một dòng Helvetica (chỉ ký tự WinAnsi)."""
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    ]
+    kids = []
+    for text in pages:
+        escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET" if text else ""
+        objects.append(
+            f"<< /Length {len(stream.encode('latin-1'))} >>\nstream\n{stream}\nendstream"
+        )
+        objects.append(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {len(objects)} 0 R >>"
+        )
+        kids.append(f"{len(objects)} 0 R")
+    objects[1] = f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {len(kids)} >>"
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    out += "".join(f"{offset:010d} 00000 n \n" for offset in offsets).encode()
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def _encrypted_pdf(user_password: str, text: str = "Mat khau") -> bytes:
+    from pypdf import PdfWriter
+
+    writer = PdfWriter(clone_from=io.BytesIO(_pdf(text)))
+    writer.encrypt(user_password=user_password, owner_password="chu-so-huu")
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
 def _code(callable_, *args) -> str:
     with pytest.raises(ChatFileError) as caught:
         callable_(*args)
@@ -94,6 +136,47 @@ def test_docx_bombs_and_garbage_are_rejected(monkeypatch):
     assert _code(extract_docx_text, no_body.getvalue()) == "docx_invalid"
 
 
+def test_pdf_text_is_extracted_per_page_with_page_markers():
+    raw = _pdf("Bao cao quy 3 (ban nhap)", "", "Doanh thu tang 25% - cafe")
+    parsed = parse_chat_file("báo cáo.PDF", raw)
+    # Trang trống bị bỏ qua nhưng số trang vẫn theo đúng tệp gốc.
+    assert parsed.text == (
+        "[Trang 1]\nBao cao quy 3 (ban nhap)\n\n[Trang 3]\nDoanh thu tang 25% - cafe"
+    )
+    assert (parsed.name, parsed.size, parsed.chars) == ("báo cáo.PDF", len(raw), len(parsed.text))
+
+
+def test_pdf_page_text_drops_control_and_bidi_characters():
+    # Font PDF hay ánh xạ glyph ra ký tự điều khiển; người dùng không sửa được.
+    assert chat_files._clean_pdf_page("A\x00B‮C\fD\r\n\n\n\nE  ") == "A BC\nD\n\nE"
+
+
+def test_pdf_with_owner_password_only_opens_and_user_password_is_refused():
+    assert parse_chat_file("han_che_in.pdf", _encrypted_pdf("")).text == "[Trang 1]\nMat khau"
+    assert _code(parse_chat_file, "khoa.pdf", _encrypted_pdf("bi-mat")) == "pdf_encrypted"
+
+
+def test_scanned_or_broken_pdfs_fail_with_fixed_codes():
+    assert _code(parse_chat_file, "scan.pdf", _pdf("", "")) == "pdf_no_text"
+    assert _code(parse_chat_file, "fake.pdf", b"MZ\x90\x00 not a pdf") == "pdf_invalid"
+    truncated = _pdf("Bao cao")[:40]
+    assert _code(parse_chat_file, "cut.pdf", truncated) == "pdf_invalid"
+
+
+def test_pdf_extraction_is_bounded_by_pages_text_and_time(monkeypatch):
+    raw = _pdf("mot", "hai", "ba")
+    monkeypatch.setattr(chat_files, "MAX_PDF_PAGES", 2)
+    assert _code(parse_chat_file, "dai.pdf", raw) == "pdf_too_large"
+    monkeypatch.setattr(chat_files, "MAX_PDF_PAGES", 10)
+    monkeypatch.setattr(chat_files, "MAX_PDF_TEXT_CHARS", 5)  # "mot" + "hai" = 6
+    assert _code(parse_chat_file, "dai.pdf", raw) == "pdf_too_large"
+    monkeypatch.setattr(chat_files, "MAX_PDF_TEXT_CHARS", 1_000)
+    ticks = iter([0.0, 1.0, chat_files.PDF_EXTRACT_SECONDS + 1])
+    with pytest.raises(ChatFileError) as caught:
+        chat_files.extract_pdf_text(raw, clock=lambda: next(ticks))
+    assert caught.value.code == "pdf_too_large"
+
+
 @pytest.mark.parametrize(("raw", "expected"), [
     ("Xin chào\r\nthế giới\r".encode(), "Xin chào\nthế giới"),
     (codecs.BOM_UTF8 + "có BOM".encode(), "có BOM"),
@@ -113,7 +196,8 @@ def test_text_files_decode_utf8_and_utf16_with_bom(raw, expected):
     ("a.txt", "safe \u202e txt.exe".encode(), "bidi"),
     ("a.txt", b"  \n\t ", "empty"),
     ("a.txt", b"", "empty"),
-    ("a.pdf", b"%PDF-1.7", "unsupported_type"),
+    ("a.pptx", b"PK\x03\x04", "unsupported_type"),
+    ("a.pdf", b"%PDF-1.7", "pdf_invalid"),
     (".txt", b"x", "unsupported_type"),
     ("a..txt", b"x", "invalid_name"),
     ("x" * 181 + ".txt", b"x", "invalid_name"),
@@ -325,6 +409,21 @@ def test_upload_route_parses_and_hands_back_a_claimable_id(session_store, clock)
         assert response.status_code == 413
 
 
+def test_upload_route_extracts_pdf_text_and_reports_pdf_errors(session_store, clock):
+    files = ChatFileStore()
+    with _client(session_store, files, limits=True) as client:
+        token = _login(client, session_store, clock)
+        response = _upload(client, _pdf("Hop dong thue nha", "Dieu 2: gia thue"), "hợp đồng.pdf")
+        assert response.status_code == 200, response.text
+        claimed = files.claim(response.json()["upload_id"], [token_digest(token)])
+        assert claimed.text == "[Trang 1]\nHop dong thue nha\n\n[Trang 2]\nDieu 2: gia thue"
+        MessageSend(content="Hỏi", file_name=claimed.name, file_content=claimed.text)
+        for body, code in ((_encrypted_pdf("bi-mat"), "pdf_encrypted"),
+                           (_pdf(""), "pdf_no_text")):
+            response = _upload(client, body, "tai lieu.pdf")
+            assert (response.status_code, response.json()["code"]) == (422, code)
+
+
 @pytest.mark.parametrize(("headers", "status", "code"), [
     ({"X-SCAP-UI": ""}, 403, None),
     ({"Origin": "https://evil.example"}, 403, None),
@@ -447,6 +546,10 @@ def test_bridge_and_picker_agree_with_server_limits_and_codes():
     assert "(tối đa 10 MB)" in CHAT_FILE_PICKER_HTML
     codes = re.search(r"CHAT_FILE_ERRORS = new Set\(\[(.*?)\]\)", script, re.DOTALL)[1]
     assert set(re.findall(r'"([a-z_]+)"', codes)) <= set(ERROR_MESSAGES)
+    # Mã máy chủ trả mà bridge không biết sẽ bị đổi thành "upload_failed" chung chung.
+    server_codes = {code for code in ERROR_MESSAGES if code.startswith(("pdf_", "docx_"))}
+    assert server_codes <= set(re.findall(r'"([a-z_]+)"', codes))
+    assert ".pdf" in CHAT_FILE_PICKER_HTML
     assert {"read_failed", "upload_failed"} <= set(ERROR_MESSAGES)
     assert "base64:" not in script and "arrayBuffer" not in script
 

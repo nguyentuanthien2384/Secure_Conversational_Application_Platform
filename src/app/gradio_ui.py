@@ -934,6 +934,24 @@ def _chat_file_upload_id(raw_payload: str | None) -> str:
     return upload_id
 
 
+def _post_to_ai(token: str, path: str, body: dict) -> tuple[dict, dict]:
+    """Gửi nội dung tới AI; bấm Gửi chính là đồng ý chia sẻ với AI bên ngoài.
+
+    Tài khoản chưa đồng ý, hoặc đồng ý theo phiên bản chính sách cũ (``/me``
+    vẫn báo ``ai_data_consent`` nhưng máy chủ không chấp nhận), bị từ chối trước
+    khi ghi gì vào cơ sở dữ liệu. Khi đó lưu consent cho tài khoản (có ghi
+    audit) rồi gửi lại đúng một lần, không thêm bước xác nhận thứ hai. Trả về
+    kết quả và cập nhật cho ô đồng ý trong tab Tài khoản.
+    """
+    try:
+        return _api(token, "POST", path, body), gr.skip()
+    except gr.Error as err:
+        if EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE not in str(err):
+            raise
+    _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
+    return _api(token, "POST", path, body), gr.update(value=True)
+
+
 # Tên trường trong lỗi 422 của API -> nhãn trên giao diện.
 _VALIDATION_FIELDS = {
     "username": "Tên đăng nhập", "password": "Mật khẩu", "current_password": "Mật khẩu hiện tại",
@@ -1630,13 +1648,11 @@ def _devices_snapshot(token):
 
 
 AI_CONSENT_SCOPE = (
-    "Sau khi bạn đồng ý, tin nhắn hiện tại và một phần lịch sử hội thoại "
+    "Bấm Gửi trong mục Trò chuyện được xem là đồng ý và tự bật mục này. Khi bật, "
+    "tin nhắn hiện tại và một phần lịch sử hội thoại "
     "(mặc định 16, tối đa 40 tin lịch sử theo cấu hình) được gửi tới AI bên ngoài. "
-    "Nội dung đi qua lớp DLP để che hoặc chặn dữ liệu nhạy cảm trước khi gửi."
-)
-CONSENT_NOTICE = (
-    "⚠️ **Tin nhắn chưa được gửi.** Bấm **Đồng ý và gửi** bên dưới "
-    "để lưu lựa chọn cho tài khoản này. " + AI_CONSENT_SCOPE
+    "Nội dung đi qua lớp DLP để che hoặc chặn dữ liệu nhạy cảm trước khi gửi. "
+    "Tắt mục này để thu hồi: lần gửi sau, AI chỉ nhận lịch sử kể từ lúc đó."
 )
 ACTIVITY_PLACEHOLDER = "_Hoạt động bảo mật sẽ hiển thị sau khi đăng nhập._"
 EMAIL_PLACEHOLDER = "_Thông tin email khôi phục sẽ hiển thị sau khi đăng nhập._"
@@ -1852,7 +1868,7 @@ CHAT_FILE_PICKER_HTML = (
     f'<input id="chat-file-input" type="file" accept="{CHAT_FILE_ACCEPT}" '
     f'data-scap-max-bytes="{MAX_CHAT_FILE_UPLOAD_BYTES}">'
     '<span class="scap-chat-file-hint" data-scap-file-label aria-live="polite">'
-    "Hỗ trợ .txt, .md, .csv, .json, .docx, mã nguồn… "
+    "Hỗ trợ .pdf, .docx, .txt, .md, .csv, .json, mã nguồn… "
     f"(tối đa {MAX_CHAT_FILE_UPLOAD_BYTES // (1024 * 1024)} MB)"
     "</span>"
     "</div>"
@@ -2327,16 +2343,10 @@ def build_ui(
                                 elem_id="chat-web-search",
                                 info="Public · Gửi truy vấn tới Google · Có thể tính phí",
                             )
-                            # Thông báo cố định dưới ô nhập, dùng cho consent và DLP.
+                            # Thông báo cố định dưới ô nhập, dùng cho lỗi gửi và DLP.
                             # Không dùng toast vì toast che nội dung hội thoại trên màn hình nhỏ.
                             md_chat_notice = gr.Markdown(
                                 "", visible=False, elem_id="chat-notice"
-                            )
-                            # Chỉ hiện sau khi máy chủ từ chối vì chưa có consent.
-                            # Một cú bấm riêng, ghi rõ tác động, tránh coi thao tác Gửi
-                            # ban đầu là sự đồng ý chia sẻ dữ liệu.
-                            btn_consent_send = gr.Button(
-                                "Đồng ý và gửi", variant="primary", size="sm", visible=False
                             )
                             md_search_answer = gr.Markdown(
                                 "", visible=False, sanitize_html=True,
@@ -2755,7 +2765,6 @@ def build_ui(
             (btn_chat_file_clear, gr.update(visible=False)),
             (cb_web_search, gr.update(value=False)),
             (md_chat_notice, gr.update(value="", visible=False)),
-            (btn_consent_send, gr.update(visible=False)),
             (md_search_answer, gr.update(value="", visible=False)),
             (md_search_suggestions, gr.update(value="", visible=False)),
             (df_cipher, _table_html(CIPHER_HEADERS, [])),
@@ -3374,9 +3383,9 @@ def build_ui(
                 return _api(token, "GET", f"/api/sessions/{session_id}").get("title") or ""
             return ""
 
-        # Thông báo consent/DLP thuộc về lượt gửi trước; giữ lại khi đã sang
+        # Thông báo lỗi/DLP thuộc về lượt gửi trước; giữ lại khi đã sang
         # hội thoại khác sẽ gắn nhầm cảnh báo vào hội thoại đang xem.
-        NOTICE_HIDDEN = (gr.update(value="", visible=False), gr.update(visible=False))
+        NOTICE_HIDDEN = (gr.update(value="", visible=False),)
         SEARCH_HIDDEN = (gr.update(value="", visible=False), gr.update(value="", visible=False))
 
         def pick_session(token, session_id):
@@ -3392,10 +3401,9 @@ def build_ui(
         # Chọn hội thoại là điều hướng, không phải thao tác chờ: nội dung cũ ở
         # lại tới khi nội dung mới về, không phủ lớp "processing" lên khung chat.
         dd_session.input(
-            _guard(pick_session, 6),
+            _guard(pick_session, 5),
             [st_token, dd_session],
-            [chatbot, tb_rename, md_chat_notice, btn_consent_send,
-             md_search_answer, md_search_suggestions],
+            [chatbot, tb_rename, md_chat_notice, md_search_answer, md_search_suggestions],
             show_progress="hidden",
         )
         # Bấm chọn, tạo, xóa, gửi hay đăng nhập đều đổi value của danh sách,
@@ -3424,9 +3432,9 @@ def build_ui(
                     *NOTICE_HIDDEN, *SEARCH_HIDDEN, *paging)
 
         btn_create.click(
-            _guard(create_session, 12),
+            _guard(create_session, 11),
             [st_token, tb_new_title, dd_new_security, dd_new_class],
-            [dd_session, dd_cipher, chatbot, tb_new_title, tb_rename, md_chat_notice, btn_consent_send,
+            [dd_session, dd_cipher, chatbot, tb_new_title, tb_rename, md_chat_notice,
              md_search_answer, md_search_suggestions, *SESSION_PAGE_OUTS],
         )
 
@@ -3450,8 +3458,9 @@ def build_ui(
                                grp_delete_auth, tb_delete_password, tb_delete_code]
         DELETE_VIEW_RESET = (gr.update(value="", visible=False), "",
                              _table_html(CIPHER_HEADERS, []), _table_html(SEARCH_HEADERS, []))
-        DELETE_OUTS = [dd_session, dd_cipher, chatbot, tb_rename, md_chat_notice, btn_consent_send,
-                       md_search_answer, md_search_suggestions, *DELETE_CONFIRM_OUTS,
+        DELETE_VIEW_OUTS = [dd_session, dd_cipher, chatbot, tb_rename, md_chat_notice,
+                            md_search_answer, md_search_suggestions]
+        DELETE_OUTS = [*DELETE_VIEW_OUTS, *DELETE_CONFIRM_OUTS,
                        file_export, tb_msg, df_cipher, df_gsearch, *SESSION_PAGE_OUTS]
 
         def cancel_delete_session():
@@ -3486,7 +3495,7 @@ def build_ui(
         def delete_session(token, session_id, pending_id, password="", code=""):
             if not pending_id or session_id != pending_id:
                 _ui_notice(gr.Warning, "Hội thoại đã thay đổi. Chọn lại hội thoại và xác nhận xóa.")
-                return (*(gr.skip() for _ in range(8)), *DELETE_HIDDEN,
+                return (*(gr.skip() for _ in DELETE_VIEW_OUTS), *DELETE_HIDDEN,
                         *(gr.skip() for _ in range(len(DELETE_VIEW_RESET) + 3)))
             try:
                 try:
@@ -3496,7 +3505,7 @@ def build_ui(
                         raise
                     if not password:
                         return (
-                            *(gr.skip() for _ in range(8)), pending_id, gr.update(visible=True),
+                            *(gr.skip() for _ in DELETE_VIEW_OUTS), pending_id, gr.update(visible=True),
                             "**Cần xác thực lại để xóa vĩnh viễn.**\n\n"
                             "Nhập mật khẩu và mã 2FA (nếu đã bật), rồi bấm xác nhận xóa lần nữa.",
                             gr.update(visible=True), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET) + 3)),
@@ -3507,7 +3516,7 @@ def build_ui(
                 # A persistent error belongs beside this destructive action;
                 # clear credential fields after every attempt, including failures.
                 return (
-                    *(gr.skip() for _ in range(8)), pending_id, gr.update(visible=True),
+                    *(gr.skip() for _ in DELETE_VIEW_OUTS), pending_id, gr.update(visible=True),
                     "⚠️ **Chưa xóa được hội thoại.** " + _safe_markdown_text(_error_text(err)),
                     gr.skip(), "", "", *(gr.skip() for _ in range(len(DELETE_VIEW_RESET) + 3)),
                 )
@@ -3522,7 +3531,7 @@ def build_ui(
                 return (
                     empty, empty, [], "",
                     gr.update(value="Đã xóa hội thoại. Bấm **Làm mới** để tải lại danh sách.", visible=True),
-                    gr.update(visible=False), *SEARCH_HIDDEN, *DELETE_HIDDEN,
+                    *SEARCH_HIDDEN, *DELETE_HIDDEN,
                     *DELETE_VIEW_RESET, {}, "", gr.update(visible=False),
                 )
             return (dd1, dd2, history, title, *NOTICE_HIDDEN, *SEARCH_HIDDEN,
@@ -3635,9 +3644,10 @@ def build_ui(
             if not message and staged_file:
                 message = f"Hãy phân tích và trả lời dựa trên tệp {staged_file.name} vừa tải lên."
             if not message:
-                return (gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False),
+                return (gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.skip(),
                         gr.skip(), gr.skip(), gr.skip())
             created_session = False
+            consent = gr.skip()
             try:
                 if use_web_search and staged_file:
                     raise gr.Error(
@@ -3680,12 +3690,7 @@ def build_ui(
                     payload["file_name"] = staged_file.name
                     # Tài liệu dài: chỉ các đoạn liên quan tới câu hỏi, vừa giới hạn API.
                     payload["file_content"] = select_file_excerpts(staged_file.text, question)
-                sent = _api(
-                    token,
-                    "POST",
-                    f"/api/sessions/{session_id}/messages",
-                    payload,
-                )
+                sent, consent = _post_to_ai(token, f"/api/sessions/{session_id}/messages", payload)
                 _clear_staged_chat_file(token)
             except gr.Error as err:
                 # Keep every refusal beside the composer. A toast disappears
@@ -3703,11 +3708,6 @@ def build_ui(
                             choices=[("🔒  Cuộc hội thoại mới", session_id)], value=session_id
                         )
                         selection = (update, update, gr.skip())
-                # Consent là lựa chọn người dùng, không phải lỗi kỹ thuật. Hiển thị
-                # ngay cạnh ô nhập và giữ nguyên nội dung để họ có thể gửi lại sau.
-                if EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err):
-                    notice = gr.update(value=CONSENT_NOTICE, visible=True)
-                    return (*selection, gr.skip(), notice, gr.update(visible=True), *paging)
                 notice = gr.update(
                     value=(
                         "⚠️ **Chưa nhận được phản hồi.** " + _safe_markdown_text(_error_text(err))
@@ -3715,7 +3715,7 @@ def build_ui(
                     ),
                     visible=True,
                 )
-                return (*selection, gr.skip(), notice, gr.update(visible=False), *paging)
+                return (*selection, gr.skip(), notice, consent, *paging)
             try:
                 dd1, dd2, history, *paging = refresh_sessions(token, session_id)
             except gr.Error as err:
@@ -3735,7 +3735,7 @@ def build_ui(
                         ),
                         visible=True,
                     ),
-                    gr.update(visible=False),
+                    consent,
                     gr.skip(), gr.skip(), gr.skip(),
                 )
             # Nếu DLP đã che dữ liệu nhạy cảm, nói rõ cho người dùng biết đã che
@@ -3752,7 +3752,7 @@ def build_ui(
                 )
             else:
                 banner = gr.update(value="", visible=False)
-            return dd1, dd2, history, "", banner, gr.update(visible=False), *paging
+            return dd1, dd2, history, "", banner, consent, *paging
 
         def send_message(token, session_id, message, confirm_external=False, use_web_search=False):
             if not use_web_search:
@@ -3761,8 +3761,9 @@ def build_ui(
             staged_file = _get_staged_chat_file(token)
             message = (message or "").strip()
             if not message and not staged_file:
-                return (gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN, *SEARCH_HIDDEN,
-                        gr.skip(), gr.skip(), gr.skip())
+                return (gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN, gr.skip(),
+                        *SEARCH_HIDDEN, gr.skip(), gr.skip(), gr.skip())
+            consent = gr.skip()
             try:
                 if staged_file:
                     raise gr.Error(
@@ -3778,7 +3779,7 @@ def build_ui(
                 session_metadata = _api(token, "GET", f"/api/sessions/{session_id}")
                 if session_metadata.get("data_classification") != "public":
                     raise gr.Error("Tra cứu Internet chỉ dùng trong hội thoại Public.")
-                result = _api(token, "POST", f"/api/sessions/{session_id}/web-search", {
+                result, consent = _post_to_ai(token, f"/api/sessions/{session_id}/web-search", {
                     "content": message, "confirm_external_ai": bool(confirm_external),
                 })
                 # Revalidate at the rendering boundary. The provider widget is
@@ -3786,31 +3787,33 @@ def build_ui(
                 marker = _search_widget_marker(result.get("search_suggestions_html"))
                 answer = _safe_chat_text(result["content"])
             except gr.Error as err:
-                needs_consent = EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err)
                 notice = gr.update(
-                    value=CONSENT_NOTICE if needs_consent else (
+                    value=(
                         "⚠️ **Chưa nhận được kết quả tra cứu.** "
                         + _safe_markdown_text(_error_text(err))
                         + "\n\nNội dung bạn nhập vẫn được giữ trong ô tin nhắn."
                     ), visible=True,
                 )
-                return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), notice,
-                        gr.update(visible=needs_consent), *SEARCH_HIDDEN,
-                        gr.skip(), gr.skip(), gr.skip())
+                return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), notice, consent,
+                        *SEARCH_HIDDEN, gr.skip(), gr.skip(), gr.skip())
             return (
-                gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN,
+                gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN, consent,
                 gr.update(value=answer, visible=True),
                 gr.update(value=marker, visible=bool(marker)),
                 gr.skip(), gr.skip(), gr.skip(),
             )
 
-        SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_chat_notice, btn_consent_send,
+        # chk_consent: lượt gửi đầu tiên tự lưu consent thì ô trong tab Tài khoản
+        # phải bật theo, nếu không người dùng thấy "chưa đồng ý" dù đã gửi được.
+        SEND_OUTS = [dd_session, dd_cipher, chatbot, tb_msg, md_chat_notice, chk_consent,
                      md_search_answer, md_search_suggestions, *SESSION_PAGE_OUTS]
         def submit_chat_message(token, session_id, message, use_web_search=False):
             # Bấm Gửi chính là xác nhận gửi tin nhắn này tới AI bên ngoài (dòng
             # chế độ hội thoại nói rõ điều đó), nên hội thoại Internal/Confidential
-            # không còn hỏi lại từng tin. API vẫn đòi confirm_external_ai cho
-            # mọi client; DLP vẫn che dữ liệu nhạy cảm và chặn Highly confidential.
+            # không còn hỏi lại từng tin, và tài khoản chưa đồng ý cũng không phải
+            # xác nhận thêm lần nào (xem _post_to_ai). API vẫn đòi consent và
+            # confirm_external_ai với mọi client; DLP vẫn che dữ liệu nhạy cảm và
+            # chặn Highly confidential.
             return send_message(token, session_id, message, True, use_web_search)
 
         # One event covers Enter and tapping Send. Separate events could both
@@ -3829,36 +3832,6 @@ def build_ui(
             show_progress="hidden",
         )
 
-        def consent_and_resend(token, session_id, message, use_web_search=False):
-            """Grant the one-time account consent, then send the still-visible message.
-
-            The consent is stored for the account, so this button appears only
-            once. As with the Send button, sending is the per-message confirmation.
-            """
-            if not (message or "").strip() and not _get_staged_chat_file(token):
-                return (
-                    gr.skip(),
-                    gr.skip(),
-                    gr.skip(),
-                    "",
-                    gr.update(value="", visible=False),
-                    gr.update(visible=False),
-                    *SEARCH_HIDDEN,
-                    gr.skip(), gr.skip(), gr.skip(),
-                )
-            if not _api(token, "GET", "/api/auth/me").get("ai_data_consent"):
-                _api(token, "PATCH", "/api/auth/ai-consent", {"ai_data_consent": True})
-            return send_message(token, session_id, message, True, use_web_search)
-
-        btn_consent_send.click(
-            _guard(consent_and_resend, len(SEND_OUTS)), [st_token, dd_session, tb_msg, cb_web_search], SEND_OUTS
-        ).then(
-            _attachment_banner_updates,
-            [st_token],
-            [md_chat_attachment, btn_chat_file_clear],
-            api_name=False,
-            show_progress="hidden",
-        )
         cb_web_search.input(lambda _selected: SEARCH_HIDDEN, [cb_web_search],
                             [md_search_answer, md_search_suggestions], api_name=False)
 

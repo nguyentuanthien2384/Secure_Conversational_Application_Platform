@@ -410,7 +410,6 @@ def test_switching_conversation_programmatically_clears_notices_and_rename(runti
                or (runtime_demo.blocks[item].value if isinstance(runtime_demo.blocks[item].value, str) else item): value
                for item, value in zip(dependency["outputs"], result, strict=True)}
     assert outputs["chat-notice"] == gr.update(value="", visible=False)
-    assert outputs["Đồng ý và gửi"] == gr.update(visible=False)
     assert outputs["Đổi tên"] == expected_title
 
 
@@ -778,17 +777,20 @@ def test_dashboard_uses_metric_cards_for_report_ready_security_overview():
     assert "Trung tâm giám sát an ninh" in source
 
 
-def test_ai_consent_notice_is_inline_and_can_retry_the_composer():
-    """Consent là lựa chọn riêng tư, không được thành toast che hội thoại."""
+def test_send_records_ai_consent_without_a_second_confirmation(runtime_demo):
+    """Bấm Gửi là đồng ý; không còn nút "Đồng ý và gửi" chặn tin nhắn đầu tiên."""
     source = UI_SOURCE.read_text(encoding="utf-8")
     assert "md_chat_notice = gr.Markdown" in source
-    assert "btn_consent_send = gr.Button(" in source
-    assert '"Đồng ý và gửi"' in source
-    assert "EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE in str(err)" in source
-    assert "Bấm **Đồng ý và gửi** bên dưới" in source
-    assert "def consent_and_resend(token, session_id, message, use_web_search=False):" in source
+    assert "EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE not in str(err)" in source
     assert '"/api/auth/ai-consent", {"ai_data_consent": True}' in source
     assert 'gr.Warning("Đã che dữ liệu nhạy cảm' not in source
+    assert not any(isinstance(component, gr.Button) and component.value == "Đồng ý và gửi"
+                   for component in runtime_demo.blocks.values())
+    # Lượt gửi tự lưu consent cập nhật luôn ô đồng ý ở tab Tài khoản.
+    consent = next(component for component in runtime_demo.blocks.values()
+                   if isinstance(component, gr.Checkbox) and "AI bên ngoài" in (component.label or ""))
+    _send, dependency = _button_event(runtime_demo, "Gửi")
+    assert dependency["outputs"][5] == consent._id
 
 
 def test_send_button_and_enter_share_one_pending_event(runtime_demo):
@@ -856,16 +858,13 @@ def test_web_search_is_an_explicit_default_off_choice_with_cost_and_privacy_info
         assert toggle.value is False and toggle.interactive is enabled
         assert toggle.visible is enabled
         send, dependency = _button_event(demo, "Gửi")
-        consent, consent_dependency = _button_event(demo, "Đồng ý và gửi")
         assert dependency["inputs"][-1] == toggle._id
-        assert consent_dependency["inputs"][-1] == toggle._id
-        assert len(send.inputs) == len(consent.inputs) == 4
+        assert len(send.inputs) == 4
         # Gradio follows __wrapped__ when injecting arguments. A wrapper that
         # advertises send_message's five parameters would break real queue runs.
         import inspect
 
         assert len(inspect.signature(send.fn).parameters) == len(send.inputs)
-        assert len(inspect.signature(consent.fn).parameters) == len(consent.inputs)
     assert "Google" in toggle.info and "phí" in toggle.info and "Public" in toggle.info
 
 
@@ -921,18 +920,26 @@ def test_disabled_search_cannot_be_enabled_by_forging_the_ui_value(runtime_demo,
     assert "chưa bật tra cứu Internet" in result[4]["value"]
 
 
-def test_consent_retry_preserves_the_search_choice(search_demo, monkeypatch):
+@pytest.mark.parametrize("use_web_search", [False, True])
+def test_first_send_records_consent_and_keeps_the_search_choice(
+    search_demo, monkeypatch, use_web_search,
+):
     from src.app import gradio_ui
 
     api = _SearchApi(consent=False)
     monkeypatch.setattr(gradio_ui, "_api", api)
     send, _dependency = _button_event(search_demo, "Gửi")
-    consent, _consent_dependency = _button_event(search_demo, "Đồng ý và gửi")
-    first = send.fn("token", "public-session", "Tin mới", True)
-    assert first[4]["value"] == gradio_ui.CONSENT_NOTICE and not api.sent
-    result = consent.fn("token", "public-session", "Tin mới", True)
-    assert api.sent == [{"content": "Tin mới", "confirm_external_ai": True}]
-    assert result[3] == ""
+    result = send.fn("token", "public-session", "Tin mới", use_web_search)
+    body = {"content": "Tin mới", "confirm_external_ai": True}
+    if not use_web_search:
+        body["use_web_search"] = False
+    assert api.consent is True and api.sent == [body]
+    assert ("PATCH", "/api/auth/ai-consent", {"ai_data_consent": True}) in api.calls
+    endpoint = "/web-search" if use_web_search else "/messages"
+    assert sum(method == "POST" and path.endswith(endpoint)
+               for method, path, _body in api.calls) == 2  # refused once, then sent
+    assert result[3] == "" and result[5] == gr.update(value=True)
+    assert result[4] == gr.update(value="", visible=False)
 
 
 def test_logout_clears_the_previous_search_choice(search_demo, monkeypatch):
@@ -974,7 +981,7 @@ def test_failed_send_keeps_composer_and_displays_persistent_error(
     assert result[3] == gr.skip(), "A refused send must not clear typed text"
     assert result[4]["visible"] is True
     assert "AI tạm thời không khả dụng" in result[4]["value"]
-    assert result[5] == gr.update(visible=False)
+    assert result[5] == gr.skip()  # consent unchanged
     if first_session is None:
         assert result[0]["value"] == result[1]["value"] == "new"
         callback.fn("token", result[0]["value"], "câu hỏi vẫn còn trong ô nhập")

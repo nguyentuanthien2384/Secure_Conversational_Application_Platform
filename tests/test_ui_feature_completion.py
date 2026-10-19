@@ -323,14 +323,15 @@ def test_new_sensitive_state_is_reset_on_logout(demo, api):
         assert updates[component._id] == ""
 
 
-def test_external_ai_consent_discloses_history_scope_before_both_consent_paths(demo):
+def test_external_ai_consent_discloses_history_scope_and_that_send_consents(demo):
     consent = next(item for item in demo.blocks.values()
                    if isinstance(item, gr.Checkbox) and item.info == gradio_ui.AI_CONSENT_SCOPE)
     assert "lịch sử" in consent.label
-    for notice in (consent.info, gradio_ui.CONSENT_NOTICE):
-        assert "tin nhắn hiện tại" in notice
-        assert "mặc định 16" in notice and "tối đa 40 tin lịch sử" in notice
-        assert "AI bên ngoài" in notice and "DLP" in notice
+    notice = consent.info
+    assert "Bấm Gửi" in notice and "đồng ý" in notice and "thu hồi" in notice
+    assert "tin nhắn hiện tại" in notice
+    assert "mặc định 16" in notice and "tối đa 40 tin lịch sử" in notice
+    assert "AI bên ngoài" in notice and "DLP" in notice
 
 
 def test_private_e2ee_ui_points_to_independent_clients_without_fetching_plaintext(api):

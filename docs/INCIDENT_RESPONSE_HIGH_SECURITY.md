@@ -35,8 +35,9 @@ rewrap. Kiểm thử restore trước khi hủy key version cũ.
 ## DLP/AI egress sai chính sách
 
 Tắt connector/provider hoặc egress network, giữ request ID và category audit
-không chứa nội dung. Thu hồi consent version bằng cách tăng
-`AI_CONSENT_VERSION`; đánh giá log vendor theo DPA/retention, thông báo người dùng
+không chứa nội dung. Tăng `AI_CONSENT_VERSION` để vô hiệu consent cũ và cắt
+lịch sử gửi AI về thời điểm đồng ý mới; giao diện web ghi lại consent ở lần bấm
+Gửi kế tiếp nên bước này không thay cho việc tắt provider/egress; đánh giá log vendor theo DPA/retention, thông báo người dùng
 và cơ quan liên quan khi cần. Không chép prompt nhạy cảm vào ticket/SIEM.
 
 ## Chuỗi audit/checkpoint gãy

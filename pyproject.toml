@@ -18,6 +18,9 @@ dependencies = [
     "psycopg[binary]>=3.2.9",
     # 2.15.0 fixes PYSEC-2026-4140..4152 (signature/JWKS parsing); keep pip-audit green.
     "PyJWT>=2.15.0",
+    # Trích chữ từ PDF đính kèm hội thoại; thuần Python. Giữ sàn ở bản mới vì
+    # các bản 6.x trước đó vá nhiều lỗi DoS khi phân tích PDF độc hại.
+    "pypdf>=6.21.1,<7.0.0",
     "python-dotenv>=1.1.1",
     "qrcode[pil]>=7.4.2",
     "redis>=5.0.0,<7.0.0",

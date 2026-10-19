@@ -1,5 +1,7 @@
 """Tài liệu đính kèm hội thoại: tải lên tối đa 10 MiB, trích văn bản, chọn đoạn gửi AI.
 
+Nhận tệp văn bản/mã nguồn (UTF-8 hoặc UTF-16 có BOM), .docx và .pdf có lớp chữ.
+
 Trình duyệt gửi nhị phân thô tới một route riêng (``CHAT_FILE_UPLOAD_PATH``)
 thay vì nhét base64 vào hàng đợi Gradio, nên chỉ route này được vượt giới hạn
 body 1 MiB chung (request_limits.py và Caddyfile). Văn bản trích ra chỉ nằm
@@ -26,6 +28,7 @@ import codecs
 import hashlib
 import html
 import io
+import logging
 import math
 import re
 import secrets
@@ -37,6 +40,8 @@ import zlib
 from collections import Counter, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+
+from pypdf import PasswordType, PdfReader
 
 from src.app.schemas import (
     ALLOWED_CHAT_FILE_EXTENSIONS,
@@ -51,6 +56,14 @@ MAX_CHAT_FILE_UPLOAD_BYTES = 10 * 1024 * 1024
 # Trần này chặn zip bomb mà vẫn đủ cho tài liệu hàng nghìn trang.
 MAX_DOCX_XML_BYTES = 20 * 1024 * 1024
 MAX_DOCX_MEMBERS = 10_000
+# PDF: pypdf đã tự giới hạn dữ liệu giải nén của mỗi luồng (75 MB). Thêm trần
+# số trang, tổng số chữ và thời gian để một tệp dựng sẵn không chiếm lâu một
+# trong hai luồng phân tích dùng chung (max_parallel của ChatFileStore). Thời
+# gian phải dưới response_header_timeout 30s của Caddy (tính từ lúc nhận xong
+# body); PDF chữ dày mất khoảng 25 ms/trang, tức vài trăm trang trong 20 giây.
+MAX_PDF_PAGES = 2_000
+MAX_PDF_TEXT_CHARS = 5_000_000
+PDF_EXTRACT_SECONDS = 20.0
 UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")
 # Tên tệp đi trong header dạng base64url(UTF-8): header chỉ chứa ASCII và
 # tên tiếng Việt không bị proxy hay IDS hiểu sai.
@@ -63,13 +76,16 @@ _MAX_MB = MAX_CHAT_FILE_UPLOAD_BYTES // (1024 * 1024)
 _BIDI_RE = re.compile("[" + "".join(sorted(UNSAFE_BIDI_CONTROLS)) + "]")
 # Sau khi chuẩn hóa xuống dòng, chỉ \n và \t là ký tự điều khiển hợp lệ.
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# Cảnh báo của pypdf về tệp hỏng nhẹ là chuyện thường với tệp người dùng tải
+# lên; không để chúng làm ngập log máy chủ.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 ERROR_MESSAGES: dict[str, str] = {
     "too_large": f"Tệp vượt quá giới hạn {_MAX_MB} MB. Hãy chọn tệp nhỏ hơn.",
     "empty": "Tệp đính kèm không có nội dung văn bản để phân tích.",
     "unsupported_type": (
         "Định dạng tệp không được hỗ trợ. Hãy chọn tệp văn bản "
-        "(.txt, .md, .csv, .json, mã nguồn…) hoặc .docx."
+        "(.txt, .md, .csv, .json, mã nguồn…), .docx hoặc .pdf."
     ),
     "invalid_name": (
         f"Tên tệp phải từ 1 đến {MAX_CHAT_FILE_NAME_CHARS} ký tự, "
@@ -78,11 +94,21 @@ ERROR_MESSAGES: dict[str, str] = {
     "not_utf8": "Tệp không phải văn bản UTF-8 hợp lệ. Hãy lưu lại tệp với mã hóa UTF-8.",
     "binary": (
         "Tệp chứa ký tự nhị phân hoặc ký tự điều khiển không hợp lệ. "
-        "Hãy chọn tệp văn bản hoặc .docx."
+        "Hãy chọn tệp văn bản, .docx hoặc .pdf."
     ),
     "bidi": "Nội dung tệp chứa ký tự điều hướng hai chiều (Bidi) không an toàn.",
     "docx_invalid": "Không đọc được tệp .docx. Hãy kiểm tra lại định dạng tệp.",
     "docx_too_large": "Nội dung giải nén của tệp .docx vượt quá giới hạn an toàn.",
+    "pdf_invalid": "Không đọc được tệp PDF. Tệp có thể bị hỏng hoặc không đúng định dạng.",
+    "pdf_encrypted": "Tệp PDF được đặt mật khẩu. Hãy gỡ mật khẩu rồi đính kèm lại.",
+    "pdf_no_text": (
+        "Tệp PDF không có lớp chữ (thường là bản scan hoặc ảnh chụp) và hệ thống chưa "
+        "hỗ trợ nhận dạng chữ (OCR). Hãy dùng PDF có chữ chọn được, hoặc chuyển sang .docx/.txt."
+    ),
+    "pdf_too_large": (
+        "Tệp PDF quá nhiều trang hoặc quá phức tạp để trích xuất "
+        f"(tối đa {MAX_PDF_PAGES} trang, {PDF_EXTRACT_SECONDS:.0f} giây xử lý)."
+    ),
     "read_failed": "Trình duyệt không đọc được tệp đã chọn. Vui lòng thử lại.",
     "upload_failed": "Không tải được tệp lên máy chủ. Kiểm tra kết nối rồi thử lại.",
     "session": (
@@ -234,6 +260,59 @@ def extract_docx_text(raw: bytes | bytearray) -> str:
     return "\n".join(paragraphs)
 
 
+def _clean_pdf_page(text: str) -> str:
+    """Chữ trích từ PDF hay lẫn ký tự điều khiển/Bidi do bảng mã của font.
+
+    Người dùng không sửa được bên trong PDF như với tệp văn bản, nên bỏ các ký
+    tự đó thay vì từ chối cả tệp; kết quả vẫn đi qua ``normalize_text``.
+    """
+    text = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")
+    text = _CONTROL_RE.sub(" ", _BIDI_RE.sub("", text.replace("\f", "\n")))
+    lines = [line.rstrip() for line in text.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def extract_pdf_text(
+    raw: bytes | bytearray, *, clock: Callable[[], float] = time.monotonic
+) -> str:
+    """Trích lớp chữ từng trang, đánh dấu ``[Trang N]`` để AI trích dẫn đúng trang."""
+    # Chuẩn PDF cho phép rác trước header, nhưng chỉ trong 1024 byte đầu.
+    if b"%PDF-" not in bytes(raw[:1024]):
+        raise ChatFileError("pdf_invalid")
+    deadline = clock() + PDF_EXTRACT_SECONDS
+    pages: list[str] = []
+    total = 0
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        if reader.is_encrypted:
+            # PDF chỉ đặt mật khẩu chủ sở hữu (chặn in/sửa) mở được bằng mật khẩu rỗng.
+            try:
+                opened = reader.decrypt("")
+            except Exception as exc:
+                raise ChatFileError("pdf_encrypted") from exc
+            if opened == PasswordType.NOT_DECRYPTED:
+                raise ChatFileError("pdf_encrypted")
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise ChatFileError("pdf_too_large")
+        for number, page in enumerate(reader.pages, start=1):
+            if clock() > deadline:
+                raise ChatFileError("pdf_too_large")
+            text = _clean_pdf_page(page.extract_text() or "")
+            if not text:
+                continue
+            total += len(text)
+            if total > MAX_PDF_TEXT_CHARS:
+                raise ChatFileError("pdf_too_large")
+            pages.append(f"[Trang {number}]\n{text}")
+    except ChatFileError:
+        raise
+    except Exception as exc:
+        raise ChatFileError("pdf_invalid") from exc
+    if not pages:
+        raise ChatFileError("pdf_no_text")
+    return "\n\n".join(pages)
+
+
 def _decode_text(raw: bytes | bytearray) -> str:
     try:
         if raw.startswith(codecs.BOM_UTF8):
@@ -265,7 +344,13 @@ def parse_chat_file(raw_name: object, raw: bytes | bytearray) -> ChatFile:
         raise ChatFileError("too_large")
     if not raw:
         raise ChatFileError("empty")
-    text = extract_docx_text(raw) if name.lower().endswith(".docx") else _decode_text(raw)
+    lowered = name.lower()
+    if lowered.endswith(".docx"):
+        text = extract_docx_text(raw)
+    elif lowered.endswith(".pdf"):
+        text = extract_pdf_text(raw)
+    else:
+        text = _decode_text(raw)
     return ChatFile.from_text(name, normalize_text(text), size=len(raw))
 
 

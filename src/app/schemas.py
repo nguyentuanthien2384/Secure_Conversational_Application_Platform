@@ -488,7 +488,7 @@ ALLOWED_CHAT_FILE_EXTENSIONS: tuple[str, ...] = (
     ".xml", ".yaml", ".yml", ".log", ".ini", ".toml", ".cfg", ".conf",
     ".sql", ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".htm",
     ".css", ".sh", ".bat", ".ps1", ".c", ".cpp", ".h", ".hpp",
-    ".java", ".go", ".rs", ".rb", ".php", ".docx",
+    ".java", ".go", ".rs", ".rb", ".php", ".docx", ".pdf",
 )
 
 
@@ -533,7 +533,7 @@ class MessageSend(BaseModel):
         )
         if matched_ext is None or len(cleaned) <= len(matched_ext):
             raise ValueError(
-                "Định dạng tệp không được hỗ trợ. Hãy chọn tệp văn bản, dữ liệu, mã nguồn hoặc .docx."
+                "Định dạng tệp không được hỗ trợ. Hãy chọn tệp văn bản, dữ liệu, mã nguồn, .docx hoặc .pdf."
             )
         return cleaned
 

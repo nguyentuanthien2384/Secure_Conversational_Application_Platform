@@ -46,7 +46,7 @@ Từ đăng nhập, phân quyền và kiểm soát dữ liệu đến mã hóa, 
 **SCAP** là đồ án môn **Bảo mật Ứng dụng và Hệ thống**, viết bằng FastAPI, Gradio 6 và SQLAlchemy. Ứng dụng đặt các kiểm soát an ninh vào cùng một luồng sử dụng: đăng nhập → tạo hội thoại → kiểm tra dữ liệu → gọi AI → mã hóa lưu trữ → ghi nhật ký kiểm toán.
 
 - **Trò chuyện:** nhiều hội thoại; đổi tên, xóa, tìm kiếm theo quyền sở hữu, xuất JSON và xem bản mã của từng tin nhắn.
-- **Đính kèm tài liệu:** tệp văn bản, mã nguồn hoặc `.docx` tối đa **10 MB**. Tài liệu dài được chọn đoạn liên quan tới câu hỏi trước khi gửi AI ([chi tiết](#dinh-kem)).
+- **Đính kèm tài liệu:** tệp văn bản, mã nguồn, `.docx` hoặc `.pdf` tối đa **10 MB**. Tài liệu dài được chọn đoạn liên quan tới câu hỏi trước khi gửi AI ([chi tiết](#dinh-kem)).
 - **Kiểm soát AI:** Claude, Gemini hoặc AI demo; người dùng phải đồng ý trước khi gửi dữ liệu ra ngoài. DLP cho phép, che, yêu cầu xác nhận, chặn hoặc chỉ xử lý local. Tra cứu Internet có dẫn nguồn (Gemini) chỉ dùng cho hội thoại Public và mặc định tắt.
 - **Bảo vệ tài khoản:** Argon2id; JWT gắn phiên phía máy chủ; TOTP và recovery code; passkey WebAuthn cho đăng nhập và xác thực lại; email khôi phục; smart lockout; quản lý thiết bị.
 - **Cảnh báo tài khoản:** Web Push, xác minh số điện thoại qua SMS, phát hiện di chuyển bất thường bằng GeoIP local. Demo dùng outbox thay cho nhà cung cấp thật.
@@ -106,7 +106,7 @@ Launcher còn nạp 8 tài khoản `lab.*` cùng hội thoại và cảnh báo m
 1. Đăng nhập `demo.user`, chọn hội thoại có sẵn hoặc bấm **+ Hội thoại mới**.
 2. Gửi một câu hỏi; phản hồi có nhãn **DEMO AI** khi không dùng provider thật.
 3. Gửi một email mẫu để thấy DLP che dữ liệu, rồi mở **Dữ liệu mã hóa** xem ciphertext, nonce, key version.
-4. Đính kèm một tài liệu `.docx` hoặc `.csv` và hỏi về nội dung của nó.
+4. Đính kèm một tài liệu `.pdf`, `.docx` hoặc `.csv` và hỏi về nội dung của nó.
 5. Thử tạo cặp khóa và mã hóa văn bản/tệp bằng [công cụ trình duyệt](#ma-hoa-trinh-duyet).
 6. Vào **Tài khoản** để xem thiết bị, hoạt động bảo mật, bật TOTP hoặc passkey.
 7. Đăng nhập `demo.mod` / `demo.boss` để xem audit và cảnh báo.
@@ -127,14 +127,14 @@ Giao diện tiếng Việt, có chế độ sáng/tối và dùng được trên
 - **Tài khoản:** mật khẩu, TOTP, đồng thuận AI, thiết bị, email khôi phục, passkey, hoạt động bảo mật.
 - **Quản trị** (admin), **Nhật ký kiểm toán** và **Bảo mật** (moderator/admin): thống kê, dashboard khả dụng, quản lý tài khoản, IDS, xác minh chuỗi audit, gỡ chặn nguồn.
 
-Thông báo consent/DLP hiện ngay dưới ô nhập. Phản hồi AI hiển thị dạng văn bản, không thực thi HTML hay tải nội dung từ đường dẫn AI trả về. Mọi quyền ở giao diện được kiểm tra lại tại API; admin cũng chỉ đọc được hội thoại của chính mình.
+Bấm **Gửi** được xem là đồng ý gửi tin nhắn tới AI bên ngoài: lần gửi đầu tiên (hoặc sau khi đổi `AI_CONSENT_VERSION`) tự lưu consent cho tài khoản, có ghi audit, không cần bấm xác nhận thêm. Tắt ô đồng ý trong tab **Tài khoản** để thu hồi; lần gửi sau, AI chỉ nhận lịch sử kể từ lúc đó. Thông báo lỗi/DLP hiện ngay dưới ô nhập. Phản hồi AI hiển thị dạng văn bản, không thực thi HTML hay tải nội dung từ đường dẫn AI trả về. Mọi quyền ở giao diện được kiểm tra lại tại API; admin cũng chỉ đọc được hội thoại của chính mình.
 
 <a id="dinh-kem"></a>
 ## Đính kèm tài liệu trong chat
 
 Bấm **📎 Đính kèm tệp tài liệu** dưới ô nhập, chọn tệp, rồi đặt câu hỏi (hoặc bấm **Gửi** ngay để yêu cầu phân tích tệp).
 
-- **Định dạng:** văn bản và dữ liệu (`.txt .md .csv .tsv .json .jsonl .xml .yaml .yml .log .ini .toml .cfg .conf .sql .html .css`), mã nguồn (`.py .js .ts .tsx .jsx .sh .bat .ps1 .c .cpp .h .hpp .java .go .rs .rb .php`) và Word `.docx`. Tệp văn bản phải là UTF-8 hoặc UTF-16 có BOM. Chưa hỗ trợ PDF.
+- **Định dạng:** văn bản và dữ liệu (`.txt .md .csv .tsv .json .jsonl .xml .yaml .yml .log .ini .toml .cfg .conf .sql .html .css`), mã nguồn (`.py .js .ts .tsx .jsx .sh .bat .ps1 .c .cpp .h .hpp .java .go .rs .rb .php`) Word `.docx` và `.pdf`. Tệp văn bản phải là UTF-8 hoặc UTF-16 có BOM. PDF phải có lớp chữ (chọn/copy được chữ): bản scan/ảnh chụp bị từ chối vì chưa có OCR, PDF đặt mật khẩu mở tệp cũng bị từ chối (PDF chỉ chặn in/sửa vẫn đọc được). Mỗi trang được đánh dấu `[Trang N]` để AI trích dẫn đúng trang.
 - **Dung lượng:** tối đa **10 MB** mỗi tệp. Trình duyệt hiện tiến độ tải lên.
 - **Tài liệu dài:** mỗi tin nhắn gửi AI tối đa 30.000 ký tự từ tài liệu. Tài liệu dài hơn không bị cắt cụt; hệ thống chọn các đoạn liên quan nhất tới câu hỏi (xếp hạng BM25, khớp cả khi gõ không dấu) và luôn giữ đoạn mở đầu. Để trống câu hỏi thì lấy các đoạn rải đều toàn tài liệu. Cả banner lẫn tin nhắn đều ghi rõ đó là trích đoạn, nên hãy hỏi cụ thể (tên mục, từ khóa, số liệu).
 - **Sau khi gửi:** tệp được gỡ khỏi ô soạn tin; phần nội dung đã gửi nằm trong tin nhắn và được mã hóa lưu trữ như mọi tin nhắn. Muốn hỏi phần khác của một tài liệu dài thì đính kèm lại.
@@ -142,7 +142,7 @@ Bấm **📎 Đính kèm tệp tài liệu** dưới ô nhập, chọn tệp, r�
 Đường đi của tệp:
 
 1. Trình duyệt gửi byte gốc tới `POST /api/ui-session/chat-file`, xác thực bằng cookie phiên HttpOnly và kiểm tra cùng origin.
-2. Máy chủ kiểm tra tên, định dạng, dung lượng, hạn mức (20 tệp/5 phút mỗi phiên, 2 tệp xử lý đồng thời) rồi trích văn bản trong bộ nhớ. `.docx` được đọc mà không mở thực thể XML và có trần giải nén chống zip bomb. Không có gì được ghi ra đĩa.
+2. Máy chủ kiểm tra tên, định dạng, dung lượng, hạn mức (20 tệp/5 phút mỗi phiên, 2 tệp xử lý đồng thời) rồi trích văn bản trong bộ nhớ. `.docx` được đọc mà không mở thực thể XML và có trần giải nén chống zip bomb. `.pdf` được đọc bằng `pypdf` (thuần Python, có trần giải nén mỗi luồng) với trần 2.000 trang, 5 triệu ký tự và 20 giây xử lý. Không có gì được ghi ra đĩa.
 3. Máy chủ trả một mã dùng một lần; chỉ tab có đúng phiên đăng nhập đã chọn tệp mới nhận được nó. Tệp chưa nhận hết hạn sau 10 phút, tệp đã gắn sau 1 giờ.
 4. Khi gửi, nội dung đi qua consent, DLP và audit như tin nhắn thường. Tra cứu Internet không nhận tệp đính kèm.
 

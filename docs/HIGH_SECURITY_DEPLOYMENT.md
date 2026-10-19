@@ -332,8 +332,10 @@ khác trước Caddy, cấu hình health check tương đương trên lớp đó
 
 ## DLP và AI
 
-Consent có timestamp và policy version; đổi `AI_CONSENT_VERSION` buộc người dùng
-đồng ý lại. Chỉ tối đa `AI_HISTORY_MESSAGES` message sau thời điểm consent được
+Consent có timestamp và policy version; đổi `AI_CONSENT_VERSION` vô hiệu consent
+cũ. Giao diện web coi thao tác bấm **Gửi** là đồng ý nên ghi consent theo version
+mới (có audit `privacy.ai_consent`) ngay ở lần gửi kế tiếp; client API khác vẫn
+phải tự gọi `PATCH /api/auth/ai-consent`. Chỉ tối đa `AI_HISTORY_MESSAGES` message sau thời điểm consent được
 giải mã làm context: mặc định 16, cấu hình 2–40. Chính sách mặc định `2026-10`
 cập nhật phạm vi này; deployment đặt policy version riêng phải đổi version khi
 thay đổi thông báo/phạm vi dữ liệu được phép gửi.
@@ -346,7 +348,8 @@ bộ. Audit chỉ ghi category/count, không ghi mẫu dữ liệu.
 
 API đòi `confirm_external_ai=true` cho mỗi tin nhắn internal/confidential. Giao
 diện web coi thao tác bấm **Gửi** là xác nhận đó (dòng chế độ hội thoại nói rõ),
-nên không hỏi lại từng tin; consent của tài khoản vẫn chỉ hỏi một lần.
+nên không hỏi lại từng tin; consent của tài khoản cũng được ghi ở lần bấm Gửi
+đầu tiên, không có bước xác nhận riêng.
 - highly confidential: block egress;
 - e2ee private: local-only phía client, máy chủ không gọi provider.
 

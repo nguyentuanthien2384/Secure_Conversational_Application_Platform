@@ -190,7 +190,8 @@
   const DEFAULT_CHAT_FILE_MAX_BYTES = 10 * 1024 * 1024;
   const CHAT_FILE_ERRORS = new Set([
     "too_large", "empty", "unsupported_type", "invalid_name", "not_utf8", "binary",
-    "bidi", "docx_invalid", "docx_too_large", "session", "busy", "rate_limited",
+    "bidi", "docx_invalid", "docx_too_large", "pdf_invalid", "pdf_encrypted", "pdf_no_text",
+    "pdf_too_large", "session", "busy", "rate_limited",
     "timeout",
   ]);
   let chatFileBusy = false;
