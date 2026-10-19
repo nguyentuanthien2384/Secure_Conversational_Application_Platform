@@ -32,6 +32,11 @@ from src.app.account_security import DEVICE_COOKIE_NAME, DEVICE_TOKEN_HEADER
 from src.app.audit import sign_ui_client_context
 from src.app.crypto_workbench_ui import WORKBENCH_CSS, WORKBENCH_HTML
 from src.app.gradio_capacity import install_gradio_capacity
+from src.app.schemas import (
+    ALLOWED_CHAT_FILE_EXTENSIONS,
+    MAX_CHAT_FILE_CONTENT_CHARS,
+    MAX_CHAT_FILE_NAME_CHARS,
+)
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
 from src.app.ui_session import COOKIE_NAME, BrowserSessionStore, UISessionCapacityError
 from src.core.ai_core.gemini_ai import validate_search_suggestions_html
@@ -59,6 +64,7 @@ SESSION_TICK_SECONDS = 10
 # Ngưỡng nhắc trước khi phiên hết hạn (giây).
 WARN_BEFORE_EXPIRY = 120
 MAX_UI_SEARCH_ROWS = 500
+MAX_CHAT_FILE_BYTES = 256 * 1024
 
 # Vùng lịch sử co theo chiều cao màn hình để ô soạn và nút Gửi luôn ở gần nội
 # dung. Giới hạn dưới vẫn đủ đọc hội thoại; giới hạn trên tránh khoảng trắng lớn
@@ -132,6 +138,7 @@ footer { display: none !important; }
 #btn-passkey-login-done, #btn-passkey-register-done,
 #btn-passkey-step-up-done { display: none !important; }
 #security-push-bridge, #security-push-result, #btn-security-push-done { display: none !important; }
+#chat-file-payload, #btn-chat-file-stage { display: none !important; }
 #scap-session-warning { padding: 12px; color: var(--scap-warn-fg); background: var(--scap-warn-bg); }
 
 /* ── Khung ngoài: một workspace full-width duy nhất cho mọi tab ─────────
@@ -617,6 +624,32 @@ footer { display: none !important; }
 #chat-composer { align-items: end; }
 #chat-composer textarea { font-size: 16px !important; line-height: 1.6; }
 #chat-composer button { min-height: 46px; }
+#chat-file-row { align-items: center; gap: 10px; margin-top: 6px; }
+.scap-chat-file-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+}
+.scap-chat-file-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 13px; border-radius: 8px;
+  border: 1px solid var(--scap-ok-bd);
+  background: var(--scap-ok-bg); color: var(--scap-ok-fg);
+  font-size: 14px; font-weight: 600; cursor: pointer;
+  transition: filter .15s ease;
+}
+.scap-chat-file-btn:hover { filter: brightness(0.96); }
+#chat-file-input {
+  position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
+}
+.scap-chat-file-hint {
+  font-size: 13px; color: var(--scap-muted);
+}
+#chat-attachment-status {
+  border-radius: 8px; padding: 10px 14px; margin-top: 6px;
+  border: 1px solid var(--scap-ok-bd);
+  border-left: 3px solid var(--scap-ok-bd);
+  background: var(--scap-ok-bg);
+}
+#chat-attachment-status p { margin: 0; font-size: 14.5px; color: var(--scap-ok-fg); }
 .mono-df { max-width: 100%; min-width: 0 !important; }
 
 /* ── Khối trạng thái ───────────────────────────────────────────────────── */
@@ -848,6 +881,171 @@ def _take_session_ended(token: str) -> bool:
         return True
 
 
+_STAGED_CHAT_FILES: dict[str, dict[str, str]] = {}
+_STAGED_CHAT_FILES_LOCK = threading.Lock()
+_STAGED_CHAT_FILES_MAX = 512
+
+
+def _token_keys(token: str | None) -> tuple[str, ...]:
+    if not token:
+        return ()
+    keys = [_token_digest(token)]
+    if _SESSION_STORE is not None:
+        current = _SESSION_STORE.current_token(token)
+        if current and current != token:
+            keys.insert(0, _token_digest(current))
+    return tuple(dict.fromkeys(keys))
+
+
+def _set_staged_chat_file(token: str, file_name: str, file_content: str) -> None:
+    keys = _token_keys(token)
+    if not keys:
+        return
+    entry = {"file_name": file_name, "file_content": file_content}
+    with _STAGED_CHAT_FILES_LOCK:
+        for key in keys:
+            _STAGED_CHAT_FILES[key] = entry
+        while len(_STAGED_CHAT_FILES) > _STAGED_CHAT_FILES_MAX:
+            del _STAGED_CHAT_FILES[next(iter(_STAGED_CHAT_FILES))]
+
+
+def _get_staged_chat_file(token: str | None) -> dict[str, str] | None:
+    keys = _token_keys(token)
+    if not keys:
+        return None
+    with _STAGED_CHAT_FILES_LOCK:
+        for key in keys:
+            found = _STAGED_CHAT_FILES.get(key)
+            if found is not None:
+                return dict(found)
+    return None
+
+
+def _clear_staged_chat_file(token: str | None) -> None:
+    keys = _token_keys(token)
+    if not keys:
+        return
+    with _STAGED_CHAT_FILES_LOCK:
+        for key in keys:
+            _STAGED_CHAT_FILES.pop(key, None)
+
+
+def _extract_docx_text(raw_bytes: bytes) -> str:
+    """Trích xuất văn bản thuần từ tệp .docx trong bộ nhớ mà không mở thực thể XML ngoài."""
+    import io
+    import zipfile
+
+    if len(raw_bytes) > MAX_CHAT_FILE_BYTES:
+        raise gr.Error("Tệp .docx vượt quá giới hạn dung lượng 256 KB.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
+            info = archive.getinfo("word/document.xml")
+            if info.file_size > 512 * 1024:
+                raise gr.Error("Nội dung giải nén của tệp .docx vượt quá giới hạn an toàn.")
+            xml_text = archive.read("word/document.xml").decode("utf-8", errors="replace")
+    except gr.Error:
+        raise
+    except Exception as exc:
+        raise gr.Error("Không đọc được tệp .docx. Hãy kiểm tra lại định dạng tệp.") from exc
+    paragraphs: list[str] = []
+    for para_match in re.finditer(r"<w:p(?:\s[^>]*)?>([\s\S]*?)</w:p>", xml_text):
+        para_xml = para_match.group(1)
+        para_xml = re.sub(r"<w:tab\b[^>]*/?>", "\t", para_xml)
+        para_xml = re.sub(r"<w:br\b[^>]*/?>", "\n", para_xml)
+        runs = [
+            html.unescape(run_match.group(1))
+            for run_match in re.finditer(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>", para_xml)
+        ]
+        line = "".join(runs).strip()
+        if line:
+            paragraphs.append(line)
+    return "\n".join(paragraphs)
+
+
+def _parse_uploaded_chat_file(raw_payload: str | None) -> tuple[str, str]:
+    """Kiểm tra và chuẩn hóa tệp do trình duyệt đọc trước khi gắn vào hội thoại."""
+    if not isinstance(raw_payload, str) or not raw_payload.strip():
+        raise gr.Error("Chưa nhận được dữ liệu tệp đính kèm.")
+    if len(raw_payload) > MAX_CHAT_FILE_BYTES * 2:
+        raise gr.Error("Tệp đính kèm vượt quá giới hạn dung lượng cho phép (tối đa 256 KB).")
+    try:
+        payload = json.loads(raw_payload)
+    except (ValueError, RecursionError) as exc:
+        raise gr.Error("Dữ liệu tệp đính kèm không hợp lệ.") from exc
+    if not isinstance(payload, dict):
+        raise gr.Error("Dữ liệu tệp đính kèm không hợp lệ.")
+    error_code = str(payload.get("error") or "")
+    if error_code == "too_large":
+        raise gr.Error("Tệp vượt quá giới hạn 256 KB. Hãy chọn tệp nhỏ hơn.")
+    if error_code == "unsupported_type":
+        raise gr.Error(
+            "Định dạng tệp không được hỗ trợ. Hãy chọn tệp văn bản (.txt, .md, .csv, .json, mã nguồn…) hoặc .docx."
+        )
+    if error_code == "read_failed":
+        raise gr.Error("Trình duyệt không đọc được tệp đã chọn. Vui lòng thử lại.")
+    if error_code:
+        raise gr.Error("Không thể xử lý tệp đính kèm.")
+
+    raw_name = str(payload.get("name") or "").strip()
+    raw_name = raw_name.replace("\\", "/").split("/")[-1].strip()
+    if not raw_name or len(raw_name) > MAX_CHAT_FILE_NAME_CHARS:
+        raise gr.Error(f"Tên tệp phải từ 1 đến {MAX_CHAT_FILE_NAME_CHARS} ký tự.")
+    if ".." in raw_name or any(
+        ord(ch) < 32 or ord(ch) == 127 or ord(ch) in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
+        for ch in raw_name
+    ):
+        raise gr.Error("Tên tệp chứa ký tự điều khiển không hợp lệ.")
+    lowered_name = raw_name.lower()
+    matched_ext = next(
+        (ext for ext in ALLOWED_CHAT_FILE_EXTENSIONS if lowered_name.endswith(ext)),
+        None,
+    )
+    if matched_ext is None or len(raw_name) <= len(matched_ext):
+        raise gr.Error(
+            "Định dạng tệp không được hỗ trợ. Hãy chọn tệp văn bản, dữ liệu, mã nguồn hoặc .docx."
+        )
+
+    if lowered_name.endswith(".docx") or payload.get("encoding") == "base64":
+        encoded = payload.get("base64") or payload.get("content") or ""
+        if not isinstance(encoded, str) or not encoded.strip():
+            raise gr.Error("Tệp .docx rỗng hoặc không hợp lệ.")
+        try:
+            raw_bytes = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise gr.Error("Không giải mã được dữ liệu tệp đính kèm.") from exc
+        if lowered_name.endswith(".docx"):
+            text_content = _extract_docx_text(raw_bytes)
+        else:
+            if len(raw_bytes) > MAX_CHAT_FILE_BYTES:
+                raise gr.Error("Tệp vượt quá giới hạn 256 KB.")
+            try:
+                text_content = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise gr.Error("Tệp không phải văn bản UTF-8 hợp lệ.") from exc
+    else:
+        raw_content = payload.get("content")
+        if not isinstance(raw_content, str):
+            raise gr.Error("Nội dung tệp đính kèm không hợp lệ.")
+        text_content = raw_content
+
+    normalized = text_content.replace("\r\n", "\n").replace("\r", "\n")
+    for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)):
+        if chr(codepoint) in normalized:
+            raise gr.Error("Nội dung tệp chứa ký tự điều hướng hai chiều (Bidi) không an toàn.")
+    if any((ord(ch) < 32 and ch not in ("\n", "\t")) or ord(ch) == 127 for ch in normalized):
+        raise gr.Error(
+            "Tệp chứa ký tự nhị phân hoặc ký tự điều khiển không hợp lệ. Hãy chọn tệp văn bản hoặc .docx."
+        )
+    cleaned = normalized.strip()
+    if not cleaned:
+        raise gr.Error("Tệp đính kèm không có nội dung văn bản để phân tích.")
+    if len(cleaned) > MAX_CHAT_FILE_CONTENT_CHARS:
+        raise gr.Error(
+            f"Nội dung tệp dài {len(cleaned):,} ký tự, vượt giới hạn {MAX_CHAT_FILE_CONTENT_CHARS:,} ký tự."
+        )
+    return raw_name, cleaned
+
+
 # Tên trường trong lỗi 422 của API -> nhãn trên giao diện.
 _VALIDATION_FIELDS = {
     "username": "Tên đăng nhập", "password": "Mật khẩu", "current_password": "Mật khẩu hiện tại",
@@ -855,6 +1053,7 @@ _VALIDATION_FIELDS = {
     "identifier": "Tên đăng nhập hoặc email", "code": "Mã xác thực", "name": "Tên",
     "role": "Vai trò", "query": "Từ khóa", "q": "Từ khóa", "security_mode": "Chế độ bảo mật",
     "data_classification": "Phân loại dữ liệu",
+    "file_name": "Tên tệp đính kèm", "file_content": "Nội dung tệp đính kèm",
 }
 
 
@@ -1756,6 +1955,19 @@ CHAT_WELCOME_HTML = (
     '</div>'
 )
 
+CHAT_FILE_ACCEPT = ",".join(ALLOWED_CHAT_FILE_EXTENSIONS)
+CHAT_FILE_PICKER_HTML = (
+    '<div class="scap-chat-file-bar">'
+    '<label class="scap-chat-file-btn" for="chat-file-input">'
+    "📎 Đính kèm tệp tài liệu"
+    "</label>"
+    f'<input id="chat-file-input" type="file" accept="{CHAT_FILE_ACCEPT}">'
+    '<span class="scap-chat-file-hint" data-scap-file-label>'
+    "Hỗ trợ .txt, .md, .csv, .json, .docx, mã nguồn… (tối đa 30.000 ký tự)"
+    "</span>"
+    "</div>"
+)
+
 
 def _static_html(markup: str, **kwargs) -> gr.Markdown:
     """Đổ một khối markup tĩnh mà không cần 'unsafe-eval'.
@@ -1875,6 +2087,10 @@ def build_ui(
         btn_push_done = gr.Button("Lưu đăng ký Push", elem_id="btn-security-push-done")
         st_push = gr.State({})
         st_phone_proof = gr.State({})
+        tb_chat_file_payload = gr.Textbox(
+            label="Dữ liệu tệp đính kèm", elem_id="chat-file-payload", container=False,
+        )
+        btn_chat_file_stage = gr.Button("Đính kèm tệp", elem_id="btn-chat-file-stage")
         # Đã hiện cảnh báo "sắp hết phiên" chưa — để chỉ nhắc một lần cho mỗi
         # phiên thay vì ở mọi lần tick trong suốt hai phút cuối.
         st_warned = gr.State(False)
@@ -2194,6 +2410,19 @@ def build_ui(
                                 btn_send = gr.Button(
                                     "Gửi", variant="primary", scale=1, min_width=110
                                 )
+                            with gr.Row(elem_id="chat-file-row"):
+                                _static_html(CHAT_FILE_PICKER_HTML, elem_id="chat-file-picker")
+                                btn_chat_file_clear = gr.Button(
+                                    "✕ Gỡ tệp đính kèm",
+                                    size="sm",
+                                    visible=False,
+                                    elem_id="btn-chat-file-clear",
+                                    scale=0,
+                                    min_width=150,
+                                )
+                            md_chat_attachment = gr.Markdown(
+                                "", visible=False, elem_id="chat-attachment-status"
+                            )
                             # Hidden while the server has web search off so the
                             # chat column is not padded by a control nobody can use.
                             cb_web_search = gr.Checkbox(
@@ -2626,6 +2855,9 @@ def build_ui(
             (btn_session_search_more, gr.update(visible=False)),
             (file_export, gr.update(value="", visible=False)),
             (tb_msg, ""),
+            (tb_chat_file_payload, ""),
+            (md_chat_attachment, gr.update(value="", visible=False)),
+            (btn_chat_file_clear, gr.update(visible=False)),
             (cb_web_search, gr.update(value=False)),
             (md_chat_notice, gr.update(value="", visible=False)),
             (btn_consent_send, gr.update(visible=False)),
@@ -3097,6 +3329,7 @@ def build_ui(
             for active_token in tokens:
                 if not active_token:
                     continue
+                _clear_staged_chat_file(active_token)
                 try:
                     _api(active_token, "POST", "/api/auth/logout")
                     _ui_notice(gr.Info, "Đã đăng xuất và thu hồi token trên máy chủ.")
@@ -3440,13 +3673,77 @@ def build_ui(
             [file_export, tb_export_password, tb_export_code],
         ).then(lambda: ("", ""), [], [tb_export_password, tb_export_code], show_progress="hidden")
 
+        def _attachment_banner_updates(token):
+            staged = _get_staged_chat_file(token)
+            if not staged:
+                return gr.update(value="", visible=False), gr.update(visible=False)
+            file_name = staged["file_name"]
+            file_content = staged["file_content"]
+            safe_name = _safe_markdown_text(file_name)
+            char_count = len(file_content)
+            return (
+                gr.update(
+                    value=(
+                        f"📎 **Đã đính kèm tệp:** {safe_name} ({char_count:,} ký tự). "
+                        "Nhập câu hỏi (hoặc bấm **Gửi** ngay để yêu cầu phân tích tệp)."
+                    ),
+                    visible=True,
+                ),
+                gr.update(visible=True),
+            )
+
+        def stage_chat_file(token, raw_payload):
+            if not token:
+                raise gr.Error("Vui lòng đăng nhập trước khi đính kèm tệp.")
+            try:
+                file_name, file_content = _parse_uploaded_chat_file(raw_payload)
+            except gr.Error as err:
+                _clear_staged_chat_file(token)
+                return (
+                    "",
+                    gr.update(value="", visible=False),
+                    gr.update(visible=False),
+                    gr.update(
+                        value="⚠️ **Không thể đính kèm tệp.** " + _safe_markdown_text(_error_text(err)),
+                        visible=True,
+                    ),
+                )
+            _set_staged_chat_file(token, file_name, file_content)
+            att_md, clear_btn = _attachment_banner_updates(token)
+            return "", att_md, clear_btn, gr.update(value="", visible=False)
+
+        btn_chat_file_stage.click(
+            _guard(stage_chat_file, 4),
+            [st_token, tb_chat_file_payload],
+            [tb_chat_file_payload, md_chat_attachment, btn_chat_file_clear, md_chat_notice],
+            api_name=False,
+        )
+
+        def clear_chat_file(token):
+            _clear_staged_chat_file(token)
+            return "", gr.update(value="", visible=False), gr.update(visible=False)
+
+        btn_chat_file_clear.click(
+            _guard(clear_chat_file, 3),
+            [st_token],
+            [tb_chat_file_payload, md_chat_attachment, btn_chat_file_clear],
+            api_name=False,
+        )
+
         def _send_chat_message(token, session_id, message, confirm_external=False, use_web_search=False):
+            staged_file = _get_staged_chat_file(token)
             message = (message or "").strip()
+            if not message and staged_file:
+                message = f"Hãy phân tích và trả lời dựa trên tệp {staged_file['file_name']} vừa tải lên."
             if not message:
                 return (gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False),
                         gr.skip(), gr.skip(), gr.skip())
             created_session = False
             try:
+                if use_web_search and staged_file:
+                    raise gr.Error(
+                        "Tra cứu Internet không hỗ trợ gửi kèm tệp. Bỏ chọn tra cứu hoặc gỡ tệp đính kèm."
+                    )
                 if use_web_search and not gemini_web_search_enabled:
                     raise gr.Error("Máy chủ chưa bật tra cứu Internet. Bỏ chọn tra cứu để gửi tin nhắn.")
                 if use_web_search and not session_id:
@@ -3476,15 +3773,20 @@ def build_ui(
                         "Tra cứu Internet chỉ dùng trong hội thoại Public. Chọn Public trong "
                         "Thiết lập hội thoại mới rồi bấm + Hội thoại mới, hoặc bỏ chọn tra cứu."
                     )
+                payload = {
+                    "content": message, "confirm_external_ai": bool(confirm_external),
+                    "use_web_search": bool(use_web_search),
+                }
+                if staged_file:
+                    payload["file_name"] = staged_file["file_name"]
+                    payload["file_content"] = staged_file["file_content"]
                 sent = _api(
                     token,
                     "POST",
                     f"/api/sessions/{session_id}/messages",
-                    {
-                        "content": message, "confirm_external_ai": bool(confirm_external),
-                        "use_web_search": bool(use_web_search),
-                    },
+                    payload,
                 )
+                _clear_staged_chat_file(token)
             except gr.Error as err:
                 # Keep every refusal beside the composer. A toast disappears
                 # quickly on mobile, making a failed send look like lost text.
@@ -3556,11 +3858,16 @@ def build_ui(
             if not use_web_search:
                 sent = _send_chat_message(token, session_id, message, confirm_external)
                 return (*sent[:6], *SEARCH_HIDDEN, *sent[6:])
+            staged_file = _get_staged_chat_file(token)
             message = (message or "").strip()
-            if not message:
+            if not message and not staged_file:
                 return (gr.skip(), gr.skip(), gr.skip(), "", *NOTICE_HIDDEN, *SEARCH_HIDDEN,
                         gr.skip(), gr.skip(), gr.skip())
             try:
+                if staged_file:
+                    raise gr.Error(
+                        "Tra cứu Internet không hỗ trợ gửi kèm tệp. Bỏ chọn tra cứu hoặc gỡ tệp đính kèm."
+                    )
                 if not gemini_web_search_enabled:
                     raise gr.Error("Máy chủ chưa bật tra cứu Internet. Bỏ chọn tra cứu để gửi tin nhắn.")
                 if not session_id:
@@ -3614,6 +3921,12 @@ def build_ui(
             inputs=[st_token, dd_session, tb_msg, cb_web_search],
             outputs=SEND_OUTS,
             trigger_mode="once",
+        ).then(
+            _attachment_banner_updates,
+            [st_token],
+            [md_chat_attachment, btn_chat_file_clear],
+            api_name=False,
+            show_progress="hidden",
         )
 
         def consent_and_resend(token, session_id, message, use_web_search=False):
@@ -3622,7 +3935,7 @@ def build_ui(
             The consent is stored for the account, so this button appears only
             once. As with the Send button, sending is the per-message confirmation.
             """
-            if not (message or "").strip():
+            if not (message or "").strip() and not _get_staged_chat_file(token):
                 return (
                     gr.skip(),
                     gr.skip(),
@@ -3639,6 +3952,12 @@ def build_ui(
 
         btn_consent_send.click(
             _guard(consent_and_resend, len(SEND_OUTS)), [st_token, dd_session, tb_msg, cb_web_search], SEND_OUTS
+        ).then(
+            _attachment_banner_updates,
+            [st_token],
+            [md_chat_attachment, btn_chat_file_clear],
+            api_name=False,
+            show_progress="hidden",
         )
         cb_web_search.input(lambda _selected: SEARCH_HIDDEN, [cb_web_search],
                             [md_search_answer, md_search_suggestions], api_name=False)

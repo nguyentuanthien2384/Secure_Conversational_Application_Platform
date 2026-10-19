@@ -481,10 +481,23 @@ class SessionResponse(BaseModel):
     updated_at: datetime
 
 
+MAX_CHAT_FILE_NAME_CHARS = 180
+MAX_CHAT_FILE_CONTENT_CHARS = 30_000
+ALLOWED_CHAT_FILE_EXTENSIONS: tuple[str, ...] = (
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl",
+    ".xml", ".yaml", ".yml", ".log", ".ini", ".toml", ".cfg", ".conf",
+    ".sql", ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".htm",
+    ".css", ".sh", ".bat", ".ps1", ".c", ".cpp", ".h", ".hpp",
+    ".java", ".go", ".rs", ".rb", ".php", ".docx",
+)
+
+
 class MessageSend(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     confirm_external_ai: bool = False
     use_web_search: bool = False
+    file_name: str | None = Field(default=None, max_length=MAX_CHAT_FILE_NAME_CHARS)
+    file_content: str | None = Field(default=None, max_length=MAX_CHAT_FILE_CONTENT_CHARS)
 
     @field_validator("content")
     @classmethod
@@ -496,6 +509,54 @@ class MessageSend(BaseModel):
         if any(ch in cleaned for ch in ("\x00", "\r", "\x1f")):
             raise ValueError("Nội dung chứa ký tự điều khiển không hợp lệ.")
         return cleaned
+
+    @field_validator("file_name")
+    @classmethod
+    def validate_file_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        _reject_unsafe_bidi_controls(value, field_label="Tên tệp đính kèm")
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Tên tệp đính kèm không được để trống.")
+        if (
+            "/" in cleaned
+            or "\\" in cleaned
+            or ".." in cleaned
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned)
+        ):
+            raise ValueError("Tên tệp đính kèm không hợp lệ.")
+        lowered = cleaned.lower()
+        matched_ext = next(
+            (ext for ext in ALLOWED_CHAT_FILE_EXTENSIONS if lowered.endswith(ext)),
+            None,
+        )
+        if matched_ext is None or len(cleaned) <= len(matched_ext):
+            raise ValueError(
+                "Định dạng tệp không được hỗ trợ. Hãy chọn tệp văn bản, dữ liệu, mã nguồn hoặc .docx."
+            )
+        return cleaned
+
+    @field_validator("file_content")
+    @classmethod
+    def validate_file_content(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        _reject_unsafe_bidi_controls(value, field_label="Nội dung tệp đính kèm")
+        normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+        if any((ord(ch) < 32 and ch not in ("\n", "\t")) or ord(ch) == 127 for ch in normalized):
+            raise ValueError("Nội dung tệp đính kèm chứa ký tự điều khiển không hợp lệ.")
+        cleaned = normalized.strip()
+        if not cleaned:
+            raise ValueError("Nội dung tệp đính kèm không được để trống.")
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_file_attachment_pair(self) -> MessageSend:
+        if (self.file_name is None) != (self.file_content is None):
+            raise ValueError("Tệp đính kèm phải có đầy đủ cả tên tệp và nội dung tệp.")
+        return self
+
 
 
 class MessageResponse(BaseModel):

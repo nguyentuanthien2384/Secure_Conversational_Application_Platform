@@ -182,6 +182,55 @@
     }
   }
 
+  const MAX_CHAT_FILE_BYTES = 256 * 1024;
+
+  function toBase64(bytes) {
+    let binary = "";
+    const chunk = 0x8000;
+    for (let index = 0; index < bytes.length; index += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
+    }
+    return btoa(binary);
+  }
+
+  function deliverChatFile(payload) {
+    const input = document.querySelector("#chat-file-payload textarea, #chat-file-payload input");
+    const button = document.querySelector("#btn-chat-file-stage");
+    if (!input || !button) return;
+    input.value = JSON.stringify(payload);
+    input.dispatchEvent(new Event("input", {bubbles: true}));
+    setTimeout(() => button.click(), 60);
+  }
+
+  async function onChatFileChange(event) {
+    const picker = event.target instanceof HTMLInputElement ? event.target : null;
+    if (!picker || picker.id !== "chat-file-input") return;
+    const file = picker.files && picker.files[0];
+    picker.value = "";
+    if (!file) return;
+    if (file.size > MAX_CHAT_FILE_BYTES) {
+      deliverChatFile({error: "too_large", name: file.name});
+      return;
+    }
+    try {
+      const lower = (file.name || "").toLowerCase();
+      if (lower.endsWith(".docx")) {
+        const buffer = await file.arrayBuffer();
+        deliverChatFile({
+          name: file.name,
+          encoding: "base64",
+          base64: toBase64(new Uint8Array(buffer)),
+        });
+      } else {
+        const buffer = await file.arrayBuffer();
+        const content = new TextDecoder("utf-8", {fatal: true}).decode(buffer);
+        deliverChatFile({name: file.name, content});
+      }
+    } catch (_) {
+      deliverChatFile({error: "read_failed", name: file.name});
+    }
+  }
+
   function start() {
     new MutationObserver(inspect).observe(document.body, {
       childList: true, subtree: true, attributes: true,
@@ -192,6 +241,7 @@
       attributeFilter: ["data-scap-google-search-widget"],
     });
     document.addEventListener("click", copyChat, {capture: true});
+    document.addEventListener("change", onChatFileChange, {capture: true});
     inspect();
     renderSearchWidgets();
     setInterval(tickCountdowns, 500);

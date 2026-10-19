@@ -3902,6 +3902,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         try:
+            file_kwargs = (
+                {"file_name": payload.file_name, "file_content": payload.file_content}
+                if payload.file_name is not None and payload.file_content is not None
+                else {}
+            )
             _, assistant_row, response_text, dlp_redacted = chat_service.chat(
                 db,
                 row,
@@ -3912,6 +3917,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 confirm_external_ai=payload.confirm_external_ai,
                 use_web_search=payload.use_web_search,
                 consent_since=user.ai_consent_at,
+                **file_kwargs,
             )
         except DLPPolicyViolation as exc:
             record_audit(
@@ -3969,13 +3975,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={"Retry-After": str(exc.retry_after) if isinstance(exc, AIProviderBusy) else "30"},
             ) from exc
         row.updated_at = utcnow()
+        audit_details: dict[str, object] = {
+            "content_length": len(payload.content),
+            "dlp_redacted": dlp_redacted,
+        }
+        if payload.file_content is not None:
+            audit_details["has_attachment"] = True
+            audit_details["file_length"] = len(payload.file_content)
         events = [{
             "event_type": "chat.message.send", "actor_id": user.id,
             "target_type": "chat_session", "target_id": session_id,
-            "details": {
-                "content_length": len(payload.content),
-                "dlp_redacted": dlp_redacted,
-            },
+            "details": audit_details,
         }]
         if dlp_redacted:
             # Sự kiện riêng để SIEM/IDS đếm được số lần DLP phải can thiệp.
@@ -4011,6 +4021,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 db, request, "chat.web_search", actor_id=user.id,
                 target_type="chat_session", target_id=session_id,
                 outcome=outcome, details=details,
+            )
+
+        if payload.file_name is not None or payload.file_content is not None:
+            audit_search("denied", {"reason": "attachment_not_allowed"})
+            raise HTTPException(
+                status_code=400,
+                detail="Không đính kèm tệp khi tra cứu Internet; hãy tắt tra cứu để hỏi đáp trên tệp.",
             )
 
         # Share the ordinary chat budget: selecting search or alternating both

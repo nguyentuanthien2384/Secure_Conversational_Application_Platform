@@ -270,7 +270,13 @@ class AIService:
         data_class: str = DataClass.INTERNAL.value,
         confirmed: bool = False,
         use_web_search: bool = False,
+        file_name: str | None = None,
+        file_content: str | None = None,
     ) -> tuple[str, list[str]]:
+        if use_web_search and (file_name is not None or file_content is not None):
+            raise PermissionError(
+                "Không đính kèm tệp khi tra cứu Internet; hãy tắt tra cứu để hỏi đáp trên tệp."
+            )
         if use_web_search and not self.settings.gemini_web_search_enabled:
             raise PermissionError("Tìm kiếm web chưa được quản trị viên bật trên server.")
         if use_web_search and self.settings.claude_api_key:
@@ -281,6 +287,14 @@ class AIService:
         sanitized_current_message, redacted_labels = self.redact_with_configured_policy(
             current_message
         )
+        sanitized_file_name: str | None = None
+        sanitized_file_content: str | None = None
+        if file_name is not None and file_content is not None:
+            sanitized_file_name, name_labels = self.redact_with_configured_policy(file_name)
+            sanitized_file_content, file_labels = self.redact_with_configured_policy(file_content)
+            redacted_labels = list(
+                dict.fromkeys(redacted_labels + name_labels + file_labels)
+            )
         if self._client is None:
             if use_web_search or not self.settings.allow_demo_ai:
                 logger.error(
@@ -288,9 +302,16 @@ class AIService:
                     "không có đường trả lời nào khả dụng."
                 )
                 raise AIProviderError(AI_UNAVAILABLE_MESSAGE)
+            file_summary = (
+                f"\n\nTệp đính kèm ({sanitized_file_name}): "
+                + (sanitized_file_content or "")[:500]
+                if sanitized_file_name and sanitized_file_content is not None
+                else ""
+            )
             return (
                 "[DEMO AI] Hệ thống đã nhận tin nhắn sau khi áp dụng DLP: "
                 + sanitized_current_message[:500]
+                + file_summary
                 + "\n\nĐây là phản hồi ngoại tuyến để dự án vẫn chạy khi chưa có API key."
             ), redacted_labels
 
@@ -315,6 +336,41 @@ class AIService:
             raise DLPPolicyViolation(decision.action, decision_labels)
         sanitized_current_message = decision.output_text or ""
         redacted_labels = list(dict.fromkeys(redacted_labels + decision_labels))
+
+        if file_name is not None and file_content is not None:
+            name_decision = self.dlp.evaluate(
+                file_name,
+                data_class=declared_class,
+                confirmed=confirmed,
+            )
+            name_decision_labels = [
+                _DLP_LABELS[item.finding_type] for item in name_decision.findings
+            ]
+            if name_decision.action in {
+                DLPAction.BLOCK,
+                DLPAction.LOCAL_ONLY,
+                DLPAction.CONFIRM,
+            }:
+                raise DLPPolicyViolation(name_decision.action, name_decision_labels)
+            file_decision = self.dlp.evaluate(
+                file_content,
+                data_class=declared_class,
+                confirmed=confirmed,
+            )
+            file_decision_labels = [
+                _DLP_LABELS[item.finding_type] for item in file_decision.findings
+            ]
+            if file_decision.action in {
+                DLPAction.BLOCK,
+                DLPAction.LOCAL_ONLY,
+                DLPAction.CONFIRM,
+            }:
+                raise DLPPolicyViolation(file_decision.action, file_decision_labels)
+            sanitized_file_name = name_decision.output_text or ""
+            sanitized_file_content = file_decision.output_text or ""
+            redacted_labels = list(
+                dict.fromkeys(redacted_labels + name_decision_labels + file_decision_labels)
+            )
 
         # Decrypt/load history only after consent, confirmation, and the current
         # message's DLP decision have all passed. A rejected request therefore
@@ -342,11 +398,17 @@ class AIService:
                 {"role": item["role"], "content": history_decision.output_text or ""}
             )
             redacted_labels.extend(history_labels)
+        payload_data: dict[str, object] = {
+            "conversation_history": sanitized_history,
+            "current_user_message": sanitized_current_message,
+        }
+        if sanitized_file_name is not None and sanitized_file_content is not None:
+            payload_data["attached_file"] = {
+                "file_name": sanitized_file_name,
+                "file_content": sanitized_file_content,
+            }
         untrusted_payload = json.dumps(
-            {
-                "conversation_history": sanitized_history,
-                "current_user_message": sanitized_current_message,
-            },
+            payload_data,
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -659,6 +721,23 @@ class ChatService:
         db.refresh(row)
         return row
 
+    @staticmethod
+    def _format_user_message_with_file(
+        content: str, file_name: str | None, file_content: str | None
+    ) -> str:
+        if not file_name or not file_content:
+            return content
+        longest_run = max(
+            (len(match.group(0)) for match in re.finditer(r"`+", file_content)),
+            default=0,
+        )
+        fence = "`" * max(3, longest_run + 1)
+        return (
+            f"📎 **Tệp đính kèm:** `{file_name}`\n"
+            f"{fence}text\n{file_content}\n{fence}\n\n"
+            f"{content}"
+        )
+
     def chat(
         self,
         db: Session,
@@ -669,6 +748,8 @@ class ChatService:
         confirm_external_ai: bool = False,
         consent_since: datetime | None = None,
         use_web_search: bool = False,
+        file_name: str | None = None,
+        file_content: str | None = None,
     ) -> tuple[SecureMessage, SecureMessage, str, list[str]]:
         if use_web_search:
             raise PermissionError(
@@ -681,6 +762,14 @@ class ChatService:
             raise PermissionError(
                 "Private E2EE không cho phép máy chủ nhận plaintext hoặc gọi AI tự động."
             )
+        stored_user_content = self._format_user_message_with_file(
+            content, file_name, file_content
+        )
+        file_kwargs = (
+            {"file_name": file_name, "file_content": file_content}
+            if file_name is not None and file_content is not None
+            else {}
+        )
         if isinstance(self.ai, AIService):
             response, redacted_labels = self.ai.generate(
                 content,
@@ -693,6 +782,7 @@ class ChatService:
                 allow_external_ai=allow_external_ai,
                 data_class=chat_session.data_classification,
                 confirmed=confirm_external_ai,
+                **file_kwargs,
             )
         else:
             # Preserve the small dependency-injection surface used by local
@@ -705,7 +795,7 @@ class ChatService:
                 since=consent_since,
             )
             response, redacted_labels = self.ai.generate(
-                content,
+                stored_user_content,
                 history,
                 allow_external_ai=allow_external_ai,
             )
@@ -730,7 +820,7 @@ class ChatService:
             user_ciphertext, user_nonce, user_epoch = self.envelope.encrypt_message(
                 db,
                 chat_session,
-                plaintext=content,
+                plaintext=stored_user_content,
                 role="user",
                 message_uuid=user_uuid,
                 message_index=first_index,
@@ -748,7 +838,7 @@ class ChatService:
             scheme = ENVELOPE_SCHEME
         else:
             user_ciphertext, user_nonce, user_key_version = self.crypto.encrypt(
-                content, chat_session.id, "user"
+                stored_user_content, chat_session.id, "user"
             )
             assistant_ciphertext, assistant_nonce, assistant_key_version = self.crypto.encrypt(
                 response, chat_session.id, "assistant"

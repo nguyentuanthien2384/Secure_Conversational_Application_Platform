@@ -1148,3 +1148,66 @@ def test_totp_qr_is_inline_and_has_no_file_toolbar():
         and component.label == "Quét bằng ứng dụng xác thực"
         for component in demo.blocks.values()
     ), "QR không được quay lại gr.Image (sẽ tạo tệp cache)"
+
+
+def test_chat_file_upload_staging_docx_and_send(runtime_demo, monkeypatch):
+    import base64
+    import io
+    import json
+    import zipfile
+
+    from src.app import gradio_ui
+
+    # 1. Verify .docx extraction without external dependencies or XXE risk
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "word/document.xml",
+            '<w:document><w:body><w:p><w:r><w:t>Báo cáo quý 3</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>Doanh thu tăng 25%.</w:t></w:r></w:p></w:body></w:document>',
+        )
+    docx_payload = json.dumps({
+        "name": "bao_cao_q3.docx",
+        "encoding": "base64",
+        "base64": base64.b64encode(buf.getvalue()).decode("ascii"),
+    })
+    parsed_name, parsed_text = gradio_ui._parse_uploaded_chat_file(docx_payload)
+    assert parsed_name == "bao_cao_q3.docx"
+    assert parsed_text == "Báo cáo quý 3\nDoanh thu tăng 25%."
+
+    # 2. Stage file via hidden bridge button and send message
+    stage_fn, _ = _button_event(runtime_demo, "Đính kèm tệp")
+    token = "test-file-token"
+    _, att_md, clear_btn, notice_md = stage_fn.fn(
+        token,
+        json.dumps({"name": "tai_lieu.txt", "content": "Nội dung tài liệu mật."}),
+    )
+    assert att_md["visible"] is True
+    assert "tai\\_lieu\\.txt" in att_md["value"]
+    assert clear_btn["visible"] is True
+    assert notice_md["visible"] is False
+
+    posted_bodies = []
+
+    def fake_api(tok, method, path, body=None, *, params=None):
+        if method == "GET" and path == "/api/sessions/sess-1":
+            return {"id": "sess-1", "security_mode": "secure", "data_classification": "internal"}
+        if method == "POST" and path == "/api/sessions/sess-1/messages":
+            posted_bodies.append(body)
+            return {"content": "Đã đọc tệp", "dlp_redacted": []}
+        if method == "GET" and path == "/api/sessions/page":
+            return {"items": [{"id": "sess-1", "title": "Hội thoại 1", "security_mode": "secure"}], "total": 1, "has_more": False}
+        if method == "GET" and path == "/api/sessions/sess-1/messages":
+            return [{"role": "user", "content": "Hỏi"}, {"role": "assistant", "content": "Trả lời"}]
+        return {}
+
+    monkeypatch.setattr(gradio_ui, "_api", fake_api)
+    send_fn, _ = _button_event(runtime_demo, "Gửi")
+    # Even when message textbox is empty, sending with a staged file auto-supplies a prompt and sends the file
+    send_fn.fn(token, "sess-1", "", False)
+    assert len(posted_bodies) == 1
+    assert posted_bodies[0]["file_name"] == "tai_lieu.txt"
+    assert posted_bodies[0]["file_content"] == "Nội dung tài liệu mật."
+    assert "tai_lieu.txt" in posted_bodies[0]["content"]
+    assert gradio_ui._get_staged_chat_file(token) is None
+

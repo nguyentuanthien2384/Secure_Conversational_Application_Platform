@@ -504,3 +504,75 @@ def test_failed_ai_generation_does_not_persist_half_a_chat_exchange(client: Test
             )
             == 0
         )
+
+
+def test_chat_message_with_file_upload_stores_and_answers_from_file(client: TestClient):
+    token = register_and_login(client, "file-chat-user")
+    session_id = client.post(
+        "/api/sessions", headers=auth(token), json={"title": "File Q&A"}
+    ).json()["id"]
+
+    send_resp = client.post(
+        f"/api/sessions/{session_id}/messages",
+        headers=auth(token),
+        json={
+            "content": "Tệp này nói về chính sách gì?",
+            "file_name": "chinh_sach_bao_mat.md",
+            "file_content": "# Chính sách bảo mật\nMọi tin nhắn đều được mã hóa bằng AES-256-GCM.",
+            "confirm_external_ai": True,
+        },
+    )
+    assert send_resp.status_code == 201, send_resp.text
+    reply = send_resp.json()
+    assert "chinh_sach_bao_mat.md" in reply["content"]
+    assert "AES-256-GCM" in reply["content"]
+
+    history = client.get(f"/api/sessions/{session_id}/messages", headers=auth(token)).json()
+    assert len(history) == 2
+    assert history[0]["role"] == "user"
+    assert "📎 **Tệp đính kèm:** `chinh_sach_bao_mat.md`" in history[0]["content"]
+    assert "AES-256-GCM" in history[0]["content"]
+
+
+def test_chat_message_file_upload_dlp_and_schema_validation(client: TestClient):
+    token = register_and_login(client, "file-dlp-user")
+    session_id = client.post(
+        "/api/sessions", headers=auth(token), json={"title": "File DLP"}
+    ).json()["id"]
+
+    # Unpaired file_name without file_content is rejected (422)
+    unpaired = client.post(
+        f"/api/sessions/{session_id}/messages",
+        headers=auth(token),
+        json={"content": "Hỏi tệp", "file_name": "notes.txt"},
+    )
+    assert unpaired.status_code == 422
+
+    # Unsupported executable extension is rejected (422)
+    bad_ext = client.post(
+        f"/api/sessions/{session_id}/messages",
+        headers=auth(token),
+        json={
+            "content": "Hỏi tệp",
+            "file_name": "malware.exe",
+            "file_content": "MZ...",
+        },
+    )
+    assert bad_ext.status_code == 422
+
+    # Sensitive email inside file_content is redacted by DLP before reaching AI
+    redacted = client.post(
+        f"/api/sessions/{session_id}/messages",
+        headers=auth(token),
+        json={
+            "content": "Tóm tắt danh bạ trong tệp",
+            "file_name": "contacts.csv",
+            "file_content": "name,email\nAlice,alice.secret@example.com",
+            "confirm_external_ai": True,
+        },
+    )
+    assert redacted.status_code == 201, redacted.text
+    body = redacted.json()
+    assert "email" in (body.get("dlp_redacted") or [])
+    assert "alice.secret@example.com" not in body["content"]
+
