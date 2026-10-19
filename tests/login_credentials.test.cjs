@@ -275,3 +275,21 @@ test("manager rejection does not break login", async () => {
   await flush();
   assert.equal(b.calls.input.length, 2);
 });
+
+test("rejects conversation-title autofill and non-username credentials from password manager", async () => {
+  const b = browser({
+    get: async () => ({type: "password", id: "🔒 Cuộc hội thoại mới", password: "EdpN9YYWyAsP5gy"}),
+  });
+  await flush();
+  assert.equal(b.user.value, "");
+  assert.equal(b.password.value, "");
+  assert.deepEqual(b.calls.input, []);
+
+  // Native DOM autofill injecting a conversation title is immediately cleared.
+  b.password.value = "EdpN9YYWyAsP5gy";
+  b.edit(b.user, "🔒 Cuộc hội thoại mới");
+  assert.equal(b.user.value, "");
+  assert.equal(b.password.value, "");
+  assert.deepEqual(b.calls.store, []);
+});
+
