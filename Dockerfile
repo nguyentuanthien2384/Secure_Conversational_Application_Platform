@@ -42,6 +42,7 @@ COPY src ./src
 COPY scripts/migrate_database.py ./scripts/migrate_database.py
 COPY scripts/create_admin.py ./scripts/create_admin.py
 COPY scripts/seed_vps_accounts.py ./scripts/seed_vps_accounts.py
+COPY scripts/reset_vps_passwords.py ./scripts/reset_vps_passwords.py
 COPY scripts/enforce_retention.py ./scripts/enforce_retention.py
 COPY scripts/migrate_envelope_encryption.py ./scripts/migrate_envelope_encryption.py
 COPY scripts/rewrap_deks.py ./scripts/rewrap_deks.py

@@ -2126,6 +2126,10 @@ def build_ui(
                                 label="Mật khẩu",
                                 type="password",
                                 max_length=128,
+                                # Khi "Hiện mật khẩu" đổi sang type="text", Gradio coi
+                                # max_lines=None là 20 dòng và vẽ <textarea>: dán mật
+                                # khẩu kèm xuống dòng sẽ giữ "\n" nên đăng nhập sai.
+                                max_lines=1,
                                 placeholder="Nhập mật khẩu",
                                 elem_id="li-pass",
                                 html_attributes=gr.InputHTMLAttributes(

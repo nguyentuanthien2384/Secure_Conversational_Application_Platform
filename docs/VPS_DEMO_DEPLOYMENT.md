@@ -224,6 +224,24 @@ lập. Mặc định không thêm, vì smart lockout đọc bảng audit nên c�
 giả lập có thể tạm khóa `demo.user`/`lab.alice` với IP thật của bạn. Đăng nhập
 `demo.boss` và bật MFA ngay, vì đây là tài khoản admin.
 
+**Đặt chung một mật khẩu mới cho các tài khoản đã có** (lệnh trên không bao giờ đổi
+mật khẩu tài khoản đã tồn tại). Lệnh liệt kê tài khoản sẽ bị đổi, hỏi `y` để xác nhận,
+rồi hỏi mật khẩu mới hai lần (ẩn, 15–128 ký tự). Mỗi tài khoản được gỡ khóa đăng
+nhập sai, bị đăng xuất khỏi mọi thiết bị và có một sự kiện audit
+`admin.password_reset` niêm phong; MFA và trạng thái khóa bởi admin giữ nguyên.
+**Tắt bộ gõ tiếng Việt (Unikey/EVKey) trước khi gõ** — Telex biến `ss`, `oo`…
+thành chữ có dấu mà không hiện ra; lệnh từ chối mật khẩu có ký tự ngoài ASCII.
+
+```bash
+cd /root/scap
+# demo.user, demo.mod, demo.boss và lab.* đang có
+bash deploy/vps-compose.sh run --rm --no-deps app /app/.venv/bin/python scripts/reset_vps_passwords.py
+# hoặc MỌI tài khoản trong CSDL (kể cả operator và tài khoản tự đăng ký)
+bash deploy/vps-compose.sh run --rm --no-deps app /app/.venv/bin/python scripts/reset_vps_passwords.py --all-users
+```
+
+Tài khoản demo nào chưa có thì chạy tiếp `seed_vps_accounts.py` với cùng mật khẩu.
+
 **Cập nhật code sau này:** trên Windows commit và push lên GitHub (VS Code →
 *Source Control* → *Commit* → *Sync*), rồi trong Termius:
 `cd /root/scap && bash deploy/update.sh`.

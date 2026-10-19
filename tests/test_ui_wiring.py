@@ -115,6 +115,9 @@ def test_login_password_manager_hints_and_ready_signal(runtime_demo):
     assert fields["li-user"].html_attributes.autocomplete == "username"
     assert fields["li-user"].max_lines == 1
     assert fields["li-pass"].html_attributes.autocomplete == "current-password"
+    # "Hiện mật khẩu" switches to type="text"; without max_lines=1 Gradio renders
+    # a multi-line <textarea> that keeps a pasted trailing newline.
+    assert fields["li-pass"].max_lines == 1
     assert fields["re-pass"].html_attributes.autocomplete == "new-password"
     ready = next(item for item in runtime_demo.config["dependencies"]
                  if item["outputs"] == [fields["login-ready"]._id])
