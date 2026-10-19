@@ -278,6 +278,9 @@ def _set_valid_high_env(monkeypatch, tmp_path: Path) -> None:
         "VAULT_ALLOW_INSECURE_HTTP": "false",
         "GOOGLE_GENAI_API_KEY": "",
         "GOOGLE_GENAI_API_KEY_FILE": "",
+        # A developer's .env may hold a Claude key; load_dotenv must not inject it.
+        "CLAUDE_API_KEY": "",
+        "CLAUDE_API_KEY_FILE": "",
         "APP_SECRET_KEY": "",
         "APP_SECRET_KEY_FILE": str(app_secret),
         "DATABASE_PASSWORD_FILE": str(database_password),
