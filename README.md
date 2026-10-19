@@ -49,7 +49,7 @@ Từ đăng nhập, phân quyền và kiểm soát dữ liệu đến mã hóa, 
 - **Cảnh báo tài khoản:** Web Push, SMS xác minh sở hữu và phát hiện di chuyển bất thường bằng GeoIP local; các nhà cung cấp thật cần cấu hình riêng, demo dùng outbox.
 - **Bảo vệ dữ liệu:** AES-256-GCM, DEK riêng từng hội thoại, AAD ràng buộc từng tin nhắn, adapter Local/Vault Transit/AWS KMS/GCP KMS.
 - **Mã hóa cục bộ:** tạo/nhập/xuất public key, sao lưu khóa riêng có mật khẩu, mã hóa/giải mã văn bản và tệp nhị phân tối đa 5 MiB ngay trong trình duyệt; nội dung của công cụ không gửi tới API/AI.
-- **Kiểm soát AI:** Gemini hoặc AI demo, đồng thuận gửi dữ liệu ra bên ngoài, DLP với chính sách cho phép/che/xác nhận/chặn/chỉ xử lý local.
+- **Kiểm soát AI:** Claude, Gemini hoặc AI demo, đồng thuận gửi dữ liệu ra bên ngoài, DLP với chính sách cho phép/che/xác nhận/chặn/chỉ xử lý local.
 - **Giám sát:** IDS/IPS chữ ký và tương quan bất thường, audit HMAC chain, checkpoint ngoài hệ thống, sự kiện JSON cho SIEM, dashboard ngân sách tài nguyên.
 - **Triển khai:** demo tạm trên laptop, local có dữ liệu lâu dài, Docker với PostgreSQL/Redis/Caddy, hồ sơ VPS nhỏ và high-security.
 
@@ -218,7 +218,7 @@ flowchart LR
     UI --> API[FastAPI REST API]
     API --> Guard[JWT · RBAC · IDS · Rate limit]
     Guard --> Policy[DLP · Consent · ChatService]
-    Policy --> AI[Gemini hoặc Demo AI]
+    Policy --> AI[Claude / Gemini hoặc Demo AI]
     Policy --> Crypto[Envelope encryption]
     Crypto --> DB[(SQLite / PostgreSQL)]
     Crypto --> KMS[Local / Vault / KMS]
@@ -262,7 +262,7 @@ Với cài đặt mới, `local_storage init` tạo `.env` từ [.env.example](.
 
 Script hỗ trợ cài đặt tự động: `powershell -ExecutionPolicy Bypass -File setup.ps1` trên Windows hoặc `bash setup.sh` trên Linux/macOS. Luồng lệnh `uv sync --frozen` ở trên phù hợp khi cần giữ đúng lockfile.
 
-**Dùng Gemini thật:** cấu hình `GOOGLE_GENAI_API_KEY` trong file riêng hoặc `GOOGLE_GENAI_API_KEY_FILE`, kiểm tra `GEMINI_MODEL`, đặt `ALLOW_DEMO_AI=false` nếu cần bắt buộc provider thật, rồi khởi động lại. Người dùng phải đồng ý trước khi gửi nội dung ra AI ngoài; DLP vẫn áp dụng.
+**Dùng AI thật (Claude / Gemini):** cấu hình `CLAUDE_API_KEY` (hoặc `CLAUDE_API_KEY_FILE`, kiểm tra `CLAUDE_BASE_URL`/`CLAUDE_MODEL`) làm provider chính, hoặc `GOOGLE_GENAI_API_KEY[_FILE]` / `GEMINI_MODEL` cho đường dự phòng Gemini, đặt `ALLOW_DEMO_AI=false` nếu cần bắt buộc provider thật, rồi khởi động lại. Người dùng phải đồng ý trước khi gửi nội dung ra AI ngoài; DLP vẫn áp dụng.
 
 **Tài khoản admin:** development có thể dùng seed/bootstrap cấu hình riêng. Production standard tạo admin bằng công cụ one-off có nhập mật khẩu tương tác; xem [hướng dẫn VPS](docs/VPS_DEMO_DEPLOYMENT.md). High profile cần quy trình provisioning/WORM tương ứng.
 
@@ -442,7 +442,7 @@ Job build/deploy-config cần repository variables chứa image digest đã xác
 - **Hồ sơ/hạ tầng:** `APP_ENV`, `SECURITY_PROFILE`, `DATABASE_URL`, `REDIS_URL`, `ALLOWED_HOSTS`, `ALLOWED_ORIGINS`, `PUBLIC_BASE_URL`.
 - **Khóa/secret:** `APP_SECRET_KEY[_FILE]`, `MASTER_ENCRYPTION_KEY[S]`, `ACTIVE_KEY_VERSION`, `KEY_PROVIDER`, `VAULT_*`, `AWS_KMS_KEY_ID`, `GCP_KMS_KEY_NAME`.
 - **Phiên/tài khoản:** `ACCESS_TOKEN_MINUTES`, `SESSION_IDLE_MINUTES`, `SESSION_ABSOLUTE_HOURS`, `LOGIN_*`, `MFA_*`, `WEBAUTHN_*`, `MAIL_*`, `SMTP_*`.
-- **AI/DLP:** `GOOGLE_GENAI_API_KEY[_FILE]`, `GEMINI_MODEL`, `GEMINI_TIMEOUT_SECONDS`, `ALLOW_DEMO_AI`, `AI_CONSENT_VERSION`, `DLP_CUSTOM_TERMS`.
+- **AI/DLP:** `CLAUDE_API_KEY[_FILE]`, `CLAUDE_BASE_URL`, `CLAUDE_MODEL`, `CLAUDE_EFFORT_LEVEL`, `CLAUDE_TIMEOUT_SECONDS`, `GOOGLE_GENAI_API_KEY[_FILE]`, `GEMINI_MODEL`, `GEMINI_TIMEOUT_SECONDS`, `ALLOW_DEMO_AI`, `AI_CONSENT_VERSION`, `DLP_CUSTOM_TERMS`.
 - **Ngân sách:** `REQUEST_*`, `PASSWORD_MAX_CONCURRENT`, `AI_*`, `GRADIO_*`, `READINESS_*`.
 - **Giám sát/retention:** `IDS_*`, `AUDIT_*`, `SIEM_JSON_LOGS`, `SECURITY_MAINTENANCE_*`, `SECURE_RETENTION_DAYS`, `CONFIDENTIAL_RETENTION_DAYS`.
 
@@ -492,7 +492,7 @@ Secure_Conversational_Application_Platform/
 │   ├── services.py / dlp.py  # Chat, AI, consent và policy DLP
 │   ├── ids.py / audit*.py    # Phát hiện, audit chain và checkpoint
 │   └── account_*.py          # Bảo vệ và khôi phục tài khoản
-├── src/core/ai_core/         # Adapter Google GenAI
+├── src/core/ai_core/         # Adapter Claude (Anthropic) và Google GenAI
 ├── scripts/                  # Demo, kiểm chứng, migration, backup và deploy
 ├── tests/                    # Python và JavaScript tests
 ├── docs/                     # Kịch bản demo, runbook, phạm vi bảo mật

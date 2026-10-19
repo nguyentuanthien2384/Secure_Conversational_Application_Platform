@@ -452,7 +452,8 @@ _REGEX_RULES: tuple[_RegexRule, ...] = (
         re.compile(
             r"\b(?:api[_ -]?key|x-api-key|access[_ -]?token|refresh[_ -]?token|"
             r"auth[_ -]?token|google[_ -]?(?:genai[_ -]?)?api[_ -]?key|"
-            r"gemini[_ -]?api[_ -]?key|(?:claude|anthropic)[_ -]?api[_ -]?key)\s*[:=]\s*"
+            r"gemini[_ -]?api[_ -]?key|"
+            r"(?:claude|anthropic)[_ -]?(?:api[_ -]?key|auth[_ -]?token))\s*[:=]\s*"
             r"(?P<value>\"(?:\\.|[^\"\\\r\n]){6,}\"|'(?:\\.|[^'\\\r\n]){6,}'|[^\s,;]{6,})",
             _FLAGS,
         ),

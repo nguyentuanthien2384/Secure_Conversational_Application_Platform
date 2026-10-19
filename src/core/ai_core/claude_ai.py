@@ -68,7 +68,7 @@ class ClaudeClient:
             raise ValueError("max_output_tokens phải là số nguyên dương.")
         if effort is not None and effort not in EFFORT_LEVELS:
             raise ValueError("effort phải là low, medium, high, xhigh hoặc max.")
-        self.model = model
+        self.model = model.strip() or DEFAULT_MODEL
         self.max_output_tokens = max_output_tokens
         self.effort = effort
         self.client = anthropic.Anthropic(
@@ -136,7 +136,16 @@ class ClaudeClient:
 
 
 if __name__ == "__main__":
+    import sys
+
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     # Cách dùng: đặt CLAUDE_API_KEY trong .env rồi chạy
     #   uv run python -m src.core.ai_core.claude_ai
-    client = ClaudeClient(model=os.getenv("CLAUDE_MODEL", DEFAULT_MODEL), timeout_seconds=25)
+    client = ClaudeClient(
+        model=os.getenv("CLAUDE_MODEL", "").strip() or DEFAULT_MODEL,
+        timeout_seconds=25,
+    )
     print(client.generate("hello"))
+

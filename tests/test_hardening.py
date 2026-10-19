@@ -439,7 +439,18 @@ def test_high_profile_allows_file_backed_ai_key_but_rejects_environment_key(
     assert Settings.from_env().google_genai_api_key == "approved-provider-key-material"
 
     _set_valid_high_env(monkeypatch, tmp_path)
+    claude_key_file = tmp_path / "claude-ai-key"
+    claude_key_file.write_text("approved-claude-key-material", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_API_KEY_FILE", str(claude_key_file))
+    assert Settings.from_env().claude_api_key == "approved-claude-key-material"
+
+    _set_valid_high_env(monkeypatch, tmp_path)
     monkeypatch.setenv("GOOGLE_GENAI_API_KEY", "inspectable-environment-provider-key")
+    with pytest.raises(RuntimeError, match="environment/URL"):
+        Settings.from_env()
+
+    _set_valid_high_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_API_KEY", "inspectable-environment-claude-key")
     with pytest.raises(RuntimeError, match="environment/URL"):
         Settings.from_env()
 

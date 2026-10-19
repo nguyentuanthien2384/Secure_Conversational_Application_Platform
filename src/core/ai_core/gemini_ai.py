@@ -443,7 +443,13 @@ class GeminiClient:
 
 
 if __name__ == "__main__":
+    import sys
+
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     # Cách dùng:
     #   export GOOGLE_GENAI_API_KEY="..."  # hoặc đặt trong .env rồi load trước đó
     client = GeminiClient(model="gemini-flash-lite-latest")
     print(client.generate("hello"))
+

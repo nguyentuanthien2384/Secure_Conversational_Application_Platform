@@ -198,7 +198,16 @@ def test_ai_service_rejects_web_search_while_claude_is_active(tmp_path):
 
 
 @pytest.mark.parametrize("text", [
-    "CLAUDE_API_KEY=abcdef123456", "anthropic api key: abcdef123456",
+    "CLAUDE_API_KEY=abcdef123456",
+    "anthropic api key: abcdef123456",
+    "ANTHROPIC_AUTH_TOKEN=abcdef123456",
+    "claude_auth_token: abcdef123456",
 ])
 def test_claude_key_assignments_are_detected(text):
     assert DLPScanner().scan(text)
+
+
+def test_claude_client_blank_model_falls_back_to_default():
+    client = ClaudeClient(api_key="sk-test", model="   ")
+    assert client.model == "claude-opus-5"
+
