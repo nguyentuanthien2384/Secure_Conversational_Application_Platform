@@ -45,11 +45,277 @@
       button.disabled = button.getAttribute("data-crypto-action") !== "clear" && (item.busy || item.blocked);
     }
   }
+  function highlightCipherRow(recordId) {
+    const tableRoot = document.getElementById("cipher-table");
+    if (!tableRoot || typeof tableRoot.querySelectorAll !== "function") return;
+    for (const row of tableRoot.querySelectorAll("tbody tr")) {
+      const cell = typeof row.querySelector === "function" ? row.querySelector("td") : null;
+      const id = cell ? String(cell.textContent || "").trim() : "";
+      if (recordId && id === String(recordId)) row.setAttribute("data-scap-selected-row", "1");
+      else if (typeof row.removeAttribute === "function") row.removeAttribute("data-scap-selected-row");
+    }
+  }
+  function decodeBridgePayload(encoded) {
+    if (typeof encoded !== "string" || !encoded || encoded.length > 524288) return null;
+    try {
+      const binary = atob(encoded);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      const decoded = new TextDecoder("utf-8", {fatal: true}).decode(bytes);
+      const parsed = JSON.parse(decoded);
+      if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.records)) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+  function extractScapPacket(text) {
+    if (typeof text !== "string" || !text.includes('"scap-encrypted-text"')) return null;
+    const trimmed = text.trim();
+    const candidates = [trimmed];
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start >= 0 && end > start && (start > 0 || end < trimmed.length - 1)) {
+      candidates.push(trimmed.slice(start, end + 1));
+    }
+    for (const candidate of candidates) {
+      if (candidate.length > 100000) continue;
+      try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === "object" && parsed.format === "scap-encrypted-text" &&
+            typeof parsed.ciphertext === "string" && typeof parsed.encryptedKey === "string" &&
+            typeof parsed.iv === "string") {
+          return {
+            packet: JSON.stringify(parsed, null, 2),
+            context: typeof parsed.context === "string" ? parsed.context : "",
+            recipientKeySha256: typeof parsed.recipientKeySha256 === "string" ? parsed.recipientKeySha256 : "",
+          };
+        }
+      } catch {}
+    }
+    return null;
+  }
+  function pickDefaultExtractedRecord(records) {
+    for (let i = records.length - 1; i >= 0; i -= 1) {
+      if (extractScapPacket(records[i]?.content)) return records[i];
+    }
+    for (let i = records.length - 1; i >= 0; i -= 1) {
+      if (typeof records[i]?.content === "string" && records[i].content.length > 0) return records[i];
+    }
+    return records[records.length - 1] || null;
+  }
+  function generateAutoPassphrase() {
+    const bytes = new Uint8Array(24);
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
+      globalThis.crypto.getRandomValues(bytes);
+      let hex = "scap-auto-";
+      for (let i = 0; i < bytes.length; i += 1) hex += bytes[i].toString(16).padStart(2, "0");
+      bytes.fill(0);
+      return hex;
+    }
+    return "Scap-Auto-Session-Passphrase-2026!";
+  }
+  function clearExtractedFile(item) {
+    if (!item?.extractedFile) return;
+    item.extractedFile.bytes?.fill(0);
+    item.extractedFile.containerBytes?.fill(0);
+    item.extractedFile = null;
+  }
+  async function populateFileSectionFromRecord(item, epoch, core, rec) {
+    clearExtractedFile(item);
+    const fileName = rec.file_name || `scap-msg-${rec.id || "cipher"}.json`;
+    const fileContext = rec.file_context || `file:${rec.context}`.slice(0, 200);
+    const snapshot = JSON.stringify({
+      id: rec.id,
+      role: rec.role,
+      encryption_scheme: rec.encryption_scheme,
+      nonce: rec.nonce,
+      ciphertext_preview: rec.ciphertext_preview,
+      created_at: rec.created_at,
+      context: rec.context,
+      content: rec.content,
+    }, null, 2);
+    const rawBytes = new TextEncoder().encode(snapshot);
+    write(item, "file-context", fileContext);
+    write(item, "file-info", `Tệp trích xuất tự động: ${fileName}\nKích thước gốc: ${rawBytes.byteLength} byte`);
+    if (!item.recipient || !isSecureContext || !core || typeof core.encryptFile !== "function") {
+      item.extractedFile = {name: fileName, context: fileContext, bytes: rawBytes, containerBytes: null};
+      write(item, "file-result", "");
+      return;
+    }
+    try {
+      const containerBytes = await core.encryptFile(item.recipient, new Uint8Array(rawBytes), {
+        name: fileName,
+        context: fileContext,
+      });
+      if (!valid(item, epoch)) { rawBytes.fill(0); containerBytes?.fill?.(0); return; }
+      item.extractedFile = {name: fileName, context: fileContext, bytes: rawBytes, containerBytes};
+      if (item.keypair && item.recipient.fingerprint === item.keypair.fingerprint && typeof core.decryptFile === "function") {
+        const restored = await core.decryptFile(
+          item.keypair.privateKey,
+          item.keypair.fingerprint,
+          new Uint8Array(containerBytes),
+        );
+        const restoredSize = restored?.bytes?.byteLength ?? rawBytes.byteLength;
+        restored?.bytes?.fill?.(0);
+        if (!valid(item, epoch)) return;
+        write(
+          item,
+          "file-result",
+          `Gói mã hóa (.scapenc): ${containerBytes.byteLength} byte\nTên tệp gốc: ${restored.name}\nDung lượng: ${restoredSize} byte\nSHA-256 nội dung: ${restored.sha256}\nNgười nhận SHA-256: ${item.recipient.fingerprint}\nNgữ cảnh công khai: ${restored.context || "(trống)"}\nToàn vẹn tệp: hợp lệ (bấm nút trên để tải .scapenc hoặc .bin)`,
+        );
+      } else {
+        write(
+          item,
+          "file-result",
+          `Gói mã hóa (.scapenc): ${containerBytes.byteLength} byte\nNgười nhận SHA-256: ${item.recipient.fingerprint}\nNgữ cảnh công khai: ${fileContext || "(trống)"}`,
+        );
+      }
+    } catch {
+      if (valid(item, epoch)) {
+        item.extractedFile = {name: fileName, context: fileContext, bytes: rawBytes, containerBytes: null};
+        write(item, "file-result", "");
+      } else rawBytes.fill(0);
+    }
+  }
+  async function applyExtractedRecord(item, record) {
+    if (!item || !record || item.blocked || blocked()) return;
+    const id = String(record.id || "");
+    const content = typeof record.content === "string" ? record.content : "";
+    const context = typeof record.context === "string" ? record.context : "";
+    const fileContext = typeof record.file_context === "string" && record.file_context
+      ? record.file_context
+      : `file:${context}`.slice(0, 200);
+    const fileName = typeof record.file_name === "string" && record.file_name
+      ? record.file_name
+      : `scap-msg-${id || "cipher"}.json`;
+    const embedded = extractScapPacket(content);
+    item.extractedRecord = {
+      id,
+      role: String(record.role || ""),
+      encryption_scheme: String(record.encryption_scheme || ""),
+      nonce: String(record.nonce || ""),
+      ciphertext_preview: String(record.ciphertext_preview || ""),
+      created_at: String(record.created_at || ""),
+      content,
+      context: embedded?.context || context,
+      file_name: fileName,
+      file_context: fileContext,
+      packet: embedded?.packet || "",
+      recipientKeySha256: embedded?.recipientKeySha256 || "",
+    };
+    highlightCipherRow(id);
+    touch(item);
+    write(item, "decrypted", "");
+    write(item, "file-context", fileContext);
+    if (embedded) {
+      write(item, "context", item.extractedRecord.context);
+      write(item, "packet", embedded.packet);
+      const fpInfo = embedded.recipientKeySha256 ? ` · Người nhận SHA-256: ${embedded.recipientKeySha256}` : "";
+      write(item, "packet-info", `Đã trích xuất gói bản mã JSON từ tin nhắn #${id}${fpInfo}`);
+      status(item, `Đã trích xuất gói bản mã từ tin nhắn #${id} vào mục 3. Bấm “Giải mã bằng khóa của bạn” để giải mã.`);
+      return;
+    }
+    write(item, "plaintext", content);
+    write(item, "context", context);
+    const core = globalThis.ScapCryptoCore;
+    if (!isSecureContext || !core || item.busy) {
+      write(item, "packet", "");
+      write(item, "packet-info", `Đã nạp tin nhắn #${id} vào mục 2.`);
+      status(item, `Đã trích xuất tin nhắn #${id} vào mục 2.`);
+      return;
+    }
+    const epoch = item.epoch;
+    item.busy = true;
+    buttons(item);
+    try {
+      if (!item.keypair && !item.recipient && typeof core.createKeyPair === "function") {
+        const autoPair = await core.createKeyPair(generateAutoPassphrase());
+        if (!valid(item, epoch)) return;
+        setPair(item, autoPair);
+        write(item, "own-info", `RSA-OAEP 3072 / SHA-256 · SHA-256: ${autoPair.fingerprint} (Khóa phiên tự động)`);
+      }
+      if (content && item.recipient && typeof core.encrypt === "function") {
+        const recipient = item.recipient;
+        const encrypted = await core.encrypt(recipient, content, context);
+        if (!valid(item, epoch)) return;
+        write(item, "packet", encrypted);
+        if (item.keypair && recipient.fingerprint === item.keypair.fingerprint && typeof core.decrypt === "function") {
+          const decrypted = await core.decrypt(item.keypair.privateKey, item.keypair.fingerprint, encrypted);
+          if (!valid(item, epoch)) return;
+          write(item, "decrypted", decrypted);
+          write(item, "packet-info", `Đã tự động đóng gói & giải mã tin nhắn #${id} · Người nhận SHA-256: ${recipient.fingerprint} · Toàn vẹn: hợp lệ.`);
+        } else {
+          write(item, "packet-info", `Đã tự động đóng gói bản mã từ tin nhắn #${id} · Người nhận SHA-256: ${recipient.fingerprint}`);
+        }
+      } else {
+        write(item, "packet", "");
+        write(item, "packet-info", `Bản ghi #${id} (${item.extractedRecord.encryption_scheme || "cipher"}) · Không có văn bản gốc từ máy chủ.`);
+      }
+      await populateFileSectionFromRecord(item, epoch, core, item.extractedRecord);
+      if (!valid(item, epoch)) return;
+      status(item, `Đã tự động trích xuất và hoàn tất cả 4 mục cho tin nhắn #${id}.`);
+    } catch {
+      if (valid(item, epoch)) {
+        write(item, "packet", "");
+        write(item, "packet-info", `Đã nạp tin nhắn #${id} vào mục 2.`);
+        status(item, `Đã trích xuất tin nhắn #${id} vào mục 2.`);
+      }
+    } finally {
+      if (valid(item, epoch)) { item.busy = false; buttons(item); touch(item); }
+    }
+  }
+  async function syncExtractedAfterKeyReady(item, epoch, core, baseStatus) {
+    if (!item.extractedRecord || !item.recipient) {
+      status(item, baseStatus);
+      return;
+    }
+    const rec = item.extractedRecord;
+    if (rec.packet) {
+      write(item, "context", rec.context);
+      write(item, "packet", rec.packet);
+      const fpInfo = rec.recipientKeySha256 ? ` · Người nhận SHA-256: ${rec.recipientKeySha256}` : "";
+      write(item, "packet-info", `Đã trích xuất gói bản mã JSON từ tin nhắn #${rec.id}${fpInfo}`);
+      await populateFileSectionFromRecord(item, epoch, core, rec);
+      if (!valid(item, epoch)) return;
+      status(item, `${baseStatus} Gói bản mã của tin nhắn #${rec.id} đã sẵn sàng ở mục 3 & 4.`);
+      return;
+    }
+    const text = value(item, "plaintext") || rec.content;
+    const ctx = value(item, "context") || rec.context;
+    if (!text) {
+      await populateFileSectionFromRecord(item, epoch, core, rec);
+      if (!valid(item, epoch)) return;
+      status(item, baseStatus);
+      return;
+    }
+    write(item, "plaintext", text);
+    write(item, "context", ctx);
+    const recipient = item.recipient;
+    const encrypted = await core.encrypt(recipient, text, ctx);
+    if (!valid(item, epoch)) return;
+    write(item, "packet", encrypted);
+    if (item.keypair && recipient.fingerprint === item.keypair.fingerprint && typeof core.decrypt === "function") {
+      const decrypted = await core.decrypt(item.keypair.privateKey, item.keypair.fingerprint, encrypted);
+      if (!valid(item, epoch)) return;
+      write(item, "decrypted", decrypted);
+      write(item, "packet-info", `Đã tự động đóng gói & giải mã tin nhắn #${rec.id} · Người nhận SHA-256: ${recipient.fingerprint} · Toàn vẹn: hợp lệ.`);
+    } else {
+      write(item, "packet-info", `Đã tự động đóng gói bản mã từ tin nhắn #${rec.id} · Người nhận SHA-256: ${recipient.fingerprint}`);
+    }
+    await populateFileSectionFromRecord(item, epoch, core, {...rec, content: text, context: ctx});
+    if (!valid(item, epoch)) return;
+    status(item, `${baseStatus} Đã tự động cập nhật bản mã văn bản (mục 3) và tệp (mục 4) cho tin nhắn #${rec.id}.`);
+  }
   function clear(item, message) {
     item.epoch += 1;
     item.busy = false;
     item.keypair = null;
     item.recipient = null;
+    item.extractedRecord = null;
+    item.extractedRecords = [];
+    clearExtractedFile(item);
+    highlightCipherRow("");
     clearTimeout(item.idle);
     item.idle = null;
     for (const [url, timer] of item.urls) {
@@ -73,6 +339,7 @@
     if (state?.node !== node) {
       if (state) clear(state, "Đã xóa khóa và dữ liệu cục bộ.");
       state = node ? {node, epoch: 0, busy: false, keypair: null, recipient: null,
+        extractNonce: "", extractedRecords: [], extractedRecord: null, extractedFile: null,
         idle: null, urls: new Map(), blocked: blocked()} : null;
       if (state) buttons(state);
     }
@@ -80,6 +347,29 @@
       const mustBlock = blocked() || !state.node.isConnected;
       if (mustBlock && !state.blocked) clear(state, "Đã xóa khóa và dữ liệu khi phiên kết thúc hoặc trang bị ẩn.");
       if (state.blocked !== mustBlock) { state.blocked = mustBlock; buttons(state); }
+      if (!state.blocked) {
+        const bridgeRoot = document.getElementById("cipher-workbench-bridge");
+        const marker = bridgeRoot && typeof bridgeRoot.querySelector === "function"
+          ? bridgeRoot.querySelector("[data-scap-cipher-extract]")
+          : null;
+        if (!marker) {
+          if (state.extractNonce) {
+            state.extractNonce = "";
+            state.extractedRecords = [];
+            highlightCipherRow("");
+          }
+        } else {
+          const nonce = marker.getAttribute?.("data-scap-cipher-nonce") || "";
+          const encoded = marker.getAttribute?.("data-scap-cipher-extract") || "";
+          if (nonce && nonce !== state.extractNonce) {
+            state.extractNonce = nonce;
+            const payload = decodeBridgePayload(encoded);
+            state.extractedRecords = payload ? payload.records : [];
+            const selected = pickDefaultExtractedRecord(state.extractedRecords);
+            if (selected) void applyExtractedRecord(state, selected);
+          }
+        }
+      }
     }
   }
   function valid(item, epoch) {
@@ -173,7 +463,7 @@
         }
         if (!valid(item, epoch)) return;
         setPair(item, pair);
-        status(item, action === "generate" ? "Đã tạo cặp khóa." : "Đã mở khóa.");
+        await syncExtractedAfterKeyReady(item, epoch, core, action === "generate" ? "Đã tạo cặp khóa." : "Đã mở khóa.");
       } else if (action === "import-public") {
         item.recipient = null;
         write(item, "recipient-info", "");
@@ -186,7 +476,7 @@
         write(item, "recipient-public", imported.publicPem);
         write(item, "recipient-file", "");
         write(item, "recipient-info", `SHA-256 của người nhận: ${imported.fingerprint}`);
-        status(item, "Đã nhập khóa công khai người nhận.");
+        await syncExtractedAfterKeyReady(item, epoch, core, "Đã nhập khóa công khai người nhận.");
       } else if (action === "encrypt") {
         write(item, "packet", "");
         if (!item.recipient) uiError("no_recipient");
@@ -211,10 +501,20 @@
         const recipient = item.recipient;
         const keypair = item.keypair;
         const context = value(item, "file-context");
-        const name = file?.name;
+        let name = file?.name;
         write(item, "file-info", "");
-        inputFileBytes = await readBinaryFile(item, file,
-          encrypting ? core.limits.fileBytes : core.limits.fileContainerBytes, epoch);
+        if (file) {
+          inputFileBytes = await readBinaryFile(item, file,
+            encrypting ? core.limits.fileBytes : core.limits.fileContainerBytes, epoch);
+        } else if (item.extractedFile) {
+          if (encrypting && item.extractedFile.bytes instanceof Uint8Array) {
+            name = item.extractedFile.name;
+            inputFileBytes = new Uint8Array(item.extractedFile.bytes);
+          } else if (!encrypting && item.extractedFile.containerBytes instanceof Uint8Array) {
+            name = "scap-encrypted-file.scapenc";
+            inputFileBytes = new Uint8Array(item.extractedFile.containerBytes);
+          } else uiError("file_input");
+        } else uiError("file_input");
         if (!valid(item, epoch)) return;
         if (encrypting) {
           outputFileBytes = await core.encryptFile(recipient, inputFileBytes, {name, context});
@@ -228,7 +528,7 @@
           const result = await core.decryptFile(keypair.privateKey, keypair.fingerprint, inputFileBytes);
           outputFileBytes = result.bytes;
           if (!valid(item, epoch)) return;
-          write(item, "file-info", `Gói mã hóa: ${file.name}\nKích thước gói: ${inputFileBytes.byteLength} byte`);
+          write(item, "file-info", `Gói mã hóa: ${name}\nKích thước gói: ${inputFileBytes.byteLength} byte`);
           download(item, epoch, outputFileBytes, "scap-restored.bin", "application/octet-stream");
           if (!valid(item, epoch)) return;
           write(item, "file-result", `Tên tệp gốc: ${result.name}\nDung lượng: ${outputFileBytes.byteLength} byte\nSHA-256 nội dung: ${result.sha256}\nNgữ cảnh công khai: ${result.context || "(trống)"}\nTệp tải xuống: scap-restored.bin`);
@@ -273,6 +573,18 @@
       if (state) clear(state, "Đã xóa khóa và dữ liệu cục bộ khi đăng xuất.");
       return;
     }
+    const cipherTable = document.getElementById("cipher-table");
+    const row = cipherTable && typeof event.target?.closest === "function" ? event.target.closest("tbody tr") : null;
+    if (row && typeof cipherTable.contains === "function" && cipherTable.contains(row)) {
+      inspect();
+      if (!state || !state.extractedRecords.length) return;
+      if (typeof row.querySelector === "function" && row.querySelector(".scap-table-empty")) return;
+      const cell = typeof row.querySelector === "function" ? row.querySelector("td") : null;
+      const rowId = cell ? String(cell.textContent || "").trim() : "";
+      const matched = state.extractedRecords.find((item) => String(item.id) === rowId);
+      if (matched) void applyExtractedRecord(state, matched);
+      return;
+    }
     const button = event.target?.closest?.("[data-crypto-action]");
     if (!button) return;
     inspect();
@@ -304,6 +616,7 @@
       if (name === "packet") { write(state, "decrypted", ""); write(state, "packet-info", ""); }
       if (name) { write(state, "file-info", ""); write(state, "file-result", ""); }
       if (name === "file-input") {
+        clearExtractedFile(state);
         const file = field(state, "file-input")?.files?.[0];
         const size = file && Number.isSafeInteger(file.size) && file.size >= 0 ? `${file.size} byte` : "không hợp lệ";
         write(state, "file-info", file ? `Đã chọn tệp (chưa xác minh): ${file.name}\nKích thước: ${size}` : "Chưa chọn tệp.");

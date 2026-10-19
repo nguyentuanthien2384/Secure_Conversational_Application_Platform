@@ -101,5 +101,8 @@ WORKBENCH_CSS = """
 .crypto-workbench button:focus-visible,.crypto-workbench input:focus-visible,.crypto-workbench textarea:focus-visible { outline:3px solid #2563eb; outline-offset:2px; }
 .crypto-workbench button:disabled { cursor:wait; opacity:.6; }
 .crypto-workbench [data-crypto-field=status] { font-weight:600; min-height:24px; }
+#cipher-table tbody tr { cursor:pointer; transition:background-color .15s ease; }
+#cipher-table tbody tr:hover td { background:rgba(37,99,235,.08); }
+#cipher-table tbody tr[data-scap-selected-row="1"] td { background:rgba(16,185,129,.14); font-weight:600; }
 @media(max-width:800px) { .crypto-workbench .crypto-grid,.crypto-workbench .crypto-profile { grid-template-columns:1fr; } .crypto-workbench { padding:12px; } }
 """

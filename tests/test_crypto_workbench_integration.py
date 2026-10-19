@@ -353,3 +353,62 @@ def test_slow_metadata_response_cannot_publish_after_logout(demo, monkeypatch):
         assert result["changed_state_ids"] == []
 
     asyncio.run(scenario())
+
+
+def test_extract_cipher_workbench_builds_bounded_base64_bridge_payload(demo, monkeypatch):
+    import base64
+
+    cipher_rows = [
+        {
+            "id": "5c14f839",
+            "role": "user",
+            "ciphertext_preview": "abc123==",
+            "nonce": "nonce-1",
+            "crypto_epoch": 1,
+            "key_version": 1,
+            "encryption_scheme": "envelope-v1",
+            "created_at": "2026-10-19T05:11:13Z",
+        },
+        {
+            "id": "bb8148d7",
+            "role": "assistant",
+            "ciphertext_preview": "def456==",
+            "nonce": "nonce-2",
+            "crypto_epoch": 1,
+            "key_version": 1,
+            "encryption_scheme": "envelope-v1",
+            "created_at": "2026-10-19T05:11:21Z",
+        },
+    ]
+    message_rows = [
+        {"id": "5c14f839", "role": "user", "content": "Nội dung câu hỏi"},
+        {"id": "bb8148d7", "role": "assistant", "content": "Nội dung phản hồi"},
+    ]
+
+    def fake_api(_token, _method, path, *_args, **_kwargs):
+        if path.endswith("/ciphertexts"):
+            return cipher_rows
+        if path.endswith("/messages"):
+            return message_rows
+        return []
+
+    monkeypatch.setattr(gradio_ui, "_api", fake_api)
+    fn = callback(demo, "extract_cipher_workbench")
+    assert fn.fn("bearer-token", "sess-1", "other-session") == gr.skip()
+    assert fn.fn("", "sess-1", "sess-1") == ""
+    markup = fn.fn("bearer-token", "sess-1", "sess-1")
+    match = re.search(
+        r'data-scap-cipher-extract="([^"]+)"\s+data-scap-cipher-nonce="([0-9a-f]{16})"',
+        markup,
+    )
+    assert match is not None
+    payload = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+    assert payload["session_id"] == "sess-1"
+    assert len(payload["records"]) == 2
+    assert payload["records"][1]["id"] == "bb8148d7"
+    assert payload["records"][1]["content"] == "Nội dung phản hồi"
+    assert (
+        payload["records"][1]["context"]
+        == "session:sess-1|msg:bb8148d7|role:assistant|epoch:1|scheme:envelope-v1"
+    )
+

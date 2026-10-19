@@ -138,7 +138,7 @@ footer { display: none !important; }
 #btn-passkey-login-done, #btn-passkey-register-done,
 #btn-passkey-step-up-done { display: none !important; }
 #security-push-bridge, #security-push-result, #btn-security-push-done { display: none !important; }
-#chat-file-payload, #btn-chat-file-stage { display: none !important; }
+#chat-file-payload, #btn-chat-file-stage, #cipher-workbench-bridge { display: none !important; }
 #scap-session-warning { padding: 12px; color: var(--scap-warn-fg); background: var(--scap-warn-bg); }
 
 /* ── Khung ngoài: một workspace full-width duy nhất cho mọi tab ─────────
@@ -2469,6 +2469,7 @@ def build_ui(
                     crypto_info = gr.JSON(label="Thông số mã hóa hội thoại · không chứa khóa", value={})
                     st_cipher_view = gr.State(None)
                     st_cipher_generation = gr.State(0)
+                    cipher_workbench_bridge = _static_html("", elem_id="cipher-workbench-bridge")
                     _static_html(WORKBENCH_HTML, elem_id="crypto-workbench")
 
                 # ---------- TÌM KIẾM ----------
@@ -2867,6 +2868,7 @@ def build_ui(
             (crypto_info, {}),
             (st_cipher_view, None),
             (st_cipher_generation, 0),
+            (cipher_workbench_bridge, ""),
             (tb_gq, ""),
             (df_gsearch, _table_html(SEARCH_HEADERS, [])),
             (tb_pw_cur, ""),
@@ -3988,7 +3990,78 @@ def build_ui(
                 for row in rows
             ])
 
-        btn_cipher.click(_guard(load_cipher, 1), [st_token, dd_cipher, st_cipher_view], [df_cipher])
+        def _truncate_utf8(text: str, max_bytes: int) -> str:
+            raw = (text or "").encode("utf-8")
+            if len(raw) <= max_bytes:
+                return text or ""
+            return raw[:max_bytes].decode("utf-8", errors="ignore")
+
+        def _cipher_extract_aad_context(session_id: str, row: dict) -> str:
+            scheme = row.get("encryption_scheme") or "legacy-v1"
+            epoch = row.get("crypto_epoch", 1)
+            msg_id = row.get("id", "")
+            role = row.get("role", "")
+            ctx = f"session:{session_id}|msg:{msg_id}|role:{role}|epoch:{epoch}|scheme:{scheme}"
+            return _truncate_utf8(ctx, 256)
+
+        def extract_cipher_workbench(token, session_id, view_id=None):
+            if view_id != session_id:
+                return gr.skip()
+            if not token or not session_id:
+                return ""
+            rows = _api(token, "GET", f"/api/sessions/{session_id}/ciphertexts")
+            if not rows:
+                return ""
+            msg_by_id = {}
+            try:
+                messages = _api(token, "GET", f"/api/sessions/{session_id}/messages")
+                for msg in (messages or []):
+                    if isinstance(msg, dict) and msg.get("id"):
+                        msg_by_id[str(msg["id"])] = str(msg.get("content") or "")
+            except gr.Error:
+                pass
+            records = []
+            for row in rows[-50:]:
+                row_id = str(row.get("id") or "")
+                content = _truncate_utf8(msg_by_id.get(row_id, ""), 65536)
+                ctx = _cipher_extract_aad_context(str(session_id), row)
+                short_id = re.sub(r"[^A-Za-z0-9_-]", "", row_id)[:12] or "cipher"
+                records.append({
+                    "id": row_id,
+                    "role": str(row.get("role") or ""),
+                    "ciphertext_preview": str(row.get("ciphertext_preview") or ""),
+                    "nonce": str(row.get("nonce") or ""),
+                    "crypto_epoch": int(row.get("crypto_epoch") or 1),
+                    "key_version": int(row.get("key_version") or 1),
+                    "encryption_scheme": str(row.get("encryption_scheme") or "legacy-v1"),
+                    "created_at": str(row.get("created_at") or ""),
+                    "content": content,
+                    "context": ctx,
+                    "file_name": f"scap-msg-{short_id}.json",
+                    "file_context": _truncate_utf8(f"file:{ctx}", 256),
+                })
+            payload = {
+                "session_id": str(session_id),
+                "records": records,
+            }
+            encoded = base64.b64encode(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii")
+            nonce = secrets.token_hex(8)
+            return (
+                f'<span data-scap-cipher-extract="{encoded}" '
+                f'data-scap-cipher-nonce="{nonce}"></span>'
+            )
+
+        btn_cipher.click(
+            _guard(load_cipher, 1), [st_token, dd_cipher, st_cipher_view], [df_cipher],
+        ).then(
+            _guard(extract_cipher_workbench, 1),
+            [st_token, dd_cipher, st_cipher_view],
+            [cipher_workbench_bridge],
+            show_progress="hidden",
+            api_visibility="private",
+        )
 
         def load_crypto_info(token, session_id, view_id=None):
             if view_id != session_id:
@@ -4007,6 +4080,9 @@ def build_ui(
             clear_crypto_view, [dd_cipher, st_cipher_generation],
             [df_cipher, crypto_info, st_cipher_view, st_cipher_generation], queue=False,
             trigger_mode="always_last", api_visibility="private",
+        ).then(
+            lambda: "", None, [cipher_workbench_bridge],
+            queue=False, show_progress="hidden", api_visibility="private",
         )
 
         # ---- tìm kiếm toàn cục ----
@@ -5108,7 +5184,7 @@ def build_ui(
         fn.api_visibility = "private"
         if fn.fn is not None and fn.fn.__name__ in {"find_in_session", "load_more_session_search"}:
             fn._scap_scope_ids = (st_session_search_generation._id,)
-        if fn.fn is not None and fn.fn.__name__ in {"load_cipher", "load_crypto_info"}:
+        if fn.fn is not None and fn.fn.__name__ in {"load_cipher", "load_crypto_info", "extract_cipher_workbench"}:
             fn._scap_scope_ids = (st_cipher_generation._id,)
     demo.config = demo.get_config_file()
     demo.queue(

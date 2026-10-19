@@ -37,9 +37,12 @@ function browser(options = {}) {
       }
     }
     getAttribute(name) { return this.attributes[name] ?? null; }
+    setAttribute(name, val) { this.attributes[name] = String(val); }
+    removeAttribute(name) { delete this.attributes[name]; }
     closest(selector) {
       if (selector === "[data-crypto-action]") return this.attributes["data-crypto-action"] ? this : null;
       if (selector === "#btn-logout, #btn-logout-all") return this.logout ? this : null;
+      if (selector === "tbody tr") return this.cipherRow || null;
       return null;
     }
     set innerHTML(_) { assert.fail("User data must never reach innerHTML"); }
@@ -60,6 +63,15 @@ function browser(options = {}) {
     return root;
   }
   let root = makeRoot();
+  let bridgeMarker = null;
+  const cipherRows = new Map();
+  const bridgeRoot = {
+    querySelector(selector) { return selector === "[data-scap-cipher-extract]" ? bridgeMarker : null; },
+  };
+  const cipherTable = {
+    querySelectorAll(selector) { return selector === "tbody tr" ? [...cipherRows.values()] : []; },
+    contains(node) { return [...cipherRows.values()].includes(node); },
+  };
   const core = {
     limits: {fileBytes: 5242880, fileContainerBytes: 5246380},
     async createKeyPair(...args) { calls.create.push(args); return options.create ? options.create(...args) : pair(); },
@@ -74,7 +86,12 @@ function browser(options = {}) {
   const document = {
     readyState: "complete", visibilityState: "visible", body,
     addEventListener(name, callback) { const list = events.get(name) || []; list.push(callback); events.set(name, list); },
-    getElementById(id) { return id === "app-sec" ? app : null; },
+    getElementById(id) {
+      if (id === "app-sec") return app;
+      if (id === "cipher-workbench-bridge") return bridgeRoot;
+      if (id === "cipher-table") return cipherTable;
+      return null;
+    },
     querySelector(selector) {
       if (selector === '#crypto-workbench [data-scap-crypto-workbench="1"]') return root;
       if (selector === "#session-bridge [data-scap-session-clear]") return clearMarker ? {} : null;
@@ -87,7 +104,7 @@ function browser(options = {}) {
   };
   Object.defineProperty(document, "cookie", {get() { calls.persistence += 1; throw new Error("No cookies allowed"); }});
   const context = {
-    document, Blob, TextEncoder, ArrayBuffer, Uint8Array, ScapCryptoCore: options.noCore ? undefined : core, isSecureContext: options.secure !== false,
+    document, Blob, TextEncoder, TextDecoder, atob, ArrayBuffer, Uint8Array, ScapCryptoCore: options.noCore ? undefined : core, isSecureContext: options.secure !== false,
     navigator: {clipboard: {async writeText(value) { calls.clipboard.push(value); if (options.clipboard) return options.clipboard(value); }}},
     URL: {createObjectURL(blob) { const url = `blob:local-${++nextUrl}`; blobs.set(url, blob); return url; },
       revokeObjectURL(url) { calls.revoked.push(url); blobs.delete(url); }},
@@ -104,7 +121,7 @@ function browser(options = {}) {
     for (const callback of events.get(name) || []) callback({type: name, target, preventDefault() {}});
   }
   return {
-    calls, app, document, core, timers,
+    calls, app, document, core, timers, cipherRows,
     field(name) { return root.fields.get(name); },
     button(name) { return root.buttons.get(name); },
     async click(name) { dispatch("click", root.buttons.get(name)); await flush(); },
@@ -120,6 +137,27 @@ function browser(options = {}) {
     detach() { root.isConnected = false; observer(); },
     replace() { const old = root; old.isConnected = false; root = makeRoot(); observer(); return old; },
     idle() { const timer = [...timers.values()].find((item) => item.duration === 300000); assert.ok(timer); timer.callback(); },
+    async extractCipher(records, nonce = "nonce-1") {
+      cipherRows.clear();
+      for (const rec of records) {
+        const cell = new Element();
+        cell.textContent = String(rec.id);
+        const tr = new Element();
+        tr.cipherRow = tr;
+        tr.querySelector = (sel) => sel === "td" ? cell : null;
+        cipherRows.set(String(rec.id), tr);
+      }
+      const encoded = Buffer.from(JSON.stringify({session_id: "sess-1", records}), "utf8").toString("base64");
+      bridgeMarker = new Element({"data-scap-cipher-extract": encoded, "data-scap-cipher-nonce": nonce});
+      observer();
+      await flush();
+    },
+    async clickCipherRow(id) {
+      const tr = cipherRows.get(String(id));
+      assert.ok(tr);
+      dispatch("click", tr);
+      await flush();
+    },
   };
 }
 
@@ -711,3 +749,124 @@ test("real WebCrypto file containers roundtrip through the controller without co
   assert.equal(b.calls.network, 0);
   assert.equal(b.calls.persistence, 0);
 });
+
+test("cipher extraction automatically completes all 4 sections (keys, plaintext/AAD, JSON packet/decryption, and file container)", async () => {
+  const b = browser({
+    encrypt: (_recipient, text, ctx) => JSON.stringify({format: "scap-encrypted-text", ciphertext: `ENC:${text}`, context: ctx}),
+    decrypt: (_priv, _fp, packet) => `DEC:${JSON.parse(packet).ciphertext}`,
+  });
+  await b.extractCipher([
+    {
+      id: "5c14f839",
+      role: "user",
+      encryption_scheme: "envelope-v1",
+      content: "Xin chào SCAP",
+      context: "session:sess-1|msg:5c14f839|role:user|epoch:1|scheme:envelope-v1",
+      file_name: "scap-msg-5c14f839.json",
+      file_context: "file:session:sess-1|msg:5c14f839|role:user|epoch:1|scheme:envelope-v1",
+    },
+    {
+      id: "bb8148d7",
+      role: "assistant",
+      encryption_scheme: "envelope-v1",
+      content: "Phản hồi bảo mật từ trợ lý",
+      context: "session:sess-1|msg:bb8148d7|role:assistant|epoch:1|scheme:envelope-v1",
+      file_name: "scap-msg-bb8148d7.json",
+      file_context: "file:session:sess-1|msg:bb8148d7|role:assistant|epoch:1|scheme:envelope-v1",
+    },
+  ]);
+  // Section 1 (Khóa của bạn): auto-generated session keypair
+  assert.equal(b.calls.create.length, 1);
+  assert.equal(b.field("own-public").value, "PUBLIC PEM alice");
+  assert.match(b.field("own-info").textContent, /Khóa phiên tự động/);
+  // Section 2 (Người nhận & văn bản gốc)
+  assert.equal(b.field("recipient-public").value, "PUBLIC PEM alice");
+  assert.equal(b.field("plaintext").value, "Phản hồi bảo mật từ trợ lý");
+  assert.equal(b.field("context").value, "session:sess-1|msg:bb8148d7|role:assistant|epoch:1|scheme:envelope-v1");
+  // Section 3 (Gói mã hóa và kết quả)
+  assert.equal(b.calls.encrypt.length, 1);
+  assert.equal(b.calls.decrypt.length, 1);
+  assert.match(b.field("packet").value, /ENC:Phản hồi bảo mật từ trợ lý/);
+  assert.equal(b.field("decrypted").value, "DEC:ENC:Phản hồi bảo mật từ trợ lý");
+  assert.match(b.field("packet-info").textContent, /Toàn vẹn: hợp lệ/);
+  // Section 4 (Mã hóa & giải mã tệp)
+  assert.equal(b.field("file-context").value, "file:session:sess-1|msg:bb8148d7|role:assistant|epoch:1|scheme:envelope-v1");
+  assert.match(b.field("file-info").textContent, /scap-msg-bb8148d7\.json/);
+  assert.match(b.field("file-result").textContent, /Toàn vẹn tệp: hợp lệ/);
+  assert.equal(b.cipherRows.get("bb8148d7").getAttribute("data-scap-selected-row"), "1");
+  assert.equal(b.cipherRows.get("5c14f839").getAttribute("data-scap-selected-row"), null);
+  // Clicking encrypt-file / decrypt-file downloads the extracted file without manual file selection
+  await b.click("encrypt-file");
+  assert.equal(b.calls.downloads.length, 1);
+  assert.equal(b.calls.downloads[0].filename, "scap-encrypted-file.scapenc");
+  await b.click("decrypt-file");
+  assert.equal(b.calls.downloads.length, 2);
+  assert.equal(b.calls.downloads[1].filename, "scap-restored.bin");
+});
+
+test("cipher extraction preserves existing user keypair and supports clicking rows in #cipher-table", async () => {
+  const b = browser({
+    encrypt: (_recipient, text, ctx) => JSON.stringify({format: "scap-encrypted-text", ciphertext: `ENC:${text}`, context: ctx}),
+    decrypt: (_priv, _fp, packet) => `DEC:${JSON.parse(packet).ciphertext}`,
+  });
+  await b.generate();
+  assert.equal(b.calls.create.length, 1);
+  assert.equal(b.calls.encrypt.length, 0);
+  await b.extractCipher([
+    {
+      id: "msg-1",
+      role: "user",
+      encryption_scheme: "envelope-v1",
+      content: "Tin nhắn thứ nhất",
+      context: "session:sess-1|msg:msg-1|role:user|epoch:1|scheme:envelope-v1",
+    },
+    {
+      id: "msg-2",
+      role: "assistant",
+      encryption_scheme: "envelope-v1",
+      content: "Tin nhắn thứ hai",
+      context: "session:sess-1|msg:msg-2|role:assistant|epoch:1|scheme:envelope-v1",
+    },
+  ], "nonce-open");
+  // Existing keypair is preserved (no second createKeyPair call)
+  assert.equal(b.calls.create.length, 1);
+  assert.equal(b.calls.encrypt.length, 1);
+  assert.equal(b.field("plaintext").value, "Tin nhắn thứ hai");
+  assert.match(b.field("packet").value, /ENC:Tin nhắn thứ hai/);
+  assert.equal(b.field("decrypted").value, "DEC:ENC:Tin nhắn thứ hai");
+  assert.equal(b.cipherRows.get("msg-2").getAttribute("data-scap-selected-row"), "1");
+  await b.clickCipherRow("msg-1");
+  assert.equal(b.calls.encrypt.length, 2);
+  assert.equal(b.field("plaintext").value, "Tin nhắn thứ nhất");
+  assert.match(b.field("packet").value, /ENC:Tin nhắn thứ nhất/);
+  assert.equal(b.field("decrypted").value, "DEC:ENC:Tin nhắn thứ nhất");
+  assert.equal(b.cipherRows.get("msg-1").getAttribute("data-scap-selected-row"), "1");
+  assert.equal(b.cipherRows.get("msg-2").getAttribute("data-scap-selected-row"), null);
+});
+
+test("cipher extraction loads embedded scap-encrypted-text JSON packet directly into Section 3", async () => {
+  const b = browser();
+  const embeddedPacket = JSON.stringify({
+    format: "scap-encrypted-text",
+    version: 1,
+    recipientKeySha256: "a".repeat(64),
+    encryptedKey: "wrapped-key-b64",
+    iv: "iv-b64",
+    ciphertext: "cipher-b64",
+    context: "custom-aad",
+  });
+  await b.extractCipher([
+    {
+      id: "pkt-99",
+      role: "user",
+      encryption_scheme: "envelope-v1",
+      content: embeddedPacket,
+      context: "session:sess-1|msg:pkt-99|role:user|epoch:1|scheme:envelope-v1",
+    },
+  ], "nonce-pkt");
+  assert.equal(b.field("context").value, "custom-aad");
+  assert.equal(JSON.parse(b.field("packet").value).ciphertext, "cipher-b64");
+  assert.match(b.field("packet-info").textContent, /pkt-99/);
+});
+
+
