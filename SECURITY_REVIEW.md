@@ -539,3 +539,71 @@ Tham chiếu: [Microsoft file security](https://learn.microsoft.com/en-us/window
   `setup.sh -n`; chưa chạy wrapper setup trên project thật, CI remote hoặc
   Linux/POSIX filesystem trong đợt này. Không chạy backup/restore trên DB thật,
   sửa ACL dữ liệu lịch sử, pentest độc lập hay thử DDoS Internet.
+
+## 10. Kiểm chứng runtime hồ sơ high-security — 18/10/2026
+
+Lần đầu chạy thật `SECURITY_PROFILE=high` bằng `docker-compose.yml` và
+`docker-compose.high-security.yml` không sửa đổi, cộng một overlay lab: CA nội
+bộ và TLS cho PostgreSQL/Redis/Vault/WORM, Vault Transit chạy server mode lưu
+trong RAM, receiver WORM giả lập (HTTPS, Bearer, append-only, idempotent). Đợt
+đầu dùng cổng danh tính lab thay OIDC; đợt sau giữ Caddyfile của repo để kiểm
+chứng health check. Đây là dịch vụ thay thế trong lab, không phải hạ tầng
+production; không đổi `.env`, DB hay stack local đang dùng.
+
+### Lỗi thật phát hiện và đã sửa
+
+- **Mọi lần đăng nhập thành công trả 503 ở high:** ACL Redis thiếu `zpopmax`
+  (hoàn slot rate limit) và `set` (claim của maintenance). Đã bổ sung, kèm test
+  đối chiếu ACL với mọi lệnh Redis ứng dụng gửi.
+- **Hội thoại mẫu biến mất trên stack mới:** seed chạy sau lượt quét retention
+  lúc khởi động nên hội thoại không có hạn lưu giữ và bị mọi truy vấn ẩn. Seed
+  demo/VPS/learning nay đặt hạn theo chính sách ngay khi tạo.
+- **Thông báo sai nguyên nhân:** xóa phần đuôi audit đã neo làm app báo
+  "Audit WORM is unavailable". Lỗi toàn vẹn nay tách riêng
+  (`AuditCheckpointIntegrityError`): khởi động báo checkpoint không khớp chuỗi,
+  SIEM ghi `audit.checkpoint.integrity_failed`, endpoint neo thủ công trả 409
+  thay vì 503 có `Retry-After`.
+
+### Phần bổ sung
+
+- **Quản trị viên đầu tiên cho high:** `scripts/create_admin.py` kiểm tra token
+  WORM trước khi hỏi mật khẩu, từ chối khi WORM không phản hồi hoặc checkpoint
+  không khớp, rồi neo sự kiện `admin.bootstrap_create` sau commit; mã thoát
+  0/1/3. `seed_vps_accounts.py` vẫn chỉ nhận hồ sơ standard.
+- **Loại instance 503 ở biên:** snippet health check chủ động `/api/ready` trong
+  Caddyfile, bật bằng `CADDY_APP_HEALTH=ready` ở overlay high; standard giữ
+  `none` vì readiness của nó còn phản ánh quá tải ngắn hạn.
+- **Tài liệu:** khóa Vault Transit phải tạo với `derived=true` (app gửi
+  `context`) cùng policy tối thiểu, quy trình tạo admin high, và bảng phân biệt
+  sự cố WORM với bằng chứng can thiệp trong runbook sự cố.
+
+### Bằng chứng kiểm chứng
+
+- Lab high build từ mã hiện tại: các lệnh Vault trong tài liệu chạy nguyên văn,
+  token của app bị từ chối khi đọc cấu hình khóa. `create_admin` chạy qua
+  `compose run` thành công, WORM nhận mốc của sự kiện tạo admin, admin đăng nhập
+  được qua biên; khi WORM tắt, lệnh từ chối và không tạo tài khoản.
+- WORM tắt kèm lưu lượng ghi audit: 2 yêu cầu được xử lý trước khi biên trả 503
+  ở giây thứ 14. WORM bật lại: app tự neo bù phần đuôi, biên định tuyến lại sau
+  22 giây. Xóa phần đuôi đã neo rồi khởi động lại: app từ chối với thông báo
+  toàn vẹn và không gửi mốc mới.
+- Caddy 2.10 thật: `none` không probe, `ready` tạo đúng một prober, giá trị sai
+  làm Caddy từ chối cấu hình.
+- Đợt đầu cùng ngày: test MLS native 14/14; Rust HPKE 7/7, `cargo audit` không
+  có lỗ hổng (một cảnh báo crate không còn bảo trì); suite trên Linux 2.120 đạt;
+  stack production-like đạt 33/33 thăm dò bảo mật; diễn tập nâng cấp trên bản sao
+  DB thật giải mã 66/66 tin nhắn, chuỗi audit 1.559/1.559 nguyên vẹn; lab high
+  xác nhận MFA bắt buộc cho admin, Vault sập trả 503, xoay khóa và rewrap đạt.
+- Suite Windows sau đợt sửa: **2.192 kiểm thử đạt**, 239 bỏ qua (POSIX/client
+  native), 0 lỗi; gồm regression mới cho admin high, thông báo toàn vẹn
+  checkpoint, health check Caddy và việc `seed_vps_accounts` vẫn từ chối high.
+  Ruff đạt; `tests/test_vps_compose.py` chạy với Docker thật.
+
+### Giới hạn
+
+Vault lưu trong RAM, WORM là receiver giả không có object lock, cổng danh tính
+không phải IdP OIDC thật. Với một instance, fail-closed nghĩa là toàn site trả
+503 trong lúc WORM sự cố. Readiness high xác minh lại mọi checkpoint lịch sử ở
+mỗi lần gọi; với `AUDIT_CHECKPOINT_INTERVAL=1` chi phí tăng theo số sự kiện audit
+nên cần đo lại khi dữ liệu lớn. Chưa kiểm chứng VPS thật, KMS cloud, IdP thật,
+Twilio/Web Push, DAST có xác thực đầy đủ hay pentest độc lập.

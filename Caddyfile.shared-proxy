@@ -22,6 +22,22 @@
 	}
 }
 
+# Same per-profile upstream health snippets as Caddyfile (see the rationale there).
+(app_health_none) {
+}
+
+(app_health_ready) {
+	health_uri /api/ready
+	health_headers {
+		Host {$PUBLIC_DOMAIN}
+	}
+	health_interval 10s
+	health_timeout 5s
+	health_status 200
+	health_fails 2
+	health_passes 1
+}
+
 http://{$PUBLIC_DOMAIN} {
 	encode zstd gzip
 
@@ -100,6 +116,8 @@ http://{$PUBLIC_DOMAIN} {
 		# share one rate-limit and audit identity.
 		header_up X-Forwarded-For {client_ip}
 		header_up X-Real-IP {client_ip}
+		# Only here, not on the assets route: each import adds its own prober.
+		import app_health_{$CADDY_APP_HEALTH:none}
 	}
 
 	header {

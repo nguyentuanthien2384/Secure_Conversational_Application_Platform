@@ -5,13 +5,14 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
+import src.app.main as app_module
 from src.app.audit_chain import append_lock, derive_audit_key, seal_event
 from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
 from src.app.db import Database
 from src.app.main import create_app
-from src.app.models import AuditEvent, User
+from src.app.models import AuditCheckpoint, AuditEvent, User
 from tests.conftest import register_and_login
 
 
@@ -324,3 +325,37 @@ def test_high_startup_refuses_an_unavailable_worm_sink(
     with pytest.raises(RuntimeError, match="refusing high-security startup"):
         with TestClient(app):
             pass
+
+
+def test_high_startup_reports_a_deleted_anchored_tail_as_tampering(
+    settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def deliver(_document, _checkpoint_id):
+        return "sha256:" + "e" * 64
+
+    app = _high_worm_app(settings, tmp_path)
+    monkeypatch.setattr(app.state.audit_checkpoint_service, "_deliver", deliver)
+    with TestClient(app):
+        pass
+    # An attacker with database access removes the anchored tail. The local
+    # chain prefix stays valid; only the checkpoint can reveal the deletion.
+    with app.state.database.session_factory() as db:
+        checkpoint = db.scalar(
+            select(AuditCheckpoint).order_by(AuditCheckpoint.last_event_id.desc()).limit(1)
+        )
+        assert checkpoint is not None
+        db.execute(delete(AuditEvent).where(AuditEvent.id >= checkpoint.last_event_id))
+        db.commit()
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        app_module, "emit_security_event", lambda event_type, **_: events.append(event_type)
+    )
+    restarted = _high_worm_app(settings, tmp_path)
+    # The sink is healthy: the old "WORM is unavailable" text would mislead.
+    monkeypatch.setattr(restarted.state.audit_checkpoint_service, "_deliver", deliver)
+    with pytest.raises(RuntimeError, match="does not match the local audit chain"):
+        with TestClient(restarted):
+            pass
+    assert "audit.checkpoint.integrity_failed" in events
+    assert "audit.checkpoint.delivery_failed" not in events

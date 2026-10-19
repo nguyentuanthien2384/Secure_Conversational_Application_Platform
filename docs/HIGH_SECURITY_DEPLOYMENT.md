@@ -112,6 +112,33 @@ High profile tắt tự đăng ký (`ALLOW_SELF_REGISTRATION=false`). Tài kho�
 được cấp qua quản trị viên/quy trình IdP đã phê duyệt; không mở lại endpoint tự
 đăng ký trên hệ thống chứa hội thoại rất nhạy cảm.
 
+### Tạo quản trị viên đầu tiên
+
+Sau khi stack đã `up -d` và migration hoàn tất, chạy lệnh một lần từ terminal
+tương tác (mật khẩu nhập ẩn hai lần, không nhận qua argument/env):
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.high-security.yml \
+  run --rm --no-deps app /app/.venv/bin/python scripts/create_admin.py --username operator
+```
+
+Entrypoint high-security staging secret vào tmpfs rồi hạ quyền trước khi chạy
+lệnh, nên lệnh dùng đúng Vault/WORM/DB credential của app. Trình tự:
+
+1. Kiểm tra token WORM trước khi hỏi mật khẩu.
+2. Từ chối, không đổi gì, nếu checkpoint hiện có không khớp chuỗi audit hoặc kho
+   WORM không phản hồi (lệnh phát lại mốc mới nhất để chứng minh kết nối).
+3. Tạo tài khoản và sự kiện `admin.bootstrap_create` đã niêm phong trong cùng
+   transaction, rồi neo sự kiện đó ra WORM.
+
+Mã thoát: `0` là đã tạo và đã neo; `1` là bị từ chối, không có tài khoản mới;
+`3` là đã tạo nhưng chưa giao được mốc. Việc giao WORM luôn diễn ra sau commit:
+neo trước commit có thể để lại mốc cho một sự kiện bị rollback, trông giống dấu
+hiệu can thiệp. Với mã `3`, readiness/maintenance của app tự thử lại; chỉ dùng
+tài khoản khi `GET /api/admin/audit/verify` báo `high_assurance_intact=true`.
+Đăng nhập qua OIDC gateway rồi bật MFA ngay: high profile bắt buộc MFA cho thao
+tác quản trị. Không dùng `BOOTSTRAP_ADMIN_*` ở hồ sơ này.
+
 Reference overlay cố ý không bật cloud AI. Nếu tổ chức đã phê duyệt DPA, vùng dữ
 liệu và paid/ZDR policy của provider, hãy mount key bằng secret tên
 `google_genai_api_key` trong một overlay riêng; bootstrap wrapper sẽ tự đặt
@@ -150,7 +177,30 @@ loopback để giao diện gọi REST nội bộ; danh sách Origin vẫn chỉ 
 ## IAM tối thiểu cho khóa
 
 Web runtime chỉ cần tạo data key, decrypt/unwrap và rewrap trên đúng một key
-resource; không có quyền tạo/xóa key, sửa policy hoặc export key. Migration job
+resource; không có quyền tạo/xóa key, sửa policy hoặc export key.
+
+Với Vault Transit, ứng dụng gửi `context` canonical (tenant, owner và phiên,
+hoặc người dùng và mục đích, cùng crypto epoch) trong mọi lệnh `datakey`,
+`decrypt` và `rewrap`. Vault chỉ nhận `context` khi khóa
+bật key derivation, nên khóa phải được tạo với `derived=true`. Thuộc tính này
+không đổi được sau khi tạo; nếu lỡ tạo sai, tạo khóa mới trước khi có dữ liệu.
+Danh tính quản trị Vault (không phải token của app) chạy:
+
+```sh
+vault secrets enable transit
+vault write -f transit/keys/scap-conversations type=aes256-gcm96 derived=true
+vault policy write scap-app - <<'POLICY'
+path "transit/datakey/plaintext/scap-conversations" { capabilities = ["update"] }
+path "transit/decrypt/scap-conversations"           { capabilities = ["update"] }
+path "transit/rewrap/scap-conversations"            { capabilities = ["update"] }
+POLICY
+vault token create -policy=scap-app
+```
+
+Ghi token vào file tại `VAULT_TOKEN_FILE_HOST` (mode `0600`), cấp ngắn hạn và
+xoay theo chính sách tổ chức. Xoay KEK bằng
+`vault write -f transit/keys/scap-conversations/rotate` dưới danh tính quản trị,
+rồi chạy `scripts/rewrap_deks.py` như mục bên dưới. Migration job
 dùng identity riêng, có thời hạn, và bị thu hồi sau cửa sổ thay đổi. Bật audit
 log của Vault/cloud KMS và cảnh báo theo lỗi unwrap, tăng đột biến, truy cập từ
 workload lạ và thao tác quản trị khóa.
@@ -258,13 +308,27 @@ tiết lộ endpoint hay lỗi nội bộ và trạng thái lỗi được giữ
 kết nối kế tiếp, tránh để endpoint công khai khuếch đại tải khi WORM đang sự cố.
 Khi khởi động, high profile xác minh toàn chuỗi, ghi một sự kiện startup rồi bắt
 buộc giao mốc đó thành công; chuỗi gãy hoặc WORM không sẵn sàng làm tiến trình
-từ chối phục vụ.
+từ chối phục vụ. Thông báo phân biệt nguyên nhân: `Audit WORM is unavailable`
+là sự cố kết nối kho WORM; `Audit checkpoint does not match the local audit
+chain` là bằng chứng can thiệp (ví dụ phần đuôi đã neo bị xóa) và phải xử lý
+theo `docs/INCIDENT_RESPONSE_HIGH_SECURITY.md`, không neo mốc mới để "sửa".
+Tương tự, `POST /api/admin/audit/checkpoint` trả 503 khi WORM lỗi nhưng 409 khi
+checkpoint hiện có không còn khớp.
 
 Việc giao WORM xảy ra sau transaction nghiệp vụ hiện tại, nên không phải một
 distributed transaction nguyên tử với thay đổi dữ liệu. Nếu sink hỏng đúng giữa
 một request, request đó có thể đã hoàn tất; lần readiness kế tiếp sẽ chuyển 503
 và tự thử bù. Hạ tầng phải loại instance 503 khỏi luồng truy cập, còn SOC vẫn
 phải cảnh báo nếu checkpoint im lặng quá SLA.
+
+Overlay tham chiếu làm việc loại instance đó bằng active health check của Caddy
+(`CADDY_APP_HEALTH=ready`): Caddy gọi thẳng `/api/ready` của app mỗi 10 giây với
+`Host` là tên miền công khai, ngừng định tuyến sau 2 lần 503 liên tiếp (khoảng
+20 giây) và định tuyến lại sau 1 lần 200. Với một instance, người dùng nhận 503
+ở biên trong thời gian đó: fail-closed có chủ đích. Probe không đi qua route công
+khai, nên `/api/ready` từ Internet vẫn bị chặn 404. Hồ sơ standard giữ mặc định
+`none` vì readiness của nó cũng phản ánh quá tải ngắn hạn. Nếu đặt load balancer
+khác trước Caddy, cấu hình health check tương đương trên lớp đó.
 
 ## DLP và AI
 

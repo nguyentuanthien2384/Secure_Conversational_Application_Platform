@@ -13,6 +13,29 @@
 	}
 }
 
+# Active upstream health check, chosen per profile with CADDY_APP_HEALTH. The
+# high overlay sets "ready": /api/ready answers 503 while the audit WORM sink is
+# unreachable or the audit tail is unanchored, and Caddy then stops routing to
+# the app (503 at the edge) until readiness recovers. Standard keeps "none":
+# its readiness also sheds load, so with one app instance an active check would
+# turn a brief overload into a full outage. Probes go straight to the upstream,
+# bypassing the public /api/ready block below. One probe every 10s plus the
+# Docker healthcheck (30s) stays under READINESS_MAX_ATTEMPTS (12/min).
+(app_health_none) {
+}
+
+(app_health_ready) {
+	health_uri /api/ready
+	health_headers {
+		Host {$PUBLIC_DOMAIN}
+	}
+	health_interval 10s
+	health_timeout 5s
+	health_status 200
+	health_fails 2
+	health_passes 1
+}
+
 {$PUBLIC_DOMAIN} {
 	# Production policy: only TLS 1.3; HTTP is redirected below and never serves content.
 	tls {
@@ -101,6 +124,8 @@
 		}
 		# Truyền IP thật để tầng ứng dụng ghi log/rate-limit đúng nguồn.
 		header_up X-Real-IP {remote_host}
+		# Only here, not on the assets route: each import adds its own prober.
+		import app_health_{$CADDY_APP_HEALTH:none}
 	}
 
 	header {

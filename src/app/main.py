@@ -48,7 +48,11 @@ from src.app.audit import (
     safe_user_agent,
 )
 from src.app.audit_chain import append_lock, derive_audit_key, seal_event, verify_chain
-from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
+from src.app.audit_checkpoint import (
+    AuditCheckpointError,
+    AuditCheckpointIntegrityError,
+    AuditCheckpointService,
+)
 from src.app.availability import (
     AdmissionMiddleware,
     AvailabilityMonitor,
@@ -482,6 +486,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     startup_db.refresh(startup_event)
                 try:
                     verification = audit_checkpoint_service.ensure_latest_anchored(startup_db)
+                except AuditCheckpointIntegrityError as exc:
+                    # Tampering evidence (e.g. a deleted anchored tail), not an
+                    # outage: say so, so responders do not chase the WORM sink.
+                    emit_security_event(
+                        "audit.checkpoint.integrity_failed",
+                        outcome="failure",
+                        audit_id=startup_event.id,
+                        entry_hash=startup_event.entry_hash,
+                    )
+                    raise RuntimeError(
+                        "Audit checkpoint does not match the local audit chain; "
+                        "refusing high-security startup."
+                    ) from exc
                 except AuditCheckpointError as exc:
                     emit_security_event(
                         "audit.checkpoint.delivery_failed",
@@ -5439,6 +5456,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         try:
             checkpoint = audit_checkpoint_service.anchor(db)
+        except AuditCheckpointIntegrityError as exc:
+            # Retrying cannot help; a new anchor would hide the evidence.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Checkpoint audit hiện có không còn khớp chuỗi cục bộ; "
+                    "cần điều tra trước khi neo mốc mới."
+                ),
+            ) from exc
         except AuditCheckpointError as exc:
             raise HTTPException(
                 status_code=503,

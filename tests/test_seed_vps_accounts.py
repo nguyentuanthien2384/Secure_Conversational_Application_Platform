@@ -110,6 +110,16 @@ def test_requires_standard_production_profile(vps_settings, database, events):
         seed.seed_vps_accounts(replace(vps_settings, environment="development"), database, password=PASSWORD)
 
 
+def test_never_seeds_demo_accounts_into_a_high_security_deployment(vps_settings, database, events):
+    # create_admin accepts a fully configured high profile; this shared check must not.
+    high = replace(vps_settings, security_profile="high",
+                   audit_worm_endpoint="https://worm.example.test/checkpoints")
+    with pytest.raises(seed.AdminProvisioningError, match="standard production"):
+        seed.seed_vps_accounts(high, database, password=PASSWORD)
+    with database.session_factory() as db:
+        assert db.scalar(select(func.count(User.id))) == 0
+
+
 def test_cli_refuses_piped_passwords(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     assert seed.main([]) == 1

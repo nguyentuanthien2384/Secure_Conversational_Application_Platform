@@ -4,7 +4,14 @@
 The standard VPS profile keeps public demo accounts and bootstrap passwords
 disabled. This operator-only command never starts the web server, migrates a
 schema, changes an existing account, or accepts a password in argv/environment.
-High-security deployments must use their audited provisioning/WORM workflow.
+
+In the high-security profile the command also follows the WORM workflow: it
+refuses while the external sink is unreachable or an existing checkpoint no
+longer matches the chain, and after the commit it anchors the sealed
+``admin.bootstrap_create`` event before reporting success. Delivery happens
+after the commit (never before: an anchor for a rolled-back event would look
+like tampering), so a sink failure at that point exits with code 3 and leaves
+the running application's readiness/maintenance loop to retry.
 """
 
 from __future__ import annotations
@@ -29,6 +36,11 @@ from src.app.audit_chain import (  # noqa: E402
     seal_event,
     verify_chain,
 )
+from src.app.audit_checkpoint import (  # noqa: E402
+    AuditCheckpointError,
+    AuditCheckpointIntegrityError,
+    AuditCheckpointService,
+)
 from src.app.config import Settings  # noqa: E402
 from src.app.db import Database  # noqa: E402
 from src.app.models import AuditEvent, User  # noqa: E402
@@ -45,6 +57,18 @@ class AdminProvisioningError(RuntimeError):
     """A fixed, credential-free operator diagnostic."""
 
 
+class AdminAnchorPending(RuntimeError):
+    """The administrator was committed, but its WORM checkpoint was not delivered."""
+
+    def __init__(self, user_id: str) -> None:
+        super().__init__(
+            "Administrator created and its audit event sealed, but the WORM checkpoint "
+            "was not delivered. The application retries automatically; use the account "
+            "only after /api/admin/audit/verify reports high_assurance_intact=true."
+        )
+        self.user_id = user_id
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         # An accidental --password/value must not be echoed by argparse.
@@ -52,13 +76,61 @@ class _ArgumentParser(argparse.ArgumentParser):
         self.exit(2, "Invalid arguments. Provide only --username NAME; passwords are entered interactively.\n")
 
 
-def _profile_check(settings: Settings) -> None:
-    if settings.environment != "production" or settings.security_profile != "standard":
-        raise AdminProvisioningError("This command requires the standard production profile.")
+def _profile_check(settings: Settings, *, allow_high: bool = False) -> None:
+    # Standard-only by default: scripts/seed_vps_accounts.py reuses this check
+    # and must never seed demo accounts into a high-security deployment.
+    profiles = {"standard", "high"} if allow_high else {"standard"}
+    if settings.environment != "production" or settings.security_profile not in profiles:
+        raise AdminProvisioningError(
+            "This command requires a standard or high production profile."
+            if allow_high
+            else "This command requires the standard production profile."
+        )
     if not settings.audit_chain_enabled:
         raise AdminProvisioningError("Administrator provisioning requires the audit chain.")
     if len(settings.secret_key) < 32 or settings.secret_key == "development-only-change-me":
         raise AdminProvisioningError("Administrator provisioning requires a production app secret.")
+    if settings.security_profile == "high" and not settings.audit_worm_endpoint:
+        raise AdminProvisioningError("High-security provisioning requires the external audit WORM sink.")
+
+
+def checkpoint_service_for(settings: Settings) -> AuditCheckpointService | None:
+    """Build the same checkpoint service the web application uses, or None."""
+    if settings.security_profile != "high":
+        return None
+    return AuditCheckpointService(
+        settings.secret_key,
+        interval=settings.audit_checkpoint_interval,
+        endpoint=settings.audit_worm_endpoint,
+        token_file=settings.audit_worm_token_file,
+        max_unanchored_events=settings.audit_max_unanchored_events,
+        probe_interval_seconds=settings.audit_worm_probe_interval_seconds,
+    )
+
+
+def _require_anchored_history(database: Database, checkpoint_service: AuditCheckpointService) -> None:
+    """Refuse before writing unless the existing tail is intact and deliverable."""
+    try:
+        with database.session_factory() as db:
+            # A fresh service has never succeeded, so this also replays the
+            # latest checkpoint once: an idle but unreachable sink is caught.
+            verification = checkpoint_service.ensure_latest_anchored(db, probe_external=True)
+    except AuditCheckpointIntegrityError:
+        raise AdminProvisioningError(
+            "The existing audit checkpoint does not match the audit chain; investigate before provisioning."
+        ) from None
+    except AuditCheckpointError:
+        raise AdminProvisioningError(
+            "The audit WORM sink is unavailable; no account was changed."
+        ) from None
+    except SQLAlchemyError:
+        raise AdminProvisioningError(
+            "Cannot access the migrated database; no account was changed."
+        ) from None
+    if verification.latest_event_id is not None and not verification.fully_anchored:
+        raise AdminProvisioningError(
+            "The existing audit tail is not fully anchored; no account was changed."
+        )
 
 
 def create_administrator(
@@ -67,13 +139,19 @@ def create_administrator(
     *,
     username: str,
     password: str,
+    checkpoint_service: AuditCheckpointService | None = None,
 ) -> str:
     """Create a new admin and its sealed audit event in the same transaction.
 
 The caller owns the database lifetime. Keeping it explicit also lets tests use
 an isolated database without loading environment settings or the web app.
+The high profile additionally needs ``checkpoint_service`` with a remote sink;
+see the module docstring for the anchoring order and :class:`AdminAnchorPending`.
 """
-    _profile_check(settings)
+    _profile_check(settings, allow_high=True)
+    high = settings.security_profile == "high"
+    if high and (checkpoint_service is None or not checkpoint_service.endpoint):
+        raise AdminProvisioningError("High-security provisioning requires the external audit WORM sink.")
     try:
         payload = RegisterRequest(username=username, password=password)
     except ValidationError:
@@ -89,6 +167,8 @@ an isolated database without loading environment settings or the web app.
         raise AdminProvisioningError(
             "Cannot access the migrated database; no account was changed."
         ) from None
+    if high:
+        _require_anchored_history(database, checkpoint_service)
 
     checker = PwnedPasswordChecker(enabled=settings.password_breach_check)
     try:
@@ -139,6 +219,25 @@ an isolated database without loading environment settings or the web app.
         entry_hash=entry_hash,
         details={"role": "admin", "source": "one_off_cli"},
     )
+    if high:
+        try:
+            with database.session_factory() as db:
+                checkpoint = checkpoint_service.anchor(db)
+                anchored = (
+                    checkpoint is not None
+                    and checkpoint.last_event_id >= event_id
+                    and checkpoint.delivered_at is not None
+                )
+        except (AuditCheckpointError, SQLAlchemyError):
+            anchored = False
+        if not anchored:
+            emit_security_event(
+                "audit.checkpoint.delivery_failed",
+                outcome="failure",
+                audit_id=event_id,
+                entry_hash=entry_hash,
+            )
+            raise AdminAnchorPending(user_id)
     return user_id
 
 
@@ -154,9 +253,11 @@ def main(argv: list[str] | None = None) -> int:
         # Load the container's configured production environment only after the
         # TTY check. This command is not part of local preparation/preflight.
         settings = Settings.from_env()
-        _profile_check(settings)
+        _profile_check(settings, allow_high=True)
         if make_url(settings.database_url).get_backend_name() != "postgresql":
             raise AdminProvisioningError("This command requires the migrated PostgreSQL database.")
+        # Validate the WORM endpoint/token mount before asking for a password.
+        checkpoint_service = checkpoint_service_for(settings)
         with warnings.catch_warnings():
             warnings.simplefilter("error", getpass.GetPassWarning)
             password = getpass.getpass("New administrator password: ")
@@ -165,9 +266,22 @@ def main(argv: list[str] | None = None) -> int:
             raise AdminProvisioningError("The passwords did not match; no account was created.")
         database = Database(settings.database_url, runtime_limits=True)
         configure_siem_logging(settings.siem_json_logs)
-        create_administrator(settings, database, username=arguments.username, password=password)
-        print("Administrator created. Sign in and enroll MFA before administrative use.")
+        create_administrator(
+            settings,
+            database,
+            username=arguments.username,
+            password=password,
+            checkpoint_service=checkpoint_service,
+        )
+        if checkpoint_service is not None:
+            print("Administrator created; its audit event is anchored in the WORM sink.")
+        else:
+            print("Administrator created.")
+        print("Sign in and enroll MFA before administrative use.")
         return 0
+    except AdminAnchorPending as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
     except AdminProvisioningError as exc:
         print(f"Admin creation refused: {exc}", file=sys.stderr)
     except (EOFError, KeyboardInterrupt):

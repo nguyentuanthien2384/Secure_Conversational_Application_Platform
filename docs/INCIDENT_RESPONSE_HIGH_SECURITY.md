@@ -47,6 +47,13 @@ ngừng đến, kiểm tra network/credential nhưng coi đây là sự cố gi�
 khi loại trừ phá hoại. `repair_audit_chain.py` chỉ dành cho tail legacy chưa seal;
 không dùng để băm lại lịch sử đã seal.
 
+Phân biệt hai tín hiệu khi high profile từ chối khởi động hoặc từ chối neo mốc:
+
+| Tín hiệu | Ý nghĩa | Xử lý |
+| --- | --- | --- |
+| `Audit WORM is unavailable`, SIEM `audit.checkpoint.delivery_failed`, `POST /api/admin/audit/checkpoint` trả 503 | Không giao được mốc tới kho WORM (mạng, TLS, token, receiver) | Khôi phục receiver; readiness/maintenance tự bù phần đuôi |
+| `Audit checkpoint does not match the local audit chain`, SIEM `audit.checkpoint.integrity_failed`, endpoint neo trả 409 | Checkpoint đã ký không còn khớp chuỗi cục bộ, ví dụ phần đuôi đã neo bị xóa | Coi là bằng chứng can thiệp: snapshot DB, đối chiếu WORM, **không** neo mốc mới hay sửa checkpoint |
+
 ## Kết thúc sự cố
 
 Ghi root cause, phạm vi dữ liệu, timeline, chỉ dấu xâm nhập, quyết định thông báo,

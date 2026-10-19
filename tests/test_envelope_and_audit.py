@@ -90,6 +90,12 @@ def test_manual_audit_checkpoint_detects_checkpoint_tampering(client: TestClient
     assert verification.json()["checkpoint_intact"] is False
     assert verification.json()["high_assurance_intact"] is False
 
+    # Re-anchoring would hide the evidence; it is a conflict, not a retryable outage.
+    again = client.post("/api/admin/audit/checkpoint", headers=auth(token))
+    assert again.status_code == 409
+    assert "Retry-After" not in again.headers
+    assert "không còn khớp" in again.json()["detail"]
+
 
 def test_retention_deletes_ciphertext_and_wrapped_dek(client: TestClient, app):
     token = register_and_login(client, "retention-user")

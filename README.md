@@ -27,6 +27,7 @@ Từ đăng nhập, phân quyền và kiểm soát dữ liệu đến mã hóa, 
 - [Chạy từ bản clone trên GitHub](#chay-demo)
 - [Tài khoản và kịch bản demo](#tai-khoan-demo)
 - [Giao diện và trải nghiệm sử dụng](#giao-dien)
+- [Mã hóa/giải mã trong trình duyệt](#ma-hoa-trinh-duyet)
 - [Vai trò và chế độ bảo mật](#vai-tro)
 - [Kiến trúc và các lớp bảo vệ](#kien-truc)
 - [Chạy local có lưu dữ liệu](#local)
@@ -47,6 +48,7 @@ Từ đăng nhập, phân quyền và kiểm soát dữ liệu đến mã hóa, 
 - **Bảo vệ tài khoản:** Argon2id, JWT có phiên phía máy chủ, TOTP/recovery code, đăng nhập và xác thực lại bằng passkey WebAuthn, email khôi phục, smart lockout và quản lý thiết bị.
 - **Cảnh báo tài khoản:** Web Push, SMS xác minh sở hữu và phát hiện di chuyển bất thường bằng GeoIP local; các nhà cung cấp thật cần cấu hình riêng, demo dùng outbox.
 - **Bảo vệ dữ liệu:** AES-256-GCM, DEK riêng từng hội thoại, AAD ràng buộc từng tin nhắn, adapter Local/Vault Transit/AWS KMS/GCP KMS.
+- **Mã hóa cục bộ:** tạo/nhập/xuất public key, sao lưu khóa riêng có mật khẩu, mã hóa/giải mã văn bản và tệp nhị phân tối đa 5 MiB ngay trong trình duyệt; nội dung của công cụ không gửi tới API/AI.
 - **Kiểm soát AI:** Gemini hoặc AI demo, đồng thuận gửi dữ liệu ra bên ngoài, DLP với chính sách cho phép/che/xác nhận/chặn/chỉ xử lý local.
 - **Giám sát:** IDS/IPS chữ ký và tương quan bất thường, audit HMAC chain, checkpoint ngoài hệ thống, sự kiện JSON cho SIEM, dashboard ngân sách tài nguyên.
 - **Triển khai:** demo tạm trên laptop, local có dữ liệu lâu dài, Docker với PostgreSQL/Redis/Caddy, hồ sơ VPS nhỏ và high-security.
@@ -58,7 +60,7 @@ Repository có **Private E2EE 1:1** dùng Olm/Double Ratchet qua `vodozemac` và
 
 ### 1. Chuẩn bị
 
-Cần **Git**, **Python 3.10+** và **uv**. Python **3.12** được dùng trong CI và Docker. Lần cài thư viện đầu tiên cần Internet; xem [hướng dẫn cài uv chính thức](https://docs.astral.sh/uv/getting-started/installation/) nếu máy chưa có `uv`.
+Cần **Git**, **Python 3.10+** và **uv**. Python **3.12** được dùng trong CI và Docker. **Node.js có Web Crypto** cần cho bộ kiểm thử JavaScript và kiểm tra tương thích Python/Web Crypto; không cần Node.js để chạy ứng dụng. Lần cài thư viện đầu tiên cần Internet; xem [hướng dẫn cài uv chính thức](https://docs.astral.sh/uv/getting-started/installation/) nếu máy chưa có `uv`.
 
 ```powershell
 git clone https://github.com/nguyentuanthien2384/Secure_Conversational_Application_Platform.git
@@ -130,8 +132,9 @@ Launcher còn nạp 8 tài khoản `lab.*` và hội thoại mẫu. Tài khoản
 1. Đăng nhập `demo.user`, chọn hội thoại có sẵn hoặc bấm **Hội thoại mới**. Mở **Thiết lập hội thoại mới** nếu muốn đặt tiêu đề/chế độ/phân loại.
 2. Gửi một câu hỏi; phản hồi có nhãn **DEMO AI** khi không dùng provider thật.
 3. Thử email mẫu để quan sát DLP, rồi mở **Dữ liệu mã hóa** để xem ciphertext/nonce/key version.
-4. Vào **Tài khoản** để xem thiết bị, hoạt động bảo mật, thiết lập TOTP hoặc passkey.
-5. Đăng nhập `demo.mod`/`demo.boss` để xem audit và cảnh báo.
+4. Trong cùng tab, thử tạo cặp khóa và mã hóa/giải mã văn bản hoặc tệp bằng [công cụ trình duyệt](#ma-hoa-trinh-duyet).
+5. Vào **Tài khoản** để xem thiết bị, hoạt động bảo mật, thiết lập TOTP hoặc passkey.
+6. Đăng nhập `demo.mod`/`demo.boss` để xem audit và cảnh báo.
 
 Sự kiện seed là **mô phỏng**, không phải bằng chứng có tấn công thật. AI demo minh họa nội dung sau DLP; kiểm chứng nhánh provider thật, consent và lọc phản hồi dùng runner/test riêng:
 
@@ -144,9 +147,9 @@ Các kết quả sinh ra trong `reports/` được bỏ qua khi commit. Đọc [
 <a id="giao-dien"></a>
 ## Giao diện và trải nghiệm sử dụng
 
-Giao diện tiếng Việt sử dụng theme `Soft`, tông emerald/slate, font hệ thống `system-ui` và `ui-monospace`/`SFMono-Regular`/`Consolas` cho dữ liệu kỹ thuật, cùng màu riêng cho dark mode. Font local phù hợp CSP mà không cần tải font ngoài. Nội dung được nhóm thành thẻ, thao tác chính có màu nổi bật và các thao tác nhạy cảm có bước xác thực lại khi cần.
+Giao diện tiếng Việt hỗ trợ chế độ sáng/tối và màn hình nhỏ. Các màn hình tập trung vào nhãn trường, thông số, nút thao tác, trạng thái và kết quả. Hướng dẫn chi tiết nằm trong tài liệu; thao tác nhạy cảm có bước xác thực lại khi cần.
 
-![Giao diện SCAP: tám tab chức năng, thanh bên hội thoại và khung trò chuyện](docs/ui/workspace-desktop.jpg)
+![Giao diện SCAP: các tab chức năng, thanh bên hội thoại và khung trò chuyện](docs/ui/workspace-desktop.jpg)
 
 ### Đăng nhập và tài khoản
 
@@ -154,19 +157,35 @@ Trang xác thực có ba luồng **Đăng nhập**, **Tạo tài khoản**, **Qu
 
 ### Không gian làm việc
 
-- **Trò chuyện:** chọn hội thoại bằng một lần bấm ở thanh bên; tạo nhanh với mặc định Secure/Internal, hoặc mở **Thiết lập hội thoại mới** để đặt tiêu đề/chế độ/phân loại. Khung trống có hướng dẫn bắt đầu; gửi bằng Enter, sao chép phản hồi, tìm trong hội thoại. Đổi tên/xuất/xóa nằm trong nhóm quản lý hội thoại.
-- **Dữ liệu mã hóa:** xem ciphertext, nonce, crypto epoch, thuật toán và nguồn quản lý khóa; chỉ chủ hội thoại được đọc thông số. Công cụ trình duyệt riêng cho phép tạo/nhập/xuất public key, sao lưu private key có mật khẩu và mã hóa/giải mã văn bản hoặc tệp nhị phân tối đa 5 MiB bằng RSA-OAEP 3072 + AES-256-GCM. Tệp được tải thành gói `.scapenc`; sau giải mã, đối chiếu tên gốc/SHA-256 và tải kết quả `.bin`. Khóa và nội dung của công cụ không gửi lên API/AI; dùng HTTPS/localhost và tải bản sao trước khi rời trang. Xem [hướng dẫn](docs/SECURITY_EXTENSIONS.md#crypto-workbench).
+- **Trò chuyện:** chọn hội thoại ở thanh bên; tạo nhanh với mặc định Secure/Internal, hoặc mở **Thiết lập hội thoại mới** để đặt tiêu đề/chế độ/phân loại. Gửi bằng Enter, sao chép phản hồi, tìm trong hội thoại. Đổi tên/xuất/xóa nằm trong nhóm quản lý hội thoại.
+- **Dữ liệu mã hóa:** xem ciphertext, nonce, crypto epoch, thuật toán và loại nhà cung cấp khóa của hội thoại thuộc tài khoản; có công cụ [mã hóa văn bản và tệp cục bộ](#ma-hoa-trinh-duyet).
 - **Tìm kiếm:** tìm toàn bộ hội thoại thuộc sở hữu tài khoản hiện tại, có phân trang và số kết quả; tìm trong hội thoại hiện tại không thay khung chat.
 - **Tài khoản:** đổi mật khẩu; TOTP/QR/recovery code; đồng thuận AI; thiết bị; email khôi phục; passkey; hoạt động bảo mật.
 - **Quản trị — admin:** thống kê người dùng/hội thoại, dashboard khả dụng, tạo tài khoản, đổi vai trò và khóa/mở khóa/xóa tài khoản.
-- **Nhật ký kiểm toán — moderator/admin:** giới thiệu phạm vi và xem các sự kiện audit gần nhất.
+- **Nhật ký kiểm toán — moderator/admin:** xem các sự kiện audit gần nhất.
 - **Bảo mật — moderator/admin:** IDS và tương quan bất thường; admin có thêm xác minh chuỗi audit, kiểm chứng phát hiện và gỡ chặn nguồn.
 
-Trên màn hình hẹp, thanh bên/chat xếp theo chiều dọc; nút mobile có vùng bấm tối thiểu 44px, nhãn nhập/tìm kiếm rõ và trạng thái focus hỗ trợ chọn hội thoại bằng bàn phím. Các tab có giới thiệu giúp người mới biết nội dung và thao tác cần thực hiện.
+Trên màn hình hẹp, thanh bên/chat xếp theo chiều dọc; nút mobile có vùng bấm tối thiểu 44px và trạng thái focus hỗ trợ thao tác bằng bàn phím.
 
 Thông báo consent/DLP nằm dưới ô nhập để người dùng hiểu lý do và hành động tiếp theo. Đồng ý cấp tài khoản cho AI và xác nhận một tin nhắn confidential là hai bước riêng. Chat hiển thị đầu ra AI dạng văn bản, có nút sao chép; không thực thi HTML hoặc tải nội dung từ đường dẫn do AI trả về.
 
 Quyền ở giao diện được kiểm tra lại tại API. Admin vẫn chỉ đọc được hội thoại thuộc sở hữu của chính mình.
+
+<a id="ma-hoa-trinh-duyet"></a>
+## Mã hóa/giải mã trong trình duyệt
+
+Mở **Dữ liệu mã hóa → Mã hóa & giải mã trong trình duyệt** trên HTTPS hoặc localhost. Công cụ dùng **RSA-OAEP 3072/SHA-256** để bảo vệ khóa **AES-256-GCM** mới cho mỗi lần mã hóa; nonce 96 bit, thẻ xác thực 128 bit, không padding.
+
+1. **Khóa của bạn:** nhập mật khẩu sao lưu riêng ít nhất 16 ký tự, xác nhận rồi tạo cặp khóa. Tải bản sao khóa riêng đã mã hóa; public key hỗ trợ sao chép, xuất PEM và nhập từ tệp. Private key đang mở không được xuất dạng rõ.
+2. **Người nhận:** nhập public key người nhận, đối chiếu toàn bộ fingerprint SHA-256 qua kênh tin cậy, rồi xác nhận khóa. Khóa vừa tạo được chọn làm người nhận ban đầu để thử mã hóa/giải mã.
+3. **Văn bản:** nhập tối đa **64 KiB UTF-8**, mã hóa thành gói JSON. Người nhận mở bản sao khóa riêng bằng mật khẩu, dán gói JSON và giải mã.
+4. **Tệp:** chọn tệp gốc tối đa **5 MiB**, mã hóa và tải `.scapenc`. Để giải mã, mở khóa riêng tương ứng rồi chọn gói đã nhận; sau khi xác minh thành công, tải `scap-restored.bin` và đối chiếu tên gốc/SHA-256 hiển thị.
+
+Ngữ cảnh AAD giới hạn **256 byte UTF-8**, là thông tin công khai trong gói. Tệp được xử lý dưới dạng byte; tên gốc, kích thước gốc và SHA-256 nằm trong phần mã hóa. Gói tệp tối đa **5.246.380 byte**, có định dạng SCAP phiên bản 1; không phải định dạng nhập chung cho mọi công cụ AES.
+
+Khóa, mật khẩu sao lưu và nội dung của công cụ không gửi tới API/AI hoặc tự lưu vào web storage/database. Trạng thái bị xóa khi đăng xuất, ẩn/rời trang, tải lại, sau 5 phút không thao tác hoặc bấm **Khóa & xóa dữ liệu tại tab**. Giữ bản sao khóa và mật khẩu riêng trước khi rời trang; mất một trong hai thì không khôi phục được khóa. Tệp đã tải về máy vẫn còn sau khi xóa trạng thái tab.
+
+Công cụ này dùng khóa riêng độc lập với mã hóa lưu trữ và client chat E2EE. Nó kiểm tra toàn vẹn gói; không có xác thực danh tính người gửi, cơ chế chống phát lại hay forward secrecy. Metadata hội thoại đọc từ API cũng không phải kết quả xác minh toàn vẹn ciphertext. Xem [giới hạn và định dạng](docs/SECURITY_EXTENSIONS.md#crypto-workbench), [kịch bản demo](docs/DEMO_SCRIPT.md).
 
 <a id="vai-tro"></a>
 ## Vai trò và chế độ bảo mật
@@ -193,6 +212,8 @@ Phân loại dữ liệu hỗ trợ `public`, `internal`, `confidential`, `highl
 ```mermaid
 flowchart LR
     Browser[Trình duyệt] --> Edge[Caddy HTTPS khi triển khai]
+    Browser --> LocalCrypto[Web Crypto · khóa riêng trong tab]
+    LocalCrypto --> Download[Tệp .scapenc / .bin]
     Edge --> UI[Gradio UI]
     UI --> API[FastAPI REST API]
     API --> Guard[JWT · RBAC · IDS · Rate limit]
@@ -208,7 +229,7 @@ flowchart LR
     Relay --> DB
 ```
 
-FastAPI và Gradio chạy trong **một tiến trình**, Gradio mount tại `/`. Callback UI gọi REST API qua HTTP nên mọi thao tác đều qua xác thực, phân quyền, hạn mức và audit. Local/demo truy cập trực tiếp ứng dụng; Caddy thuộc luồng triển khai HTTPS.
+FastAPI và Gradio chạy trong **một tiến trình**, Gradio mount tại `/`. Callback Gradio gọi REST API qua HTTP để áp dụng xác thực, phân quyền, hạn mức và audit. Công cụ Web Crypto xử lý khóa/nội dung ngay trong tab, không dùng callback Gradio cho các dữ liệu này. Local/demo truy cập trực tiếp ứng dụng; Caddy thuộc luồng triển khai HTTPS.
 
 <details>
 <summary><strong>Các kiểm soát đã triển khai trong mã nguồn</strong></summary>
@@ -281,11 +302,30 @@ Hệ thống kiểm tra cả checkpoint mới nhất và các checkpoint cũ cò
 
 ### Production và VPS demo
 
-Để chuẩn bị gói source trước khi có quyền SSH, chạy `.\deploy\deploy.ps1 package`.
-Lệnh tạo `deploy/out/scap-source-release.tar.gz` và checksum, không đọc `.env`,
-không đưa database/khóa/outbox vào archive và không liên hệ VPS. Máy nhận cần
-kiểm tra checksum/manifest rồi tự cấu hình và build image; xem
-[quy trình đóng gói](docs/VPS_DEMO_DEPLOYMENT.md).
+Đóng gói source trên local trước khi triển khai, không cần SSH hoặc Docker:
+
+```powershell
+.\deploy\deploy.ps1 package -Output deploy/out/scap-source-release.tar.gz
+```
+
+Lệnh tương đương dùng được trên Windows/Linux/macOS:
+
+```bash
+uv run --frozen python -m scripts.package_release create --project . --output deploy/out/scap-source-release.tar.gz
+```
+
+Gói có manifest và file `.sha256`, không đọc `.env`, không chứa database/khóa/outbox và không liên hệ VPS. Công cụ từ chối ghi đè archive/checksum đã có; dùng tên `--output` mới khi đóng gói lại.
+
+Sau khi chuyển archive và checksum tới máy nhận Linux:
+
+```bash
+sha256sum -c scap-source-release.tar.gz.sha256
+tar -xzf scap-source-release.tar.gz
+cd scap-source
+python3 -m scripts.package_release verify --project .
+```
+
+Đối chiếu checksum qua kênh tin cậy, sau đó cấu hình và build image trên máy nhận theo [quy trình đóng gói/triển khai](docs/VPS_DEMO_DEPLOYMENT.md). Cập nhật mã nguồn không đồng bộ database hoặc số liệu giữa local và VPS.
 
 [docker-compose.yml](docker-compose.yml) có `db`, `redis`, `migrate`, `app`, `caddy`. PostgreSQL/Redis nằm trong mạng backend; Caddy publish 80/443 và terminate HTTPS. Production yêu cầu domain/DNS đúng, bí mật riêng, `BASE_IMAGE` pin digest SHA-256, docs/seed/bootstrap password tắt và tài khoản database runtime không sở hữu schema.
 
@@ -319,12 +359,14 @@ Trong development, schema đầy đủ có tại `/docs`, `/redoc` và `/openapi
 
 - **Xác thực, prefix `/api/auth`:** `register`, `login`, `mfa/*`, `me`, `refresh`, `logout`, `logout-all`, `step-up` và `sessions`.
 - **Bảo vệ tài khoản, prefix `/api/auth`:** `password`, `ai-consent`, `security-activity`, `email`, `password-reset/*`, `passkeys/*` (có step-up), `notifications/*` và `sign-in-risk/status`.
-- **Hội thoại:** `/api/sessions`, `/api/sessions/{id}`; dưới mỗi hội thoại có `messages`, `ciphertexts`, `security`, `export`, `export-ticket`; tìm kiếm `/api/search/messages`.
+- **Hội thoại:** `/api/sessions`, `/api/sessions/{id}`; dưới mỗi hội thoại có `messages`, `ciphertexts`, `crypto-info`, `security`, `export`, `export-ticket`; tìm kiếm `/api/search/messages`.
 - **Private E2EE:** `/api/e2ee/devices`, `/api/e2ee/devices/{id}/prekeys`, `/api/e2ee/users/{username}/prekey-bundle`, `/api/sessions/{id}/e2ee/state`, `members` và `envelopes`.
 - **Quản trị/giám sát, prefix `/api/admin`:** `users`, `stats`, `availability`, `audit`, `audit/verify`, `audit/checkpoint`, `ids/*`, `security-alerts`, `security/maintenance`.
 - **Tình trạng:** `/api/health` là liveness tối giản; `/api/ready` kiểm tra DB và checkpoint WORM mới nhất trong high profile.
 
 Gửi access token bằng header `Authorization: Bearer <token>`. API export stream trực tiếp; vé tải dùng một lần, có hạn 60 giây và gắn phiên đăng nhập. Không chia sẻ token hoặc đường dẫn vé tải.
+
+`GET /api/sessions/{id}/crypto-info` chỉ cho chủ hội thoại đọc thuật toán, epoch, loại nhà cung cấp khóa và số bản ghi theo định dạng. Endpoint không trả khóa, không giải mã bản mã và trả `integrity_verification: "not_performed"`. Luồng mã hóa/giải mã văn bản và tệp trong trình duyệt không có endpoint upload hoặc giải mã phía máy chủ.
 
 Danh sách có phân trang qua `/api/sessions/page`, `/api/sessions/{id}/messages/page`, `/api/search/messages/page` và `/api/admin/users/page`. Response gồm `items`, `total`, `offset`, `limit`, `has_more`, `next_offset`. Các thay đổi dữ liệu và audit bắt buộc cùng transaction; thao tác nhạy cảm kiểm tra lại đúng bearer hiện tại trước khi ghi. Cursor E2EE gồm thời điểm và ID để không bỏ sót hai bản ghi trùng thời gian.
 
@@ -346,13 +388,19 @@ uv run --frozen pip-audit -r requirements-audit.txt
 uv run --frozen python -m scripts.validate_security --output-dir reports/security-validation
 ```
 
-Kiểm tra JavaScript cho thông tin đăng nhập cần Node.js:
+Kiểm tra toàn bộ JavaScript, gồm quản lý thông tin đăng nhập, passkey, Push, lõi mã hóa văn bản/tệp và vòng đời giao diện, bằng Node.js có Web Crypto. Lệnh dưới đây dùng được trong PowerShell và Bash:
 
 ```bash
-node --test tests/login_credentials.test.cjs
+node --test tests/login_credentials.test.cjs tests/passkey_bridge.test.cjs tests/security_push.test.cjs tests/crypto_workbench_core.test.cjs tests/crypto_workbench_file_core.test.cjs tests/crypto_workbench_ui.test.cjs
 ```
 
-Các test bao phủ xác thực/ownership/RBAC, race condition, crypto/AAD, DLP, passkey/email, token reuse, audit/WORM, E2EE relay, retention, UI callback, quyền lưu trữ và giới hạn tài nguyên. Xem [tests/](tests/) để chọn phạm vi phù hợp khi sửa mã nguồn.
+Trong Bash, có thể dùng lệnh ngắn `node --test tests/*.test.cjs`. Chạy riêng kiểm tra metadata, ranh giới UI và tương thích định dạng tệp Python/Web Crypto:
+
+```bash
+uv run --frozen python -m pytest tests/test_crypto_info.py tests/test_crypto_workbench_integration.py tests/test_crypto_file_interop.py
+```
+
+Kiểm tra tương thích tệp tự bỏ qua nếu thiếu Node.js; một lượt pytest có test bỏ qua không chứng minh phần đó đã được kiểm tra. Các test khác bao phủ xác thực/ownership/RBAC, race condition, crypto/AAD, DLP, passkey/email, token reuse, audit/WORM, E2EE relay, retention, UI callback, quyền lưu trữ và giới hạn tài nguyên. Xem [tests/](tests/) để chọn phạm vi phù hợp khi sửa mã nguồn. Kết quả local không thay thế kiểm thử trên cấu hình VPS thực tế hoặc kiểm toán độc lập.
 
 Kiểm thử PostgreSQL trong `tests/test_postgres_security_integration.py` dùng biến `SCAP_TEST_POSTGRES_URL`. Chỉ trỏ biến này tới cluster thử nghiệm mới trên loopback, database quản trị `scap_security_tests`, chưa có role `scap_app`/`scap_auditor`. Fixture tạo/xóa database ngẫu nhiên riêng từng test và hai role thử nghiệm, không dùng database local/VPS đang vận hành. Khi không đặt biến, nhóm test này được bỏ qua; CI cấp cluster PostgreSQL tạm riêng và chạy nhóm này bằng quyền runtime tối thiểu, ngoài bộ test mặc định.
 
@@ -378,6 +426,7 @@ container là chính container đó, không phải ứng dụng trên máy host.
 [security.yml](.github/workflows/security.yml) chạy trên push `main`, pull request và khi gọi thủ công:
 
 - **`test`:** lockfile, pytest/coverage, Node test, kiểm chứng bảo mật ngoại tuyến, Ruff, Bandit và audit dependency runtime từ lockfile.
+- **`native-mls-client`:** build helper OpenMLS, kiểm thử native/HPKE, audit hai Cargo lockfile và diễn tập nhóm MLS.
 - **`private-storage-windows`:** kiểm tra ACL Windows thực, kho private, secret file, mail outbox và backup mã hóa.
 - **`secret-scan` / `sast`:** Gitleaks toàn lịch sử và Semgrep với rule local.
 - **`filesystem-scan` / `image-scan`:** Trivy cho source và image thực, SBOM CycloneDX, runtime probe quyền/secret.
@@ -433,6 +482,8 @@ Secure_Conversational_Application_Platform/
 ├── src/app/                  # FastAPI, Gradio, auth, crypto, DLP, IDS, audit
 │   ├── main.py               # App, middleware và REST routes
 │   ├── gradio_ui.py          # Theme, CSS và callback giao diện
+│   ├── crypto_workbench_ui.py # Trường native của công cụ mã hóa cục bộ
+│   ├── crypto_info.py        # Metadata mã hóa theo quyền sở hữu
 │   ├── ui_assets/            # Avatar và JavaScript UI cần cho runtime
 │   ├── config.py             # Settings và guard production/high
 │   ├── security.py           # Argon2id, JWT, AES-GCM, TOTP, rate limiter
@@ -480,6 +531,7 @@ Sau khi clone, tạo lại môi trường bằng `uv sync --frozen --group dev` 
 ### Giới hạn cần hiểu
 
 - `secure`/`confidential` mã hóa **khi lưu trữ**; server xử lý plaintext theo policy. Chúng không đồng nghĩa E2EE.
+- Công cụ mã hóa trình duyệt dùng khóa riêng theo tab và định dạng SCAP, độc lập với khóa hội thoại/Olm/MLS. Mã độc cùng origin hoặc trình duyệt bị xâm nhập vẫn có thể dùng khóa đang mở; xóa trạng thái không bảo đảm xóa mọi bản sao trong bộ nhớ hoặc tệp đã tải xuống. Độ dài bản mã vẫn cho biết xấp xỉ dung lượng tệp.
 - Client Private E2EE 1:1 và nhóm MLS đã có luồng gửi/nhận, pin fingerprint, kho mã hóa và outbox bền vững. MLS hiện giới hạn ở nhóm do owner quản lý, một thiết bị mỗi tài khoản. Chưa có kiểm chứng tương thích với client bên ngoài hoặc audit/pentest độc lập cho tích hợp SCAP; demo không phải chứng nhận E2EE production. Không phục hồi bản sao trạng thái mật mã cũ để tiếp tục gửi tin.
 - JWT/audit signing secret ở web process; WORM giúp phát hiện rollback sau checkpoint nhưng full host compromise vẫn có rủi ro.
 - DLP/IDS là phòng thủ chiều sâu, có thể có false positive/false negative; signature IDS không thay thế truy vấn tham số hóa và authorization.
@@ -492,7 +544,7 @@ Sau khi clone, tạo lại môi trường bằng `uv sync --frozen --group dev` 
 
 - **Chạy và trình bày:** [Hướng dẫn local](HUONG_DAN_CHAY.md), [Docker](HUONG_DAN_DOCKER.md), [kịch bản demo](docs/DEMO_SCRIPT.md), [phân tích dự án](docs/PHAN_TICH_DU_AN.md).
 - **Triển khai/vận hành:** [VPS demo](docs/VPS_DEMO_DEPLOYMENT.md), [high-security](docs/HIGH_SECURITY_DEPLOYMENT.md), [availability/private storage/backup](docs/security/availability.md), [xử lý sự cố](docs/INCIDENT_RESPONSE_HIGH_SECURITY.md), [supply chain](docs/supply-chain/README.md).
-- **Tài khoản và ứng dụng:** [bảo vệ tài khoản](docs/ACCOUNT_PROTECTION.md), [passkey/Push/SMS/GeoIP/MLS](docs/SECURITY_EXTENSIONS.md), [bảo mật nâng cao](docs/ADVANCED_SECURITY.md), [bảo mật và tự động hóa](docs/SECURITY_AUTOMATION.md).
+- **Tài khoản và ứng dụng:** [bảo vệ tài khoản](docs/ACCOUNT_PROTECTION.md), [mã hóa trình duyệt](docs/SECURITY_EXTENSIONS.md#crypto-workbench), [passkey/Push/SMS/GeoIP/MLS](docs/SECURITY_EXTENSIONS.md), [bảo mật nâng cao](docs/ADVANCED_SECURITY.md), [bảo mật và tự động hóa](docs/SECURITY_AUTOMATION.md).
 - **Ranh giới và quản trị dữ liệu:** [E2EE client contract](docs/E2EE_CLIENT_CONTRACT.md), [data inventory/DPIA baseline](docs/PRIVACY_DATA_INVENTORY.md), [truy vết yêu cầu](docs/SECURITY_REQUIREMENTS_TRACEABILITY.md), [security governance](docs/SECURITY_GOVERNANCE.md).
 - **Đánh giá/chính sách:** [SECURITY.md](SECURITY.md), [SECURITY_REVIEW.md](SECURITY_REVIEW.md), [cách sinh báo cáo](reports/README.md).
 

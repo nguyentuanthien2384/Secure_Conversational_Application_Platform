@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 import src.app.main as app_module
 from src.app.audit_chain import append_lock, derive_audit_key, seal_event, verify_chain
-from src.app.audit_checkpoint import AuditCheckpointError, AuditCheckpointService
+from src.app.audit_checkpoint import AuditCheckpointIntegrityError, AuditCheckpointService
 from src.app.db import Database
 from src.app.main import create_app
 from src.app.models import AuditCheckpoint, AuditEvent, User
@@ -151,7 +151,8 @@ def test_new_anchor_cannot_conceal_an_existing_broken_checkpoint(
     latest = _append_event(audit_database, event_id=3)
     deliveries_before = len(deliveries)
     with audit_database.session_factory() as db:
-        with pytest.raises(AuditCheckpointError):
+        # Evidence, not an outage: callers must not report a WORM failure.
+        with pytest.raises(AuditCheckpointIntegrityError):
             if operation == "maybe_anchor":
                 service.maybe_anchor(db, latest)
             else:

@@ -40,6 +40,14 @@ class AuditCheckpointError(RuntimeError):
     """Checkpoint creation or delivery failed without leaking sink details."""
 
 
+class AuditCheckpointIntegrityError(AuditCheckpointError):
+    """Local audit evidence no longer matches a signed checkpoint.
+
+    Unlike a sink outage, retrying cannot fix this: operators must investigate
+    (for example a deleted, anchored audit tail) before anchoring again.
+    """
+
+
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
     """Never forward the WORM bearer token to a redirect target."""
 
@@ -240,12 +248,12 @@ class AuditCheckpointService:
         # guard applies to request-time, manual, readiness and maintenance paths.
         previous = self.verify_latest(db)
         if previous.present and not previous.intact:
-            raise AuditCheckpointError("The existing audit checkpoint is not intact.")
+            raise AuditCheckpointIntegrityError("The existing audit checkpoint is not intact.")
         latest_event = db.scalar(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1))
         if latest_event is None or not latest_event.entry_hash:
             return None
         if not valid_sha256_digest(latest_event.entry_hash):
-            raise AuditCheckpointError("The latest audit event hash is invalid.")
+            raise AuditCheckpointIntegrityError("The latest audit event hash is invalid.")
         # Cache scalar values before a commit/rollback can expire ORM state.
         # This keeps the concurrent-insert recovery path deterministic on every
         # SQLAlchemy backend, including PostgreSQL deployments.

@@ -121,6 +121,10 @@ services:
 
   caddy:
     image: ${CADDY_IMAGE:?set CADDY_IMAGE to an immutable name@sha256 digest}
+    environment:
+      # Stop routing to the app while /api/ready is 503 (audit WORM sink
+      # unreachable or audit tail unanchored); see the Caddyfile snippets.
+      CADDY_APP_HEALTH: ready
 
   app:
     env_file: !reset []
