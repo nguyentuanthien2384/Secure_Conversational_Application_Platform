@@ -258,6 +258,45 @@ def test_balanced_ai_profile_adds_history_field_to_older_configuration(project):
     assert vps.check(project) == []
 
 
+CLAUDE_KEY = "sk-ant-api03-unit-test-provider-key_only"
+
+
+def _strip_claude_lines(project):
+    # Configurations created before Claude support have no CLAUDE_* fields.
+    path = project / "deploy/.env.vps"
+    lines = vps._read(path, private=True)[0]
+    path.write_text("\n".join(line for line in lines if not line.startswith("CLAUDE_")) + "\n",
+                    encoding="utf-8")
+
+
+def test_claude_settings_upgrade_an_older_configuration(project):
+    ready(project)
+    _strip_claude_lines(project)
+    replace(project, AI_MAX_OUTPUT_TOKENS="512", ALLOW_DEMO_AI="true")
+    before = values(project)
+    assert vps.check(project) == []
+
+    changed = vps.configure(project, claude_model="claude-opus-5-5", claude_api_key=CLAUDE_KEY)
+
+    expected = {"CLAUDE_API_KEY": CLAUDE_KEY, "CLAUDE_MODEL": "claude-opus-5-5",
+                "ALLOW_DEMO_AI": "false", "AI_MAX_OUTPUT_TOKENS": "2048"}
+    assert changed == sorted(expected)
+    assert values(project) == {**before, **vps._CLAUDE_DEFAULTS, **expected}
+    lines = vps._read(project / "deploy/.env.vps", private=True)[0]
+    assert all(sum(line.startswith(f"{key}=") for line in lines) == 1 for key in vps._CLAUDE_DEFAULTS)
+    check_private_file(project / "deploy/.env.vps")
+    assert vps.check(project) == []
+
+
+def test_claude_key_keeps_a_larger_budget_and_model_alone_keeps_demo_setting(project):
+    ready(project)
+    replace(project, AI_MAX_OUTPUT_TOKENS="4096", ALLOW_DEMO_AI="true")
+    assert vps.configure(project, claude_model="claude-opus-5-5") == ["CLAUDE_MODEL"]
+    assert values(project)["ALLOW_DEMO_AI"] == "true"
+    assert vps.configure(project, claude_api_key=CLAUDE_KEY) == ["ALLOW_DEMO_AI", "CLAUDE_API_KEY"]
+    assert values(project)["AI_MAX_OUTPUT_TOKENS"] == "4096"
+
+
 @pytest.mark.parametrize("value,accepted", [("4096", True), ("4097", False)])
 def test_vps_answer_token_budget_remains_bounded(project, value, accepted):
     ready(project)
@@ -272,6 +311,10 @@ def test_vps_answer_token_budget_remains_bounded(project, value, accepted):
     ({"images": {"BASE_IMAGE": "python:3.12-slim"}}, "BASE_IMAGE"),
     ({"images": {"APP_SECRET_KEY": "x@sha256:" + "a" * 64}}, "APP_SECRET_KEY"),
     ({"ai_quality": "unlimited"}, "AI quality"),
+    ({"claude_model": "gpt-5"}, "CLAUDE_MODEL"),
+    ({"claude_model": "claude-opus-5-5\nALLOW_DEMO_AI=true"}, "CLAUDE_MODEL"),
+    ({"claude_api_key": "short"}, "CLAUDE_API_KEY"),
+    ({"claude_api_key": CLAUDE_KEY + "'$x"}, "CLAUDE_API_KEY"),
     ({}, "Nothing to configure"),
 ])
 def test_configure_rejects_invalid_values_without_writing(project, kwargs, field):
@@ -280,6 +323,35 @@ def test_configure_rejects_invalid_values_without_writing(project, kwargs, field
     with pytest.raises(vps.PreparationError, match=field):
         vps.configure(project, **kwargs)
     assert (project / "deploy/.env.vps").read_bytes() == original
+
+
+def test_claude_key_cli_uses_only_a_hidden_prompt(project, monkeypatch, capsys):
+    ready(project)
+    path = project / "deploy/.env.vps"
+    arguments = ["configure", "--project", str(project), "--claude-model", "claude-opus-5-5",
+                 "--claude-key"]
+    original = path.read_bytes()
+    monkeypatch.setattr(vps.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(vps.getpass, "getpass", lambda *_: pytest.fail("must not prompt"))
+    assert vps.main(arguments) == 1 and path.read_bytes() == original
+
+    def fallback(*_):
+        # getpass would echo the key on a terminal it cannot control.
+        vps.warnings.warn("cannot hide input", vps.getpass.GetPassWarning, stacklevel=1)
+        pytest.fail("must stop before an echoing fallback")
+
+    monkeypatch.setattr(vps.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(vps.getpass, "getpass", fallback)
+    assert vps.main(arguments) == 1 and path.read_bytes() == original
+
+    prompts = []
+    monkeypatch.setattr(vps.getpass, "getpass", lambda prompt: prompts.append(prompt) or f"  {CLAUDE_KEY}\n")
+    assert vps.main(arguments) == 0
+    output = capsys.readouterr()
+    assert prompts == ["Claude API key (input hidden): "]
+    assert "CLAUDE_API_KEY" in output.out and CLAUDE_KEY not in output.out + output.err
+    assert values(project)["CLAUDE_API_KEY"] == CLAUDE_KEY
+    assert vps.main(["check", "--project", str(project)]) == 0
 
 
 def test_configure_requires_existing_private_configuration(project):

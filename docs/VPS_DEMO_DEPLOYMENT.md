@@ -323,6 +323,37 @@ Một restore/migration/quarantine thất bại cũng không tự mở lại tra
 | `curl` trên Windows 10 báo `SEC_E_UNSUPPORTED_FUNCTION` | Windows 10 không có TLS 1.3 mà SCAP yêu cầu; mở bằng Chrome/Edge/Firefox |
 | PowerShell chặn script | `powershell -ExecutionPolicy Bypass -File deploy\deploy.ps1 <lệnh> …` |
 
+#### Dùng Claude trên VPS
+
+Khóa trong `.env` local không tự lên server. Trong **Termius**, tại `/root/scap`,
+chạy một lệnh; khi thấy `Claude API key (input hidden):`, dán key của nhà cung
+cấp cổng rồi nhấn Enter (màn hình không hiện ký tự nào là đúng):
+
+```bash
+cd /root/scap &&
+git pull --ff-only &&
+python3 -m scripts.prepare_vps configure --project . --claude-model claude-opus-5-5 --claude-key &&
+bash deploy/update.sh
+```
+
+Lệnh chỉ đổi `CLAUDE_API_KEY`, `CLAUDE_MODEL` và `ALLOW_DEMO_AI=false` (bắt buộc
+dùng Claude thật, không rơi về AI demo). Nó nâng `AI_MAX_OUTPUT_TOKENS` lên 2048
+nếu đang thấp hơn, vì Opus 5.5 luôn suy nghĩ và token suy nghĩ tính vào trần này
+(một câu trả lời một dòng đo được khoảng 575 token). File cấu hình cũ chưa có các
+dòng `CLAUDE_*` được bổ sung một lần. Mọi khóa mã hóa, mật khẩu database và
+cấu hình khác giữ nguyên. Key không nằm trong lịch sử lệnh hay output.
+`update.sh` sao lưu CSDL, build image từ code mới rồi khởi động lại app.
+
+Kiểm tra container đang chạy (in `True claude-opus-5-5`, không in key):
+
+```bash
+bash deploy/vps-compose.sh exec -T app /app/.venv/bin/python -c 'import os; print(bool(os.environ.get("CLAUDE_API_KEY", "").strip()), os.environ.get("CLAUDE_MODEL"))'
+```
+
+Đổi model sau này chỉ cần `--claude-model <tên>` (không kèm `--claude-key`) rồi
+`bash deploy/vps-compose.sh up -d --no-deps --force-recreate app`. Mỗi câu trả lời
+tính phí theo bảng giá của nhà cung cấp cổng; giới hạn mỗi lần gọi là 25 giây.
+
 #### Gemini báo chưa có API key sau khi deploy
 
 Khóa trong `.env` trên máy Windows chỉ dùng cho môi trường local. VPS đọc

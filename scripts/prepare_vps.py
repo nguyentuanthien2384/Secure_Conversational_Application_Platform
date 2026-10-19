@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import ipaddress
 import os
 import re
 import secrets
 import stat
 import sys
+import warnings
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
@@ -94,6 +96,20 @@ _AI_QUALITY_PROFILES = {
 # Configurations from earlier versions can keep running before the new optional
 # history field is explicitly added through the balanced quality profile.
 _OPTIONAL_LIMIT_DEFAULTS = {"AI_HISTORY_MESSAGES": "16", "CLAUDE_TIMEOUT_SECONDS": "25"}
+# Files created before Claude support have no CLAUDE_* lines; add the template
+# values once when Claude is configured.
+_CLAUDE_DEFAULTS = {
+    "CLAUDE_API_KEY": "",
+    "CLAUDE_BASE_URL": "https://1gw.gwai.cloud",
+    "CLAUDE_MODEL": "claude-opus-5",
+    "CLAUDE_EFFORT_LEVEL": "low",
+    "CLAUDE_TIMEOUT_SECONDS": "25",
+}
+_CLAUDE_MODEL = re.compile(r"claude-[a-z0-9]+(?:-[a-z0-9]+){0,6}")
+_PROVIDER_KEY = re.compile(r"[A-Za-z0-9_-]{20,256}")
+# Current Claude models always think and thinking counts toward max_tokens: a
+# one-line reply from claude-opus-5-5 measured ~575 output tokens (2026-10-19).
+_CLAUDE_MIN_OUTPUT_TOKENS = 2048
 
 
 class PreparationError(RuntimeError):
@@ -221,8 +237,13 @@ def initialize(project: str | Path, *, domain: str = "", email: str = "") -> str
 
 def configure(project: str | Path, *, domain: str = "", email: str = "",
               images: dict[str, str] | None = None, edge_mode: str = "",
-              ai_quality: str = "") -> list[str]:
-    """Fill public deployment fields in the existing private file; secrets stay unchanged."""
+              ai_quality: str = "", claude_model: str = "",
+              claude_api_key: str = "") -> list[str]:
+    """Fill public deployment fields in the existing private file; secrets stay unchanged.
+
+    ``claude_api_key`` is the one secret this command writes, and only when the
+    operator supplies it; it also requires real AI (``ALLOW_DEMO_AI=false``).
+    """
     target = _project(project) / "deploy" / ".env.vps"
     lines, values = _read(target, private=True)
     replacements = {}
@@ -234,6 +255,28 @@ def configure(project: str | Path, *, domain: str = "", email: str = "",
             lines = [*lines, "# AI history setting added by prepare_vps configure.",
                      "AI_HISTORY_MESSAGES=16"]
             values = {**values, "AI_HISTORY_MESSAGES": "16"}
+    if claude_model or claude_api_key:
+        if claude_model and not _CLAUDE_MODEL.fullmatch(claude_model):
+            raise PreparationError("CLAUDE_MODEL: use a model id such as claude-opus-5-5.")
+        if claude_api_key and not _PROVIDER_KEY.fullmatch(claude_api_key):
+            raise PreparationError("CLAUDE_API_KEY: paste the provider key exactly as issued.")
+        missing = [key for key in _CLAUDE_DEFAULTS if key not in values]
+        if missing:
+            lines = [*lines, "# Claude settings added by prepare_vps configure.",
+                     *(f"{key}={_CLAUDE_DEFAULTS[key]}" for key in missing)]
+            values = {**values, **{key: _CLAUDE_DEFAULTS[key] for key in missing}}
+        if claude_model:
+            replacements["CLAUDE_MODEL"] = claude_model
+        if claude_api_key:
+            replacements["CLAUDE_API_KEY"] = claude_api_key
+            replacements["ALLOW_DEMO_AI"] = "false"
+            try:
+                budget = int(replacements.get("AI_MAX_OUTPUT_TOKENS",
+                                              values.get("AI_MAX_OUTPUT_TOKENS", "")))
+            except ValueError:
+                budget = 0
+            if budget < _CLAUDE_MIN_OUTPUT_TOKENS:
+                replacements["AI_MAX_OUTPUT_TOKENS"] = str(_CLAUDE_MIN_OUTPUT_TOKENS)
     if edge_mode:
         if edge_mode not in _EDGE_MODES:
             raise PreparationError(f"SCAP_EDGE_MODE: use {' or '.join(_EDGE_MODES)}.")
@@ -262,7 +305,9 @@ def configure(project: str | Path, *, domain: str = "", email: str = "",
             raise PreparationError(f"{key}: use one of {', '.join(_IMAGES)} with name@sha256:<64 hex>.")
         replacements[key] = value
     if not replacements:
-        raise PreparationError("Nothing to configure; pass a domain, email, image, edge mode or AI quality.")
+        raise PreparationError(
+            "Nothing to configure; pass a domain, email, image, edge mode, AI quality or Claude setting."
+        )
     if not replacements.keys() <= values.keys():
         raise PreparationError("Deployment configuration is missing template fields; recreate it with init.")
     output = []
@@ -432,7 +477,11 @@ def main(argv: list[str] | None = None) -> int:
     update.add_argument("--image", action="append", default=[], metavar="KEY=NAME@sha256:DIGEST")
     update.add_argument("--edge-mode", choices=_EDGE_MODES, default="")
     update.add_argument("--ai-quality", choices=tuple(_AI_QUALITY_PROFILES), default="",
-                        help="Set bounded answer/history budgets and require real Gemini; keep model and keys.")
+                        help="Set bounded answer/history budgets and require real AI; keep model and keys.")
+    update.add_argument("--claude-model", default="", metavar="MODEL",
+                        help="Claude model id offered by the provider, e.g. claude-opus-5-5.")
+    update.add_argument("--claude-key", action="store_true",
+                        help="Prompt (hidden) for the Claude API key and require real AI.")
     verify = commands.add_parser("check", help="Check readiness without printing secrets or starting services.")
     verify.add_argument("--project", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
@@ -444,9 +493,24 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "configure":
             images = dict(item.split("=", 1) if "=" in item else (item, "") for item in args.image)
+            claude_api_key = ""
+            if args.claude_key:
+                # Never accept the key in argv or shell history: hidden TTY prompt only.
+                if not sys.stdin.isatty():
+                    print("VPS preparation failed: --claude-key needs an interactive terminal.",
+                          file=sys.stderr)
+                    return 1
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", getpass.GetPassWarning)
+                    claude_api_key = getpass.getpass("Claude API key (input hidden): ").strip()
+                if not claude_api_key:
+                    print("VPS preparation failed: no Claude API key was entered.", file=sys.stderr)
+                    return 1
             changed = configure(args.project, domain=args.domain, email=args.email, images=images,
-                                edge_mode=args.edge_mode, ai_quality=args.ai_quality)
-            print(f"Updated deploy/.env.vps: {', '.join(changed)}; secrets unchanged.")
+                                edge_mode=args.edge_mode, ai_quality=args.ai_quality,
+                                claude_model=args.claude_model, claude_api_key=claude_api_key)
+            note = "other secrets unchanged" if claude_api_key else "secrets unchanged"
+            print(f"Updated deploy/.env.vps: {', '.join(changed)}; {note}.")
             return 0
         issues = check(args.project)
         if issues:
@@ -458,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except PreparationError as exc:
         print(f"VPS preparation failed: {exc}", file=sys.stderr)
+    except (EOFError, KeyboardInterrupt, getpass.GetPassWarning):
+        print("VPS preparation cancelled; deploy/.env.vps was not changed.", file=sys.stderr)
     except (OSError, PrivateStorageError):
         print("VPS preparation failed: configuration missing, unsafe or inaccessible; no values shown.",
               file=sys.stderr)
