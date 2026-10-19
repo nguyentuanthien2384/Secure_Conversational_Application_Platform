@@ -182,16 +182,18 @@
     }
   }
 
-  const MAX_CHAT_FILE_BYTES = 256 * 1024;
-
-  function toBase64(bytes) {
-    let binary = "";
-    const chunk = 0x8000;
-    for (let index = 0; index < bytes.length; index += chunk) {
-      binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
-    }
-    return btoa(binary);
-  }
+  // Chat attachments. The file goes as raw bytes to a dedicated same-origin
+  // route (HttpOnly session cookie, no base64, never through the Gradio
+  // queue); only the returned one-use upload id or an error code is handed to
+  // the hidden Gradio box, so the server can bind the file to this tab's login.
+  const CHAT_FILE_UPLOAD_PATH = "/api/ui-session/chat-file";
+  const DEFAULT_CHAT_FILE_MAX_BYTES = 10 * 1024 * 1024;
+  const CHAT_FILE_ERRORS = new Set([
+    "too_large", "empty", "unsupported_type", "invalid_name", "not_utf8", "binary",
+    "bidi", "docx_invalid", "docx_too_large", "session", "busy", "rate_limited",
+    "timeout",
+  ]);
+  let chatFileBusy = false;
 
   function deliverChatFile(payload) {
     const input = document.querySelector("#chat-file-payload textarea, #chat-file-payload input");
@@ -202,32 +204,80 @@
     setTimeout(() => button.click(), 60);
   }
 
+  function encodeFileName(name) {
+    const bytes = new TextEncoder().encode(name);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function showChatFileProgress(picker, text) {
+    const hint = picker.closest(".scap-chat-file-bar")?.querySelector("[data-scap-file-label]");
+    const label = picker.closest(".scap-chat-file-bar")?.querySelector(".scap-chat-file-btn");
+    if (hint) {
+      if (hint.dataset.scapIdleText === undefined) hint.dataset.scapIdleText = hint.textContent;
+      hint.textContent = text ?? hint.dataset.scapIdleText;
+    }
+    label?.setAttribute("aria-disabled", text === null ? "false" : "true");
+    picker.disabled = text !== null;
+  }
+
+  function uploadChatFile(file, onProgress) {
+    return new Promise(resolve => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", CHAT_FILE_UPLOAD_PATH);
+      xhr.responseType = "json";
+      xhr.timeout = 180000;
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.setRequestHeader("X-SCAP-UI", "1");
+      xhr.setRequestHeader("X-SCAP-File-Name", encodeFileName(file.name || ""));
+      xhr.upload.onprogress = event => {
+        if (event.lengthComputable && event.total) onProgress(event.loaded / event.total);
+      };
+      xhr.onload = () => {
+        const body = xhr.response && typeof xhr.response === "object" ? xhr.response : {};
+        if (xhr.status === 200 && /^[A-Za-z0-9_-]{32}$/.test(body.upload_id || "")) {
+          resolve({upload_id: body.upload_id});
+        } else if (CHAT_FILE_ERRORS.has(body.code)) {
+          resolve({error: body.code});
+        } else {
+          resolve({error: xhr.status === 413 ? "too_large" : "upload_failed"});
+        }
+      };
+      xhr.onerror = xhr.ontimeout = xhr.onabort = () => resolve({error: "upload_failed"});
+      xhr.send(file);
+    });
+  }
+
   async function onChatFileChange(event) {
     const picker = event.target instanceof HTMLInputElement ? event.target : null;
     if (!picker || picker.id !== "chat-file-input") return;
     const file = picker.files && picker.files[0];
     picker.value = "";
-    if (!file) return;
-    if (file.size > MAX_CHAT_FILE_BYTES) {
-      deliverChatFile({error: "too_large", name: file.name});
+    if (!file || chatFileBusy) return;
+    const limit = Number(picker.dataset.scapMaxBytes) || DEFAULT_CHAT_FILE_MAX_BYTES;
+    if (file.size > limit) {
+      deliverChatFile({error: "too_large"});
       return;
     }
+    if (!file.size) {
+      deliverChatFile({error: "empty"});
+      return;
+    }
+    chatFileBusy = true;
+    showChatFileProgress(picker, "Đang tải tệp lên… 0%");
     try {
-      const lower = (file.name || "").toLowerCase();
-      if (lower.endsWith(".docx")) {
-        const buffer = await file.arrayBuffer();
-        deliverChatFile({
-          name: file.name,
-          encoding: "base64",
-          base64: toBase64(new Uint8Array(buffer)),
-        });
-      } else {
-        const buffer = await file.arrayBuffer();
-        const content = new TextDecoder("utf-8", {fatal: true}).decode(buffer);
-        deliverChatFile({name: file.name, content});
-      }
+      const result = await uploadChatFile(file, ratio => {
+        showChatFileProgress(picker, ratio < 1
+          ? `Đang tải tệp lên… ${Math.floor(ratio * 100)}%`
+          : "Đang trích xuất nội dung…");
+      });
+      deliverChatFile(result);
     } catch (_) {
-      deliverChatFile({error: "read_failed", name: file.name});
+      deliverChatFile({error: "read_failed"});
+    } finally {
+      chatFileBusy = false;
+      showChatFileProgress(picker, null);
     }
   }
 

@@ -30,13 +30,19 @@ from markdown_it.renderer import RendererHTML
 
 from src.app.account_security import DEVICE_COOKIE_NAME, DEVICE_TOKEN_HEADER
 from src.app.audit import sign_ui_client_context
+from src.app.chat_files import (
+    CHAT_FILES,
+    MAX_CHAT_FILE_UPLOAD_BYTES,
+    UPLOAD_ID_RE,
+    ChatFile,
+    ChatFileError,
+    format_size,
+    select_file_excerpts,
+)
+from src.app.chat_files import error_message as chat_file_error_message
 from src.app.crypto_workbench_ui import WORKBENCH_CSS, WORKBENCH_HTML
 from src.app.gradio_capacity import install_gradio_capacity
-from src.app.schemas import (
-    ALLOWED_CHAT_FILE_EXTENSIONS,
-    MAX_CHAT_FILE_CONTENT_CHARS,
-    MAX_CHAT_FILE_NAME_CHARS,
-)
+from src.app.schemas import ALLOWED_CHAT_FILE_EXTENSIONS, MAX_CHAT_FILE_CONTENT_CHARS
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
 from src.app.ui_session import COOKIE_NAME, BrowserSessionStore, UISessionCapacityError
 from src.core.ai_core.gemini_ai import validate_search_suggestions_html
@@ -64,7 +70,6 @@ SESSION_TICK_SECONDS = 10
 # Ngưỡng nhắc trước khi phiên hết hạn (giây).
 WARN_BEFORE_EXPIRY = 120
 MAX_UI_SEARCH_ROWS = 500
-MAX_CHAT_FILE_BYTES = 256 * 1024
 
 # Vùng lịch sử co theo chiều cao màn hình để ô soạn và nút Gửi luôn ở gần nội
 # dung. Giới hạn dưới vẫn đủ đọc hội thoại; giới hạn trên tránh khoảng trắng lớn
@@ -637,6 +642,7 @@ footer { display: none !important; }
   transition: filter .15s ease;
 }
 .scap-chat-file-btn:hover { filter: brightness(0.96); }
+.scap-chat-file-btn[aria-disabled="true"] { opacity: .6; cursor: progress; }
 #chat-file-input {
   position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
 }
@@ -650,6 +656,7 @@ footer { display: none !important; }
   background: var(--scap-ok-bg);
 }
 #chat-attachment-status p { margin: 0; font-size: 14.5px; color: var(--scap-ok-fg); }
+#chat-attachment-status p + p { margin-top: 6px; }
 .mono-df { max-width: 100%; min-width: 0 !important; }
 
 /* ── Khối trạng thái ───────────────────────────────────────────────────── */
@@ -881,11 +888,6 @@ def _take_session_ended(token: str) -> bool:
         return True
 
 
-_STAGED_CHAT_FILES: dict[str, dict[str, str]] = {}
-_STAGED_CHAT_FILES_LOCK = threading.Lock()
-_STAGED_CHAT_FILES_MAX = 512
-
-
 def _token_keys(token: str | None) -> tuple[str, ...]:
     if not token:
         return ()
@@ -897,153 +899,39 @@ def _token_keys(token: str | None) -> tuple[str, ...]:
     return tuple(dict.fromkeys(keys))
 
 
-def _set_staged_chat_file(token: str, file_name: str, file_content: str) -> None:
+def _get_staged_chat_file(token: str | None) -> ChatFile | None:
     keys = _token_keys(token)
-    if not keys:
-        return
-    entry = {"file_name": file_name, "file_content": file_content}
-    with _STAGED_CHAT_FILES_LOCK:
-        for key in keys:
-            _STAGED_CHAT_FILES[key] = entry
-        while len(_STAGED_CHAT_FILES) > _STAGED_CHAT_FILES_MAX:
-            del _STAGED_CHAT_FILES[next(iter(_STAGED_CHAT_FILES))]
-
-
-def _get_staged_chat_file(token: str | None) -> dict[str, str] | None:
-    keys = _token_keys(token)
-    if not keys:
-        return None
-    with _STAGED_CHAT_FILES_LOCK:
-        for key in keys:
-            found = _STAGED_CHAT_FILES.get(key)
-            if found is not None:
-                return dict(found)
-    return None
+    return CHAT_FILES.staged(keys) if keys else None
 
 
 def _clear_staged_chat_file(token: str | None) -> None:
     keys = _token_keys(token)
-    if not keys:
-        return
-    with _STAGED_CHAT_FILES_LOCK:
-        for key in keys:
-            _STAGED_CHAT_FILES.pop(key, None)
+    if keys:
+        CHAT_FILES.clear(keys)
 
 
-def _extract_docx_text(raw_bytes: bytes) -> str:
-    """Trích xuất văn bản thuần từ tệp .docx trong bộ nhớ mà không mở thực thể XML ngoài."""
-    import io
-    import zipfile
+def _chat_file_upload_id(raw_payload: str | None) -> str:
+    """Đọc thông điệp nhỏ mà session_bridge.js đặt vào ô ẩn sau khi tải tệp lên.
 
-    if len(raw_bytes) > MAX_CHAT_FILE_BYTES:
-        raise gr.Error("Tệp .docx vượt quá giới hạn dung lượng 256 KB.")
-    try:
-        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
-            info = archive.getinfo("word/document.xml")
-            if info.file_size > 512 * 1024:
-                raise gr.Error("Nội dung giải nén của tệp .docx vượt quá giới hạn an toàn.")
-            xml_text = archive.read("word/document.xml").decode("utf-8", errors="replace")
-    except gr.Error:
-        raise
-    except Exception as exc:
-        raise gr.Error("Không đọc được tệp .docx. Hãy kiểm tra lại định dạng tệp.") from exc
-    paragraphs: list[str] = []
-    for para_match in re.finditer(r"<w:p(?:\s[^>]*)?>([\s\S]*?)</w:p>", xml_text):
-        para_xml = para_match.group(1)
-        para_xml = re.sub(r"<w:tab\b[^>]*/?>", "\t", para_xml)
-        para_xml = re.sub(r"<w:br\b[^>]*/?>", "\n", para_xml)
-        runs = [
-            html.unescape(run_match.group(1))
-            for run_match in re.finditer(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>", para_xml)
-        ]
-        line = "".join(runs).strip()
-        if line:
-            paragraphs.append(line)
-    return "\n".join(paragraphs)
-
-
-def _parse_uploaded_chat_file(raw_payload: str | None) -> tuple[str, str]:
-    """Kiểm tra và chuẩn hóa tệp do trình duyệt đọc trước khi gắn vào hội thoại."""
+    Chỉ có mã upload hoặc mã lỗi đi qua hàng đợi Gradio; bản thân tệp đã tới
+    route upload riêng. Mã lỗi được tra ở máy chủ, không hiển thị chữ từ client.
+    """
     if not isinstance(raw_payload, str) or not raw_payload.strip():
         raise gr.Error("Chưa nhận được dữ liệu tệp đính kèm.")
-    if len(raw_payload) > MAX_CHAT_FILE_BYTES * 2:
-        raise gr.Error("Tệp đính kèm vượt quá giới hạn dung lượng cho phép (tối đa 256 KB).")
+    if len(raw_payload) > 512:
+        raise gr.Error(chat_file_error_message("invalid"))
     try:
         payload = json.loads(raw_payload)
     except (ValueError, RecursionError) as exc:
-        raise gr.Error("Dữ liệu tệp đính kèm không hợp lệ.") from exc
+        raise gr.Error(chat_file_error_message("invalid")) from exc
     if not isinstance(payload, dict):
-        raise gr.Error("Dữ liệu tệp đính kèm không hợp lệ.")
-    error_code = str(payload.get("error") or "")
-    if error_code == "too_large":
-        raise gr.Error("Tệp vượt quá giới hạn 256 KB. Hãy chọn tệp nhỏ hơn.")
-    if error_code == "unsupported_type":
-        raise gr.Error(
-            "Định dạng tệp không được hỗ trợ. Hãy chọn tệp văn bản (.txt, .md, .csv, .json, mã nguồn…) hoặc .docx."
-        )
-    if error_code == "read_failed":
-        raise gr.Error("Trình duyệt không đọc được tệp đã chọn. Vui lòng thử lại.")
-    if error_code:
-        raise gr.Error("Không thể xử lý tệp đính kèm.")
-
-    raw_name = str(payload.get("name") or "").strip()
-    raw_name = raw_name.replace("\\", "/").split("/")[-1].strip()
-    if not raw_name or len(raw_name) > MAX_CHAT_FILE_NAME_CHARS:
-        raise gr.Error(f"Tên tệp phải từ 1 đến {MAX_CHAT_FILE_NAME_CHARS} ký tự.")
-    if ".." in raw_name or any(
-        ord(ch) < 32 or ord(ch) == 127 or ord(ch) in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
-        for ch in raw_name
-    ):
-        raise gr.Error("Tên tệp chứa ký tự điều khiển không hợp lệ.")
-    lowered_name = raw_name.lower()
-    matched_ext = next(
-        (ext for ext in ALLOWED_CHAT_FILE_EXTENSIONS if lowered_name.endswith(ext)),
-        None,
-    )
-    if matched_ext is None or len(raw_name) <= len(matched_ext):
-        raise gr.Error(
-            "Định dạng tệp không được hỗ trợ. Hãy chọn tệp văn bản, dữ liệu, mã nguồn hoặc .docx."
-        )
-
-    if lowered_name.endswith(".docx") or payload.get("encoding") == "base64":
-        encoded = payload.get("base64") or payload.get("content") or ""
-        if not isinstance(encoded, str) or not encoded.strip():
-            raise gr.Error("Tệp .docx rỗng hoặc không hợp lệ.")
-        try:
-            raw_bytes = base64.b64decode(encoded, validate=True)
-        except Exception as exc:
-            raise gr.Error("Không giải mã được dữ liệu tệp đính kèm.") from exc
-        if lowered_name.endswith(".docx"):
-            text_content = _extract_docx_text(raw_bytes)
-        else:
-            if len(raw_bytes) > MAX_CHAT_FILE_BYTES:
-                raise gr.Error("Tệp vượt quá giới hạn 256 KB.")
-            try:
-                text_content = raw_bytes.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise gr.Error("Tệp không phải văn bản UTF-8 hợp lệ.") from exc
-    else:
-        raw_content = payload.get("content")
-        if not isinstance(raw_content, str):
-            raise gr.Error("Nội dung tệp đính kèm không hợp lệ.")
-        text_content = raw_content
-
-    normalized = text_content.replace("\r\n", "\n").replace("\r", "\n")
-    for codepoint in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)):
-        if chr(codepoint) in normalized:
-            raise gr.Error("Nội dung tệp chứa ký tự điều hướng hai chiều (Bidi) không an toàn.")
-    if any((ord(ch) < 32 and ch not in ("\n", "\t")) or ord(ch) == 127 for ch in normalized):
-        raise gr.Error(
-            "Tệp chứa ký tự nhị phân hoặc ký tự điều khiển không hợp lệ. Hãy chọn tệp văn bản hoặc .docx."
-        )
-    cleaned = normalized.strip()
-    if not cleaned:
-        raise gr.Error("Tệp đính kèm không có nội dung văn bản để phân tích.")
-    if len(cleaned) > MAX_CHAT_FILE_CONTENT_CHARS:
-        raise gr.Error(
-            f"Nội dung tệp dài {len(cleaned):,} ký tự, vượt giới hạn {MAX_CHAT_FILE_CONTENT_CHARS:,} ký tự."
-        )
-    return raw_name, cleaned
+        raise gr.Error(chat_file_error_message("invalid"))
+    if payload.get("error"):
+        raise gr.Error(chat_file_error_message(payload["error"]))
+    upload_id = payload.get("upload_id")
+    if not isinstance(upload_id, str) or not UPLOAD_ID_RE.fullmatch(upload_id):
+        raise gr.Error(chat_file_error_message("invalid"))
+    return upload_id
 
 
 # Tên trường trong lỗi 422 của API -> nhãn trên giao diện.
@@ -1961,9 +1849,11 @@ CHAT_FILE_PICKER_HTML = (
     '<label class="scap-chat-file-btn" for="chat-file-input">'
     "📎 Đính kèm tệp tài liệu"
     "</label>"
-    f'<input id="chat-file-input" type="file" accept="{CHAT_FILE_ACCEPT}">'
-    '<span class="scap-chat-file-hint" data-scap-file-label>'
-    "Hỗ trợ .txt, .md, .csv, .json, .docx, mã nguồn… (tối đa 30.000 ký tự)"
+    f'<input id="chat-file-input" type="file" accept="{CHAT_FILE_ACCEPT}" '
+    f'data-scap-max-bytes="{MAX_CHAT_FILE_UPLOAD_BYTES}">'
+    '<span class="scap-chat-file-hint" data-scap-file-label aria-live="polite">'
+    "Hỗ trợ .txt, .md, .csv, .json, .docx, mã nguồn… "
+    f"(tối đa {MAX_CHAT_FILE_UPLOAD_BYTES // (1024 * 1024)} MB)"
     "</span>"
     "</div>"
 )
@@ -3683,26 +3573,29 @@ def build_ui(
             staged = _get_staged_chat_file(token)
             if not staged:
                 return gr.update(value="", visible=False), gr.update(visible=False)
-            file_name = staged["file_name"]
-            file_content = staged["file_content"]
-            safe_name = _safe_markdown_text(file_name)
-            char_count = len(file_content)
-            return (
-                gr.update(
-                    value=(
-                        f"📎 **Đã đính kèm tệp:** {safe_name} ({char_count:,} ký tự). "
-                        "Nhập câu hỏi (hoặc bấm **Gửi** ngay để yêu cầu phân tích tệp)."
-                    ),
-                    visible=True,
-                ),
-                gr.update(visible=True),
+            value = (
+                f"📎 **Đã đính kèm tệp:** {_safe_markdown_text(staged.name)} "
+                f"({format_size(staged.size)} · {staged.chars:,} ký tự). "
+                "Nhập câu hỏi (hoặc bấm **Gửi** ngay để yêu cầu phân tích tệp)."
             )
+            if staged.excerpted:
+                value += (
+                    f"\n\nTài liệu dài hơn {MAX_CHAT_FILE_CONTENT_CHARS:,} ký tự nên khi gửi, "
+                    "hệ thống chỉ chuyển cho AI **các đoạn liên quan nhất tới câu hỏi**. "
+                    "Hãy hỏi cụ thể (tên mục, từ khóa, số liệu); để trống câu hỏi sẽ gửi "
+                    "các đoạn rải đều toàn tài liệu."
+                )
+            return gr.update(value=value, visible=True), gr.update(visible=True)
 
         def stage_chat_file(token, raw_payload):
             if not token:
                 raise gr.Error("Vui lòng đăng nhập trước khi đính kèm tệp.")
             try:
-                file_name, file_content = _parse_uploaded_chat_file(raw_payload)
+                upload_id = _chat_file_upload_id(raw_payload)
+                try:
+                    CHAT_FILES.claim(upload_id, _token_keys(token))
+                except ChatFileError as exc:
+                    raise gr.Error(str(exc)) from exc
             except gr.Error as err:
                 _clear_staged_chat_file(token)
                 return (
@@ -3714,7 +3607,6 @@ def build_ui(
                         visible=True,
                     ),
                 )
-            _set_staged_chat_file(token, file_name, file_content)
             att_md, clear_btn = _attachment_banner_updates(token)
             return "", att_md, clear_btn, gr.update(value="", visible=False)
 
@@ -3739,8 +3631,9 @@ def build_ui(
         def _send_chat_message(token, session_id, message, confirm_external=False, use_web_search=False):
             staged_file = _get_staged_chat_file(token)
             message = (message or "").strip()
+            question = message
             if not message and staged_file:
-                message = f"Hãy phân tích và trả lời dựa trên tệp {staged_file['file_name']} vừa tải lên."
+                message = f"Hãy phân tích và trả lời dựa trên tệp {staged_file.name} vừa tải lên."
             if not message:
                 return (gr.skip(), gr.skip(), gr.skip(), "", gr.skip(), gr.update(visible=False),
                         gr.skip(), gr.skip(), gr.skip())
@@ -3784,8 +3677,9 @@ def build_ui(
                     "use_web_search": bool(use_web_search),
                 }
                 if staged_file:
-                    payload["file_name"] = staged_file["file_name"]
-                    payload["file_content"] = staged_file["file_content"]
+                    payload["file_name"] = staged_file.name
+                    # Tài liệu dài: chỉ các đoạn liên quan tới câu hỏi, vừa giới hạn API.
+                    payload["file_content"] = select_file_excerpts(staged_file.text, question)
                 sent = _api(
                     token,
                     "POST",

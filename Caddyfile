@@ -45,7 +45,15 @@
 
 	# Enforce the same high-sensitivity upload ceiling at the Internet edge.
 	# Caddy returns 413 before FastAPI/Gradio reads more than this amount.
-	request_body {
+	# Chat attachments (raw bytes, at most 10 MiB) have one dedicated upload
+	# route that streams and bounds its own body; the matchers are disjoint so
+	# the 1MB limit cannot wrap that route's larger one.
+	@chat_file_upload path /api/ui-session/chat-file
+	request_body @chat_file_upload {
+		max_size 10MiB
+	}
+	@ordinary_body not path /api/ui-session/chat-file
+	request_body @ordinary_body {
 		max_size 1MB
 	}
 

@@ -11,7 +11,13 @@ import anyio
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from src.app.chat_files import CHAT_FILE_UPLOAD_PATH, MAX_CHAT_FILE_UPLOAD_BYTES
+
 MAX_BODY_BYTES = 1_048_576
+# Exact POST routes that stream a raw (non-JSON) body and bound it themselves.
+# They are not buffered here, so authentication, rate limits and the upload
+# concurrency cap run before up to this many bytes are read.
+STREAMED_BODY_LIMITS: dict[str, int] = {CHAT_FILE_UPLOAD_PATH: MAX_CHAT_FILE_UPLOAD_BYTES}
 MAX_URI_BYTES = 16_384
 MAX_HEADER_BYTES = 32_768
 MAX_HEADER_COUNT = 100
@@ -57,6 +63,27 @@ def _json_strings(value: object) -> None:
     elif isinstance(value, list):
         for child in value:
             _json_strings(child)
+
+
+class StreamedBodyLimitExceeded(Exception):
+    """A streamed route kept reading after its body passed the limit."""
+
+
+def _bounded_receive(receive: Receive, limit: int) -> Receive:
+    seen = 0
+
+    async def bounded() -> Message:
+        nonlocal seen
+        # One over-limit chunk is delivered so the route can answer 413 itself;
+        # a route that ignores it and reads on fails closed instead.
+        if seen > limit:
+            raise StreamedBodyLimitExceeded
+        message = await receive()
+        if message["type"] == "http.request":
+            seen += len(message.get("body", b""))
+        return message
+
+    return bounded
 
 
 def _validate_json(body: bytearray) -> None:
@@ -168,8 +195,16 @@ class RequestLimitsMiddleware:
         ):
             await reject(400, "Content-Length không hợp lệ.")
             return
-        if lengths and int(lengths[0]) > MAX_BODY_BYTES:
-            await reject(413, "Request body vượt quá 1 MiB.")
+        streamed_limit = (
+            STREAMED_BODY_LIMITS.get(scope.get("path", ""))
+            if scope.get("method") == "POST" else None
+        )
+        body_limit = streamed_limit or MAX_BODY_BYTES
+        if lengths and int(lengths[0]) > body_limit:
+            await reject(413, f"Request body vượt quá {body_limit // 1_048_576} MiB.")
+            return
+        if streamed_limit is not None:
+            await self.app(scope, _bounded_receive(receive, streamed_limit), send)
             return
         body = bytearray()
         try:

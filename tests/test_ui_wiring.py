@@ -1153,45 +1153,7 @@ def test_totp_qr_is_inline_and_has_no_file_toolbar():
     ), "QR không được quay lại gr.Image (sẽ tạo tệp cache)"
 
 
-def test_chat_file_upload_staging_docx_and_send(runtime_demo, monkeypatch):
-    import base64
-    import io
-    import json
-    import zipfile
-
-    from src.app import gradio_ui
-
-    # 1. Verify .docx extraction without external dependencies or XXE risk
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(
-            "word/document.xml",
-            '<w:document><w:body><w:p><w:r><w:t>Báo cáo quý 3</w:t></w:r></w:p>'
-            '<w:p><w:r><w:t>Doanh thu tăng 25%.</w:t></w:r></w:p></w:body></w:document>',
-        )
-    docx_payload = json.dumps({
-        "name": "bao_cao_q3.docx",
-        "encoding": "base64",
-        "base64": base64.b64encode(buf.getvalue()).decode("ascii"),
-    })
-    parsed_name, parsed_text = gradio_ui._parse_uploaded_chat_file(docx_payload)
-    assert parsed_name == "bao_cao_q3.docx"
-    assert parsed_text == "Báo cáo quý 3\nDoanh thu tăng 25%."
-
-    # 2. Stage file via hidden bridge button and send message
-    stage_fn, _ = _button_event(runtime_demo, "Đính kèm tệp")
-    token = "test-file-token"
-    _, att_md, clear_btn, notice_md = stage_fn.fn(
-        token,
-        json.dumps({"name": "tai_lieu.txt", "content": "Nội dung tài liệu mật."}),
-    )
-    assert att_md["visible"] is True
-    assert "tai\\_lieu\\.txt" in att_md["value"]
-    assert clear_btn["visible"] is True
-    assert notice_md["visible"] is False
-
-    posted_bodies = []
-
+def _chat_file_api(posted_bodies):
     def fake_api(tok, method, path, body=None, *, params=None):
         if method == "GET" and path == "/api/sessions/sess-1":
             return {"id": "sess-1", "security_mode": "secure", "data_classification": "internal"}
@@ -1204,7 +1166,29 @@ def test_chat_file_upload_staging_docx_and_send(runtime_demo, monkeypatch):
             return [{"role": "user", "content": "Hỏi"}, {"role": "assistant", "content": "Trả lời"}]
         return {}
 
-    monkeypatch.setattr(gradio_ui, "_api", fake_api)
+    return fake_api
+
+
+def test_chat_file_upload_id_is_claimed_by_its_own_login_and_sent(runtime_demo, monkeypatch):
+    import json
+
+    from src.app import gradio_ui
+    from src.app.chat_files import CHAT_FILES, ChatFile, token_digest
+
+    stage_fn, _ = _button_event(runtime_demo, "Đính kèm tệp")
+    token = "test-file-token"
+    upload_id = CHAT_FILES.put_pending(
+        token_digest(token), ChatFile.from_text("tai_lieu.txt", "Nội dung tài liệu mật.")
+    )
+    _, att_md, clear_btn, notice_md = stage_fn.fn(token, json.dumps({"upload_id": upload_id}))
+    assert att_md["visible"] is True
+    assert "tai\_lieu\.txt" in att_md["value"]
+    assert "đoạn liên quan" not in att_md["value"]
+    assert clear_btn["visible"] is True
+    assert notice_md["visible"] is False
+
+    posted_bodies = []
+    monkeypatch.setattr(gradio_ui, "_api", _chat_file_api(posted_bodies))
     send_fn, _ = _button_event(runtime_demo, "Gửi")
     # Even when message textbox is empty, sending with a staged file auto-supplies a prompt and sends the file
     send_fn.fn(token, "sess-1", "", False)
@@ -1213,4 +1197,59 @@ def test_chat_file_upload_staging_docx_and_send(runtime_demo, monkeypatch):
     assert posted_bodies[0]["file_content"] == "Nội dung tài liệu mật."
     assert "tai_lieu.txt" in posted_bodies[0]["content"]
     assert gradio_ui._get_staged_chat_file(token) is None
+
+
+def test_chat_file_upload_rejects_foreign_ids_and_reports_bridge_errors(runtime_demo):
+    import json
+
+    from src.app import gradio_ui
+    from src.app.chat_files import CHAT_FILES, ChatFile, ChatFileError, token_digest
+
+    stage_fn, _ = _button_event(runtime_demo, "Đính kèm tệp")
+    # Another login (another tab or account in this browser) uploaded it.
+    upload_id = CHAT_FILES.put_pending(
+        token_digest("other-login"), ChatFile.from_text("bi_mat.txt", "Không phải của bạn.")
+    )
+    _, att_md, _clear, notice_md = stage_fn.fn("my-login", json.dumps({"upload_id": upload_id}))
+    assert att_md["visible"] is False
+    assert notice_md["visible"] is True and "hết hạn" in notice_md["value"]
+    assert gradio_ui._get_staged_chat_file("my-login") is None
+    # The id is single-use even for the rightful owner after a failed claim.
+    with pytest.raises(ChatFileError):
+        CHAT_FILES.claim(upload_id, [token_digest("other-login")])
+
+    _, _, _, notice_md = stage_fn.fn("my-login", json.dumps({"error": "too_large"}))
+    assert "10 MB" in notice_md["value"]
+    for payload in ('{"error": "<b>x</b>"}', '{"upload_id": "../../etc"}', "[]", "x" * 600):
+        _, _, _, notice_md = stage_fn.fn("my-login", payload)
+        assert notice_md["visible"] is True
+        assert "Không thể xử lý tệp đính kèm" in notice_md["value"]
+
+
+def test_long_chat_file_sends_only_relevant_excerpts_within_api_limit(runtime_demo, monkeypatch):
+    import json
+
+    from src.app import gradio_ui
+    from src.app.chat_files import CHAT_FILES, ChatFile, token_digest
+    from src.app.schemas import MAX_CHAT_FILE_CONTENT_CHARS, MessageSend
+
+    filler = "".join(f"Mục {i}: nội dung tham khảo chung về quy trình nội bộ.\n" for i in range(4000))
+    needle = "Doanh thu năm 2025 của chi nhánh Đà Nẵng đạt 812 tỷ đồng.\n"
+    text = "BÁO CÁO TỔNG HỢP\n" + filler[: len(filler) // 2] + needle + filler[len(filler) // 2:]
+    token = "long-file-token"
+    upload_id = CHAT_FILES.put_pending(token_digest(token), ChatFile.from_text("bao_cao.txt", text))
+    stage_fn, _ = _button_event(runtime_demo, "Đính kèm tệp")
+    _, att_md, _clear, _notice = stage_fn.fn(token, json.dumps({"upload_id": upload_id}))
+    assert f"{len(text):,} ký tự" in att_md["value"]
+    assert "các đoạn liên quan nhất tới câu hỏi" in att_md["value"]
+
+    posted_bodies = []
+    monkeypatch.setattr(gradio_ui, "_api", _chat_file_api(posted_bodies))
+    send_fn, _ = _button_event(runtime_demo, "Gửi")
+    send_fn.fn(token, "sess-1", "doanh thu nam 2025 o Da Nang la bao nhieu?", False)
+    sent = posted_bodies[0]["file_content"]
+    assert len(sent) <= MAX_CHAT_FILE_CONTENT_CHARS
+    assert needle.strip() in sent
+    assert sent.startswith("[SCAP: tài liệu gốc dài") and "BÁO CÁO TỔNG HỢP" in sent
+    MessageSend(content="Hỏi", file_name="bao_cao.txt", file_content=sent)
 

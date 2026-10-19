@@ -23,11 +23,27 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import anyio
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.requests import ClientDisconnect
 
 from src.app.account_security import DEVICE_COOKIE_NAME
 from src.app.browser_security import browser_request_denial
+from src.app.chat_files import (
+    CHAT_FILE_UPLOAD_PATH,
+    CHAT_FILES,
+    FILE_NAME_HEADER,
+    MAX_CHAT_FILE_UPLOAD_BYTES,
+    UPLOAD_READ_SECONDS,
+    ChatFileError,
+    ChatFileStore,
+    decode_file_name_header,
+    error_message,
+    normalize_file_name,
+    parse_chat_file,
+    token_digest,
+)
 
 COOKIE_NAME = "scap_ui_session"
 _HANDLE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
@@ -226,6 +242,7 @@ def register_ui_session_routes(
     *,
     production: bool = False,
     device_cookie_days: int = 365,
+    chat_files: ChatFileStore = CHAT_FILES,
 ) -> None:
     """Register same-origin cookie handoff endpoints before mounting Gradio.
 
@@ -349,6 +366,67 @@ def register_ui_session_routes(
                 path="/",
             )
         return response
+
+    @app.post(CHAT_FILE_UPLOAD_PATH, include_in_schema=False)
+    async def upload_chat_file(request: Request):
+        """Nhận một tệp thô (≤ 10 MiB) cho ô soạn tin và trả mã chờ cho tab đã chọn tệp.
+
+        Cookie phiên chỉ cho biết token nào được nhận tệp. Văn bản chưa đi đâu
+        cho tới khi callback Gradio của tab có cùng token nhận mã này và người
+        dùng gửi tin nhắn qua API (xác thực, consent, DLP như mọi tin nhắn).
+        Mọi kiểm tra rẻ chạy trước khi đọc body; middleware không đệm route này.
+        """
+
+        def file_error(code: str, status_code: int) -> JSONResponse:
+            return JSONResponse(
+                {"code": code, "detail": error_message(code)},
+                status_code=status_code, headers=_NO_STORE,
+            )
+
+        if denied(request):
+            return error(403, "Yêu cầu tải tệp phải đến từ cùng trang ứng dụng.")
+        restored = store.restore(request.cookies.get(COOKIE_NAME))
+        if restored is None:
+            return file_error("session", 401)
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/octet-stream":
+            return error(415, "Tệp đính kèm phải gửi dưới dạng application/octet-stream.")
+        try:
+            name = normalize_file_name(
+                decode_file_name_header(request.headers.getlist(FILE_NAME_HEADER))
+            )
+        except ChatFileError as exc:
+            return file_error(exc.code, 400)
+        owner = token_digest(restored[0])
+        if not chat_files.admit(owner):
+            return file_error("rate_limited", 429)
+        if not chat_files.try_begin():
+            return file_error("busy", 503)
+        try:
+            body = bytearray()
+            try:
+                with anyio.fail_after(UPLOAD_READ_SECONDS):
+                    async for chunk in request.stream():
+                        if len(body) + len(chunk) > MAX_CHAT_FILE_UPLOAD_BYTES:
+                            return file_error("too_large", 413)
+                        body.extend(chunk)
+            except TimeoutError:
+                return file_error("timeout", 408)
+            except ClientDisconnect:
+                return file_error("upload_failed", 400)
+            try:
+                # CPU-bound (giải nén, giải mã, nén lại): không chặn event loop.
+                parsed = await anyio.to_thread.run_sync(parse_chat_file, name, body)
+            except ChatFileError as exc:
+                return file_error(exc.code, 413 if exc.code == "too_large" else 422)
+        finally:
+            chat_files.end()
+        upload_id = chat_files.put_pending(owner, parsed)
+        return JSONResponse(
+            {"upload_id": upload_id, "name": parsed.name, "size": parsed.size,
+             "chars": parsed.chars},
+            headers=_NO_STORE,
+        )
 
     @app.post("/api/ui-session/clear", include_in_schema=False)
     async def clear(request: Request):
