@@ -458,7 +458,7 @@ bản mã không giải được.
 | Build lỗi ở `uv sync --no-dev --frozen` | `uv.lock` không khớp `pyproject.toml`, hoặc mạng chậm. Chạy `uv lock` trên host rồi build lại |
 | Đăng nhập báo sai dù mật khẩu đúng | Đã bị lockout sau 5 lần sai. Chờ `LOGIN_LOCKOUT_SECONDS=900`, hoặc `UPDATE users SET failed_login_attempts=0, locked_until=NULL WHERE username='...';` |
 | Hội thoại cũ lỗi giải mã | `MASTER_ENCRYPTION_KEY` đã bị đổi. Khôi phục khóa cũ hoặc dùng keyring rotation |
-| Bot trả lời chung chung | Chưa có `GOOGLE_GENAI_API_KEY` → chế độ DEMO AI, vẫn đủ để demo bảo mật |
+| Bot trả lời chung chung | Chưa có `CLAUDE_API_KEY` → chế độ DEMO AI, vẫn đủ để demo bảo mật |
 | Muốn reset sạch từ đầu | `docker compose down -v` → `docker compose up -d` (cách A tự seed lại, chuỗi audit về lại nguyên vẹn) |
 | **Windows + Git Bash:** `exec: "D:/Download/Git/app/.venv/bin/python": no such file or directory` | Git Bash tự đổi đường dẫn `/app/...` thành đường dẫn Windows. Thêm `MSYS_NO_PATHCONV=1` trước lệnh, hoặc chạy bằng PowerShell |
 | `audit/verify` báo `chain_intact: false`, `prev_hash_mismatch` mà không ai tấn công | Đã chạy `seed_demo_data.py --reset` trên DB đang dùng → xoá bản ghi audit giữa chuỗi. Không vá được; `down -v` rồi `up` lại |

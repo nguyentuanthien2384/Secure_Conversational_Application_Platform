@@ -372,39 +372,27 @@ bash deploy/vps-compose.sh exec -T app /app/.venv/bin/python -c 'import os; prin
 `bash deploy/vps-compose.sh up -d --no-deps --force-recreate app`. Mỗi câu trả lời
 tính phí theo bảng giá của nhà cung cấp cổng; giới hạn mỗi lần gọi là 25 giây.
 
-#### Gemini báo chưa có API key sau khi deploy
+#### Xóa cấu hình Gemini cũ trên VPS
 
-Khóa trong `.env` trên máy Windows chỉ dùng cho môi trường local. VPS đọc
-`deploy/.env.vps`; file `.env` local không nằm trong image và không được tự tải
-lên server. Khi `GOOGLE_GENAI_API_KEY` để trống và `ALLOW_DEMO_AI=true`, ứng dụng
-chuyển sang AI demo ngoại tuyến.
-
-Trong Termius, tại `/root/scap`, kiểm tra **container đang chạy** có khóa hay chưa.
-Lệnh này chỉ in `True`/`False`, không in API key:
-
-```bash
-bash deploy/vps-compose.sh exec -T app /app/.venv/bin/python -c 'import os; print(bool(os.environ.get("GOOGLE_GENAI_API_KEY", "").strip()))'
-```
-
-Nếu là `False`, mở `deploy/.env.vps` trên VPS bằng trình soạn thảo và chỉ điền
-`GOOGLE_GENAI_API_KEY`. Có thể đặt thêm `ALLOW_DEMO_AI=false` để bắt buộc dùng
-Gemini thật. Giữ nguyên mọi bí mật khác, đặc biệt `APP_SECRET_KEY`,
-`MASTER_ENCRYPTION_KEY` và mật khẩu database; không ghi đè cả file bằng `.env`
-local, không xóa file hoặc tạo lại khóa. Nếu deploy bằng `deploy.ps1`, cập nhật
-cùng hai trường trong file riêng trên Windows để lần upload sau giữ cấu hình này.
-
-Sau khi lưu, tạo lại container app để nạp environment mới, rồi chạy lại lệnh
-kiểm tra phía trên (phải trả về `True`). Không cần build lại image:
+Gemini và tính năng "Tra cứu Internet" đã được gỡ khỏi ứng dụng; Claude là nhà
+cung cấp AI duy nhất. File `deploy/.env.vps` tạo từ trước vẫn có thể còn các dòng
+`GOOGLE_GENAI_API_KEY`, `GEMINI_MODEL`, `GEMINI_WEB_SEARCH_ENABLED`,
+`GEMINI_TIMEOUT_SECONDS`. Ứng dụng bỏ qua chúng và `update.sh` không báo lỗi,
+nhưng nên xóa để không còn giữ key Gemini trên server. Trong **Termius**, tại
+`/root/scap`, sau khi đã `git pull`:
 
 ```bash
-bash deploy/vps-compose.sh up -d --no-deps --force-recreate app
+python3 -m scripts.prepare_vps configure --project . --claude-model claude-opus-5-5
 ```
+
+Lệnh in các dòng đã xóa dạng `removed GEMINI_MODEL`, giữ nguyên `CLAUDE_API_KEY`
+và mọi khóa, mật khẩu khác. Lệnh `--claude-key` ở mục trên cũng tự xóa các dòng này.
 
 Các mục bên dưới mô tả chi tiết từng bước khi muốn làm thủ công ở chế độ `direct`.
 
-#### Cấu hình Gemini trả lời dài hơn và nhớ ngữ cảnh
+#### Cấu hình Claude trả lời dài hơn và nhớ ngữ cảnh
 
-Sau khi đã nạp khóa Gemini trên VPS, có thể chọn cấu hình `balanced` trong
+Sau khi đã nạp khóa Claude trên VPS, có thể chọn cấu hình `balanced` trong
 Termius. Lệnh chỉ đổi `AI_MAX_OUTPUT_TOKENS=2048`, `AI_HISTORY_MESSAGES=16` và
 `ALLOW_DEMO_AI=false`; giữ nguyên model, API key, mọi khóa mã hóa và quota.
 File cấu hình cũ chưa có `AI_HISTORY_MESSAGES` được thêm trường này một lần.
@@ -416,50 +404,24 @@ python3 -m scripts.prepare_vps configure --project . --ai-quality balanced &&
 bash deploy/update.sh
 ```
 
-Model mặc định vẫn là `gemini-flash-lite-latest`; cấu hình này không tự đổi model,
-bật tìm kiếm hoặc mở khóa hạn mức của Google. Miễn phí hay tính phí còn tùy
-quota và billing của project Google gắn với key. Câu trả lời dài hơn và lịch sử dài
-hơn sử dụng nhiều token hơn trong quota của tài khoản. Giới hạn trên VPS là
+Cấu hình này không đổi model. Câu trả lời dài hơn và lịch sử dài hơn dùng nhiều
+token hơn, tính phí theo bảng giá của nhà cung cấp cổng. Giới hạn trên VPS là
 4.096 token đầu ra và 2–40 tin nhắn lịch sử; 16 tin nhắn tương đương khoảng
-8 lượt hỏi–đáp. Deadline mỗi lần gọi Gemini giữ ở 20 giây, tối đa 25 giây.
+8 lượt hỏi–đáp. Deadline mỗi lần gọi Claude là 25 giây, thử lại tối đa một lần.
 
 Nội dung gửi đi vẫn cần sự đồng ý và qua DLP; model không nhận những giá trị đã
 bị ẩn. Câu trả lời được kiểm tra toàn bộ trước khi hiển thị, giữ đến 32.000 ký
 tự thay vì cắt âm thầm ở 8.000. Nếu placeholder DLP làm nội dung vượt giới hạn,
 giao diện có thông báo yêu cầu tiếp tục. Giao diện cho phép Markdown đã được
 lọc an toàn; HTML thô và ảnh từ nguồn không tin cậy không được thực thi.
-Tính chính xác phụ thuộc model và nguồn thông tin; API key chỉ cấp quyền truy
-cập, không bảo đảm mọi câu trả lời đúng hoặc giống ứng dụng Gemini.
+Tính chính xác phụ thuộc model; API key chỉ cấp quyền truy cập, không bảo đảm
+mọi câu trả lời đúng. Chat không truy cập Internet.
 
 Chính sách consent mặc định hiện là `2026-10`, nêu rõ tin hiện tại và phạm vi
 lịch sử được gửi sau DLP. Nếu `deploy/.env.vps` còn đặt
 `AI_CONSENT_VERSION=2026-09`, cập nhật thành `2026-10` rồi recreate app trong
 lần nâng cấp này để yêu cầu người dùng đồng ý lại. Tương tự với `.env` local.
 Không dùng lại phiên bản consent cũ khi tăng phạm vi dữ liệu gửi đi.
-
-#### Tra cứu Internet có nguồn (mặc định tắt)
-
-`GEMINI_WEB_SEARCH_ENABLED=false` giữ tra cứu tắt để ưu tiên quota miễn phí.
-Google Search qua Gemini API là dịch vụ có thể tính phí; xem
-[bảng giá Google](https://ai.google.dev/gemini-api/docs/pricing) trước khi bật.
-Khi đã kiểm tra quota/billing, quản trị viên có thể đặt trường này thành `true`
-trong `deploy/.env.vps` và recreate app bằng `bash deploy/vps-compose.sh up -d --no-deps --force-recreate app`.
-
-Trong giao diện, tạo/chọn hội thoại **Public**, chọn **Tra cứu Internet và dẫn
-nguồn**, rồi gửi câu hỏi chỉ chứa thông tin công khai. Lượt tra cứu có đồng thuận,
-DLP, kiểm tra chủ sở hữu và dùng chung quota với chat. Server chỉ gửi câu hỏi
-hiện tại; không giải mã hoặc gửi lịch sử hội thoại cho tìm kiếm. Kết quả hiển thị
-ở mục riêng và không lưu câu hỏi/kết quả/gợi ý vào database, export hoặc audit
-nội dung. Gợi ý được xóa khi đổi hội thoại, gửi lượt tiếp theo hoặc đăng xuất;
-tải lại trang không phục hồi kết quả tra cứu.
-
-Trích dẫn gắn với metadata Google trả về, gồm vị trí UTF-8 của đoạn văn được
-dẫn nguồn. Widget gợi ý Google được kiểm tra rồi hiển thị nguyên bản trong vùng
-DOM có CSS riêng; nếu có script, ảnh tải từ xa, CSS gọi mạng hoặc liên kết không
-hợp lệ, toàn bộ kết quả bị từ chối. App không tự tải các URL nguồn. Search có thể
-không được model sử dụng cho một câu hỏi; khi không có nguồn, giao diện nói rõ
-thay vì khẳng định đã kiểm chứng. Chế độ chat thường không truy cập Internet.
-Xem [tài liệu Grounding](https://ai.google.dev/gemini-api/docs/generate-content/google-search).
 
 ## 1. Chuẩn bị ngay trên máy cá nhân
 

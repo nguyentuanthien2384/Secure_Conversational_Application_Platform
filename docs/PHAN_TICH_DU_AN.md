@@ -39,7 +39,7 @@ giống như một "ChatGPT thu nhỏ" nhưng tập trung vào **bảo mật to�
 - **Backend:** FastAPI (một tiến trình duy nhất) — `src/app/main.py`
 - **Frontend:** Gradio 6 (mount vào FastAPI tại `/`) — `src/app/gradio_ui.py`
 - **Database:** SQLite (demo) / PostgreSQL (production)
-- **AI:** Google Gemini SDK hoặc demo AI ngoại tuyến
+- **AI:** Claude (Anthropic SDK, qua cổng tương thích) hoặc demo AI ngoại tuyến
 - **Mã hóa:** AES-256-GCM + Envelope Encryption (Vault/KMS)
 
 ---
@@ -61,7 +61,7 @@ Khi người dùng gõ tin nhắn "Xin chào" và gửi đi, hành trình của 
 🔍 [Lớp 3] DLP — Có lộ dữ liệu nhạy cảm không? (Số thẻ? Email?)
     │
     ▼
-🤖 [Lớp 4] AI xử lý và trả lời (Gemini / Demo AI)
+🤖 [Lớp 4] AI xử lý và trả lời (Claude / Demo AI)
     │
     ▼
 🔒 [Lớp 5] MÃ HÓA — Lưu dưới dạng bản mã AES-256-GCM
@@ -299,7 +299,7 @@ Tất cả các tính năng hình thành **một chuỗi phòng thủ nhiều l�
 
 | File | Chức năng |
 |:---|:---|
-| `ai_core/gemini_ai.py` | Wrapper quanh SDK `google-genai` |
+| `ai_core/claude_ai.py` | Wrapper quanh SDK `anthropic` (Messages API) |
 
 ### Thư mục `scripts/`
 

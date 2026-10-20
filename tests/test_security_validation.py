@@ -200,7 +200,7 @@ def test_fresh_process_never_reads_env_file_or_opens_configured_database(tmp_pat
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
         "DATABASE_URL": f"sqlite:///{sentinel.as_posix()}",
         "APP_SECRET_KEY_FILE": str(tmp_path / "must-not-read-secret"),
-        "GOOGLE_GENAI_API_KEY_FILE": str(tmp_path / "must-not-read-api-key"),
+        "CLAUDE_API_KEY_FILE": str(tmp_path / "must-not-read-api-key"),
     })
     result = subprocess.run(
         [sys.executable, "-m", "scripts.validate_security", "--scenario", "benign", "--output-dir", str(tmp_path / "reports")],

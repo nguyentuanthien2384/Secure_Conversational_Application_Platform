@@ -25,8 +25,8 @@ def test_two_client_rehearsal_ignores_existing_secrets_database_and_proxies(tmp_
         "APP_ENV": "production", "SECURITY_PROFILE": "high",
         "DATABASE_URL": f"sqlite:///{sentinel.as_posix()}",
         "APP_SECRET_KEY_FILE": str(tmp_path / "must-not-read-secret"),
-        "GOOGLE_GENAI_API_KEY": "never-print-provider-credential",
-        "GOOGLE_GENAI_API_KEY_FILE": str(tmp_path / "must-not-read-provider-file"),
+        "CLAUDE_API_KEY": "never-print-provider-credential",
+        "CLAUDE_API_KEY_FILE": str(tmp_path / "must-not-read-provider-file"),
         "SELF_BASE_URL": "https://example.invalid", "PUBLIC_BASE_URL": "https://example.invalid",
         "HTTP_PROXY": "http://example.invalid:9999", "HTTPS_PROXY": "http://example.invalid:9999",
     })

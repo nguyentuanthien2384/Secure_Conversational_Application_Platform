@@ -276,8 +276,6 @@ def _set_valid_high_env(monkeypatch, tmp_path: Path) -> None:
         "VAULT_ADDR": "https://vault.example.test",
         "VAULT_TOKEN_FILE": "/run/secrets/vault_token",
         "VAULT_ALLOW_INSECURE_HTTP": "false",
-        "GOOGLE_GENAI_API_KEY": "",
-        "GOOGLE_GENAI_API_KEY_FILE": "",
         # A developer's .env may hold a Claude key; load_dotenv must not inject it.
         "CLAUDE_API_KEY": "",
         "CLAUDE_API_KEY_FILE": "",
@@ -433,21 +431,10 @@ def test_high_profile_allows_file_backed_ai_key_but_rejects_environment_key(
     monkeypatch, tmp_path: Path
 ):
     _set_valid_high_env(monkeypatch, tmp_path)
-    ai_key_file = tmp_path / "google-ai-key"
-    ai_key_file.write_text("approved-provider-key-material", encoding="utf-8")
-    monkeypatch.setenv("GOOGLE_GENAI_API_KEY_FILE", str(ai_key_file))
-    assert Settings.from_env().google_genai_api_key == "approved-provider-key-material"
-
-    _set_valid_high_env(monkeypatch, tmp_path)
     claude_key_file = tmp_path / "claude-ai-key"
     claude_key_file.write_text("approved-claude-key-material", encoding="utf-8")
     monkeypatch.setenv("CLAUDE_API_KEY_FILE", str(claude_key_file))
     assert Settings.from_env().claude_api_key == "approved-claude-key-material"
-
-    _set_valid_high_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("GOOGLE_GENAI_API_KEY", "inspectable-environment-provider-key")
-    with pytest.raises(RuntimeError, match="environment/URL"):
-        Settings.from_env()
 
     _set_valid_high_env(monkeypatch, tmp_path)
     monkeypatch.setenv("CLAUDE_API_KEY", "inspectable-environment-claude-key")

@@ -187,7 +187,7 @@ def test_stale_or_missing_confirmation_never_deletes_either_session(
     result = confirm.fn("token", selected, pending, "entered password", "123456")
     assert not api.calls
     assert [item["id"] for item in api.sessions] == ["first", "second"]
-    assert result[7] == ""
+    assert result[5] == ""
     _assert_confirmation_cleared(_mapped(delete_demo, dependency, result))
 
 
@@ -209,7 +209,7 @@ def test_confirm_deletes_only_frozen_session_and_refreshes_selection_and_sensiti
     mapped = _mapped(delete_demo, dependency, result)
     assert mapped["Đổi tên"] == "Hội thoại còn lại"
     _assert_deleted_views_cleared(delete_demo, mapped)
-    assert result[7] == ""
+    assert result[5] == ""
     _assert_confirmation_cleared(mapped)
 
 
@@ -220,9 +220,9 @@ def test_failed_delete_keeps_confirmation_and_text_but_clears_credentials(delete
     result = confirm.fn("token", "first", "first", "entered password", "123456")
     assert api.deletes == ["/api/sessions/first"]
     assert [item["id"] for item in api.sessions] == ["first", "second"]
-    assert all(value == gr.skip() for value in result[:7])
+    assert all(value == gr.skip() for value in result[:5])
     mapped = _mapped(delete_demo, dependency, result)
-    assert result[7] == "first"
+    assert result[5] == "first"
     assert mapped["session-delete-confirm"] == gr.update(visible=True)
     assert "Chưa xóa được" in mapped["session-delete-notice"]
     assert "&lt;img" in mapped["session-delete-notice"] and "<img" not in mapped["session-delete-notice"]
@@ -239,7 +239,7 @@ def test_step_up_is_requested_only_when_server_requires_it_and_retries_same_targ
     confirm, dependency = _button_event(delete_demo, "Xác nhận xóa vĩnh viễn")
     first = confirm.fn("token", "first", "first")
     mapped = _mapped(delete_demo, dependency, first)
-    assert first[7] == "first"
+    assert first[5] == "first"
     assert mapped["session-delete-auth"] == gr.update(visible=True)
     assert "Cần xác thực lại" in mapped["session-delete-notice"]
     assert not any(path == "/api/auth/step-up" for _method, path, _body in api.calls)
@@ -283,7 +283,7 @@ def test_failed_reauthentication_preserves_target_and_clears_password_and_code(d
     confirm, dependency = _button_event(delete_demo, "Xác nhận xóa vĩnh viễn")
     result = confirm.fn("token", "first", "first", "wrong-test-password", "123456")
     mapped = _mapped(delete_demo, dependency, result)
-    assert result[7] == "first"
+    assert result[5] == "first"
     assert mapped["session-delete-confirm"] == gr.update(visible=True)
     assert "Chưa xóa được" in mapped["session-delete-notice"]
     assert mapped["session-delete-password"] == mapped["session-delete-code"] == ""

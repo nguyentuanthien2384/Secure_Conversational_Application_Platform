@@ -114,7 +114,7 @@ Quy trình vận hành phải xác minh danh tính và ghi audit trước khi th
 
 Trước khi bật một dịch vụ ngoài, hồ sơ release phải ghi: pháp nhân, vùng dữ liệu,
 loại dữ liệu, mục đích, retention/logging, subprocessor, cơ chế transfer, DPA/BAA
-nếu áp dụng, quyền xóa/export và cách thông báo sự cố. Riêng Gemini/cloud AI phải
+nếu áp dụng, quyền xóa/export và cách thông báo sự cố. Riêng Claude/cloud AI phải
 xác minh paid/ZDR feature thực tế; không suy luận ZDR chỉ từ việc có billing.
 
 Vault/KMS, IdP, WORM/SIEM và backup cũng là processor/security dependency và cần

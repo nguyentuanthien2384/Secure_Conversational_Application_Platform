@@ -458,7 +458,7 @@ def _settings(directory: Path) -> Settings:
         environment="test", database_url=f"sqlite:///{directory / 'validation.db'}",
         secret_key=secrets.token_urlsafe(48),
         master_encryption_key=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii"),
-        allow_demo_ai=True, google_genai_api_key="", password_breach_check=False,
+        allow_demo_ai=True, claude_api_key="", password_breach_check=False,
         redis_url="", key_provider="local", audit_worm_endpoint="",
         bootstrap_admin_username="", bootstrap_admin_password="", seed_demo_data=False,
         siem_json_logs=False, retention_sweep_on_startup=False, docs_enabled=False,

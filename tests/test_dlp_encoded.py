@@ -249,7 +249,7 @@ class _RecordingProvider:
 
 
 def _service(settings, response="Safe answer"):
-    service = AIService(replace(settings, google_genai_api_key=""))
+    service = AIService(replace(settings, claude_api_key=""))
     provider = _RecordingProvider(response)
     service._client = provider
     return service, provider
@@ -296,7 +296,7 @@ def test_demo_sample_redacts_plain_and_encoded_email_before_offline_echo(setting
     email = "sinhvien@example.com"
     encoded = _base64(email)
     sample = f"Email mẫu của tôi: {email}. Chuỗi Base64: {encoded}"
-    service = AIService(replace(settings, google_genai_api_key="", allow_demo_ai=True))
+    service = AIService(replace(settings, claude_api_key="", allow_demo_ai=True))
     response, labels = service.generate(sample, [], allow_external_ai=False)
     assert response.startswith("[DEMO AI]")
     assert response.count("[REDACTED:EMAIL]") == 2

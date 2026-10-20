@@ -6,8 +6,7 @@ from dataclasses import replace
 import pytest
 
 from src.app.config import Settings
-from src.app.dlp import DataClass
-from src.app.services import MAX_PROVIDER_RESPONSE_CHARACTERS, AIService, DLPPolicyViolation
+from src.app.services import MAX_PROVIDER_RESPONSE_CHARACTERS, AIService
 from tests.conftest import register_and_login
 
 
@@ -37,12 +36,12 @@ def test_balanced_ai_defaults_are_loaded_without_model_change(monkeypatch):
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("SECURITY_PROFILE", "standard")
     monkeypatch.setenv("KEY_PROVIDER", "local")
-    for name in ("AI_HISTORY_MESSAGES", "AI_MAX_OUTPUT_TOKENS", "GEMINI_MODEL"):
+    for name in ("AI_HISTORY_MESSAGES", "AI_MAX_OUTPUT_TOKENS", "CLAUDE_MODEL"):
         monkeypatch.delenv(name, raising=False)
     configured = Settings.from_env()
     assert configured.ai_history_messages == 16
     assert configured.ai_max_output_tokens == 2048
-    assert configured.gemini_model == "gemini-flash-lite-latest"
+    assert configured.claude_model == "claude-opus-5-5"
 
 
 def test_configured_history_preserves_order_and_redacts_every_sent_item(settings):
@@ -121,70 +120,3 @@ def test_system_instruction_requires_honesty_about_uncertainty_and_sources(setti
     assert "không tuyên bố" in instruction
     assert "bịa nguồn" in instruction
     assert "Dùng Markdown" in instruction
-
-
-def test_search_requires_server_opt_in_before_loading_history_or_calling_provider(settings):
-    service = AIService(settings)
-    provider = RecordingProvider()
-    service._client = provider
-
-    def history():
-        pytest.fail("Disabled search must not decrypt history.")
-
-    with pytest.raises(PermissionError, match="chưa được"):
-        service.generate("Public question", history, allow_external_ai=True,
-                         data_class=DataClass.PUBLIC.value, use_web_search=True)
-    assert provider.calls == []
-
-
-@pytest.mark.parametrize("classification", [DataClass.INTERNAL, DataClass.CONFIDENTIAL,
-                                            DataClass.HIGHLY_CONFIDENTIAL, DataClass.E2EE_PRIVATE])
-def test_search_cannot_use_nonpublic_conversation_history(settings, classification):
-    service = AIService(replace(settings, gemini_web_search_enabled=True))
-    provider = RecordingProvider()
-    service._client = provider
-
-    def history():
-        pytest.fail("Nonpublic search must not decrypt history.")
-
-    with pytest.raises(PermissionError, match="Public"):
-        service.generate("Question", history, allow_external_ai=True,
-                         data_class=classification.value, confirmed=True, use_web_search=True)
-    assert provider.calls == []
-
-
-@pytest.mark.parametrize("in_history", [False, True])
-def test_search_with_sensitive_prompt_or_history_is_blocked_before_provider(settings, in_history):
-    service = AIService(replace(settings, gemini_web_search_enabled=True))
-    provider = RecordingProvider()
-    service._client = provider
-    sensitive = "Contact student@example.com"
-    current = "Public question" if in_history else sensitive
-    history = [{"role": "user", "content": sensitive}] if in_history else []
-
-    with pytest.raises(DLPPolicyViolation):
-        service.generate(current, history, allow_external_ai=True,
-                         data_class=DataClass.PUBLIC.value, use_web_search=True)
-    assert provider.calls == []
-
-
-def test_search_rejects_sensitive_grounded_output_without_redacting_or_returning_it(settings):
-    service = AIService(replace(settings, gemini_web_search_enabled=True))
-    service._client = RecordingProvider("Contact student@example.com")
-    with pytest.raises(DLPPolicyViolation):
-        service.generate("Public question", [], allow_external_ai=True,
-                         data_class=DataClass.PUBLIC.value, use_web_search=True)
-
-
-def test_search_flag_is_explicit_and_clean_grounded_text_is_not_modified(settings):
-    response = "Ｗｉｄｅ text from a grounded result"
-    service = AIService(replace(settings, gemini_web_search_enabled=True))
-    provider = RecordingProvider(response)
-    service._client = provider
-    output, labels = service.generate("Public question", [], allow_external_ai=True,
-                                      data_class=DataClass.PUBLIC.value, use_web_search=True)
-    assert output == response and labels == []
-    assert provider.calls[0][1]["use_web_search"] is True
-    assert "chỉ được dùng Google Search" in provider.calls[0][1]["system_instruction"]
-    service.generate("Ordinary question", [], allow_external_ai=True)
-    assert "use_web_search" not in provider.calls[1][1]

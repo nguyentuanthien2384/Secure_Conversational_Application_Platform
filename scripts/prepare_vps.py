@@ -55,7 +55,7 @@ _FIXED = {
 _EMPTY = (
     "BOOTSTRAP_ADMIN_USERNAME", "BOOTSTRAP_ADMIN_PASSWORD", "APP_SECRET_KEY_FILE",
     "MASTER_ENCRYPTION_KEYS", "ACTIVE_KEY_VERSION", "DATABASE_PASSWORD_FILE",
-    "REDIS_PASSWORD_FILE", "GOOGLE_GENAI_API_KEY_FILE", "CLAUDE_API_KEY_FILE",
+    "REDIS_PASSWORD_FILE", "CLAUDE_API_KEY_FILE",
     "VAULT_TOKEN_FILE",
     "OIDC_PROXY_SECRET_FILE", "AUDIT_WORM_TOKEN_FILE",
 )
@@ -82,7 +82,7 @@ _LIMITS = {
     "GRADIO_CONCURRENCY_LIMIT": (1, 2), "GRADIO_RETAINED_EVENTS": (1, 128),
     "GRADIO_STATE_CAPACITY": (1, 256), "UVICORN_LIMIT_CONCURRENCY": (32, 64),
     "UVICORN_BACKLOG": (16, 128), "UVICORN_KEEPALIVE_SECONDS": (1, 10),
-    "UVICORN_SHUTDOWN_SECONDS": (10, 60), "GEMINI_TIMEOUT_SECONDS": (5, 25),
+    "UVICORN_SHUTDOWN_SECONDS": (10, 60),
     "CLAUDE_TIMEOUT_SECONDS": (5, 25),
     "MAIL_MAX_PENDING": (1, 16),
 }
@@ -101,10 +101,13 @@ _OPTIONAL_LIMIT_DEFAULTS = {"AI_HISTORY_MESSAGES": "16", "CLAUDE_TIMEOUT_SECONDS
 _CLAUDE_DEFAULTS = {
     "CLAUDE_API_KEY": "",
     "CLAUDE_BASE_URL": "https://1gw.gwai.cloud",
-    "CLAUDE_MODEL": "claude-opus-5",
+    "CLAUDE_MODEL": "claude-opus-5-5",
     "CLAUDE_EFFORT_LEVEL": "low",
     "CLAUDE_TIMEOUT_SECONDS": "25",
 }
+# Gemini was removed; configuring Claude drops its leftover settings and key.
+_OBSOLETE_GEMINI = re.compile(r"GOOGLE_GENAI_API_KEY(?:_FILE)?|GEMINI_[A-Z0-9_]+")
+_OBSOLETE_GEMINI_COMMENT = "# Legacy Gemini, used only while CLAUDE_API_KEY is empty. Web search needs Gemini."
 _CLAUDE_MODEL = re.compile(r"claude-[a-z0-9]+(?:-[a-z0-9]+){0,6}")
 _PROVIDER_KEY = re.compile(r"[A-Za-z0-9_-]{20,256}")
 # Current Claude models always think and thinking counts toward max_tokens: a
@@ -208,7 +211,7 @@ def initialize(project: str | Path, *, domain: str = "", email: str = "") -> str
         raise PreparationError("Deployment template must contain the safe VPS demo settings.")
     if any(values.get(k) for k in (*_EMPTY, *_IMAGES, *_PASSWORDS,
                                    "APP_SECRET_KEY", "MASTER_ENCRYPTION_KEY",
-                                   "GOOGLE_GENAI_API_KEY", "CLAUDE_API_KEY", "SMTP_PASSWORD")):
+                                   "CLAUDE_API_KEY", "SMTP_PASSWORD")):
         raise PreparationError("Deployment template must not contain credentials or image selections.")
     origin = f"https://{domain}" if domain else ""
     replacements = {
@@ -247,6 +250,7 @@ def configure(project: str | Path, *, domain: str = "", email: str = "",
     target = _project(project) / "deploy" / ".env.vps"
     lines, values = _read(target, private=True)
     replacements = {}
+    removed = []
     if ai_quality:
         if ai_quality not in _AI_QUALITY_PROFILES:
             raise PreparationError("AI quality: use balanced.")
@@ -265,6 +269,11 @@ def configure(project: str | Path, *, domain: str = "", email: str = "",
             lines = [*lines, "# Claude settings added by prepare_vps configure.",
                      *(f"{key}={_CLAUDE_DEFAULTS[key]}" for key in missing)]
             values = {**values, **{key: _CLAUDE_DEFAULTS[key] for key in missing}}
+        removed = [key for key in values if _OBSOLETE_GEMINI.fullmatch(key)]
+        if removed:
+            lines = [line for line in lines if line.strip() != _OBSOLETE_GEMINI_COMMENT
+                     and not ((match := _ASSIGNMENT.fullmatch(line)) and match[1] in removed)]
+            values = {key: value for key, value in values.items() if key not in removed}
         if claude_model:
             replacements["CLAUDE_MODEL"] = claude_model
         if claude_api_key:
@@ -331,7 +340,7 @@ def configure(project: str | Path, *, domain: str = "", email: str = "",
     except BaseException:
         staged.unlink(missing_ok=True)
         raise
-    return sorted(replacements)
+    return sorted(replacements) + [f"removed {key}" for key in sorted(removed)]
 
 
 def check(project: str | Path) -> list[str]:
@@ -388,15 +397,8 @@ def check(project: str | Path) -> list[str]:
     for key in ("ALLOW_DEMO_AI", "ALLOW_SELF_REGISTRATION"):
         if values.get(key) not in {"true", "false"}:
             issues.append(f"{key}: use true or false.")
-    if values.get("GEMINI_WEB_SEARCH_ENABLED", "false") not in {"true", "false"}:
-        issues.append("GEMINI_WEB_SEARCH_ENABLED: use true or false.")
-    if values.get("ALLOW_DEMO_AI") == "false" and not (
-        values.get("CLAUDE_API_KEY") or values.get("GOOGLE_GENAI_API_KEY")
-    ):
-        issues.append(
-            "CLAUDE_API_KEY (or legacy GOOGLE_GENAI_API_KEY): "
-            "required when offline demo AI is disabled."
-        )
+    if values.get("ALLOW_DEMO_AI") == "false" and not values.get("CLAUDE_API_KEY"):
+        issues.append("CLAUDE_API_KEY: required when offline demo AI is disabled.")
     for key, (minimum, maximum) in _LIMITS.items():
         try:
             if not minimum <= int(values.get(key, _OPTIONAL_LIMIT_DEFAULTS.get(key, ""))) <= maximum:

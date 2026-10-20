@@ -17,7 +17,7 @@ Các giá trị mặc định có thể cấu hình bằng biến môi trường
 - `PASSWORD_MAX_CONCURRENT=2`: phép băm/xác minh Argon2 đồng thời, kể cả đăng nhập, đổi mật khẩu và mã khôi phục. Với tham số hiện tại, hai phép Argon2 sử dụng khoảng 128 MiB riêng cho vùng nhớ băm; còn phải dự phòng RAM cho ứng dụng và hệ điều hành.
 - `AI_MAX_CONCURRENT=2`: lời gọi AI bên ngoài đang chạy trong một tiến trình.
 - `AI_GLOBAL_MAX_ATTEMPTS=60`, `AI_DAILY_MAX_ATTEMPTS=1000`: ngân sách lời gọi AI theo phút và theo cửa sổ 24 giờ.
-- `AI_MAX_OUTPUT_TOKENS=1024`: trần token đầu ra mỗi lần gọi model; `GEMINI_TIMEOUT_SECONDS=20` là timeout cấu hình cho SDK.
+- `AI_MAX_OUTPUT_TOKENS=1024`: trần token đầu ra mỗi lần gọi model; `CLAUDE_TIMEOUT_SECONDS=25` là timeout cấu hình cho SDK.
 - `GRADIO_QUEUE_MAX_SIZE=32`, `GRADIO_CONCURRENCY_LIMIT=4`: hàng đợi giao diện hữu hạn và trần mặc định cho mỗi nhóm callback.
 - `GRADIO_RETAINED_EVENTS=128`, `GRADIO_RESULT_TTL_SECONDS=120`: số kết quả/sự kiện giữ lại và thời hạn lưu kết quả, tránh tích lũy phản hồi sau khi client rời đi.
 - `GRADIO_STATE_CAPACITY=256`: số state giao diện được giữ; vé chuyển phiên và browser-session store cũng có giới hạn dung lượng/thời gian riêng.

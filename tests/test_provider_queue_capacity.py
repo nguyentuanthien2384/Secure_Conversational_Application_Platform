@@ -18,8 +18,7 @@ from src.app.config import Settings
 from src.app.gradio_ui import build_ui
 from src.app.security import SlidingWindowRateLimiter
 from src.app.services import AI_BUSY_MESSAGE, AIProviderBusy, AIProviderError, AIService
-from src.core.ai_core import gemini_ai
-from src.core.ai_core.gemini_ai import GeminiClient
+from src.core.ai_core import claude_ai
 
 
 class EchoProvider:
@@ -159,36 +158,6 @@ def test_budget_backend_failure_blocks_upstream_and_releases_capacity(settings: 
     assert provider.calls == 1
 
 
-@pytest.mark.parametrize(
-    ("extra_config", "expected"),
-    [
-        (None, 1_024),
-        ({"max_output_tokens": 8_192}, 1_024),
-        ({"maxOutputTokens": 8_192}, 1_024),
-        ({"max_output_tokens": 128}, 128),
-        ({"max_output_tokens": None}, 1_024),
-    ],
-)
-def test_gemini_applies_deployment_token_cap_to_actual_sdk_config(
-    monkeypatch, extra_config, expected: int
-) -> None:
-    captured = []
-
-    def generate_content(**kwargs):
-        captured.append(kwargs["config"])
-        return SimpleNamespace(
-            candidates=[SimpleNamespace(content=SimpleNamespace(parts=[SimpleNamespace(text="ok")]))]
-        )
-
-    monkeypatch.setattr(
-        gemini_ai.genai, "Client",
-        lambda **_kwargs: SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)),
-    )
-    client = GeminiClient(api_key="unit-test-key", max_output_tokens=1_024)
-    assert client.generate("Hello", extra_config=extra_config) == "ok"
-    assert captured[0].max_output_tokens == expected
-
-
 def test_ai_service_passes_configured_token_cap_to_provider(settings: Settings, monkeypatch) -> None:
     captured = {}
 
@@ -196,8 +165,8 @@ def test_ai_service_passes_configured_token_cap_to_provider(settings: Settings, 
         captured.update(kwargs)
         return EchoProvider()
 
-    monkeypatch.setattr(gemini_ai, "GeminiClient", fake_client)
-    AIService(replace(settings, google_genai_api_key="unit-test-key", ai_max_output_tokens=512))
+    monkeypatch.setattr(claude_ai, "ClaudeClient", fake_client)
+    AIService(replace(settings, claude_api_key="sk-unit-test", ai_max_output_tokens=512))
     assert captured["max_output_tokens"] == 512
 
 

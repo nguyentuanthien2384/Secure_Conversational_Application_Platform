@@ -8,7 +8,7 @@ _ = load_dotenv()
 
 # Cổng tương thích Anthropic Messages API mà nhà cung cấp key hướng dẫn dùng.
 DEFAULT_BASE_URL = "https://1gw.gwai.cloud"
-DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_MODEL = "claude-opus-5-5"
 EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 # Các model này từ chối output_config.effort bằng 400, nên không gửi trường đó.
 _MODELS_WITHOUT_EFFORT = re.compile(r"^claude-(?:3|(?:haiku|sonnet)-4-5)")
@@ -16,7 +16,7 @@ _COMPLETE_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "max_tokens"})
 
 
 class ClaudeClient:
-    """Wrapper gọn nhẹ cho Anthropic Messages API (Claude), cùng giao diện với GeminiClient.
+    """Wrapper gọn nhẹ cho Anthropic Messages API (Claude), nhà cung cấp AI của ứng dụng.
 
     Chỉ đọc biến riêng của dự án (`CLAUDE_API_KEY`, `CLAUDE_BASE_URL`). Key, base URL
     và timeout luôn được truyền tường minh cho SDK, nên SDK KHÔNG tự lấy
@@ -27,7 +27,7 @@ class ClaudeClient:
         api_key: Key của cổng (dạng `sk-...`). Nếu None, đọc `CLAUDE_API_KEY`.
             Gửi bằng header `Authorization: Bearer`, giống `ANTHROPIC_AUTH_TOKEN`
             trong hướng dẫn của nhà cung cấp.
-        model: Tên model mặc định, ví dụ "claude-opus-5".
+        model: Tên model mặc định, ví dụ "claude-opus-5-5".
         base_url: Địa chỉ cổng. Nếu None, đọc `CLAUDE_BASE_URL` rồi mới tới mặc định.
         timeout_seconds: Thời hạn mỗi lần gọi. None giữ mặc định 10 phút của SDK,
             quá lâu cho một request web, nên ứng dụng luôn truyền giá trị này.
@@ -85,7 +85,6 @@ class ClaudeClient:
         system_instruction: str | None = None,
         temperature: float | None = None,
         model: str | None = None,
-        use_web_search: bool = False,
     ) -> str:
         """Gọi `messages.create` và trả về phần text của câu trả lời.
 
@@ -95,14 +94,10 @@ class ClaudeClient:
             temperature: Nhiệt độ sampling. Các model Claude mới từ chối giá trị
                 khác mặc định, nên để None.
             model: Ghi đè model mặc định cho lần gọi này (tùy chọn).
-            use_web_search: Không hỗ trợ; Google Search grounding chỉ có ở Gemini.
 
         Raises:
-            NotImplementedError: Khi yêu cầu tìm kiếm web.
             RuntimeError: Khi câu trả lời không hoàn tất hoặc không có text.
         """
-        if use_web_search:
-            raise NotImplementedError("Tìm kiếm web chỉ hỗ trợ với nhà cung cấp Gemini.")
         model = model or self.model
         options = {}
         if system_instruction:

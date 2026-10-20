@@ -47,7 +47,7 @@ Từ đăng nhập, phân quyền và kiểm soát dữ liệu đến mã hóa, 
 
 - **Trò chuyện:** nhiều hội thoại; đổi tên, xóa, tìm kiếm theo quyền sở hữu, xuất JSON và xem bản mã của từng tin nhắn.
 - **Đính kèm tài liệu:** tệp văn bản, mã nguồn, `.docx` hoặc `.pdf` tối đa **10 MB**. Tài liệu dài được chọn đoạn liên quan tới câu hỏi trước khi gửi AI ([chi tiết](#dinh-kem)).
-- **Kiểm soát AI:** Claude, Gemini hoặc AI demo; người dùng phải đồng ý trước khi gửi dữ liệu ra ngoài. DLP cho phép, che, yêu cầu xác nhận, chặn hoặc chỉ xử lý local. Tra cứu Internet có dẫn nguồn (Gemini) chỉ dùng cho hội thoại Public và mặc định tắt.
+- **Kiểm soát AI:** Claude (qua cổng tương thích Anthropic) hoặc AI demo; người dùng phải đồng ý trước khi gửi dữ liệu ra ngoài. DLP cho phép, che, yêu cầu xác nhận, chặn hoặc chỉ xử lý local.
 - **Bảo vệ tài khoản:** Argon2id; JWT gắn phiên phía máy chủ; TOTP và recovery code; passkey WebAuthn cho đăng nhập và xác thực lại; email khôi phục; smart lockout; quản lý thiết bị.
 - **Cảnh báo tài khoản:** Web Push, xác minh số điện thoại qua SMS, phát hiện di chuyển bất thường bằng GeoIP local. Demo dùng outbox thay cho nhà cung cấp thật.
 - **Bảo vệ dữ liệu:** AES-256-GCM, mỗi hội thoại một DEK riêng, AAD gắn với từng tin nhắn. Khóa được bọc bởi Local, Vault Transit, AWS KMS hoặc GCP KMS.
@@ -144,7 +144,7 @@ Bấm **📎 Đính kèm tệp tài liệu** dưới ô nhập, chọn tệp, r�
 1. Trình duyệt gửi byte gốc tới `POST /api/ui-session/chat-file`, xác thực bằng cookie phiên HttpOnly và kiểm tra cùng origin.
 2. Máy chủ kiểm tra tên, định dạng, dung lượng, hạn mức (20 tệp/5 phút mỗi phiên, 2 tệp xử lý đồng thời) rồi trích văn bản trong bộ nhớ. `.docx` được đọc mà không mở thực thể XML và có trần giải nén chống zip bomb. `.pdf` được đọc bằng `pypdf` (thuần Python, có trần giải nén mỗi luồng) với trần 2.000 trang, 5 triệu ký tự và 20 giây xử lý. Không có gì được ghi ra đĩa.
 3. Máy chủ trả một mã dùng một lần; chỉ tab có đúng phiên đăng nhập đã chọn tệp mới nhận được nó. Tệp chưa nhận hết hạn sau 10 phút, tệp đã gắn sau 1 giờ.
-4. Khi gửi, nội dung đi qua consent, DLP và audit như tin nhắn thường. Tra cứu Internet không nhận tệp đính kèm.
+4. Khi gửi, nội dung đi qua consent, DLP và audit như tin nhắn thường.
 
 Chỉ đúng route upload được nhận body tới 10 MiB, ở cả middleware lẫn Caddy; mọi route khác vẫn giới hạn 1 MB. Mã nguồn: [chat_files.py](src/app/chat_files.py).
 
@@ -189,7 +189,7 @@ flowchart LR
     UI --> API[FastAPI REST API]
     API --> Guard[JWT · RBAC · IDS · Rate limit]
     Guard --> Policy[DLP · Consent · ChatService]
-    Policy --> AI[Claude / Gemini hoặc Demo AI]
+    Policy --> AI[Claude hoặc Demo AI]
     Policy --> Crypto[Envelope encryption]
     Crypto --> DB[(SQLite / PostgreSQL)]
     Crypto --> KMS[Local / Vault / KMS]
@@ -229,7 +229,7 @@ uv run --frozen python run_app.py
 
 `local_storage init` tạo `.env` từ [.env.example](.env.example), sinh khóa và đặt database/outbox vào `local_data/` với quyền truy cập riêng. `.env` đã có được giữ nguyên; nếu thấy database mà thiếu cấu hình, công cụ từ chối sinh khóa mới để không mất khả năng giải mã. Có thể dùng `setup.ps1` (Windows) hoặc `setup.sh` (Linux/macOS) để cài tự động.
 
-**Dùng AI thật:** đặt `CLAUDE_API_KEY` (hoặc `CLAUDE_API_KEY_FILE`, cùng `CLAUDE_BASE_URL`/`CLAUDE_MODEL`) cho Claude, hoặc `GOOGLE_GENAI_API_KEY` / `GEMINI_MODEL` cho Gemini; đặt `ALLOW_DEMO_AI=false` nếu bắt buộc dùng provider thật, rồi khởi động lại. Có Claude thì Claude được ưu tiên. Người dùng vẫn phải đồng ý trước khi gửi dữ liệu ra ngoài, và DLP vẫn áp dụng.
+**Dùng AI thật:** đặt `CLAUDE_API_KEY` (hoặc `CLAUDE_API_KEY_FILE`, cùng `CLAUDE_BASE_URL`/`CLAUDE_MODEL`, mặc định `claude-opus-5-5`); đặt `ALLOW_DEMO_AI=false` nếu bắt buộc dùng Claude thật, rồi khởi động lại. Claude là nhà cung cấp AI duy nhất. Người dùng vẫn phải đồng ý trước khi gửi dữ liệu ra ngoài, và DLP vẫn áp dụng.
 
 Sao lưu cấu hình và khóa cùng database: mất khóa thì không phục hồi được nội dung đã mã hóa. Xem [availability/backup](docs/security/availability.md).
 
@@ -255,7 +255,7 @@ Bản demo đang chạy tại `https://scap.thiennt.id.vn` trên VPS 123HOST, d�
 cd /root/scap && bash deploy/update.sh
 ```
 
-`update.sh` sao lưu database, `git pull`, kiểm tra cấu hình, build image, chạy migration và khởi động lại app cùng Caddy. Cài đặt lần đầu, VPS riêng (`direct`), cách deploy từ Windows bằng `deploy/deploy.ps1`, cấu hình Claude/Gemini và xử lý sự cố: [VPS_DEMO_DEPLOYMENT.md](docs/VPS_DEMO_DEPLOYMENT.md).
+`update.sh` sao lưu database, `git pull`, kiểm tra cấu hình, build image, chạy migration và khởi động lại app cùng Caddy. Cài đặt lần đầu, VPS riêng (`direct`), cách deploy từ Windows bằng `deploy/deploy.ps1`, cấu hình Claude và xử lý sự cố: [VPS_DEMO_DEPLOYMENT.md](docs/VPS_DEMO_DEPLOYMENT.md).
 
 Production yêu cầu domain/DNS đúng, bí mật riêng, `BASE_IMAGE` ghim digest SHA-256, tắt docs/seed/bootstrap password và tài khoản database runtime không sở hữu schema.
 
@@ -270,7 +270,7 @@ Production yêu cầu domain/DNS đúng, bí mật riêng, `BASE_IMAGE` ghim dig
 
 - **Xác thực** (`/api/auth`): `register`, `login`, `mfa/*`, `me`, `refresh`, `logout`, `logout-all`, `step-up`, `sessions`.
 - **Bảo vệ tài khoản** (`/api/auth`): `password`, `ai-consent`, `security-activity`, `email`, `password-reset/*`, `passkeys/*`, `notifications/*`, `sign-in-risk/status`.
-- **Hội thoại:** `/api/sessions`, `/api/sessions/{id}` và bên dưới là `messages`, `ciphertexts`, `crypto-info`, `security`, `export`, `export-ticket`, `web-search`; tìm kiếm `/api/search/messages`.
+- **Hội thoại:** `/api/sessions`, `/api/sessions/{id}` và bên dưới là `messages`, `ciphertexts`, `crypto-info`, `security`, `export`, `export-ticket`; tìm kiếm `/api/search/messages`.
 - **Private E2EE:** `/api/e2ee/devices`, `/api/e2ee/devices/{id}/prekeys`, `/api/e2ee/users/{username}/prekey-bundle`, `/api/sessions/{id}/e2ee/state`, `members`, `envelopes`.
 - **Quản trị/giám sát** (`/api/admin`): `users`, `stats`, `availability`, `audit`, `audit/verify`, `audit/checkpoint`, `ids/*`, `security-alerts`, `security/maintenance`.
 - **Tình trạng:** `/api/health` (liveness), `/api/ready` (DB và checkpoint WORM trong hồ sơ high).
@@ -301,7 +301,7 @@ Một số test JavaScript chạy qua pytest và tự bỏ qua khi máy không c
 - **Hạ tầng:** `APP_ENV`, `SECURITY_PROFILE`, `DATABASE_URL`, `REDIS_URL`, `ALLOWED_HOSTS`, `ALLOWED_ORIGINS`, `PUBLIC_BASE_URL`.
 - **Khóa/secret:** `APP_SECRET_KEY[_FILE]`, `MASTER_ENCRYPTION_KEY[S]`, `ACTIVE_KEY_VERSION`, `KEY_PROVIDER`, `VAULT_*`, `AWS_KMS_KEY_ID`, `GCP_KMS_KEY_NAME`.
 - **Phiên/tài khoản:** `ACCESS_TOKEN_MINUTES`, `SESSION_IDLE_MINUTES`, `SESSION_ABSOLUTE_HOURS`, `LOGIN_*`, `MFA_*`, `WEBAUTHN_*`, `MAIL_*`, `SMTP_*`.
-- **AI/DLP:** `CLAUDE_*`, `GOOGLE_GENAI_API_KEY[_FILE]`, `GEMINI_MODEL`, `GEMINI_WEB_SEARCH_ENABLED`, `ALLOW_DEMO_AI`, `AI_*`, `AI_CONSENT_VERSION`, `DLP_CUSTOM_TERMS`.
+- **AI/DLP:** `CLAUDE_*`, `ALLOW_DEMO_AI`, `AI_*`, `AI_CONSENT_VERSION`, `DLP_CUSTOM_TERMS`.
 - **Ngân sách:** `REQUEST_*`, `PASSWORD_MAX_CONCURRENT`, `GRADIO_*`, `READINESS_*`.
 - **Giám sát/retention:** `IDS_*`, `AUDIT_*`, `SIEM_JSON_LOGS`, `SECURITY_MAINTENANCE_*`, `SECURE_RETENTION_DAYS`, `CONFIDENTIAL_RETENTION_DAYS`.
 
@@ -328,7 +328,7 @@ Secure_Conversational_Application_Platform/
 │   ├── services.py / dlp.py  # Chat, AI, consent và policy DLP
 │   ├── ids.py / audit*.py    # Phát hiện xâm nhập, audit chain, checkpoint
 │   └── account_*.py          # Bảo vệ và khôi phục tài khoản
-├── src/core/ai_core/         # Adapter Claude và Google GenAI
+├── src/core/ai_core/         # Adapter Claude (Anthropic Messages API)
 ├── clients/                  # Client terminal E2EE (Olm) và MLS
 ├── scripts/                  # Demo, kiểm chứng, migration, backup, VPS
 ├── tests/                    # Test Python và JavaScript

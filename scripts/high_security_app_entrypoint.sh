@@ -44,10 +44,6 @@ if [ "${REQUIRE_HIGH_APP_SECRETS:-false}" = "true" ]; then
   export OIDC_PROXY_SECRET_FILE="$secret_dir/oidc_proxy_secret"
   export AUDIT_WORM_TOKEN_FILE="$secret_dir/audit_worm_token"
   export REDIS_PASSWORD_FILE="$secret_dir/redis_password"
-  if [ -f /run/secrets/google_genai_api_key ]; then
-    stage_secret /run/secrets/google_genai_api_key google_genai_api_key
-    export GOOGLE_GENAI_API_KEY_FILE="$secret_dir/google_genai_api_key"
-  fi
   if [ -f /run/secrets/claude_api_key ]; then
     stage_secret /run/secrets/claude_api_key claude_api_key
     export CLAUDE_API_KEY_FILE="$secret_dir/claude_api_key"

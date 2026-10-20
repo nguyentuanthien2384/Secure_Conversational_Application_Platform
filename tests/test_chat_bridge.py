@@ -38,27 +38,15 @@ class Button extends Element {
     return null;
   }
 }
-let widgetValue = '<a href="https://www.google.com/search?q=one">one</a>';
-const shadow = {innerHTML:''}; let attaches = 0;
-const marker = {style:{}, getAttribute:()=>Buffer.from(widgetValue).toString('base64'),
-  attachShadow: options => {assert.equal(options.mode,'closed'); assertsAttach(); return shadow;}};
-function assertsAttach() {assert.equal(++attaches,1);}
-const panel = {querySelectorAll:()=>[marker]};
 const document = {readyState:'complete', body:{},
-  getElementById: id => id === 'chat-history' ? chat : id === 'chat-search-suggestions' ? panel : null,
+  getElementById: id => id === 'chat-history' ? chat : null,
   querySelectorAll: () => [], addEventListener: (name, fn) => { if(name === 'click') click=fn; }};
 const context = {document, Element, URL, Promise, Set, WeakMap, performance:{now:()=>0},
   MutationObserver: class {constructor(fn) {mutations.push(fn);} observe() {}},
-  atob: value=>Buffer.from(value,'base64').toString('binary'), Uint8Array, TextDecoder,
   setInterval:()=>0, setTimeout:()=>0,
   navigator:{clipboard:{writeText:async text=>copied.push(text)}}};
 vm.runInNewContext(fs.readFileSync(process.argv[1], 'utf8'), context);
-assert.equal(shadow.innerHTML, widgetValue);
-widgetValue = '<a href="https://www.google.com/search?q=two">two</a>';
 mutations.forEach(fn=>fn());
-assert.equal(shadow.innerHTML, widgetValue);
-assert.equal(attaches,1);
-assert.equal(marker.style.contain,'layout paint style');
 async function invoke(button) {
   let stopped = false;
   click({target:button, preventDefault(){}, stopImmediatePropagation(){stopped=true;}});

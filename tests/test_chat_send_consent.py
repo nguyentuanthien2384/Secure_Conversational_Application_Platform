@@ -1,14 +1,9 @@
-"""Gemini provider integration: deadlines, retries, response parsing and UI consent.
+"""Chat send flow: system prompt, consent on first send and confidential confirmation.
 
-No test here reaches Google. A local socket that never answers stands in for a
-hung provider, and the UI callbacks run against an in-memory fake API.
+The UI callbacks run against an in-memory fake API; nothing reaches a provider.
 """
 
 from __future__ import annotations
-
-import socket
-import time
-from types import SimpleNamespace
 
 import gradio as gr
 import pytest
@@ -16,95 +11,6 @@ import pytest
 from src.app import gradio_ui
 from src.app.config import Settings
 from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE, AIService
-from src.core.ai_core import gemini_ai
-from src.core.ai_core.gemini_ai import GeminiClient
-
-
-def _http_options(client: GeminiClient):
-    return client.client._api_client._http_options
-
-
-def test_client_sets_a_deadline_and_bounded_retry():
-    options = _http_options(GeminiClient(api_key="unit-test-key", timeout_seconds=7, retry_attempts=2))
-    assert options.timeout == 7000
-    assert options.retry_options.attempts == 2
-    assert options.retry_options.max_delay <= 4.0
-
-
-def test_client_without_options_keeps_sdk_single_attempt():
-    options = _http_options(GeminiClient(api_key="unit-test-key"))
-    assert options.timeout is None and options.retry_options is None
-
-
-@pytest.mark.parametrize(("kwargs", "message"), [
-    ({"timeout_seconds": 0}, "timeout_seconds"),
-    ({"retry_attempts": 0}, "retry_attempts"),
-])
-def test_client_rejects_invalid_limits(kwargs, message):
-    with pytest.raises(ValueError, match=message):
-        GeminiClient(api_key="unit-test-key", **kwargs)
-
-
-def test_ai_service_applies_configured_provider_deadline(tmp_path):
-    settings = Settings(
-        environment="test",
-        database_url=f"sqlite:///{tmp_path / 'ai.db'}",
-        google_genai_api_key="unit-test-key",
-        gemini_timeout_seconds=9,
-    )
-    options = _http_options(AIService(settings)._client)
-    assert options.timeout == 9000
-    assert options.retry_options.attempts == 2
-
-
-@pytest.mark.parametrize("value", ["4", "26", "slow"])
-def test_provider_deadline_configuration_is_bounded(monkeypatch, value):
-    monkeypatch.setattr("src.app.config.load_dotenv", lambda: None)
-    monkeypatch.setenv("APP_ENV", "test")
-    monkeypatch.setenv("SECURITY_PROFILE", "standard")
-    monkeypatch.setenv("KEY_PROVIDER", "local")
-    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDS", value)
-    with pytest.raises(RuntimeError, match="GEMINI_TIMEOUT_SECONDS"):
-        Settings.from_env()
-
-
-def test_hung_provider_fails_within_the_deadline(monkeypatch):
-    """Before the fix the SDK waited forever on a connection that never answers."""
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(8)  # accepts TCP handshakes, never sends an HTTP response
-    port = listener.getsockname()[1]
-    real_client = gemini_ai.genai.Client
-
-    def local_client(*, api_key, http_options):
-        http_options.base_url = f"http://127.0.0.1:{port}/"
-        return real_client(api_key=api_key, http_options=http_options)
-
-    monkeypatch.setattr(gemini_ai.genai, "Client", local_client)
-    client = GeminiClient(api_key="unit-test-key", timeout_seconds=1, retry_attempts=1)
-    started = time.monotonic()
-    try:
-        with pytest.raises(Exception) as caught:
-            client.generate("ping")
-    finally:
-        listener.close()
-    assert time.monotonic() - started < 10
-    assert "timeout" in type(caught.value).__name__.lower()
-
-
-@pytest.mark.parametrize("response", [
-    SimpleNamespace(candidates=None),
-    SimpleNamespace(candidates=[SimpleNamespace(content=None)]),
-    SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=None))]),
-    SimpleNamespace(candidates=[SimpleNamespace(content=SimpleNamespace(parts=[]))]),
-])
-def test_blocked_or_empty_candidates_raise_a_clear_runtime_error(response):
-    client = GeminiClient(api_key="unit-test-key")
-    client.client = SimpleNamespace(
-        models=SimpleNamespace(generate_content=lambda **_kwargs: response)
-    )
-    with pytest.raises(RuntimeError):
-        client.generate("ping")
 
 
 def test_system_instruction_matches_safe_markdown_chat_view(tmp_path):
@@ -144,6 +50,11 @@ def _callback(demo, name):
     return next(
         item.fn for item in demo.fns.values() if item.fn is not None and item.fn.__name__ == name
     )
+
+
+def _send(demo, session_id, message):
+    """Bước gửi sau begin_send: tin đang chờ và lịch sử cũ nằm trong State."""
+    return _callback(demo, "send_pending")("token", session_id, {"message": message, "history": []})
 
 
 class FakeApi:
@@ -197,7 +108,7 @@ def test_first_send_records_consent_in_the_auto_created_conversation(demo, monke
     api = FakeApi(consent=False)
     monkeypatch.setattr(gradio_ui, "_api", api)
 
-    outputs = _callback(demo, "submit_chat_message")("token", None, "Xin chào")
+    outputs = _send(demo, None, "Xin chào")
     assert [session["id"] for session in api.sessions] == ["s1"]  # no orphan, no retry
     assert outputs[0]["value"] == "s1"  # the new conversation is now selected
     assert api.consent is True and len(api.sent) == 1
@@ -209,9 +120,9 @@ def test_send_button_confirms_a_confidential_message_without_a_second_prompt(dem
     """Tapping Send is the per-message confirmation; the API still requires the flag."""
     api = FakeApi(consent=True, mode="confidential")
     monkeypatch.setattr(gradio_ui, "_api", api)
-    outputs = _callback(demo, "submit_chat_message")("token", "s9", "Kế hoạch nội bộ")
+    outputs = _send(demo, "s9", "Kế hoạch nội bộ")
     assert api.sent == [{
-        "content": "Kế hoạch nội bộ", "confirm_external_ai": True, "use_web_search": False,
+        "content": "Kế hoạch nội bộ", "confirm_external_ai": True,
     }]
     assert ("PATCH", "/api/auth/ai-consent") not in api.calls
     assert outputs[3] == "" and outputs[4]["visible"] is False and outputs[5] == gr.skip()
@@ -228,10 +139,10 @@ def test_send_without_current_consent_needs_no_confirmation_button(
     """
     api = FakeApi(consent=False, mode="confidential", reported_consent=reported_consent)
     monkeypatch.setattr(gradio_ui, "_api", api)
-    outputs = _callback(demo, "submit_chat_message")("token", "s9", "Kế hoạch nội bộ")
+    outputs = _send(demo, "s9", "Kế hoạch nội bộ")
     assert api.consent is True
     assert api.sent == [{
-        "content": "Kế hoạch nội bộ", "confirm_external_ai": True, "use_web_search": False,
+        "content": "Kế hoạch nội bộ", "confirm_external_ai": True,
     }]
     assert outputs[3] == "" and outputs[4]["visible"] is False
     assert not any(isinstance(item, gr.Button) and item.value == "Đồng ý và gửi"
@@ -241,8 +152,9 @@ def test_send_without_current_consent_needs_no_confirmation_button(
 def test_other_refusals_are_not_retried_as_consent(demo, monkeypatch):
     api = FakeApi(consent=False, refuse="DLP đã chặn nội dung Highly confidential.")
     monkeypatch.setattr(gradio_ui, "_api", api)
-    outputs = _callback(demo, "submit_chat_message")("token", "s9", "Bí mật")
+    outputs = _send(demo, "s9", "Bí mật")
     assert api.calls.count(("POST", "/api/sessions/s9/messages")) == 1
     assert ("PATCH", "/api/auth/ai-consent") not in api.calls and api.consent is False
-    assert outputs[3] == gr.skip()  # the composer keeps the text
+    assert outputs[3] == "Bí mật"  # the text returns to the composer
+    assert outputs[2] == []  # and the optimistic bubble is removed
     assert "DLP đã chặn" in outputs[4]["value"] and outputs[5] == gr.skip()

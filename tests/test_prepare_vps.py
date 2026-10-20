@@ -137,7 +137,7 @@ def test_invalid_or_placeholder_domains_never_create_secrets(project, domain):
     ({"ALLOWED_ORIGINS": "https://other.scap.vn"}, "ALLOWED_ORIGINS"),
     ({"WEBAUTHN_RP_ID": "localhost"}, "WEBAUTHN_RP_ID"),
     ({"MAIL_BACKEND": "outbox"}, "MAIL_BACKEND"),
-    ({"ALLOW_DEMO_AI": "false"}, "GOOGLE_GENAI_API_KEY"),
+    ({"ALLOW_DEMO_AI": "false"}, "CLAUDE_API_KEY"),
     ({"PASSWORD_MAX_CONCURRENT": "8"}, "PASSWORD_MAX_CONCURRENT"),
     ({"REQUEST_IP_MAX_STREAMS": "2"}, "REQUEST_IP_MAX_STREAMS"),
     ({"MASTER_ENCRYPTION_KEY": "invalid-secret"}, "MASTER_ENCRYPTION_KEY"),
@@ -186,8 +186,8 @@ def test_single_quoted_smtp_password_remains_literal(project):
 
 def test_template_cannot_inject_real_provider_credentials(project):
     template = project / "deploy/vps.env.example"
-    template.write_text(template.read_text().replace("GOOGLE_GENAI_API_KEY=",
-                                                    "GOOGLE_GENAI_API_KEY=private-value"))
+    template.write_text(template.read_text().replace("CLAUDE_API_KEY=",
+                                                    "CLAUDE_API_KEY=private-value", 1))
     with pytest.raises(vps.PreparationError, match="must not contain credentials"):
         vps.initialize(project)
 
@@ -227,8 +227,8 @@ def test_configure_changes_only_requested_fields(project):
 
 def test_balanced_ai_profile_preserves_model_keys_and_other_configuration(project):
     ready(project)
-    replace(project, GOOGLE_GENAI_API_KEY="unit-test-provider-key", AI_MAX_OUTPUT_TOKENS="512",
-            AI_HISTORY_MESSAGES="8", ALLOW_DEMO_AI="true", GEMINI_WEB_SEARCH_ENABLED="true")
+    replace(project, CLAUDE_API_KEY="unit-test-provider-key", AI_MAX_OUTPUT_TOKENS="512",
+            AI_HISTORY_MESSAGES="8", ALLOW_DEMO_AI="true")
     before = values(project)
 
     changed = vps.configure(project, ai_quality="balanced")
@@ -243,7 +243,7 @@ def test_balanced_ai_profile_preserves_model_keys_and_other_configuration(projec
 
 def test_balanced_ai_profile_adds_history_field_to_older_configuration(project):
     ready(project)
-    replace(project, GOOGLE_GENAI_API_KEY="unit-test-provider-key")
+    replace(project, CLAUDE_API_KEY="unit-test-provider-key")
     path = project / "deploy/.env.vps"
     original_lines = vps._read(path, private=True)[0]
     path.write_text("\n".join(line for line in original_lines
@@ -295,6 +295,32 @@ def test_claude_key_keeps_a_larger_budget_and_model_alone_keeps_demo_setting(pro
     assert values(project)["ALLOW_DEMO_AI"] == "true"
     assert vps.configure(project, claude_api_key=CLAUDE_KEY) == ["ALLOW_DEMO_AI", "CLAUDE_API_KEY"]
     assert values(project)["AI_MAX_OUTPUT_TOKENS"] == "4096"
+
+
+def test_configuring_claude_removes_leftover_gemini_settings(project):
+    """VPS files created while Gemini existed keep its key and settings until Claude is set."""
+    ready(project)
+    path = project / "deploy/.env.vps"
+    path.write_text(path.read_text(encoding="utf-8") + "\n".join((
+        "# Legacy Gemini, used only while CLAUDE_API_KEY is empty. Web search needs Gemini.",
+        "GOOGLE_GENAI_API_KEY=old-gemini-provider-key",
+        "GOOGLE_GENAI_API_KEY_FILE=",
+        "GEMINI_MODEL=gemini-flash-lite-latest",
+        "GEMINI_WEB_SEARCH_ENABLED=false",
+        "GEMINI_TIMEOUT_SECONDS=20",
+    )) + "\n", encoding="utf-8")
+    assert vps.check(project) == []  # leftovers never block an update
+
+    changed = vps.configure(project, claude_model="claude-opus-5-5")
+
+    assert changed == ["CLAUDE_MODEL", "removed GEMINI_MODEL", "removed GEMINI_TIMEOUT_SECONDS",
+                       "removed GEMINI_WEB_SEARCH_ENABLED", "removed GOOGLE_GENAI_API_KEY",
+                       "removed GOOGLE_GENAI_API_KEY_FILE"]
+    content = path.read_text(encoding="utf-8")
+    assert "GEMINI" not in content and "GOOGLE_GENAI" not in content and "old-gemini" not in content
+    assert values(project)["CLAUDE_MODEL"] == "claude-opus-5-5"
+    check_private_file(path)
+    assert vps.check(project) == []
 
 
 @pytest.mark.parametrize("value,accepted", [("4096", True), ("4097", False)])

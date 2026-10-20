@@ -495,7 +495,6 @@ ALLOWED_CHAT_FILE_EXTENSIONS: tuple[str, ...] = (
 class MessageSend(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     confirm_external_ai: bool = False
-    use_web_search: bool = False
     file_name: str | None = Field(default=None, max_length=MAX_CHAT_FILE_NAME_CHARS)
     file_content: str | None = Field(default=None, max_length=MAX_CHAT_FILE_CONTENT_CHARS)
 
@@ -569,12 +568,6 @@ class MessageResponse(BaseModel):
     # (ví dụ ["mật khẩu", "số thẻ"]). Chỉ chứa nhãn, tuyệt đối không chứa giá trị
     # gốc, nên an toàn để hiển thị trên giao diện và ghi vào audit log.
     dlp_redacted: list[str] = Field(default_factory=list)
-
-
-class WebSearchResponse(BaseModel):
-    # Search suggestions are transient UI metadata, never conversation rows.
-    content: str = Field(max_length=32_000)
-    search_suggestions_html: str | None = Field(default=None, max_length=32_000)
 
 
 class RawMessageResponse(BaseModel):

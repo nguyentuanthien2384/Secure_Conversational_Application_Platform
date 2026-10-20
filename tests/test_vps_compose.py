@@ -29,7 +29,7 @@ def resolved_compose(tmp_path: Path, *, overlay="vps-demo", extra=(), overrides=
         "VAULT_ADDR=https://old-laptop.invalid\nVAULT_TOKEN_FILE=/old/token\n"
         "APP_SECRET_KEY_FILE=/old/app.key\nDATABASE_PASSWORD_FILE=/old/db.key\n"
         "REDIS_PASSWORD_FILE=/old/redis.key\nOIDC_PROXY_SECRET_FILE=/old/oidc.key\n"
-        "GOOGLE_GENAI_API_KEY_FILE=/old/gemini.key\nCLAUDE_API_KEY_FILE=/old/claude.key\n",
+        "CLAUDE_API_KEY_FILE=/old/claude.key\n",
         encoding="utf-8",
     )
     values = {
@@ -114,7 +114,7 @@ def test_vps_merge_rejects_local_demo_flags_and_stale_secret_paths(tmp_path):
     for name in (
         "BOOTSTRAP_ADMIN_PASSWORD", "VAULT_ADDR", "VAULT_TOKEN_FILE", "APP_SECRET_KEY_FILE",
         "DATABASE_PASSWORD_FILE", "REDIS_PASSWORD_FILE", "OIDC_PROXY_SECRET_FILE",
-        "GOOGLE_GENAI_API_KEY_FILE", "CLAUDE_API_KEY_FILE",
+        "CLAUDE_API_KEY_FILE",
     ):
         assert app_env[name] == ""
     assert app_env["ALLOWED_ORIGINS"] == "https://demo.example.org"

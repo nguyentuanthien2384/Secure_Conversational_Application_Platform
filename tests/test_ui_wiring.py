@@ -75,6 +75,22 @@ def _button_event(demo, label):
     return _event_for(demo, button)
 
 
+def _send_event(demo):
+    """The queued send step that follows the instant begin_send step."""
+    _begin, begin_dependency = _button_event(demo, "Gửi")
+    dependency = next(item for item in demo.config["dependencies"]
+                      if item["trigger_after"] == begin_dependency["id"])
+    return demo.fns[dependency["id"]], dependency
+
+
+def _send(demo, token, session_id, message, history=()):
+    """Run the Send chain as the browser does: instant begin step, then the queued send."""
+    begin, _ = _button_event(demo, "Gửi")
+    *_shown, pending = begin.fn(token, message, list(history))
+    send, _ = _send_event(demo)
+    return send.fn(token, session_id, pending)
+
+
 def _page(items):
     return {"items": items, "total": len(items), "offset": 0, "limit": 100,
             "has_more": False, "next_offset": None}
@@ -789,169 +805,84 @@ def test_send_records_ai_consent_without_a_second_confirmation(runtime_demo):
     # Lượt gửi tự lưu consent cập nhật luôn ô đồng ý ở tab Tài khoản.
     consent = next(component for component in runtime_demo.blocks.values()
                    if isinstance(component, gr.Checkbox) and "AI bên ngoài" in (component.label or ""))
-    _send, dependency = _button_event(runtime_demo, "Gửi")
+    _step, dependency = _send_event(runtime_demo)
     assert dependency["outputs"][5] == consent._id
 
 
 def test_send_button_and_enter_share_one_pending_event(runtime_demo):
     """Mobile can emit submit and click before its previous send has completed."""
     click, dependency = _button_event(runtime_demo, "Gửi")
-    composer = runtime_demo.blocks[dependency["inputs"][2]]
+    composer = runtime_demo.blocks[dependency["inputs"][1]]
     submit, submit_dependency = _event_for(runtime_demo, composer, "submit")
     assert submit is click
     assert submit_dependency is dependency
     assert dependency["trigger_mode"] == "once"
 
 
-@pytest.fixture(scope="module")
-def search_demo():
-    from src.app.gradio_ui import build_ui
+def test_send_shows_the_message_at_once_and_locks_the_composer_without_overlay(runtime_demo):
+    """No "processing | 0.7/8.7s" over the chat: the user's bubble appears before the AI call.
 
-    return build_ui(gemini_web_search_enabled=True)
-
-
-class _SearchApi:
-    def __init__(self, *, data_class="public", consent=True):
-        self.data_class = data_class
-        self.consent = consent
-        self.calls = []
-        self.sent = []
-
-    def __call__(self, _token, method, path, body=None, **_kwargs):
-        from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
-
-        self.calls.append((method, path, body))
-        if path == "/api/auth/me":
-            return {"ai_data_consent": self.consent}
-        if path == "/api/auth/ai-consent":
-            self.consent = body["ai_data_consent"]
-            return {}
-        if method == "POST" and path.endswith(("/messages", "/web-search")):
-            if not self.consent:
-                raise gr.Error(EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE)
-            self.sent.append(body)
-            if path.endswith("/web-search"):
-                return {"content": "**Kết quả công khai**", "search_suggestions_html": (
-                    '<a href="https://www.google.com/search?q=public+fact">public fact</a>'
-                )}
-            return {"dlp_redacted": []}
-        session = {
-            "id": "public-session", "title": "Nội dung công khai", "security_mode": "secure",
-            "data_classification": self.data_class,
-        }
-        if path == "/api/sessions/page":
-            return _page([session])
-        if method == "GET" and path.endswith("/messages"):
-            return []
-        if method == "GET" and path == "/api/sessions/public-session":
-            return session
-        raise AssertionError((method, path, body))
-
-
-def test_web_search_is_an_explicit_default_off_choice_with_cost_and_privacy_info(
-    runtime_demo, search_demo,
-):
-    for demo, enabled in ((runtime_demo, False), (search_demo, True)):
-        toggle = next(component for component in demo.blocks.values()
-                      if component.elem_id == "chat-web-search")
-        assert isinstance(toggle, gr.Checkbox)
-        assert toggle.value is False and toggle.interactive is enabled
-        assert toggle.visible is enabled
-        send, dependency = _button_event(demo, "Gửi")
-        assert dependency["inputs"][-1] == toggle._id
-        assert len(send.inputs) == 4
-        # Gradio follows __wrapped__ when injecting arguments. A wrapper that
-        # advertises send_message's five parameters would break real queue runs.
-        import inspect
-
-        assert len(inspect.signature(send.fn).parameters) == len(send.inputs)
-    assert "Google" in toggle.info and "phí" in toggle.info and "Public" in toggle.info
-
-
-@pytest.mark.parametrize("use_web_search", [False, True])
-def test_public_chat_forwards_the_explicit_search_choice(search_demo, monkeypatch, use_web_search):
+    The composer stays locked until the answer arrives, so a second Enter cannot
+    send a duplicate while the queued step waits for the AI.
+    """
     from src.app import gradio_ui
 
-    api = _SearchApi()
-    monkeypatch.setattr(gradio_ui, "_api", api)
-    send, _dependency = _button_event(search_demo, "Gửi")
-    result = send.fn("token", "public-session", "Kiểm tra tin mới", use_web_search)
-    body = {"content": "Kiểm tra tin mới", "confirm_external_ai": True}
-    if not use_web_search:
-        body["use_web_search"] = False
-    assert api.sent == [body]
-    endpoint = "/web-search" if use_web_search else "/messages"
-    assert any(method == "POST" and path.endswith(endpoint) for method, path, _ in api.calls)
-    if use_web_search:
-        assert not any(path.endswith("/messages") for _method, path, _body in api.calls)
-        assert result[2] == gr.skip()
-        assert "<strong>" in result[6]["value"]
-        assert "data-scap-google-search-widget" in result[7]["value"]
-    assert result[3] == ""
+    begin, begin_dependency = _button_event(runtime_demo, "Gửi")
+    send, send_dependency = _send_event(runtime_demo)
+    finish_dependency = next(item for item in runtime_demo.config["dependencies"]
+                             if item["trigger_after"] == send_dependency["id"])
+    finish = runtime_demo.fns[finish_dependency["id"]]
+    assert begin_dependency["queue"] is False and begin.fn.__name__ == "begin_send"
+    assert send_dependency["trigger_only_on_success"] is True
+    assert finish_dependency["trigger_only_on_success"] is False  # unlock after errors too
+    for item in (begin_dependency, send_dependency, finish_dependency):
+        assert item["show_progress"] == "hidden"
+    chatbot_id, composer_id, button_id = begin_dependency["outputs"][:3]
+    assert send_dependency["outputs"][2] == chatbot_id
+    assert finish_dependency["outputs"][:2] == [composer_id, button_id]
+
+    old = [{"role": "assistant", "content": "Chào bạn"}]
+    shown, composer, button, pending = begin.fn("token", "  2 + 2 = ?  ", old)
+    question = {"role": "user", "content": gradio_ui._safe_chat_text("2 + 2 = ?")}
+    assert shown[:-1] == [*old, question]
+    assert shown[-1]["role"] == "assistant" and shown[-1]["metadata"]["status"] == "pending"
+    assert composer == gr.update(value="", interactive=False)
+    assert button == gr.update(interactive=False)
+    assert pending == {"message": "2 + 2 = ?", "history": old, "sent": [*old, question]}
+    # Nothing to send: nothing is locked and the send step does nothing.
+    assert begin.fn("token", "   ", old) == (gr.skip(), gr.skip(), gr.skip(), None)
+    assert send.fn("token", "s1", None) == (*(gr.skip(),) * 9, None)
+    unlocked = finish.fn("token")
+    assert unlocked[:2] == (gr.update(interactive=True), gr.update(interactive=True))
 
 
-@pytest.mark.parametrize("session_id, data_class", [
-    (None, "public"), ("public-session", "internal"), ("public-session", "confidential"),
-])
-def test_search_requires_a_precreated_public_conversation(
-    search_demo, monkeypatch, session_id, data_class,
-):
-    from src.app import gradio_ui
-
-    api = _SearchApi(data_class=data_class)
-    monkeypatch.setattr(gradio_ui, "_api", api)
-    send, _dependency = _button_event(search_demo, "Gửi")
-    result = send.fn("token", session_id, "Nội dung vẫn trong ô nhập", True)
-    assert not api.sent
-    assert not any(method == "POST" for method, _path, _body in api.calls)
-    assert result[3] == gr.skip()
-    assert result[4]["visible"] is True and "Public" in result[4]["value"]
-
-
-def test_disabled_search_cannot_be_enabled_by_forging_the_ui_value(runtime_demo, monkeypatch):
-    from src.app import gradio_ui
-
-    api = _SearchApi()
-    monkeypatch.setattr(gradio_ui, "_api", api)
-    send, _dependency = _button_event(runtime_demo, "Gửi")
-    result = send.fn("token", "public-session", "Tin mới", True)
-    assert not api.calls
-    assert result[3] == gr.skip()
-    assert "chưa bật tra cứu Internet" in result[4]["value"]
-
-
-@pytest.mark.parametrize("use_web_search", [False, True])
-def test_first_send_records_consent_and_keeps_the_search_choice(
-    search_demo, monkeypatch, use_web_search,
-):
-    from src.app import gradio_ui
-
-    api = _SearchApi(consent=False)
-    monkeypatch.setattr(gradio_ui, "_api", api)
-    send, _dependency = _button_event(search_demo, "Gửi")
-    result = send.fn("token", "public-session", "Tin mới", use_web_search)
-    body = {"content": "Tin mới", "confirm_external_ai": True}
-    if not use_web_search:
-        body["use_web_search"] = False
-    assert api.consent is True and api.sent == [body]
-    assert ("PATCH", "/api/auth/ai-consent", {"ai_data_consent": True}) in api.calls
-    endpoint = "/web-search" if use_web_search else "/messages"
-    assert sum(method == "POST" and path.endswith(endpoint)
-               for method, path, _body in api.calls) == 2  # refused once, then sent
-    assert result[3] == "" and result[5] == gr.update(value=True)
-    assert result[4] == gr.update(value="", visible=False)
-
-
-def test_logout_clears_the_previous_search_choice(search_demo, monkeypatch):
+def test_logout_during_a_pending_send_unlocks_the_composer(runtime_demo, monkeypatch):
+    """The pending send's unlock result is discarded after logout, so logout unlocks."""
     from src.app import gradio_ui
 
     monkeypatch.setattr(gradio_ui, "_api", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(gr, "Info", lambda *_args, **_kwargs: None)
-    logout, dependency = _button_event(search_demo, "Đăng xuất")
-    result = logout.fn("previous-token")
-    toggle = next(component for component in search_demo.blocks.values()
-                  if component.elem_id == "chat-web-search")
-    assert dict(zip(dependency["outputs"], result, strict=True))[toggle._id] == gr.update(value=False)
+    logout, dependency = _button_event(runtime_demo, "Đăng xuất")
+    _begin, begin_dependency = _button_event(runtime_demo, "Gửi")
+    composer_id, button_id = begin_dependency["outputs"][1:3]
+    reset = dict(zip(dependency["outputs"], logout.fn("previous-token"), strict=True))
+    assert reset[composer_id] == gr.update(value="", interactive=True)
+    assert reset[button_id] == gr.update(interactive=True)
+
+
+def test_chat_has_no_internet_search_after_gemini_removal(runtime_demo):
+    """Google Search grounding only existed with Gemini; Claude is the only provider."""
+    import inspect
+
+    ids = {getattr(component, "elem_id", None) for component in runtime_demo.blocks.values()}
+    assert not ids & {"chat-web-search", "chat-search-answer", "chat-search-suggestions"}
+    api_source = (UI_SOURCE.parent / "main.py").read_text(encoding="utf-8")
+    assert "/web-search" not in api_source and "gemini" not in api_source.lower()
+    for send, _dependency in (_button_event(runtime_demo, "Gửi"), _send_event(runtime_demo)):
+        assert len(send.inputs) == 3
+        # Gradio follows __wrapped__ when injecting arguments. A wrapper that
+        # advertises a different parameter count would break real queue runs.
+        assert len(inspect.signature(send.fn).parameters) == len(send.inputs)
 
 
 @pytest.mark.parametrize("first_session", [None, "existing"])
@@ -976,18 +907,19 @@ def test_failed_send_keeps_composer_and_displays_persistent_error(
 
     monkeypatch.setattr(gradio_ui, "_api", api)
     monkeypatch.setattr(gr, "Info", lambda *args, **kwargs: None)
-    callback, _ = _button_event(runtime_demo, "Gửi")
-    result = callback.fn("token", first_session, "câu hỏi vẫn còn trong ô nhập")
-    assert result[3] == gr.skip(), "A refused send must not clear typed text"
+    old = [{"role": "assistant", "content": "Chào bạn"}]
+    result = _send(runtime_demo, "token", first_session, "câu hỏi vẫn còn trong ô nhập", history=old)
+    assert result[3] == "câu hỏi vẫn còn trong ô nhập", "A refused send must keep typed text"
     assert result[4]["visible"] is True
     assert "AI tạm thời không khả dụng" in result[4]["value"]
     assert result[5] == gr.skip()  # consent unchanged
     if first_session is None:
         assert result[0]["value"] == result[1]["value"] == "new"
-        callback.fn("token", result[0]["value"], "câu hỏi vẫn còn trong ô nhập")
+        _send(runtime_demo, "token", result[0]["value"], "câu hỏi vẫn còn trong ô nhập")
         assert calls.count(("POST", "/api/sessions")) == 1
     else:
-        assert result[:3] == (gr.skip(),) * 3
+        assert result[:2] == (gr.skip(),) * 2
+        assert result[2] == old  # the optimistic bubble is removed
 
 
 def test_successful_send_with_failed_history_read_does_not_invite_duplicate_retry(
@@ -1003,9 +935,10 @@ def test_successful_send_with_failed_history_read_does_not_invite_duplicate_retr
         return {"security_mode": "secure"}
 
     monkeypatch.setattr(gradio_ui, "_api", api)
-    callback, _ = _button_event(runtime_demo, "Gửi")
-    result = callback.fn("token", "existing", "đã được lưu")
+    result = _send(runtime_demo, "token", "existing", "đã được lưu")
     assert result[3] == ""
+    # The sent message stays visible until Làm mới; the "đang soạn" bubble goes.
+    assert [item["role"] for item in result[2]] == ["user"]
     assert result[4]["visible"] is True
     assert "Tin nhắn đã gửi" in result[4]["value"]
     assert "Làm mới" in result[4]["value"]
@@ -1196,9 +1129,11 @@ def test_chat_file_upload_id_is_claimed_by_its_own_login_and_sent(runtime_demo, 
 
     posted_bodies = []
     monkeypatch.setattr(gradio_ui, "_api", _chat_file_api(posted_bodies))
-    send_fn, _ = _button_event(runtime_demo, "Gửi")
+    begin, _ = _button_event(runtime_demo, "Gửi")
+    shown, *_lock, _pending = begin.fn(token, "", [])
+    assert "tai_lieu.txt" in shown[-2]["content"] and shown[-2]["role"] == "user"
     # Even when message textbox is empty, sending with a staged file auto-supplies a prompt and sends the file
-    send_fn.fn(token, "sess-1", "", False)
+    _send(runtime_demo, token, "sess-1", "")
     assert len(posted_bodies) == 1
     assert posted_bodies[0]["file_name"] == "tai_lieu.txt"
     assert posted_bodies[0]["file_content"] == "Nội dung tài liệu mật."
@@ -1252,8 +1187,7 @@ def test_long_chat_file_sends_only_relevant_excerpts_within_api_limit(runtime_de
 
     posted_bodies = []
     monkeypatch.setattr(gradio_ui, "_api", _chat_file_api(posted_bodies))
-    send_fn, _ = _button_event(runtime_demo, "Gửi")
-    send_fn.fn(token, "sess-1", "doanh thu nam 2025 o Da Nang la bao nhieu?", False)
+    _send(runtime_demo, token, "sess-1", "doanh thu nam 2025 o Da Nang la bao nhieu?")
     sent = posted_bodies[0]["file_content"]
     assert len(sent) <= MAX_CHAT_FILE_CONTENT_CHARS
     assert needle.strip() in sent

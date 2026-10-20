@@ -162,7 +162,6 @@ from src.app.schemas import (
     UserResponse,
     UserRoleUpdate,
     UserStatusUpdate,
-    WebSearchResponse,
 )
 from src.app.secret_files import SecretFileTooLarge, read_secret_text
 from src.app.security import (
@@ -3847,11 +3846,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db: Annotated[Session, Depends(get_db)],
     ):
         row = require_owned_session(session_id, user, db, request, for_update=True)
-        if payload.use_web_search:
-            raise HTTPException(
-                status_code=400,
-                detail="Tra cứu Internet không lưu vào hội thoại; hãy dùng mục tra cứu riêng.",
-            )
         # Serialize index allocation and quota checks for a conversation. The
         # UNIQUE(session_id, message_index) constraint remains the final replay
         # barrier if two application instances race.
@@ -3915,7 +3909,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     user.ai_data_consent and user.ai_consent_version == settings.ai_consent_version
                 ),
                 confirm_external_ai=payload.confirm_external_ai,
-                use_web_search=payload.use_web_search,
                 consent_since=user.ai_consent_at,
                 **file_kwargs,
             )
@@ -4002,90 +3995,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content=response_text,
             created_at=assistant_row.created_at,
             dlp_redacted=dlp_redacted,
-        )
-
-    @app.post("/api/sessions/{session_id}/web-search", response_model=WebSearchResponse)
-    def web_search_endpoint(
-        session_id: str,
-        payload: MessageSend,
-        request: Request,
-        response: Response,
-        user: Annotated[User, Depends(current_user)],
-        db: Annotated[Session, Depends(get_db)],
-    ):
-        """Answer a public query without storing it or loading chat history."""
-        row = require_owned_session(session_id, user, db, request, for_update=True)
-
-        def audit_search(outcome: str, details: dict):
-            record_audit(
-                db, request, "chat.web_search", actor_id=user.id,
-                target_type="chat_session", target_id=session_id,
-                outcome=outcome, details=details,
-            )
-
-        if payload.file_name is not None or payload.file_content is not None:
-            audit_search("denied", {"reason": "attachment_not_allowed"})
-            raise HTTPException(
-                status_code=400,
-                detail="Không đính kèm tệp khi tra cứu Internet; hãy tắt tra cứu để hỏi đáp trên tệp.",
-            )
-
-        # Share the ordinary chat budget: selecting search or alternating both
-        # endpoints cannot multiply the user's allowed external AI calls.
-        allowed, retry_after = message_limiter.allow(
-            f"message:{user.id}", settings.message_max_attempts,
-            settings.message_window_seconds,
-        )
-        if not allowed:
-            audit_search("blocked", {"reason": "rate_limit"})
-            raise HTTPException(
-                status_code=429, detail="Tần suất gửi tin nhắn quá cao.",
-                headers={"Retry-After": str(retry_after)},
-            )
-        try:
-            if row.security_mode == "private_e2ee":
-                raise PermissionError("Private E2EE không cho phép gửi plaintext hoặc gọi AI tự động.")
-            consent = user.ai_data_consent and user.ai_consent_version == settings.ai_consent_version
-            if not consent:
-                raise PermissionError("Cần đồng ý trước khi gửi nội dung đến nhà cung cấp AI bên ngoài.")
-            # Suggestions and grounded results have separate retention rules.
-            # This route is intentionally stateless: neither input, output nor
-            # suggestion metadata enters the encrypted conversation database.
-            # No decrypt/load callback is passed, so existing chat stays local.
-            answer, _labels = chat_service.ai.generate(
-                payload.content, [], allow_external_ai=True,
-                data_class=row.data_classification, use_web_search=True,
-            )
-        except DLPPolicyViolation as exc:
-            record_audit(
-                db, request, "dlp.policy", actor_id=user.id,
-                target_type="chat_session", target_id=session_id, outcome="blocked",
-                details={"action": exc.action.value, "categories": list(exc.categories)},
-            )
-            raise HTTPException(
-                status_code=422,
-                detail={"code": f"dlp_{exc.action.value}", "message": str(exc),
-                        "categories": list(exc.categories)},
-            ) from exc
-        except PermissionError as exc:
-            audit_search("denied", {"reason": "policy_or_consent_required"})
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except AIProviderError as exc:
-            if isinstance(exc, AIProviderBusy):
-                availability_monitor.reject("ai_capacity_or_quota")
-            audit_search("failure", {
-                "reason": "ai_provider_busy" if isinstance(exc, AIProviderBusy)
-                else "ai_provider_unavailable",
-            })
-            raise HTTPException(
-                status_code=503, detail=str(exc),
-                headers={"Retry-After": str(exc.retry_after) if isinstance(exc, AIProviderBusy) else "30"},
-            ) from exc
-        audit_search("success", {"content_length": len(payload.content)})
-        response.headers["Cache-Control"] = "no-store"
-        return WebSearchResponse(
-            content=str(answer),
-            search_suggestions_html=getattr(answer, "search_suggestions_html", None),
         )
 
     @app.get("/api/search/messages")
@@ -5629,10 +5538,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         retained_events=settings.gradio_retained_events,
         result_ttl_seconds=settings.gradio_result_ttl_seconds,
         state_capacity=settings.gradio_state_capacity,
-        # Google Search grounding only exists on Gemini; hide it while Claude is active.
-        gemini_web_search_enabled=(
-            settings.gemini_web_search_enabled and not settings.claude_api_key
-        ),
     )
     gradio_auth_dependency = None
     if settings.gradio_auth_mode == "oidc":

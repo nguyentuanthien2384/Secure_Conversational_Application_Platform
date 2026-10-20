@@ -235,21 +235,16 @@ class Settings:
     password_min_length: int = 15
     password_breach_check: bool = False
     allow_demo_ai: bool = True
-    # Claude qua cổng tương thích Anthropic; được ưu tiên hơn Gemini khi có key.
+    # Claude qua cổng tương thích Anthropic là nhà cung cấp AI duy nhất.
     claude_api_key: str = field(default="", repr=False)
     claude_base_url: str = "https://1gw.gwai.cloud"
-    claude_model: str = "claude-opus-5"
+    claude_model: str = "claude-opus-5-5"
     # Empty = the model's own default effort. Thinking tokens count toward
     # AI_MAX_OUTPUT_TOKENS, so a low effort keeps answers fast and complete.
     claude_effort: str = "low"
-    # Same per-attempt budget as Gemini: 2 x 25 s plus backoff fits the UI's 60 s.
-    claude_timeout_seconds: int = 25
-    google_genai_api_key: str = ""
-    gemini_model: str = "gemini-flash-lite-latest"
-    gemini_web_search_enabled: bool = False
     # Per-attempt provider deadline; one retry is allowed. 2 x 25 s plus backoff
     # still ends before the UI gives up on the API call at 60 s.
-    gemini_timeout_seconds: int = 20
+    claude_timeout_seconds: int = 25
     bootstrap_admin_username: str = ""
     bootstrap_admin_password: str = ""
     docs_enabled: bool = True
@@ -382,9 +377,6 @@ class Settings:
             raise RuntimeError(
                 "CLAUDE_EFFORT_LEVEL chỉ chấp nhận low, medium, high, xhigh, max hoặc để trống."
             )
-        google_genai_api_key = _secret_setting(
-            "GOOGLE_GENAI_API_KEY", "GOOGLE_GENAI_API_KEY_FILE"
-        )
         master_key = os.getenv("MASTER_ENCRYPTION_KEY", "").strip()
         keyring = _keyring_env()
         if (
@@ -519,7 +511,6 @@ class Settings:
                     )
                 if (
                     os.getenv("APP_SECRET_KEY", "").strip()
-                    or os.getenv("GOOGLE_GENAI_API_KEY", "").strip()
                     or os.getenv("CLAUDE_API_KEY", "").strip()
                     or urlparse(raw_database_url).password not in (None, "")
                     or urlparse(raw_redis_url).password not in (None, "")
@@ -602,7 +593,6 @@ class Settings:
             "SECURITY_MAINTENANCE_BATCH_SIZE": (500, 1, 5_000),
             "SECURITY_MAINTENANCE_ANOMALY_WINDOW_MINUTES": (60, 1, 1_440),
             "SIGN_IN_HISTORY_DAYS": (90, 1, 730),
-            "GEMINI_TIMEOUT_SECONDS": (20, 5, 25),
             "CLAUDE_TIMEOUT_SECONDS": (25, 5, 25),
             "TOKEN_REUSE_GRACE_SECONDS": (30, 5, 300),
             "DEVICE_TOKEN_DAYS": (365, 1, 730),
@@ -730,9 +720,6 @@ class Settings:
             claude_model=os.getenv("CLAUDE_MODEL", "").strip() or cls.claude_model,
             claude_effort=claude_effort,
             claude_timeout_seconds=numeric_limits["CLAUDE_TIMEOUT_SECONDS"],
-            google_genai_api_key=google_genai_api_key,
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest"),
-            gemini_web_search_enabled=_bool_env("GEMINI_WEB_SEARCH_ENABLED", False),
             bootstrap_admin_username=os.getenv("BOOTSTRAP_ADMIN_USERNAME", ""),
             bootstrap_admin_password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD", ""),
             docs_enabled=_bool_env("DOCS_ENABLED", environment != "production"),
@@ -763,7 +750,6 @@ class Settings:
             gcp_kms_key_name=os.getenv("GCP_KMS_KEY_NAME", "").strip(),
             step_up_minutes=numeric_limits["STEP_UP_MINUTES"],
             sign_in_history_days=numeric_limits["SIGN_IN_HISTORY_DAYS"],
-            gemini_timeout_seconds=numeric_limits["GEMINI_TIMEOUT_SECONDS"],
             token_reuse_grace_seconds=numeric_limits["TOKEN_REUSE_GRACE_SECONDS"],
             device_token_days=numeric_limits["DEVICE_TOKEN_DAYS"],
             mail_backend=mail_backend,

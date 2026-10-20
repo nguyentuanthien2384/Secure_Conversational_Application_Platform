@@ -1,7 +1,7 @@
 """Kiểm thử đường xử lý lỗi của nhà cung cấp AI bên ngoài.
 
-Trước bản vá này, lời gọi ``GeminiClient.generate`` không được bọc trong
-``try/except``. Khi Gemini trả 401 (key sai), 429 (hết quota) hoặc khi mạng
+Trước bản vá này, lời gọi ``generate`` của client AI không được bọc trong
+``try/except``. Khi nhà cung cấp trả 401 (key sai), 429 (hết quota) hoặc khi mạng
 hỏng, exception của SDK lọt thẳng ra ngoài và FastAPI biến nó thành HTTP 500
 kèm traceback — vừa sai mã trạng thái (đây là lỗi tạm thời phía nhà cung cấp,
 không phải lỗi lập trình), vừa là information disclosure (OWASP A09 / CWE-209:
@@ -40,8 +40,8 @@ LEAKY_DETAIL = (
 )
 
 
-class _ExplodingGeminiClient:
-    """Đóng vai ``GeminiClient`` nhưng luôn ném lỗi như SDK thật."""
+class _ExplodingProviderClient:
+    """Đóng vai ``ClaudeClient`` nhưng luôn ném lỗi như SDK thật."""
 
     def __init__(self, exc: Exception | None = None):
         self._exc = exc or RuntimeError(LEAKY_DETAIL)
@@ -50,14 +50,14 @@ class _ExplodingGeminiClient:
         raise self._exc
 
 
-class _EchoGeminiClient:
+class _EchoProviderClient:
     def generate(self, *args, **kwargs):
         return "safe response"
 
 
 def _ai_service_with_failing_client(settings: Settings) -> AIService:
     service = AIService(settings)
-    service._client = _ExplodingGeminiClient()
+    service._client = _ExplodingProviderClient()
     return service
 
 
@@ -103,7 +103,7 @@ def test_missing_key_with_demo_disabled_raises_aiprovidererror(settings: Setting
 
 def test_history_loader_is_not_called_before_ai_consent(settings: Settings):
     service = AIService(settings)
-    service._client = _EchoGeminiClient()
+    service._client = _EchoProviderClient()
 
     def forbidden_history_load():
         raise AssertionError("encrypted history must remain unopened")
@@ -118,7 +118,7 @@ def test_history_loader_is_not_called_before_ai_consent(settings: Settings):
 
 def test_history_loader_is_not_called_when_current_message_is_blocked(settings: Settings):
     service = AIService(settings)
-    service._client = _EchoGeminiClient()
+    service._client = _EchoProviderClient()
 
     def forbidden_history_load():
         raise AssertionError("encrypted history must remain unopened")
@@ -134,7 +134,7 @@ def test_history_loader_is_not_called_when_current_message_is_blocked(settings: 
 
 def test_chat_endpoint_returns_503_not_500(client: TestClient, app):
     """API phải trả 503 + Retry-After, và không lộ chi tiết lỗi gốc."""
-    app.state.chat_service.ai._client = _ExplodingGeminiClient()
+    app.state.chat_service.ai._client = _ExplodingProviderClient()
 
     token = register_and_login(client, "ai.loi.provider")
     headers = {"Authorization": f"Bearer {token}"}
@@ -158,7 +158,7 @@ def test_chat_endpoint_returns_503_not_500(client: TestClient, app):
 
 def test_no_message_persisted_when_provider_fails(client: TestClient, app):
     """Lỗi AI không được để lại tin nhắn user mồ côi trong DB."""
-    app.state.chat_service.ai._client = _ExplodingGeminiClient()
+    app.state.chat_service.ai._client = _ExplodingProviderClient()
 
     token = register_and_login(client, "ai.loi.khong.ghi")
     headers = {"Authorization": f"Bearer {token}"}
@@ -185,21 +185,21 @@ def test_no_message_persisted_when_provider_fails(client: TestClient, app):
 def test_client_construction_failure_does_not_crash_startup(settings: Settings, monkeypatch):
     """Khởi tạo client thất bại chỉ làm suy giảm tính năng AI, không sập app.
 
-    Thay module ``gemini_ai`` bằng một stub luôn ném lỗi ở constructor, mô phỏng
+    Thay module ``claude_ai`` bằng một stub luôn ném lỗi ở constructor, mô phỏng
     key sai định dạng hoặc SDK không khởi tạo được.
     """
     import sys
     import types
 
-    stub = types.ModuleType("src.core.ai_core.gemini_ai")
+    stub = types.ModuleType("src.core.ai_core.claude_ai")
 
     def _boom(*args, **kwargs):
         raise ValueError("API key sai định dạng")
 
-    stub.GeminiClient = _boom
-    monkeypatch.setitem(sys.modules, "src.core.ai_core.gemini_ai", stub)
+    stub.ClaudeClient = _boom
+    monkeypatch.setitem(sys.modules, "src.core.ai_core.claude_ai", stub)
 
-    broken = replace(settings, google_genai_api_key="khong-phai-key-hop-le")
+    broken = replace(settings, claude_api_key="khong-phai-key-hop-le")
     service = AIService(broken)  # không được ném exception
     assert service._client is None
     # allow_demo_ai=True nên vẫn trả lời được ở chế độ ngoại tuyến.

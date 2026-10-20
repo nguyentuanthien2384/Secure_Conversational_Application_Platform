@@ -110,7 +110,7 @@ CLI/CI riêng; không gọi nó từ một ứng dụng đang phục vụ ngư�
 
 Bot `[DEMO AI]` trên giao diện chỉ minh họa bản xem trước đã che và không cần
 consent gửi dữ liệu ra ngoài. Bằng chứng cho nhánh provider đến từ test giả lập
-ở runner: không được diễn giải thành việc đã gọi hoặc kiểm thử Gemini thật.
+ở runner: không được diễn giải thành việc đã gọi hoặc kiểm thử Claude thật.
 Chính sách AI ngoài chặn secret, khóa riêng và thẻ thanh toán thay vì chỉ che
 rồi gửi. Chi tiết và giới hạn nằm trong [ADVANCED_SECURITY.md](ADVANCED_SECURITY.md).
 

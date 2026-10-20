@@ -141,8 +141,8 @@ tác quản trị. Không dùng `BOOTSTRAP_ADMIN_*` ở hồ sơ này.
 
 Reference overlay cố ý không bật cloud AI. Nếu tổ chức đã phê duyệt DPA, vùng dữ
 liệu và paid/ZDR policy của provider, hãy mount key bằng secret tên
-`google_genai_api_key` trong một overlay riêng; bootstrap wrapper sẽ tự đặt
-`GOOGLE_GENAI_API_KEY_FILE`. High profile từ chối `GOOGLE_GENAI_API_KEY` dạng
+`claude_api_key` trong một overlay riêng; bootstrap wrapper sẽ tự đặt
+`CLAUDE_API_KEY_FILE`. High profile từ chối `CLAUDE_API_KEY` dạng
 environment. Không bật secret này cho Private E2EE; disclosure ở mode đó phải do
 client tin cậy chọn, làm sạch và xác nhận rõ ràng.
 

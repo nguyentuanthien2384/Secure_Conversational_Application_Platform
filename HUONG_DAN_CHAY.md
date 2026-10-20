@@ -206,12 +206,20 @@ nhất quán và dễ diễn tập lại.
 
 ## 8. Dùng Claude thật thay cho AI ngoại tuyến
 
-Mở `.env`, dán key `sk-...` vào `CLAUDE_API_KEY=` rồi chạy `uv run python run_app.py`.
-Các biến còn lại đã điền sẵn theo hướng dẫn của nhà cung cấp cổng:
-`CLAUDE_BASE_URL=https://1gw.gwai.cloud`, `CLAUDE_MODEL=claude-opus-5` (có thể đổi
-sang `claude-sonnet-5` hoặc `claude-haiku-4-5` để trả lời nhanh hơn),
-`CLAUDE_EFFORT_LEVEL=low`, `CLAUDE_TIMEOUT_SECONDS=25`. Ứng dụng chỉ đọc các biến
-`CLAUDE_*` này, không đọc `ANTHROPIC_*` của Claude Code/VSCode. Key Gemini cũ
-không còn được dùng khi đã có `CLAUDE_API_KEY`; tìm kiếm web (Google Search) chỉ
-hoạt động với Gemini nên được ẩn khi dùng Claude. `scripts.demo_local` vẫn luôn
-dùng AI ngoại tuyến.
+Claude là nhà cung cấp AI duy nhất của ứng dụng (Gemini và tính năng "Tra cứu
+Internet" đã được gỡ). Mở `.env`, dán key `sk-...` vào `CLAUDE_API_KEY=` rồi chạy
+`uv run python run_app.py`. Các biến còn lại đã điền sẵn theo hướng dẫn của nhà
+cung cấp cổng: `CLAUDE_BASE_URL=https://1gw.gwai.cloud`,
+`CLAUDE_MODEL=claude-opus-5-5` (giống VPS), `CLAUDE_EFFORT_LEVEL=low`,
+`CLAUDE_TIMEOUT_SECONDS=25`. Ứng dụng chỉ đọc các biến `CLAUDE_*` này, không đọc
+`ANTHROPIC_*` của Claude Code/VSCode. Khi chưa có key, ứng dụng dùng AI ngoại
+tuyến (nếu `ALLOW_DEMO_AI=true`); `scripts.demo_local` luôn dùng AI ngoại tuyến.
+
+**Tốc độ trả lời (đo ngày 19/10/2026, system prompt thật của ứng dụng):** qua cổng
+`1gw.gwai.cloud`, Claude mất khoảng 6–10 giây mỗi câu; `claude-opus-5`,
+`claude-opus-5-5` hay `claude-sonnet-5-5` ở effort `low` đều tương đương. Riêng
+thời gian chờ cổng trước byte đầu tiên đã 2–4 giây, rồi model suy nghĩ ẩn vài
+trăm token, kể cả với câu "xin chào". Ứng dụng chỉ hiển thị câu trả lời khi đã
+có đủ cả câu (DLP phải quét trọn phản hồi trước khi hiện). Trong lúc chờ, khung
+chat hiện ngay câu hỏi kèm dòng "Đang soạn câu trả lời…" thay cho lớp phủ
+"processing".

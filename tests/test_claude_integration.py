@@ -15,10 +15,9 @@ from src.app.config import Settings
 from src.app.dlp import DLPScanner
 from src.app.services import AIService
 from src.core.ai_core.claude_ai import ClaudeClient
-from src.core.ai_core.gemini_ai import GeminiClient
 
 
-def _message(*, text="Xin chào", stop_reason="end_turn", model="claude-opus-5"):
+def _message(*, text="Xin chào", stop_reason="end_turn", model="claude-opus-5-5"):
     content = [{"type": "thinking", "thinking": "", "signature": "sig"}]
     if text is not None:
         content.append({"type": "text", "text": text})
@@ -83,7 +82,7 @@ def test_generate_sends_bearer_key_system_prompt_effort_and_token_cap():
     assert request.headers["authorization"] == "Bearer sk-unit-test"
     assert "x-api-key" not in request.headers
     body = json.loads(request.content)
-    assert body["model"] == "claude-opus-5"
+    assert body["model"] == "claude-opus-5-5"
     assert body["max_tokens"] == 512
     assert body["system"] == "Chỉ thị"
     assert body["output_config"] == {"effort": "low"}
@@ -121,14 +120,6 @@ def test_truncated_response_is_labelled():
     assert reply.startswith("Phần đầu") and "giới hạn token" in reply
 
 
-def test_web_search_is_not_sent_to_claude():
-    client = ClaudeClient(api_key="sk-unit-test")
-    requests = _mocked(client, _message())
-    with pytest.raises(NotImplementedError):
-        client.generate("Câu hỏi", use_web_search=True)
-    assert requests == []
-
-
 def _env(monkeypatch, **values):
     monkeypatch.setattr("src.app.config.load_dotenv", lambda: None)
     for name in ("CLAUDE_API_KEY", "CLAUDE_API_KEY_FILE", "CLAUDE_BASE_URL", "CLAUDE_MODEL",
@@ -159,7 +150,7 @@ def test_settings_defaults_without_claude_variables(monkeypatch):
     _env(monkeypatch)
     configured = Settings.from_env()
     assert configured.claude_api_key == ""
-    assert configured.claude_model == "claude-opus-5"
+    assert configured.claude_model == "claude-opus-5-5"
     assert configured.claude_effort == "low"
     assert configured.claude_timeout_seconds == 25
 
@@ -176,25 +167,16 @@ def test_settings_reject_unsafe_claude_values(monkeypatch, name, value):
         Settings.from_env()
 
 
-def test_ai_service_prefers_claude_and_keeps_gemini_as_legacy_fallback(tmp_path):
-    base = Settings(environment="test", database_url=f"sqlite:///{tmp_path / 'ai.db'}",
-                    google_genai_api_key="unit-test-gemini-key")
-    assert isinstance(AIService(base)._client, GeminiClient)
+def test_ai_service_uses_claude_as_its_only_provider(tmp_path):
+    base = Settings(environment="test", database_url=f"sqlite:///{tmp_path / 'ai.db'}")
+    assert AIService(base)._client is None  # no key: offline demo AI or 503
 
     service = AIService(replace(base, claude_api_key="sk-unit-test", claude_timeout_seconds=9))
     assert isinstance(service._client, ClaudeClient)
-    assert service.provider_model == "claude-opus-5"
+    assert service.provider_model == "claude-opus-5-5"
     assert service._client.client.timeout == 9.0
     assert service._client.client.max_retries == 1
     assert service._client.max_output_tokens == base.ai_max_output_tokens
-
-
-def test_ai_service_rejects_web_search_while_claude_is_active(tmp_path):
-    settings = Settings(environment="test", database_url=f"sqlite:///{tmp_path / 'ai.db'}",
-                        claude_api_key="sk-unit-test", gemini_web_search_enabled=True)
-    with pytest.raises(PermissionError, match="Gemini"):
-        AIService(settings).generate("Câu hỏi", [], allow_external_ai=True,
-                                     data_class="public", use_web_search=True)
 
 
 @pytest.mark.parametrize("text", [
@@ -209,5 +191,5 @@ def test_claude_key_assignments_are_detected(text):
 
 def test_claude_client_blank_model_falls_back_to_default():
     client = ClaudeClient(api_key="sk-test", model="   ")
-    assert client.model == "claude-opus-5"
+    assert client.model == "claude-opus-5-5"
 

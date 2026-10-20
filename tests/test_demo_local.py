@@ -28,8 +28,6 @@ def test_fresh_demo_process_ignores_existing_config_and_cleans_temporary_data(tm
         "DATABASE_URL": f"sqlite:///{sentinel.as_posix()}",
         "APP_ENV": "production", "SECURITY_PROFILE": "high",
         "APP_SECRET_KEY_FILE": str(tmp_path / "must-not-read-secret"),
-        "GOOGLE_GENAI_API_KEY_FILE": str(tmp_path / "must-not-read-provider-key"),
-        "GOOGLE_GENAI_API_KEY": "never-use-or-print-this-provider-secret",
         "CLAUDE_API_KEY_FILE": str(tmp_path / "must-not-read-claude-key"),
         "CLAUDE_API_KEY": "sk-never-use-or-print-this-claude-secret",
         "SELF_BASE_URL": "https://example.invalid/never-use-this-api",
@@ -60,7 +58,6 @@ def test_demo_enforces_offline_settings_and_restores_process_globals(tmp_path, m
     original_ui = (gradio_ui.BASE_URL, gradio_ui.PUBLIC_BASE_URL)
     with demo_application(tmp_path, 8765) as app:
         settings = app.state.settings
-        assert settings.google_genai_api_key == ""
         assert settings.claude_api_key == ""
         assert not settings.redis_url and not settings.audit_worm_endpoint
         assert not settings.password_breach_check

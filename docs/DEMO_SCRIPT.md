@@ -1,7 +1,7 @@
 # Kịch bản demo đồ án SCAP trên máy cá nhân
 
 Demo dùng dữ liệu giả, SQLite tạm và AI ngoại tuyến. Mục tiêu là chứng minh
-kiểm soát bảo mật của ứng dụng bằng thao tác có thể lặp lại. Không cần Gemini
+kiểm soát bảo mật của ứng dụng bằng thao tác có thể lặp lại. Không cần Claude
 API key, Docker, máy chủ, tên miền hoặc kết nối Internet trong buổi trình bày
 sau khi đã cài đủ thư viện.
 
