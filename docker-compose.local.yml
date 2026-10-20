@@ -47,6 +47,10 @@ services:
       SEED_DEMO_DATA: "true"
       # Script vận hành nằm ngoài /app nên cần PYTHONPATH để `import src` chạy.
       PYTHONPATH: /app
+      # GeoIP (tùy chọn): `uv run python -m scripts.update_geoip --dir local_data/geoip`
+      # rồi đặt GEOIP_BACKEND=maxmind trong .env. Tra cứu cục bộ, không gửi IP ra ngoài.
+      GEOIP_BACKEND: ${GEOIP_BACKEND:-disabled}
+      GEOIP_DATABASE_FILE: /run/scap-geoip/geoip-city.mmdb
     # Chỉ bind vào loopback, không phơi ra LAN.
     ports:
       - "127.0.0.1:8000:8000"
@@ -55,6 +59,7 @@ services:
   # CHỈ DÙNG KHI HỌC/DEMO: image production vẫn giữ bất biến.
     volumes:
       - ./scripts:/opt/scap-scripts:ro
+      - ./local_data/geoip:/run/scap-geoip:ro
 
   # ── SỬA LỖI: migrate crash "ModuleNotFoundError: No module named 'src'" ──
   # Dockerfile đặt WORKDIR /app và chạy `python scripts/migrate_database.py`.

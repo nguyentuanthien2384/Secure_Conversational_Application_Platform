@@ -137,7 +137,7 @@ def test_security_overlay_uses_explicit_read_only_non_creating_bind_for_app_only
     app_env = services["app"]["environment"]
     assert app_env["VAPID_PRIVATE_KEY_FILE"] == "/run/scap-security/vapid.pem"
     assert app_env["TWILIO_AUTH_TOKEN_FILE"] == "/run/scap-security/twilio-token"
-    assert app_env["GEOIP_DATABASE_FILE"] == "/run/scap-security/GeoLite2-City.mmdb"
+    assert app_env["GEOIP_DATABASE_FILE"] == "/run/scap-security/geoip-city.mmdb"
     assert (app_env["PUSH_BACKEND"], app_env["SMS_BACKEND"], app_env["GEOIP_BACKEND"]) == ("webpush", "twilio", "maxmind")
     for name in ("migrate", "db", "redis", "caddy"):
         assert all(item["target"] != "/run/scap-security" for item in services[name].get("volumes", []))

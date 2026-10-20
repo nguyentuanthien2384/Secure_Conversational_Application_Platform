@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import math
 import os
 import re
@@ -18,6 +19,7 @@ from src.app.models import AuditEvent
 from src.app.private_storage import read_regular_file
 
 TRAVEL_EVENT = "auth.login.impossible_travel"
+logger = logging.getLogger("secure_chat.geoip")
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,9 @@ class SignInRiskSettings:
     history_hours: int = 24
     min_distance_km: int = 500
     max_speed_kmh: int = 900
+    # Feeds such as DB-IP City Lite publish city coordinates without MaxMind's
+    # accuracy_radius. Assume this uncertainty so a distance stays a lower bound.
+    default_accuracy_km: int = 200
 
     def __post_init__(self):
         if self.backend not in {"disabled", "maxmind"}:
@@ -35,6 +40,7 @@ class SignInRiskSettings:
         for value, low, high in (
             (self.max_database_age_days, 1, 365), (self.history_hours, 1, 168),
             (self.min_distance_km, 100, 20_000), (self.max_speed_kmh, 100, 3_000),
+            (self.default_accuracy_km, 1, 500),
         ):
             if type(value) is not int or not low <= value <= high:
                 raise ValueError("GeoIP risk thresholds are outside their supported bounds.")
@@ -50,6 +56,7 @@ class SignInRiskSettings:
             history_hours=int(os.getenv("GEOIP_HISTORY_HOURS", "24")),
             min_distance_km=int(os.getenv("GEOIP_MIN_DISTANCE_KM", "500")),
             max_speed_kmh=int(os.getenv("GEOIP_MAX_SPEED_KMH", "900")),
+            default_accuracy_km=int(os.getenv("GEOIP_DEFAULT_ACCURACY_KM", "200")),
         )
 
 
@@ -59,6 +66,8 @@ class Location:
     longitude: float
     accuracy_km: float
     country: str
+    # Shown only to the account owner for their own address; never stored.
+    city: str = ""
 
 
 class LocalGeoIp:
@@ -68,6 +77,7 @@ class LocalGeoIp:
         self.settings = settings
         self.reader = None
         self.build_epoch = None
+        self.database_type = ""
         self.available = settings.backend == "disabled"
         if settings.backend == "disabled":
             return
@@ -81,15 +91,19 @@ class LocalGeoIp:
                     raise ValueError("GeoIP database exceeds the memory budget.")
                 self.reader = maxminddb.open_database(source, maxminddb.MODE_FD)
             metadata = self.reader.metadata()
+            if "City" not in metadata.database_type or type(metadata.build_epoch) is not int:
+                raise ValueError("GeoIP database must be a City database.")
             self.build_epoch = metadata.build_epoch
-            age = datetime.now(timezone.utc).timestamp() - metadata.build_epoch
-            if ("City" not in metadata.database_type or age < -86_400
-                    or age > settings.max_database_age_days * 86_400):
-                raise ValueError("GeoIP database must be a recent City database.")
-            self.available = True
+            self.database_type = str(metadata.database_type)[:64]
         except Exception:
             self.close()
             raise RuntimeError("Cannot load a recent local GeoIP City database; check the geoip extra and file.") from None
+        # An outdated feed is reported unavailable, exactly as when it expires
+        # while running: an optional advisory signal must not stop sign-in.
+        self.available = True
+        if not self.check_freshness():
+            logger.warning("GeoIP City database is older than GEOIP_MAX_DATABASE_AGE_DAYS; "
+                           "travel checks are paused until it is updated.")
 
     def close(self):
         if self.reader is not None:
@@ -110,14 +124,18 @@ class LocalGeoIp:
                 return None
             location = document.get("location", {})
             country = document.get("country", {}).get("iso_code", "")
-            coordinates = [location.get(key) for key in ("latitude", "longitude", "accuracy_radius")]
+            coordinates = [location.get("latitude"), location.get("longitude"),
+                           location.get("accuracy_radius", self.settings.default_accuracy_km)]
             if any(type(number) not in (int, float) or not math.isfinite(number) for number in coordinates):
                 return None
             latitude, longitude, accuracy = coordinates
             if (not -90 <= latitude <= 90 or not -180 <= longitude <= 180 or not 0 <= accuracy <= 500
                     or not isinstance(country, str) or not re.fullmatch(r"[A-Z]{2}", country)):
                 return None
-            return Location(latitude, longitude, accuracy, country)
+            city = (document.get("city") or {}).get("names", {}).get("en", "")
+            if not isinstance(city, str) or len(city) > 100 or not city.isprintable():
+                city = ""
+            return Location(latitude, longitude, accuracy, country, city)
         except ValueError:
             return None
         except Exception:
@@ -151,9 +169,33 @@ class SignInRiskService:
     def close(self):
         self.geoip.close()
 
-    def status(self):
-        return {"backend": self.settings.backend, "available": self.geoip.check_freshness(),
-                "action": "alert_only", "external_ip_lookup": False}
+    def status(self, ip: str | None = None) -> dict:
+        """Readiness for the account page; ``ip`` is the caller's own address."""
+        available = self.geoip.check_freshness()
+        result = {"backend": self.settings.backend, "available": available,
+                  "action": "alert_only", "external_ip_lookup": False,
+                  "history_hours": self.settings.history_hours,
+                  "min_distance_km": self.settings.min_distance_km,
+                  "max_speed_kmh": self.settings.max_speed_kmh}
+        if self.geoip.build_epoch is not None:
+            built = datetime.fromtimestamp(self.geoip.build_epoch, timezone.utc)
+            result["database"] = {
+                "type": self.geoip.database_type, "built": built.date().isoformat(),
+                "age_days": max(0, (datetime.now(timezone.utc) - built).days),
+                "max_age_days": self.settings.max_database_age_days,
+            }
+        if ip is not None and self.settings.backend != "disabled":
+            try:
+                public = ipaddress.ip_address(ip).is_global
+            except ValueError:
+                public = False
+            place = self.geoip.lookup(ip) if public and available else None
+            # Coordinates stay server-side; the owner sees an approximate place.
+            result["current"] = (
+                {"resolved": True, "country": place.country, "city": place.city} if place
+                else {"resolved": False, "reason": "unknown" if public else "private"}
+            )
+        return result
 
     def assess(self, db: Session, user_id: str, ip: str, now: datetime) -> dict | None:
         current = self.geoip.lookup(ip)

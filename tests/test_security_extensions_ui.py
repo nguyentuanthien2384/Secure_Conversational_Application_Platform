@@ -263,6 +263,26 @@ def test_geoip_ui_distinguishes_disabled_unavailable_and_advisory(demo, monkeypa
     assert calls == [("A", "GET", "/api/auth/sign-in-risk/status")]
 
 
+def test_geoip_ui_explains_feed_place_rules_and_credits_db_ip():
+    base = {"backend": "maxmind", "available": True, "action": "alert_only",
+            "history_hours": 24, "min_distance_km": 500, "max_speed_kmh": 900,
+            "database": {"type": "DBIP-City-Lite", "built": "2026-10-01", "age_days": 19,
+                         "max_age_days": 90}}
+    text = gradio_ui._geoip_status_markdown(
+        {**base, "current": {"resolved": True, "country": "VN", "city": "Ha*noi"}})
+    assert "DB-IP City Lite, cập nhật 01/10/2026 (19 ngày trước)" in text
+    assert "Ha\\*noi, VN" in text and "không được lưu" in text
+    assert "500 km" in text and "900 km/h" in text and "24 giờ" in text
+    assert "[IP Geolocation by DB-IP](https://db-ip.com)" in text
+    private = gradio_ui._geoip_status_markdown({**base, "current": {"resolved": False, "reason": "private"}})
+    assert "địa chỉ nội bộ" in private
+    maxmind = gradio_ui._geoip_status_markdown(
+        {**base, "database": {**base["database"], "type": "GeoLite2-City"}})
+    assert "GeoLite2\\-City" in maxmind and "DB-IP" not in maxmind  # Markdown-escaped name
+    stale = gradio_ui._geoip_status_markdown({**base, "available": False})
+    assert "chưa khả dụng" in stale and "90 ngày" in stale
+
+
 def test_geoip_ui_reads_real_authenticated_status_without_revealing_lookup_path(demo, http_api):
     token = register_and_login(http_api, "ui-geoip-status")
     status = callback(demo, "load_geoip_status").fn(token)

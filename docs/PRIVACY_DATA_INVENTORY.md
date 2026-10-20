@@ -43,7 +43,9 @@ và thời hạn theo môi trường thật trước production.
 - Provider Push/SMS nhận địa chỉ đích và cảnh báo cố định; SMS xác minh chứa mã
   một lần. Cảnh báo không kèm username, IP, nội dung chat hoặc khóa. Queue và
   provider acceptance không chứng minh đã giao hoặc đã đọc thông báo.
-- GeoIP tùy chọn tra IP đăng nhập trong City MMDB local, không gọi API định vị.
+- GeoIP tùy chọn tra IP đăng nhập trong City MMDB local (DB-IP City Lite, CC BY 4.0, tải
+  về máy chủ hằng tháng), không gọi API định vị. Audit chỉ lưu mã quốc gia và khoảng
+  cách làm tròn; vị trí ước lượng của IP hiện tại chỉ hiển thị cho chính người dùng.
   Audit cảnh báo giữ mã quốc gia, khoảng cách/tốc độ đã làm tròn và thời gian;
   không giữ tọa độ. Vị trí suy ra chỉ là ước lượng và không tự khóa tài khoản.
 

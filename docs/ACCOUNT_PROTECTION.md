@@ -168,7 +168,7 @@ với đúng tài khoản. UI lưu token này trong cookie `scap_device` (HttpOn
 | :--- | :--- |
 | Passkey cho bước xác thực lại (step-up) | Có — UV bắt buộc, challenge 180 giây dùng một lần, gắn đúng tài khoản và JTI; mật khẩu + TOTP vẫn là lựa chọn khác |
 | Thông báo đẩy (push) / SMS | Có — tự nguyện đăng ký, subscription/số điện thoại mã hóa, SMS phải xác minh; mặc định tắt; outbox demo không gửi thật |
-| Đánh giá rủi ro theo vị trí địa lý (impossible travel) | Có — adapter MaxMind City cục bộ, trừ bán kính sai số, chỉ cảnh báo; cần cơ sở dữ liệu mới và extra geoip |
+| Đánh giá rủi ro theo vị trí địa lý (impossible travel) | Có — City MMDB cục bộ (DB-IP City Lite qua `scripts.update_geoip`, hoặc MaxMind), trừ bán kính sai số, chỉ cảnh báo |
 | CSP không `unsafe-inline` | Script đã dùng nonce, chặn inline handler; CSS runtime Gradio vẫn cần allowance riêng |
 
 ## 11. Kiểm chứng

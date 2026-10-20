@@ -323,6 +323,36 @@ def test_configuring_claude_removes_leftover_gemini_settings(project):
     assert vps.check(project) == []
 
 
+def test_geoip_dir_enables_the_read_only_city_database(project):
+    ready(project)
+    before = values(project)
+    changed = vps.configure(project, geoip_dir="/root/scap-security")
+    assert changed == ["GEOIP_BACKEND", "SCAP_SECURITY_FILES_DIR"]
+    assert values(project) == {**before, "GEOIP_BACKEND": "maxmind",
+                               "SCAP_SECURITY_FILES_DIR": "/root/scap-security"}
+    assert vps.check(project) == []
+    assert vps.main(["configure", "--project", str(project), "--geoip-dir", "/srv/scap/geo"]) == 0
+    assert values(project)["SCAP_SECURITY_FILES_DIR"] == "/srv/scap/geo"
+
+
+@pytest.mark.parametrize("folder", ["relative/geo", "/root/../etc", "/root/scap security",
+                                    "C:/geoip", "/root/geo$x", "/"])
+def test_geoip_dir_must_be_an_absolute_plain_server_folder(project, folder):
+    ready(project)
+    with pytest.raises(vps.PreparationError, match="SCAP_SECURITY_FILES_DIR"):
+        vps.configure(project, geoip_dir=folder)
+
+
+@pytest.mark.parametrize("changes,field", [
+    ({"GEOIP_BACKEND": "cloud"}, "GEOIP_BACKEND"),
+    ({"GEOIP_BACKEND": "maxmind", "SCAP_SECURITY_FILES_DIR": ""}, "SCAP_SECURITY_FILES_DIR"),
+])
+def test_check_rejects_unusable_geoip_settings(project, changes, field):
+    ready(project)
+    replace(project, **changes)
+    assert any(issue.startswith(field) for issue in vps.check(project))
+
+
 @pytest.mark.parametrize("value,accepted", [("4096", True), ("4097", False)])
 def test_vps_answer_token_budget_remains_bounded(project, value, accepted):
     ready(project)

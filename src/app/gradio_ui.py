@@ -1613,6 +1613,48 @@ def _chat_history(token, session_id, session=None):
     return [{"role": row["role"], "content": _safe_chat_text(row["content"])} for row in rows]
 
 
+def _geoip_status_markdown(status: dict) -> str:
+    """Explain the sign-in location check; the place shown is the reader's own."""
+    if status.get("backend") == "disabled":
+        return "GeoIP đang tắt. Cần cấu hình cơ sở dữ liệu City cục bộ để đánh giá vị trí."
+    database = status.get("database") or {}
+    kind = str(database.get("type") or "")
+    source = "DB-IP City Lite" if kind.startswith("DBIP") else (_safe_markdown_text(kind) or "City MMDB")
+    try:
+        built = datetime.fromisoformat(str(database.get("built"))).strftime("%d/%m/%Y")
+    except ValueError:
+        built = ""
+    if not status.get("available"):
+        if built:
+            return (f"**GeoIP chưa khả dụng.** Cơ sở dữ liệu {source} (cập nhật {built}) đã quá "
+                    f"{database.get('max_age_days')} ngày hoặc bị lỗi; tạm dừng đánh giá vị trí "
+                    "đăng nhập cho tới khi được cập nhật.")
+        return "GeoIP hiện không khả dụng; chưa thể kết luận về vị trí đăng nhập."
+    lines = [f"**GeoIP đang bật** · {source}" + (
+        f", cập nhật {built} ({database.get('age_days')} ngày trước)." if built else ".")]
+    current = status.get("current") or {}
+    if current.get("resolved"):
+        place = ", ".join(_safe_markdown_text(part) for part in (current.get("city"), current.get("country"))
+                          if part)
+        lines.append(f"Địa chỉ IP hiện tại của bạn được ước lượng ở **{place}**. "
+                     "Vị trí này chỉ hiển thị cho bạn và không được lưu.")
+    elif current.get("reason") == "private":
+        lines.append("Địa chỉ IP hiện tại là địa chỉ nội bộ (máy cá nhân, Docker hoặc mạng LAN) nên "
+                     "không định vị được; trên máy chủ thật hệ thống dùng IP công khai của bạn.")
+    elif current:
+        lines.append("Chưa định vị được địa chỉ IP hiện tại trong cơ sở dữ liệu.")
+    lines.append(
+        f"Mỗi lần đăng nhập thành công được so với các lần đăng nhập trong {status.get('history_hours')} "
+        f"giờ trước. Nếu hai vị trí cách nhau trên {status.get('min_distance_km')} km và tốc độ di chuyển "
+        f"cần thiết vượt {status.get('max_speed_kmh')} km/h, hệ thống ghi **Đăng nhập xa bất thường** vào "
+        "Hoạt động bảo mật và gửi thông báo. Chỉ cảnh báo, không tự khóa tài khoản; VPN hoặc mạng "
+        "di động có thể làm vị trí ước lượng sai."
+    )
+    if kind.startswith("DBIP"):
+        lines.append("Dữ liệu vị trí: [IP Geolocation by DB-IP](https://db-ip.com) (CC BY 4.0).")
+    return "\n\n".join(lines)
+
+
 def _devices_snapshot(token):
     rows = _api(token, "GET", "/api/auth/sessions")
     table = [
@@ -4191,13 +4233,7 @@ def build_ui(
         )
 
         def load_geoip_status(token):
-            status = _api(token, "GET", "/api/auth/sign-in-risk/status")
-            if status.get("backend") == "disabled":
-                return "GeoIP đang tắt. Cần cấu hình cơ sở dữ liệu City cục bộ để đánh giá vị trí."
-            if not status.get("available"):
-                return "GeoIP hiện không khả dụng; chưa thể kết luận về vị trí đăng nhập."
-            return ("GeoIP dùng cơ sở dữ liệu cục bộ. Cảnh báo chỉ dựa trên vị trí IP ước lượng, "
-                    "có thể sai khi dùng VPN và không tự khóa tài khoản.")
+            return _geoip_status_markdown(_api(token, "GET", "/api/auth/sign-in-risk/status"))
 
         btn_geoip_status.click(_guard(load_geoip_status, 1), [st_token], [md_geoip_status], api_name=False)
 

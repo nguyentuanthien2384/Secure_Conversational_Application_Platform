@@ -36,6 +36,16 @@ main() {
     echo "  [!] VPS khong co Python >= 3.10; bo qua kiem tra truoc khi build." >&2
   fi
 
+  # GeoIP bat: tai co so du lieu City (DB-IP Lite, hang thang) khi ban hien tai
+  # da cu hon 25 ngay. Loi mang chi la canh bao neu file cu van con dung duoc.
+  if [ "$({ grep -m1 '^GEOIP_BACKEND=' deploy/.env.vps || true; } | cut -d= -f2-)" = maxmind ]; then
+    geoip_dir=$({ grep -m1 '^SCAP_SECURITY_FILES_DIR=' deploy/.env.vps || true; } | cut -d= -f2-)
+    echo "==> GeoIP: kiem tra co so du lieu vi tri trong $geoip_dir"
+    PYTHONDONTWRITEBYTECODE=1 python3 -m scripts.update_geoip --dir "$geoip_dir" --refresh-after-days 25 \
+      || [ -f "$geoip_dir/geoip-city.mmdb" ] \
+      || die "Chua co co so du lieu GeoIP; kiem tra Internet roi chay lai, hoac dat GEOIP_BACKEND=disabled."
+  fi
+
   echo "==> 4/4 Build image (vai phut; JobFind van chay binh thuong)"
   bash deploy/vps-compose.sh build app
 

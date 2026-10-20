@@ -383,8 +383,11 @@ do owner quản lý, một thiết bị mỗi tài khoản.
 Trong **Tài khoản**, có thể trình bày xác thực lại bằng passkey và đăng ký số
 điện thoại bằng mã SMS trong outbox demo. Dùng `localhost` cho WebAuthn. Màn
 hình trạng thái cho biết kênh đang tắt, outbox hay provider; không mô tả outbox
-là SMS/Push đã giao tới thiết bị. GeoIP chỉ hoạt động khi có City MMDB hợp lệ,
-mới; thiếu database phải hiện chưa khả dụng. Xem
+là SMS/Push đã giao tới thiết bị. GeoIP cần City MMDB hợp lệ, mới
+(`uv run python -m scripts.update_geoip --dir local_data/geoip`); trên máy cá nhân
+IP đăng nhập là địa chỉ nội bộ nên màn hình nói rõ không định vị được, còn trên
+VPS hiện vị trí ước lượng của IP thật. Thiếu hoặc quá hạn database phải hiện
+chưa khả dụng. Xem
 [cấu hình và phạm vi kiểm chứng](SECURITY_EXTENSIONS.md).
 
 **Nói:** “Tôi sử dụng thư viện OpenMLS và kiểm tra vòng đời thành viên bằng

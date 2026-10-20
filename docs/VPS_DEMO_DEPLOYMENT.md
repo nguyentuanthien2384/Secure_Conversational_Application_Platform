@@ -72,7 +72,7 @@ thư mục mới, sao lưu DB và giữ cấu hình/khóa hiện hành trước 
 
 Push/SMS/GeoIP mặc định tắt. Khi dùng provider thật, chuẩn bị file bí mật và
 database GeoIP ngoài bundle, đặt `SCAP_SECURITY_FILES_DIR` để wrapper tự thêm
-overlay chỉ đọc. Xem [hướng dẫn các phần bảo mật bổ sung](SECURITY_EXTENSIONS.md).
+overlay chỉ đọc. Bật GeoIP bằng Termius: mục "Bật GeoIP" bên dưới. Xem [hướng dẫn các phần bảo mật bổ sung](SECURITY_EXTENSIONS.md).
 
 ## Cách nhanh: deploy bằng Termius hoặc `deploy/deploy.ps1`
 
@@ -371,6 +371,34 @@ bash deploy/vps-compose.sh exec -T app /app/.venv/bin/python -c 'import os; prin
 Đổi model sau này chỉ cần `--claude-model <tên>` (không kèm `--claude-key`) rồi
 `bash deploy/vps-compose.sh up -d --no-deps --force-recreate app`. Mỗi câu trả lời
 tính phí theo bảng giá của nhà cung cấp cổng; giới hạn mỗi lần gọi là 25 giây.
+
+#### Bật GeoIP (cảnh báo đăng nhập xa bất thường) trên VPS
+
+Trong **Termius**, tại `/root/scap`:
+
+```bash
+cd /root/scap &&
+git pull --ff-only &&
+python3 -m scripts.prepare_vps configure --project . --geoip-dir /root/scap-security &&
+python3 -m scripts.update_geoip --dir /root/scap-security &&
+bash deploy/update.sh
+```
+
+Lệnh `configure` chỉ đặt `SCAP_SECURITY_FILES_DIR=/root/scap-security` và
+`GEOIP_BACKEND=maxmind`; `update_geoip` tải DB-IP City Lite (~60 MB, giải nén
+~130 MB), kiểm tra rồi mới cài `geoip-city.mmdb`; `update.sh` build và mount thư
+mục đó chỉ đọc vào container. Từ đó mỗi lần `update.sh` tự tải bản mới khi bản
+hiện tại cũ hơn 25 ngày. Để cập nhật cả khi không deploy, thêm cron (`crontab -e`):
+
+```bash
+17 3 * * * cd /root/scap && bash deploy/update-geoip.sh >> /var/log/scap-geoip.log 2>&1
+```
+
+Script chỉ tải khi cần và khởi động lại app (vài giây) khi có bản mới. Kiểm tra
+bằng tài khoản bất kỳ: **Tài khoản → Kiểm tra đánh giá vị trí đăng nhập** phải
+hiện "GeoIP đang bật · DB-IP City Lite" và vị trí ước lượng của IP bạn đang dùng.
+Tắt lại: đặt `GEOIP_BACKEND=disabled` trong `deploy/.env.vps` rồi
+`bash deploy/vps-compose.sh up -d --no-deps --force-recreate app`.
 
 #### Xóa cấu hình Gemini cũ trên VPS
 

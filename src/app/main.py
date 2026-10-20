@@ -3115,8 +3115,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return active
 
     @app.get("/api/auth/sign-in-risk/status")
-    def sign_in_risk_status(user: Annotated[User, Depends(current_user)]):
-        return sign_in_risk.status()
+    def sign_in_risk_status(request: Request, user: Annotated[User, Depends(current_user)]):
+        # The caller sees only the approximate place of their own current
+        # address; nothing about it is stored or logged.
+        return sign_in_risk.status(client_ip(request))
 
     @app.get("/api/auth/security-activity", response_model=SecurityActivityResponse)
     def security_activity(

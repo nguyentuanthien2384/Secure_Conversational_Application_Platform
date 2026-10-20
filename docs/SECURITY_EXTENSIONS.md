@@ -71,32 +71,59 @@ ký lại, tránh khôi phục nhầm kênh cũ.
 
 ## Bật cảnh báo di chuyển bất thường
 
+Mỗi lần đăng nhập thành công, SCAP tra IP trong một cơ sở dữ liệu City MMDB nằm
+ngay trên máy chủ (không gửi IP tới dịch vụ định vị nào) và so với các lần đăng
+nhập thành công trong `GEOIP_HISTORY_HOURS` giờ trước. Nếu hai vị trí cách nhau
+trên `GEOIP_MIN_DISTANCE_KM` và tốc độ di chuyển cần thiết vượt
+`GEOIP_MAX_SPEED_KMH`, hệ thống ghi **Đăng nhập xa bất thường** vào Hoạt động bảo
+mật và gửi thông báo. Chỉ cảnh báo, không tự khóa tài khoản.
+
+**Nguồn dữ liệu mặc định:** DB-IP "IP to City Lite": miễn phí, cập nhật hằng
+tháng, giấy phép CC BY 4.0, không cần tài khoản. Giao diện ghi nguồn "IP
+Geolocation by DB-IP" như giấy phép yêu cầu. Tải và cài (script kiểm tra file
+trước khi thay, chỉ dùng thư viện chuẩn của Python):
+
+```powershell
+uv run python -m scripts.update_geoip --dir local_data/geoip
+```
+
+Muốn dùng MaxMind GeoLite2-City (cần tài khoản và license riêng), tải file
+`.mmdb`/`.mmdb.gz` về rồi cài bằng `--source-file <đường dẫn>`. Cả hai đều theo
+định dạng MaxMind DB nên `GEOIP_BACKEND=maxmind` dùng chung cho mọi nguồn.
+
 ```dotenv
 GEOIP_BACKEND=maxmind
-GEOIP_DATABASE_FILE=local_data/geoip/GeoLite2-City.mmdb
+GEOIP_DATABASE_FILE=local_data/geoip/geoip-city.mmdb
 GEOIP_MAX_DATABASE_AGE_DAYS=90
 GEOIP_HISTORY_HOURS=24
 GEOIP_MIN_DISTANCE_KM=500
 GEOIP_MAX_SPEED_KMH=900
+GEOIP_DEFAULT_ACCURACY_KM=200
 ```
 
-Cung cấp MaxMind City MMDB hợp lệ và mới theo giấy phép của nhà cung cấp.
-Ứng dụng không tải database hoặc gửi IP tới dịch vụ tra cứu bên ngoài. File
-test trong `tests/fixtures/maxmind` là dữ liệu tổng hợp của upstream, không dùng
-làm dữ liệu định vị production. Theo dõi tuổi database và cập nhật bằng quy
-trình của nhà cung cấp, rồi khởi động lại ứng dụng để nạp bản mới.
+Docker local tự mount `local_data/geoip` chỉ đọc vào container
+(`docker-compose.local.yml`), nên chỉ cần đặt `GEOIP_BACKEND=maxmind` trong
+`.env` rồi tạo lại container app. Trên máy cá nhân, IP đăng nhập là địa chỉ nội
+bộ (127.0.0.1, mạng Docker) nên không định vị được; tính năng thực sự đánh giá
+khi chạy trên VPS với IP công khai của người dùng. File test trong
+`tests/fixtures/maxmind` là dữ liệu tổng hợp, không dùng để định vị thật.
 
-So sánh chỉ dùng đăng nhập đã hoàn tất của cùng tài khoản. Khoảng cách trừ bán
-kính sai số của cả hai vị trí; chỉ phát cảnh báo khi vượt cả ngưỡng khoảng cách
-và tốc độ. Không lưu tọa độ vào audit, không tự khóa tài khoản. VPN/mạng di động
-có thể tạo cảnh báo nhầm. Feed thiếu, hỏng hoặc quá hạn hiển thị chưa khả dụng.
-Kiểm tra trạng thái trong **Tài khoản → Hoạt động bảo mật gần đây**.
+Khoảng cách được trừ bán kính sai số của cả hai vị trí. DB-IP không có bán kính
+sai số nên dùng `GEOIP_DEFAULT_ACCURACY_KM` (mặc định 200 km mỗi đầu), để khoảng
+cách luôn là cận dưới. Không lưu tọa độ hay tên thành phố vào audit, chỉ lưu mã
+quốc gia và khoảng cách làm tròn. VPN hoặc mạng di động có thể làm vị trí ước
+lượng sai. App nạp file lúc khởi động; dữ liệu quá `GEOIP_MAX_DATABASE_AGE_DAYS`
+ngày thì tạm dừng đánh giá (báo "chưa khả dụng") chứ không chặn đăng nhập. Kiểm
+tra trong **Tài khoản → Hoạt động bảo mật gần đây → Kiểm tra đánh giá vị trí
+đăng nhập**: hiện nguồn dữ liệu, ngày cập nhật, ngưỡng cảnh báo và vị trí ước
+lượng của chính IP bạn đang dùng (chỉ hiển thị cho bạn, không lưu).
 
 ## Đóng gói cho Docker/VPS
 
 Image app và migration đã chứa SDK cho Push và GeoIP. Đặt các file cần dùng vào
 một thư mục riêng tư đã tồn tại trên máy chủ: `vapid.pem`, `twilio-token`,
-`GeoLite2-City.mmdb`; chỉ cần file tương ứng với kênh được bật. File bí mật phải
+`geoip-city.mmdb`; chỉ cần file tương ứng với kênh được bật. File GeoIP do
+`scripts.update_geoip` tạo với quyền 644 để user `app` trong container đọc được. File bí mật phải
 đọc được bởi UID app trong container và không cấp quyền đọc công khai.
 
 Đặt `SCAP_SECURITY_FILES_DIR` thành đường dẫn tuyệt đối của thư mục đó trong

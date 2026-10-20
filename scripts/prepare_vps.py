@@ -105,6 +105,8 @@ _CLAUDE_DEFAULTS = {
     "CLAUDE_EFFORT_LEVEL": "low",
     "CLAUDE_TIMEOUT_SECONDS": "25",
 }
+# Absolute server folder for read-only provider files (GeoIP database, etc.).
+_SERVER_DIR = re.compile(r"/(?:[A-Za-z0-9_][A-Za-z0-9._-]{0,63}/){0,8}[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
 # Gemini was removed; configuring Claude drops its leftover settings and key.
 _OBSOLETE_GEMINI = re.compile(r"GOOGLE_GENAI_API_KEY(?:_FILE)?|GEMINI_[A-Z0-9_]+")
 _OBSOLETE_GEMINI_COMMENT = "# Legacy Gemini, used only while CLAUDE_API_KEY is empty. Web search needs Gemini."
@@ -241,7 +243,7 @@ def initialize(project: str | Path, *, domain: str = "", email: str = "") -> str
 def configure(project: str | Path, *, domain: str = "", email: str = "",
               images: dict[str, str] | None = None, edge_mode: str = "",
               ai_quality: str = "", claude_model: str = "",
-              claude_api_key: str = "") -> list[str]:
+              claude_api_key: str = "", geoip_dir: str = "") -> list[str]:
     """Fill public deployment fields in the existing private file; secrets stay unchanged.
 
     ``claude_api_key`` is the one secret this command writes, and only when the
@@ -286,6 +288,19 @@ def configure(project: str | Path, *, domain: str = "", email: str = "",
                 budget = 0
             if budget < _CLAUDE_MIN_OUTPUT_TOKENS:
                 replacements["AI_MAX_OUTPUT_TOKENS"] = str(_CLAUDE_MIN_OUTPUT_TOKENS)
+    if geoip_dir:
+        if not _SERVER_DIR.fullmatch(geoip_dir) or ".." in geoip_dir.split("/"):
+            raise PreparationError(
+                "SCAP_SECURITY_FILES_DIR: use an absolute server folder such as /root/scap-security."
+            )
+        # Files created before GeoIP support may lack these keys; add them once.
+        missing = [key for key in ("SCAP_SECURITY_FILES_DIR", "GEOIP_BACKEND") if key not in values]
+        if missing:
+            lines = [*lines, "# GeoIP settings added by prepare_vps configure.",
+                     *(f"{key}=" for key in missing)]
+            values = {**values, **{key: "" for key in missing}}
+        replacements["SCAP_SECURITY_FILES_DIR"] = geoip_dir
+        replacements["GEOIP_BACKEND"] = "maxmind"
     if edge_mode:
         if edge_mode not in _EDGE_MODES:
             raise PreparationError(f"SCAP_EDGE_MODE: use {' or '.join(_EDGE_MODES)}.")
@@ -315,7 +330,7 @@ def configure(project: str | Path, *, domain: str = "", email: str = "",
         replacements[key] = value
     if not replacements:
         raise PreparationError(
-            "Nothing to configure; pass a domain, email, image, edge mode, AI quality or Claude setting."
+            "Nothing to configure; pass a domain, email, image, edge mode, AI quality, Claude or GeoIP setting."
         )
     if not replacements.keys() <= values.keys():
         raise PreparationError("Deployment configuration is missing template fields; recreate it with init.")
@@ -397,6 +412,11 @@ def check(project: str | Path) -> list[str]:
     for key in ("ALLOW_DEMO_AI", "ALLOW_SELF_REGISTRATION"):
         if values.get(key) not in {"true", "false"}:
             issues.append(f"{key}: use true or false.")
+    geoip = values.get("GEOIP_BACKEND", "disabled")
+    if geoip not in {"disabled", "maxmind"}:
+        issues.append("GEOIP_BACKEND: use disabled or maxmind.")
+    elif geoip == "maxmind" and not _SERVER_DIR.fullmatch(values.get("SCAP_SECURITY_FILES_DIR", "")):
+        issues.append("SCAP_SECURITY_FILES_DIR: an absolute server folder is required for GeoIP.")
     if values.get("ALLOW_DEMO_AI") == "false" and not values.get("CLAUDE_API_KEY"):
         issues.append("CLAUDE_API_KEY: required when offline demo AI is disabled.")
     for key, (minimum, maximum) in _LIMITS.items():
@@ -484,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Claude model id offered by the provider, e.g. claude-opus-5-5.")
     update.add_argument("--claude-key", action="store_true",
                         help="Prompt (hidden) for the Claude API key and require real AI.")
+    update.add_argument("--geoip-dir", default="", metavar="DIR",
+                        help="Enable GeoIP with geoip-city.mmdb from this absolute server folder.")
     verify = commands.add_parser("check", help="Check readiness without printing secrets or starting services.")
     verify.add_argument("--project", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
@@ -510,7 +532,8 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
             changed = configure(args.project, domain=args.domain, email=args.email, images=images,
                                 edge_mode=args.edge_mode, ai_quality=args.ai_quality,
-                                claude_model=args.claude_model, claude_api_key=claude_api_key)
+                                claude_model=args.claude_model, claude_api_key=claude_api_key,
+                                geoip_dir=args.geoip_dir)
             note = "other secrets unchanged" if claude_api_key else "secrets unchanged"
             print(f"Updated deploy/.env.vps: {', '.join(changed)}; {note}.")
             return 0

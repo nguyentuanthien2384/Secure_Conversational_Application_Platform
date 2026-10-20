@@ -15,7 +15,13 @@ from src.app import sign_in_risk
 from src.app.audit_chain import verify_chain
 from src.app.db import utcnow
 from src.app.models import AuditEvent, AuthSession, User
-from src.app.sign_in_risk import LocalGeoIp, Location, SignInRiskSettings, conservative_distance_km
+from src.app.sign_in_risk import (
+    LocalGeoIp,
+    Location,
+    SignInRiskService,
+    SignInRiskSettings,
+    conservative_distance_km,
+)
 from tests.conftest import register_and_login
 
 DATABASE = Path(__file__).parent / "fixtures/maxmind/GeoIP2-City-Test.mmdb"
@@ -40,17 +46,26 @@ def real_reader(monkeypatch):
 
 def test_actual_maxmind_fd_reader_and_private_addresses(real_reader):
     location = real_reader.lookup("81.2.69.160")
-    assert location == Location(51.5142, -0.0931, 100, "GB")
+    assert location == Location(51.5142, -0.0931, 100, "GB", "London")
     assert real_reader.lookup("127.0.0.1") is None
     assert real_reader.lookup("192.168.1.1") is None
     assert real_reader.lookup("not-an-address") is None
     assert real_reader.lookup("2001:db8::1") is None
 
 
-def test_bad_or_stale_database_fails_at_startup(tmp_path, monkeypatch):
+def test_missing_or_non_city_database_fails_at_startup(tmp_path):
     pytest.importorskip("maxminddb")
     with pytest.raises(RuntimeError, match="recent local GeoIP"):
         LocalGeoIp(SignInRiskSettings(backend="maxmind", database_file=str(tmp_path / "missing")))
+    not_mmdb = tmp_path / "geoip-city.mmdb"
+    not_mmdb.write_bytes(b"not a MaxMind database" * 100)
+    with pytest.raises(RuntimeError, match="recent local GeoIP"):
+        LocalGeoIp(SignInRiskSettings(backend="maxmind", database_file=str(not_mmdb)))
+
+
+def test_stale_database_at_startup_pauses_checks_instead_of_stopping_sign_in(monkeypatch):
+    """A feed that expires while the app is down behaves like one expiring at runtime."""
+    pytest.importorskip("maxminddb")
     future = datetime.now(timezone.utc) + timedelta(days=1000)
 
     class FutureClock(datetime):
@@ -59,8 +74,42 @@ def test_bad_or_stale_database_fails_at_startup(tmp_path, monkeypatch):
             return future
 
     monkeypatch.setattr(sign_in_risk, "datetime", FutureClock)
-    with pytest.raises(RuntimeError, match="recent local GeoIP"):
-        LocalGeoIp(SignInRiskSettings(backend="maxmind", database_file=str(DATABASE)))
+    service = SignInRiskService(SignInRiskSettings(backend="maxmind", database_file=str(DATABASE)))
+    try:
+        assert service.geoip.lookup("81.2.69.160") is None
+        status = service.status("81.2.69.160")
+        assert status["available"] is False and status["database"]["type"] == "GeoIP2-City"
+        assert status["database"]["age_days"] > 90 and status["current"] == {
+            "resolved": False, "reason": "unknown"}
+    finally:
+        service.close()
+
+
+def test_feed_without_accuracy_radius_uses_the_conservative_default(real_reader, monkeypatch):
+    """DB-IP City Lite has coordinates but no accuracy_radius."""
+    document = {"country": {"iso_code": "VN"}, "city": {"names": {"en": "Hanoi"}},
+                "location": {"latitude": 21.0278, "longitude": 105.834}}
+    monkeypatch.setattr(real_reader, "reader", SimpleNamespace(get=lambda _: document, close=lambda: None))
+    assert real_reader.lookup("113.160.0.1") == Location(21.0278, 105.834, 200, "VN", "Hanoi")
+    wider = LocalGeoIp(SignInRiskSettings())
+    wider.settings = SignInRiskSettings(default_accuracy_km=350)
+    wider.reader = real_reader.reader
+    assert wider.lookup("113.160.0.1").accuracy_km == 350
+
+
+def test_status_reports_feed_and_only_the_callers_approximate_place(real_reader, monkeypatch):
+    service = SignInRiskService(SignInRiskSettings())
+    service.settings = SignInRiskSettings(backend="maxmind", database_file=str(DATABASE))
+    service.geoip = real_reader
+    status = service.status("81.2.69.160")
+    assert status["available"] is True and status["action"] == "alert_only"
+    assert status["database"]["type"] == "GeoIP2-City" and status["database"]["age_days"] == 1
+    assert (status["history_hours"], status["min_distance_km"], status["max_speed_kmh"]) == (24, 500, 900)
+    assert status["current"] == {"resolved": True, "country": "GB", "city": "London"}
+    assert "latitude" not in json.dumps(status) and "51.5" not in json.dumps(status)
+    assert service.status("10.1.2.3")["current"] == {"resolved": False, "reason": "private"}
+    assert service.status("not-an-address")["current"]["reason"] == "private"
+    assert "current" not in SignInRiskService(SignInRiskSettings()).status("81.2.69.160")
 
 
 def test_running_reader_stops_assessing_after_its_feed_expires(real_reader, monkeypatch):
@@ -76,7 +125,8 @@ def test_running_reader_stops_assessing_after_its_feed_expires(real_reader, monk
 
 @pytest.mark.parametrize("change", [{"backend": "cloud"}, {"backend": "maxmind"},
                                    {"min_distance_km": 0}, {"max_speed_kmh": 99},
-                                   {"history_hours": 999}, {"max_database_age_days": 0}])
+                                   {"history_hours": 999}, {"max_database_age_days": 0},
+                                   {"default_accuracy_km": 0}, {"default_accuracy_km": 501}])
 def test_invalid_settings_are_rejected(change):
     with pytest.raises(ValueError):
         SignInRiskSettings(**change)
@@ -163,6 +213,20 @@ def test_unknown_corrupt_feed_is_unavailable_and_status_requires_auth(client, ap
     assert reader.lookup("81.2.69.160") is None and not reader.available
     response = client.get("/api/auth/sign-in-risk/status", headers={"Authorization": "Bearer " + token})
     assert response.status_code == 200 and response.json()["available"] is False
+
+
+def test_status_endpoint_locates_the_callers_own_address(client, app, monkeypatch):
+    service = app.state.sign_in_risk
+    monkeypatch.setattr(service, "settings", replace(service.settings, backend="maxmind",
+                                                     database_file="feed.mmdb"))
+    monkeypatch.setattr(service.geoip, "check_freshness", lambda: True)
+    _install_locations(app, monkeypatch)
+    _set_ip(client, "81.2.69.160")
+    token = register_and_login(client, "travel.where")
+    body = client.get("/api/auth/sign-in-risk/status",
+                      headers={"Authorization": "Bearer " + token}).json()
+    assert body["current"] == {"resolved": True, "country": "GB", "city": ""}
+    assert body["external_ip_lookup"] is False
 
 
 def test_old_location_and_same_ip_do_not_raise_travel(client, app, monkeypatch):
