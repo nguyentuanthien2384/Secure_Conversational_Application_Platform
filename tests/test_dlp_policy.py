@@ -234,6 +234,70 @@ def test_false_positive_corpus_stays_clean(benign: str):
     assert DLPScanner().scan(benign) == ()
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        # From an Express lab handout that was blocked as a whole.
+        "const username = req.body.username\nconst password = req.body.password",
+        'password: process.env.DB_PASSWORD || "",',
+        "secret: process.env.SESSION_SECRET,",
+        "const password = await bcrypt.hash(req.body.password, 10);",
+        "if (user?.password) { password = user?.password; }",
+        "password = request.form['password']",
+        'password = os.getenv("DB_PASSWORD")',
+        "password = getpass()",
+        "apiKey = req.headers['x-api-key']",
+        "access_token = response.data.access_token",
+        "password: string;",
+        "password = None",
+        "password: ${DB_PASSWORD}",
+        'password: "<your-password>"',
+        # This scanner's own output, replayed as conversation history.
+        "const password = [REDACTED:SECRET]; api_key=[REDACTED:API_KEY]",
+        "password: ********",
+        '{"username": "string", "password": "string"}',
+        '"password":{"type":"string","minLength":8}',
+        '<label for="password">Password:</label><input type="password" name="password">',
+        "POSTGRES_PASSWORD_FILE=/run/secrets/db_password",
+        "DB_USER=root\nDB_PASSWORD=\nDB_NAME=express_lab",
+        "const hashedPassword = hashSync(password)",
+    ],
+)
+def test_code_references_to_credentials_are_not_secrets(code: str):
+    decision = DLPScanner().evaluate(code, data_class=DataClass.INTERNAL, confirmed=True)
+    assert decision.findings == ()
+    assert decision.action is DLPAction.ALLOW
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "password: hunter22",
+        "mật khẩu: Abc@12345",
+        "password: `123456`",
+        "password = \"req.body.password\"",
+        "password=Pa(ss)word1",
+        # Synthetic dotted token: segments with inner digits are not identifiers.
+        "access_token=SYNTH3TIC9dotted.t0ken4.n0t7real8value9x",
+        # Quoted JSON / PHP / escaped-JSON keys and other assignment operators.
+        '{"username": "admin", "password": "hunter22"}',
+        "'password' => 'hunter22'",
+        '"raw": "{\\n  \\"password\\": \\"123456\\"\\n}"',
+        'password := "hunter22"',
+        # Env/config names with prefixes.
+        "DB_PASSWORD=hunter22",
+        "export POSTGRES_PASSWORD=hunter22",
+        "JWT_SECRET: my-jwt-signing-secret",
+        "SECRET_KEY=django-insecure-abc123xyz",
+        "AWS_SECRET_ACCESS_KEY=SYNTHETIC/aws/secret/for/dlp/tests/0000",
+        "TELEGRAM_BOT_TOKEN=000000000:SYNTHETIC-test-token-not-real",
+    ],
+)
+def test_literal_credentials_next_to_code_rules_are_still_blocked(payload: str):
+    decision = DLPScanner().evaluate(payload, data_class=DataClass.INTERNAL, confirmed=True)
+    assert decision.action is DLPAction.BLOCK
+
+
 def test_policy_is_configurable_but_must_cover_every_class():
     actions = {item: DLPAction.BLOCK for item in DataClass}
     actions[DataClass.PUBLIC] = DLPAction.ALLOW

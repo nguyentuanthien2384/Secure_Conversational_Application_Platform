@@ -407,6 +407,66 @@ def _valid_tax_id_checksum(value: str) -> bool:
     return int(digits[-1]) == expected
 
 
+# In source code the unquoted right-hand side of ``password = ...`` is usually an
+# expression naming where the credential lives, not the credential itself:
+# ``req.body.password``, ``process.env.DB_PASSWORD``, ``getenv("DB_PASSWORD")``.
+# Treating those as secrets blocked whole lab handouts and codebases.  Segments
+# must read like hand-written identifiers (digits only at the end), so dotted
+# random tokens such as ``SYNTH3TIC9dotted.t0ken4`` are still detected.
+# Quoted literals and plain values like ``password: hunter2`` stay secrets.
+_CODE_WORD = r"[A-Za-z_$][A-Za-z_$]*\d*"
+_CODE_STRING = r"(?:\"[^\"]*\"|'[^']*'|`[^`]*`)"
+_CODE_REFERENCE_RE = re.compile(
+    # Member access, optionally called or indexed: req.body.password,
+    # user?.password, process.env.DB_PASSWORD, bcrypt.hash(password
+    rf"{_CODE_WORD}(?:\??\.{_CODE_WORD})+(?:[(\[].*|[)\]]*)"
+    # One call or index with a simple argument: getpass(), getenv("X"), form['password']
+    rf"|{_CODE_WORD}(?:\((?:{_CODE_WORD}|{_CODE_STRING})?\)|\[(?:{_CODE_WORD}|{_CODE_STRING})\])"
+    r"[)\]]*"
+)
+_PLACEHOLDER_RE = re.compile(
+    r"\$\{[^{}]*\}|\{\{[^{}]*\}\}|<[^<>]+>"
+    # Masked values and this scanner's own output.  A redacted AI answer is
+    # stored and replayed as history (``password = [REDACTED:SECRET]``); seeing
+    # the placeholder as a secret blocked every later turn of the conversation.
+    r"|[*•xX]{3,}|\[REDACTED(?::[A-Z_+]+)?\]"
+)
+_NESTED_OBJECT_RE = re.compile(r"\{\s*[\"']?[\w$-]+[\"']?\s*:")
+_CODE_KEYWORDS = frozenset(
+    {"await", "null", "none", "undefined", "true", "false", "this", "self", "string"}
+)
+
+
+def _is_literal_secret(value: str) -> bool:
+    quoted = value[0] in {'"', "'"}
+    inner = (value[1:-1] if quoted else value).strip()
+    if _PLACEHOLDER_RE.fullmatch(inner) or inner.casefold() in _CODE_KEYWORDS:
+        return False
+    if quoted:
+        return True
+    return not (
+        value.startswith("<")  # markup such as ``Password:</label>``
+        or _NESTED_OBJECT_RE.match(value)  # a schema such as ``"password":{"type":``
+        or _CODE_REFERENCE_RE.fullmatch(value)
+    )
+
+
+# Keys may be bare words, env/config names (``DB_PASSWORD``, ``JWT_SECRET``) or
+# quoted JSON/PHP keys (``"password": ...``, ``'password' => ...``).  The
+# look-behind replaces ``\b`` so ``_``/``-`` prefixes match while camelCase
+# identifiers such as ``hashedPassword`` do not.  Whitespace stays on one line:
+# ``DB_PASSWORD=`` left empty must not swallow the next line as its value.
+_KEY_START = r"(?<![^\W_])"
+_KEY_END = r"\\?[\"']?[ \t]*(?:is|là)?[ \t]*(?::=|=>|[:=])[ \t]*"
+
+
+def _assigned_value(minimum: int) -> str:
+    return (
+        rf"(?P<value>\"(?:\\.|[^\"\\\r\n]){{{minimum},}}\""
+        rf"|'(?:\\.|[^'\\\r\n]){{{minimum},}}'|[^\s,;]{{{minimum},}})"
+    )
+
+
 _FLAGS = re.IGNORECASE | re.UNICODE
 
 _REGEX_RULES: tuple[_RegexRule, ...] = (
@@ -414,12 +474,12 @@ _REGEX_RULES: tuple[_RegexRule, ...] = (
         "secret.assignment",
         FindingType.SECRET,
         re.compile(
-            r"\b(?:password|passwd|passphrase|pwd|mật\s*khẩu|client[_ -]?secret|"
-            r"private[_ -]?secret|secret)\s*(?:is|là)?\s*[:=]\s*"
-            r"(?P<value>\"(?:\\.|[^\"\\\r\n]){4,}\"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;]{4,})",
+            rf"{_KEY_START}(?:password|passwd|passphrase|pwd|mật\s*khẩu|client[_ -]?secret|"
+            rf"private[_ -]?secret|secret){_KEY_END}{_assigned_value(4)}",
             _FLAGS,
         ),
         DataClass.HIGHLY_CONFIDENTIAL,
+        validator=_is_literal_secret,
     ),
     _RegexRule(
         "token.bearer",
@@ -450,14 +510,27 @@ _REGEX_RULES: tuple[_RegexRule, ...] = (
         "api_key.assignment",
         FindingType.API_KEY,
         re.compile(
-            r"\b(?:api[_ -]?key|x-api-key|access[_ -]?token|refresh[_ -]?token|"
-            r"auth[_ -]?token|google[_ -]?(?:genai[_ -]?)?api[_ -]?key|"
-            r"gemini[_ -]?api[_ -]?key|"
-            r"(?:claude|anthropic)[_ -]?(?:api[_ -]?key|auth[_ -]?token))\s*[:=]\s*"
-            r"(?P<value>\"(?:\\.|[^\"\\\r\n]){6,}\"|'(?:\\.|[^'\\\r\n]){6,}'|[^\s,;]{6,})",
+            rf"{_KEY_START}(?:api[_ -]?key|x-api-key|access[_ -]?token|refresh[_ -]?token|"
+            r"auth[_ -]?token|secret[_ -]?(?:access[_ -]?)?key|"
+            r"google[_ -]?(?:genai[_ -]?)?api[_ -]?key|gemini[_ -]?api[_ -]?key|"
+            rf"(?:claude|anthropic)[_ -]?(?:api[_ -]?key|auth[_ -]?token)){_KEY_END}"
+            rf"{_assigned_value(6)}",
             _FLAGS,
         ),
         DataClass.HIGHLY_CONFIDENTIAL,
+        validator=_is_literal_secret,
+    ),
+    _RegexRule(
+        # Upper-case env names only (GITHUB_TOKEN, TELEGRAM_BOT_TOKEN): a bare
+        # lower-case ``token`` is far too common in prose and code.
+        "api_key.env_token",
+        FindingType.API_KEY,
+        re.compile(
+            rf"{_KEY_START}(?-i:(?:[A-Z][A-Z0-9]*_)+TOKEN){_KEY_END}{_assigned_value(6)}",
+            _FLAGS,
+        ),
+        DataClass.HIGHLY_CONFIDENTIAL,
+        validator=_is_literal_secret,
     ),
     _RegexRule(
         "api_key.known_format",
@@ -957,6 +1030,7 @@ class DLPScanner:
         *,
         data_class: DataClass | str = DataClass.PUBLIC,
         confirmed: bool = False,
+        redact_types: Iterable[FindingType] = (),
     ) -> DLPDecision:
         """Apply data classification and return the trust-boundary decision.
 
@@ -964,14 +1038,21 @@ class DLPScanner:
         restrictive.  A client cannot label a private key as ``public`` to
         bypass policy.  Unconfirmed ``confirm`` and all blocked/local-only
         outcomes intentionally return no egress payload.
+
+        ``redact_types`` names finding types that are always removed from the
+        payload instead of raising its class.  It suits discrete credentials in
+        content the user cannot edit, such as an attached file: replacing the
+        value removes all of its confidentiality.  It never lowers the declared
+        class, and every other finding still classifies as usual.
         """
 
         normalized = normalize_text(text)
         spans = self._detect_spans(normalized)
         findings = self._safe_findings(spans)
+        removable = frozenset(redact_types)
         declared = _coerce_data_class(data_class)
         inferred = max(
-            (item.data_class for item in findings),
+            (item.data_class for item in findings if item.finding_type not in removable),
             key=lambda item: _CLASS_RANK[item],
             default=DataClass.PUBLIC,
         )
@@ -982,7 +1063,9 @@ class DLPScanner:
 
         output: str | None = None
         if action is DLPAction.ALLOW:
-            output = normalized
+            output = self._redact_spans(
+                normalized, [item for item in spans if item.finding_type in removable]
+            )
         elif action is DLPAction.REDACT:
             output = self._redact_spans(normalized, spans)
 

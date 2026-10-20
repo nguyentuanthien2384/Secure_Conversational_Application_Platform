@@ -106,3 +106,24 @@ def test_page_parameters_are_bounded(client, app, path, params):
             db.scalar(select(User).where(User.username == "paging-limits")).role = "admin"
             db.commit()
     assert client.get(path, headers=auth(token), params=params).status_code == 422
+
+
+def test_text_search_is_rate_limited_per_account(client, monkeypatch):
+    monkeypatch.setattr("src.app.main.SEARCH_MAX_ATTEMPTS", 3)
+    token = register_and_login(client, "search-heavy")
+    other = register_and_login(client, "search-other")
+    session_id = client.post("/api/sessions", headers=auth(token), json={"title": "s"}).json()["id"]
+    searches = [
+        ("/api/search/messages", {"q": "x"}),
+        ("/api/search/messages/page", {"q": "x"}),
+        (f"/api/sessions/{session_id}/messages/page", {"query": "x"}),
+    ]
+    for path, params in searches:
+        assert client.get(path, headers=auth(token), params=params).status_code == 200
+
+    blocked = client.get(f"/api/sessions/{session_id}/messages", headers=auth(token),
+                         params={"query": "x"})
+    assert blocked.status_code == 429 and int(blocked.headers["Retry-After"]) >= 1
+    # Listing without a query is not a search, and other accounts keep their budget.
+    assert client.get(f"/api/sessions/{session_id}/messages/page", headers=auth(token)).status_code == 200
+    assert client.get("/api/search/messages", headers=auth(other), params={"q": "x"}).status_code == 200

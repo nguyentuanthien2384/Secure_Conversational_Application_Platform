@@ -256,24 +256,72 @@ def _service(settings, response="Safe answer"):
 
 
 @pytest.mark.parametrize("encode", [lambda text: text, _base64, _percent, _entities])
-@pytest.mark.parametrize("in_history", [False, True], ids=["current-prompt", "history"])
-def test_gemini_auth_key_is_blocked_before_provider_egress(settings, encode, in_history):
+def test_gemini_auth_key_is_blocked_before_provider_egress(settings, encode):
     secret = "AQ.AbSYNTHETIC_key_For_DLP_tests_0123456789"
     payload = encode(secret)
     service, provider = _service(settings)
-    history = [{"role": "user", "content": payload}] if in_history else []
 
     with pytest.raises(DLPPolicyViolation) as error:
-        service.generate(
-            "Explain security" if in_history else payload,
-            history,
-            allow_external_ai=True,
-            data_class="public",
-        )
+        service.generate(payload, [], allow_external_ai=True, data_class="public")
 
     assert error.value.action is DLPAction.BLOCK
     assert not provider.calls
     assert secret not in str(error.value) and payload not in str(error.value)
+
+
+@pytest.mark.parametrize("encode", [lambda text: text, _base64, _percent, _entities])
+@pytest.mark.parametrize("source", ["history", "attachment"])
+def test_gemini_auth_key_in_uneditable_content_is_redacted_before_egress(
+    settings, encode, source
+):
+    secret = "AQ.AbSYNTHETIC_key_For_DLP_tests_0123456789"
+    payload = encode(secret)
+    service, provider = _service(settings)
+    in_history = source == "history"
+
+    service.generate(
+        "Explain security",
+        [{"role": "user", "content": f"key {payload} end"}] if in_history else [],
+        allow_external_ai=True,
+        data_class="public",
+        **({} if in_history else {"file_name": "notes.txt", "file_content": f"key {payload} end"}),
+    )
+
+    prompt = provider.calls[0][0]
+    assert "[REDACTED:API_KEY]" in prompt and " end" in prompt
+    assert secret not in prompt and payload not in prompt
+
+
+@pytest.mark.parametrize("source", ["history", "attachment"])
+def test_personal_identifiers_in_uneditable_content_still_block(settings, source):
+    service, provider = _service(settings)
+    content = 'password: "hunter22"\nCCCD 001203004567'
+    in_history = source == "history"
+
+    with pytest.raises(DLPPolicyViolation) as error:
+        service.generate(
+            "Explain",
+            [{"role": "user", "content": content}] if in_history else [],
+            allow_external_ai=True,
+            **({} if in_history else {"file_name": "cv.txt", "file_content": content}),
+        )
+
+    assert error.value.action is DLPAction.BLOCK
+    assert not provider.calls
+
+
+def test_declared_highly_confidential_attachment_still_blocks(settings):
+    service, provider = _service(settings)
+    with pytest.raises(DLPPolicyViolation):
+        service.generate(
+            "Explain",
+            [],
+            allow_external_ai=True,
+            data_class="highly_confidential",
+            file_name="lab.txt",
+            file_content='{"password": "123456"}',
+        )
+    assert not provider.calls
 
 
 @pytest.mark.parametrize("encode", [lambda text: text, _base64, _percent, _entities])
@@ -290,6 +338,25 @@ def test_gemini_auth_key_is_redacted_from_provider_output(settings, encode):
     assert response == "before ;[REDACTED:API_KEY]; after"
     assert labels == ["API key / token"]
     assert secret not in response and payload not in response
+
+
+def test_redacted_credential_in_stored_answer_does_not_block_later_turns(settings):
+    service, provider = _service(
+        settings, 'Ví dụ: const password = "hunter22"; api_key=abcdef123456'
+    )
+    first, labels = service.generate(
+        "Cho ví dụ đăng nhập Express", [], allow_external_ai=True
+    )
+    assert "hunter22" not in first and "abcdef123456" not in first
+    assert set(labels) == {"mật khẩu", "API key / token"}
+
+    # The redacted answer is what gets stored and replayed as history.
+    history = [
+        {"role": "user", "content": "Cho ví dụ đăng nhập Express"},
+        {"role": "assistant", "content": first},
+    ]
+    service.generate("Giải thích tiếp", history, allow_external_ai=True)
+    assert len(provider.calls) == 2
 
 
 def test_demo_sample_redacts_plain_and_encoded_email_before_offline_echo(settings):
@@ -334,15 +401,16 @@ def test_encoded_credential_rejects_before_history_decryption_and_provider_call(
     assert "current-secret" not in str(error.value)
 
 
-def test_encoded_credential_in_history_blocks_provider_call(settings):
+def test_encoded_credential_in_history_is_redacted_before_provider_call(settings):
     service, provider = _service(settings)
-    with pytest.raises(DLPPolicyViolation):
-        service.generate(
-            "Explain this",
-            [{"role": "user", "content": _percent("password:historical-secret")}],
-            allow_external_ai=True,
-        )
-    assert not provider.calls
+    _, labels = service.generate(
+        "Explain this",
+        [{"role": "user", "content": _percent("password:historical-secret")}],
+        allow_external_ai=True,
+    )
+    prompt = provider.calls[0][0]
+    assert "historical-secret" not in prompt and "[REDACTED:SECRET]" in prompt
+    assert "mật khẩu" in labels
 
 
 def test_encoded_pii_is_removed_from_current_prompt_and_history_before_egress(settings):

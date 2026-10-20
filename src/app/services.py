@@ -116,6 +116,22 @@ _DLP_LABELS = {
     FindingType.INSPECTION_LIMIT: "dữ liệu vượt giới hạn kiểm tra",
 }
 
+# Content the user cannot edit before sending (an attached file, and earlier
+# turns replayed as history, which store attachments verbatim) has credentials
+# redacted instead of blocking the request.  A lab handout's sample login body
+# otherwise blocked the whole document and every later turn.  A credential is a
+# discrete value, so removing it removes its confidentiality; personal data and
+# inspection-limit findings still block, and the typed message is unaffected.
+_UNEDITABLE_REDACT_TYPES = frozenset(
+    {
+        FindingType.SECRET,
+        FindingType.API_KEY,
+        FindingType.JWT,
+        FindingType.BEARER_TOKEN,
+        FindingType.PRIVATE_KEY,
+    }
+)
+
 
 # Data-loss-prevention rules applied before any content leaves the trust boundary
 # towards a third-party AI provider.
@@ -313,6 +329,7 @@ class AIService:
                 file_name,
                 data_class=declared_class,
                 confirmed=confirmed,
+                redact_types=_UNEDITABLE_REDACT_TYPES,
             )
             name_decision_labels = [
                 _DLP_LABELS[item.finding_type] for item in name_decision.findings
@@ -327,6 +344,7 @@ class AIService:
                 file_content,
                 data_class=declared_class,
                 confirmed=confirmed,
+                redact_types=_UNEDITABLE_REDACT_TYPES,
             )
             file_decision_labels = [
                 _DLP_LABELS[item.finding_type] for item in file_decision.findings
@@ -353,6 +371,7 @@ class AIService:
                 item["content"],
                 data_class=data_class,
                 confirmed=confirmed,
+                redact_types=_UNEDITABLE_REDACT_TYPES,
             )
             history_labels = [
                 _DLP_LABELS[finding.finding_type] for finding in history_decision.findings

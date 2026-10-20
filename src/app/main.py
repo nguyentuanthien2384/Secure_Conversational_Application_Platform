@@ -195,6 +195,11 @@ bearer = HTTPBearer(auto_error=False)
 INVALID_TOKEN_CHALLENGE = {"WWW-Authenticate": 'Bearer error="invalid_token"'}
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 CSP_DIRECTIVE_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+# Ciphertext cannot be indexed, so a text search decrypts every message it
+# scans: one global search costs CPU for an account's whole history. The UI
+# searches on submit, far below this per-account budget.
+SEARCH_MAX_ATTEMPTS = 30
+SEARCH_WINDOW_SECONDS = 60
 DISABLED_GRADIO_UPLOAD_PATHS = frozenset(
     {"/gradio_api/upload", "/gradio_api/upload_progress"}
 )
@@ -392,6 +397,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     mfa_limiter = limiter_type(*limiter_args)
     password_change_limiter = limiter_type(*limiter_args)
     refresh_limiter = limiter_type(*limiter_args)
+    search_limiter = limiter_type(*limiter_args)
     auth_audit_limiter = limiter_type(*limiter_args)
     recovery_limiter = limiter_type(*limiter_args)
     admission_limiter = (
@@ -1432,6 +1438,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             audit_access_denial(db, request, "privileged_mfa_required", event_type="authorization.denied", actor_id=user.id)
             raise HTTPException(status_code=403, detail="Tài khoản đặc quyền bắt buộc bật MFA.")
         return user
+
+    def throttle_search(db: Session, request: Request, user: User) -> None:
+        allowed, retry_after = search_limiter.allow(
+            f"search:{user.id}", SEARCH_MAX_ATTEMPTS, SEARCH_WINDOW_SECONDS
+        )
+        if not allowed:
+            record_audit(
+                db, request, "chat.message.search", actor_id=user.id,
+                outcome="blocked", details={"reason": "rate_limit"},
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Tìm kiếm quá thường xuyên; vui lòng thử lại sau ít giây.",
+                headers={"Retry-After": str(retry_after)},
+            )
 
     def require_owned_session(
         session_id: str,
@@ -3733,6 +3754,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         query: Annotated[str | None, Query(min_length=1, max_length=120)] = None,
     ):
         row = require_owned_session(session_id, user, db, request)
+        if query is not None:
+            throttle_search(db, request, user)
         try:
             return chat_service.list_messages(db, row, query=query)
         except PermissionError as exc:
@@ -3758,6 +3781,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                               .where(SecureMessage.session_id == row.id)) or 0
             messages = chat_service.list_messages(db, row, limit=limit, offset=offset)
         else:
+            throttle_search(db, request, user)
             messages, total = chat_service.search_message_page(db, row, query=query, offset=offset, limit=limit)
         record_audit(
             db, request, "chat.message.search" if query is not None else "chat.message.list",
@@ -4012,6 +4036,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         Decryption happens server-side per message; results never include other
         users' sessions because the query is scoped to ``owner_id``.
         """
+        throttle_search(db, request, user)
         session_stmt = (
             select(ChatSession)
             .where(ChatSession.owner_id == user.id, retained_session_clause())
@@ -4059,6 +4084,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
     ):
+        throttle_search(db, request, user)
         conditions = [ChatSession.owner_id == user.id, retained_session_clause(),
                       ChatSession.security_mode != "private_e2ee"]
         if settings.security_profile == "high" and not user.mfa_enabled:
