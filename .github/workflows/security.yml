@@ -60,7 +60,7 @@ jobs:
       - run: uv run bandit -r src/app clients -ll -ii -f json -o reports-bandit.json
       - run: uv export --frozen --no-dev --all-extras --no-emit-project --output-file requirements-audit.txt
       - run: uv run pip-audit -r requirements-audit.txt -f json -o reports-pip-audit.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: security-test-reports
@@ -127,7 +127,7 @@ jobs:
         run: uv run --frozen --extra e2ee-client python -m pytest tests/test_mls_client.py tests/test_mls_cli.py --junitxml=reports/native-mls-client.xml
       - name: Rehearse three MLS clients against a separate temporary server
         run: uv run --frozen --extra e2ee-client python -m scripts.demo_mls --check
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-mls-evidence
@@ -156,7 +156,7 @@ jobs:
       - run: uv sync --frozen --group dev --extra e2ee-client
       - name: Verify real Windows ACLs, private setup and encrypted backups
         run: uv run python -m pytest tests/test_private_storage.py tests/test_secret_files.py tests/test_local_storage.py tests/test_mailer_capacity.py tests/test_secure_backup.py tests/test_e2ee_client.py tests/test_e2ee_client_resilience.py tests/test_private_chat_terminal_output.py -q --junitxml=reports/windows-private-storage.xml
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: windows-private-storage
@@ -216,7 +216,7 @@ jobs:
           scan-ref: .
           format: cyclonedx
           output: sbom-source.cdx.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: sbom-source
@@ -269,7 +269,7 @@ jobs:
           image-ref: secure-chat:ci
           format: cyclonedx
           output: sbom-image.cdx.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: sbom-image
@@ -281,7 +281,7 @@ jobs:
         run: |
           docker save --output secure-chat-image.tar secure-chat:ci
           sha256sum secure-chat-image.tar sbom-image.cdx.json > SHA256SUMS
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
           name: secure-chat-supply-chain
