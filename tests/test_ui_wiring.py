@@ -1122,7 +1122,7 @@ def test_chat_file_upload_id_is_claimed_by_its_own_login_and_sent(runtime_demo, 
     )
     _, att_md, clear_btn, notice_md = stage_fn.fn(token, json.dumps({"upload_id": upload_id}))
     assert att_md["visible"] is True
-    assert "tai\_lieu\.txt" in att_md["value"]
+    assert r"tai\_lieu\.txt" in att_md["value"]
     assert "đoạn liên quan" not in att_md["value"]
     assert clear_btn["visible"] is True
     assert notice_md["visible"] is False
@@ -1137,6 +1137,7 @@ def test_chat_file_upload_id_is_claimed_by_its_own_login_and_sent(runtime_demo, 
     assert len(posted_bodies) == 1
     assert posted_bodies[0]["file_name"] == "tai_lieu.txt"
     assert posted_bodies[0]["file_content"] == "Nội dung tài liệu mật."
+    assert posted_bodies[0]["sanitize_external_ai"] is True
     assert "tai_lieu.txt" in posted_bodies[0]["content"]
     assert gradio_ui._get_staged_chat_file(token) is None
 
@@ -1175,7 +1176,7 @@ def test_long_chat_file_sends_only_relevant_excerpts_within_api_limit(runtime_de
     from src.app.chat_files import CHAT_FILES, ChatFile, token_digest
     from src.app.schemas import MAX_CHAT_FILE_CONTENT_CHARS, MessageSend
 
-    filler = "".join(f"Mục {i}: nội dung tham khảo chung về quy trình nội bộ.\n" for i in range(4000))
+    filler = "".join(f"Mục {i}: nội dung tham khảo chung về quy trình nội bộ.\n" for i in range(900))
     needle = "Doanh thu năm 2025 của chi nhánh Đà Nẵng đạt 812 tỷ đồng.\n"
     text = "BÁO CÁO TỔNG HỢP\n" + filler[: len(filler) // 2] + needle + filler[len(filler) // 2:]
     token = "long-file-token"

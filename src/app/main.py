@@ -3935,6 +3935,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     user.ai_data_consent and user.ai_consent_version == settings.ai_consent_version
                 ),
                 confirm_external_ai=payload.confirm_external_ai,
+                sanitize_external_ai=payload.sanitize_external_ai,
                 consent_since=user.ai_consent_at,
                 **file_kwargs,
             )
@@ -3997,6 +3998,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         audit_details: dict[str, object] = {
             "content_length": len(payload.content),
             "dlp_redacted": dlp_redacted,
+            "sanitize_external_ai": payload.sanitize_external_ai,
         }
         if payload.file_content is not None:
             audit_details["has_attachment"] = True
@@ -5566,6 +5568,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         retained_events=settings.gradio_retained_events,
         result_ttl_seconds=settings.gradio_result_ttl_seconds,
         state_capacity=settings.gradio_state_capacity,
+        file_sanitizer=lambda content: chat_service.ai._sanitize_external_projection(content),
     )
     gradio_auth_dependency = None
     if settings.gradio_auth_mode == "oidc":

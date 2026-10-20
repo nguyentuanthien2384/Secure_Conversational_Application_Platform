@@ -123,6 +123,7 @@ def test_send_button_confirms_a_confidential_message_without_a_second_prompt(dem
     outputs = _send(demo, "s9", "Kế hoạch nội bộ")
     assert api.sent == [{
         "content": "Kế hoạch nội bộ", "confirm_external_ai": True,
+        "sanitize_external_ai": True,
     }]
     assert ("PATCH", "/api/auth/ai-consent") not in api.calls
     assert outputs[3] == "" and outputs[4]["visible"] is False and outputs[5] == gr.skip()
@@ -143,6 +144,7 @@ def test_send_without_current_consent_needs_no_confirmation_button(
     assert api.consent is True
     assert api.sent == [{
         "content": "Kế hoạch nội bộ", "confirm_external_ai": True,
+        "sanitize_external_ai": True,
     }]
     assert outputs[3] == "" and outputs[4]["visible"] is False
     assert not any(isinstance(item, gr.Button) and item.value == "Đồng ý và gửi"

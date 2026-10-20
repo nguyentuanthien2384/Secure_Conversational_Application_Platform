@@ -495,6 +495,9 @@ ALLOWED_CHAT_FILE_EXTENSIONS: tuple[str, ...] = (
 class MessageSend(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     confirm_external_ai: bool = False
+    # Explicitly request a sanitized projection; the conversation's stored
+    # classification and encrypted originals remain unchanged.
+    sanitize_external_ai: bool = False
     file_name: str | None = Field(default=None, max_length=MAX_CHAT_FILE_NAME_CHARS)
     file_content: str | None = Field(default=None, max_length=MAX_CHAT_FILE_CONTENT_CHARS)
 

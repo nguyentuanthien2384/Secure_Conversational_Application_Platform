@@ -19,8 +19,9 @@ import re
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -41,9 +42,14 @@ from src.app.chat_files import (
 )
 from src.app.chat_files import error_message as chat_file_error_message
 from src.app.crypto_workbench_ui import WORKBENCH_CSS, WORKBENCH_HTML
+from src.app.dlp import DLPScanner
 from src.app.gradio_capacity import install_gradio_capacity
 from src.app.schemas import ALLOWED_CHAT_FILE_EXTENSIONS, MAX_CHAT_FILE_CONTENT_CHARS
-from src.app.services import EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE
+from src.app.services import (
+    EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE,
+    DLPPolicyViolation,
+    sanitize_external_projection,
+)
 from src.app.ui_session import COOKIE_NAME, BrowserSessionStore, UISessionCapacityError
 
 BASE_URL = os.getenv("SELF_BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
@@ -1388,7 +1394,8 @@ def _session_policy_markdown(token, session_id):
     class_label = _DATA_CLASS_LABELS.get(data_class) or _safe_markdown_text(data_class)
     return (
         f"🔒 **Hội thoại đang chọn:** {mode_label} · {class_label} (không thể đổi)  \n"
-        "Bấm **Gửi** là xác nhận gửi tin nhắn tới AI; DLP vẫn che hoặc chặn dữ liệu nhạy cảm."
+        "Bấm **Gửi** là xác nhận gửi bản đã che dữ liệu nhạy cảm tới AI, gồm tin nhắn, "
+        "tên tệp, nội dung tệp và lịch sử. Nếu không kiểm tra an toàn được, DLP sẽ chặn gửi."
     )
 
 
@@ -1976,6 +1983,7 @@ def build_ui(
     retained_events: int = 128,
     result_ttl_seconds: int = 120,
     state_capacity: int = 256,
+    file_sanitizer: Callable[[str], tuple[str, list[str]]] | None = None,
 ) -> gr.Blocks:
     global _CLIENT_CONTEXT_KEY, _SESSION_STORE
     if any(type(value) is not int or value < 1 for value in (queue_max_size, concurrency_limit)):
@@ -1984,6 +1992,7 @@ def build_ui(
     _SESSION_STORE = session_store
     if client_context_key is not None:
         _CLIENT_CONTEXT_KEY = client_context_key
+    file_sanitizer = file_sanitizer or partial(sanitize_external_projection, DLPScanner())
     if AVATARS is not None:
         # Serve the public avatar file in place. Copied into the cache it was swept
         # by delete_cache below a minute later, after which every chat reply showed
@@ -3656,6 +3665,7 @@ def build_ui(
                         gr.skip(), gr.skip(), gr.skip())
             created_session = False
             consent = gr.skip()
+            file_labels = []
             try:
                 if not session_id:
                     # Never copy plaintext message content into the unencrypted
@@ -3674,11 +3684,25 @@ def build_ui(
                     raise gr.Error(
                         "Phiên Private E2EE chỉ nhận bản mã từ client Double Ratchet/MLS."
                     )
-                payload = {"content": message, "confirm_external_ai": bool(confirm_external)}
+                payload = {
+                    "content": message,
+                    "confirm_external_ai": bool(confirm_external),
+                    "sanitize_external_ai": True,
+                }
                 if staged_file:
                     payload["file_name"] = staged_file.name
-                    # Tài liệu dài: chỉ các đoạn liên quan tới câu hỏi, vừa giới hạn API.
-                    payload["file_content"] = select_file_excerpts(staged_file.text, question)
+                    file_text = staged_file.text
+                    if staged_file.excerpted:
+                        # Quét TRƯỚC khi cắt đoạn: một mật khẩu bị tách khỏi nhãn
+                        # "password:" có thể không còn được nhận diện ở API.
+                        try:
+                            file_text, file_labels = file_sanitizer(file_text)
+                        except DLPPolicyViolation as exc:
+                            raise gr.Error(
+                                "Không thể kiểm tra an toàn toàn bộ nội dung tệp để chọn trích đoạn. "
+                                "Hãy tách tài liệu thành các tệp nhỏ hơn rồi gửi lại."
+                            ) from exc
+                    payload["file_content"] = select_file_excerpts(file_text, question)
                 sent, consent = _post_to_ai(token, f"/api/sessions/{session_id}/messages", payload)
                 _clear_staged_chat_file(token)
             except gr.Error as err:
@@ -3729,13 +3753,13 @@ def build_ui(
                 )
             # Nếu DLP đã che dữ liệu nhạy cảm, nói rõ cho người dùng biết đã che
             # NHÓM nào — không bao giờ hiện lại giá trị gốc.
-            labels = (sent or {}).get("dlp_redacted") or []
+            labels = list(dict.fromkeys(file_labels + ((sent or {}).get("dlp_redacted") or [])))
             if labels:
                 banner = gr.update(
                     value=(
                         "🛡️ **Lớp DLP đã can thiệp.** Trong nội dung dành cho AI hoặc phản hồi AI, "
                         "hệ thống đã che: **" + ", ".join(labels) + "**. "
-                        "Bản gốc vẫn được mã hoá AES-256-GCM và lưu nguyên trong hội thoại của bạn."
+                        "Nội dung trong hội thoại được lưu mã hóa AES-256-GCM."
                     ),
                     visible=True,
                 )
@@ -3753,8 +3777,8 @@ def build_ui(
             # chế độ hội thoại nói rõ điều đó), nên hội thoại Internal/Confidential
             # không còn hỏi lại từng tin, và tài khoản chưa đồng ý cũng không phải
             # xác nhận thêm lần nào (xem _post_to_ai). API vẫn đòi consent và
-            # confirm_external_ai với mọi client; DLP vẫn che dữ liệu nhạy cảm và
-            # chặn Highly confidential.
+            # confirm_external_ai với mọi client. UI yêu cầu chỉ gửi bản đã che;
+            # nhãn Highly confidential và cơ chế lưu mã hóa vẫn được giữ nguyên.
             return _send_chat_message(token, session_id, message, True)
 
         # Tin đang chờ AI trả lời: nội dung và lịch sử trước khi gửi (để hoàn

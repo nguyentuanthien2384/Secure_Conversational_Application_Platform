@@ -136,15 +136,17 @@ Bấm **📎 Đính kèm tệp tài liệu** dưới ô nhập, chọn tệp, r�
 
 - **Định dạng:** văn bản và dữ liệu (`.txt .md .csv .tsv .json .jsonl .xml .yaml .yml .log .ini .toml .cfg .conf .sql .html .css`), mã nguồn (`.py .js .ts .tsx .jsx .sh .bat .ps1 .c .cpp .h .hpp .java .go .rs .rb .php`) Word `.docx` và `.pdf`. Tệp văn bản phải là UTF-8 hoặc UTF-16 có BOM. PDF phải có lớp chữ (chọn/copy được chữ): bản scan/ảnh chụp bị từ chối vì chưa có OCR, PDF đặt mật khẩu mở tệp cũng bị từ chối (PDF chỉ chặn in/sửa vẫn đọc được). Mỗi trang được đánh dấu `[Trang N]` để AI trích dẫn đúng trang.
 - **Dung lượng:** tối đa **10 MB** mỗi tệp. Trình duyệt hiện tiến độ tải lên.
-- **Tài liệu dài:** mỗi tin nhắn gửi AI tối đa 30.000 ký tự từ tài liệu. Tài liệu dài hơn không bị cắt cụt; hệ thống chọn các đoạn liên quan nhất tới câu hỏi (xếp hạng BM25, khớp cả khi gõ không dấu) và luôn giữ đoạn mở đầu. Để trống câu hỏi thì lấy các đoạn rải đều toàn tài liệu. Cả banner lẫn tin nhắn đều ghi rõ đó là trích đoạn, nên hãy hỏi cụ thể (tên mục, từ khóa, số liệu).
-- **Sau khi gửi:** tệp được gỡ khỏi ô soạn tin; phần nội dung đã gửi nằm trong tin nhắn và được mã hóa lưu trữ như mọi tin nhắn. Muốn hỏi phần khác của một tài liệu dài thì đính kèm lại.
+- **Tài liệu dài:** mỗi tin nhắn gửi AI tối đa 30.000 ký tự từ tài liệu. Trước khi chọn trích đoạn, DLP quét và che toàn bộ nội dung nguồn để không tách bí mật khỏi ngữ cảnh nhận diện. Giới hạn kiểm tra là 65.536 ký tự sau chuẩn hóa, cùng các hạn mức giải mã DLP; nếu vượt, hãy tách thành tệp nhỏ hơn. Trong giới hạn này, hệ thống chọn các đoạn liên quan nhất tới câu hỏi (xếp hạng BM25, khớp cả khi gõ không dấu) và luôn giữ đoạn mở đầu. Để trống câu hỏi thì lấy các đoạn rải đều. Hãy hỏi cụ thể (tên mục, từ khóa, số liệu).
+- **Sau khi gửi:** tệp được gỡ khỏi ô soạn tin; phần nội dung đã gửi nằm trong tin nhắn và được mã hóa lưu trữ như mọi tin nhắn. Với tài liệu dài, phần lưu là trích đoạn đã che; tệp gốc chỉ được giữ tạm trong bộ nhớ rồi gỡ. Muốn hỏi phần khác thì đính kèm lại.
 
 Đường đi của tệp:
 
 1. Trình duyệt gửi byte gốc tới `POST /api/ui-session/chat-file`, xác thực bằng cookie phiên HttpOnly và kiểm tra cùng origin.
 2. Máy chủ kiểm tra tên, định dạng, dung lượng, hạn mức (20 tệp/5 phút mỗi phiên, 2 tệp xử lý đồng thời) rồi trích văn bản trong bộ nhớ. `.docx` được đọc mà không mở thực thể XML và có trần giải nén chống zip bomb. `.pdf` được đọc bằng `pypdf` (thuần Python, có trần giải nén mỗi luồng) với trần 2.000 trang, 5 triệu ký tự và 20 giây xử lý. Không có gì được ghi ra đĩa.
 3. Máy chủ trả một mã dùng một lần; chỉ tab có đúng phiên đăng nhập đã chọn tệp mới nhận được nó. Tệp chưa nhận hết hạn sau 10 phút, tệp đã gắn sau 1 giờ.
-4. Khi gửi, nội dung đi qua consent, DLP và audit như tin nhắn thường.
+4. Khi bấm **Gửi**, giao diện yêu cầu gửi **bản đã che** bằng `sanitize_external_ai=true`: DLP che các giá trị nhạy cảm phát hiện được trong câu hỏi, tên tệp, nội dung tệp và lịch sử trước khi gọi AI. Luồng này dùng được cả trong hội thoại `highly_confidential`, giữ nguyên nhãn phân loại và mã hóa dữ liệu lưu trữ; các câu hỏi tiếp theo cũng quét lại lịch sử. Nếu vượt giới hạn kiểm tra hoặc bản đã che chưa ổn định, hệ thống chặn gửi. Private E2EE vẫn không gửi AI ngoài.
+
+API mặc định (`sanitize_external_ai=false`) giữ chính sách chặn `highly_confidential`. Client muốn gửi bản đã che phải yêu cầu rõ cờ này, có consent hiện hành và xác nhận gửi cho hội thoại Confidential/Highly confidential. DLP dựa trên detector (mật khẩu, token, khóa, email, điện thoại, CCCD, mã số thuế, số thẻ, ngữ cảnh sức khỏe và từ điển nội bộ cấu hình), không bảo đảm nhận diện mọi thông tin bí mật viết tự do.
 
 Chỉ đúng route upload được nhận body tới 10 MiB, ở cả middleware lẫn Caddy; mọi route khác vẫn giới hạn 1 MB. Mã nguồn: [chat_files.py](src/app/chat_files.py).
 

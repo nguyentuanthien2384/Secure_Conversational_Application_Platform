@@ -49,6 +49,19 @@ nhấn mạnh xác thực và làm sạch đầu ra model. SCAP mở rộng scan
   phục vụ phát hiện, không chạy code hay gọi dịch vụ ngoài.
 - Giữ chính sách hiện có: secret/private key → block egress; email/từ điển
   confidential → redact; nội dung khai báo confidential vẫn cần xác nhận.
+- Luồng gửi bản đã che (`sanitize_external_ai=true`, được giao diện yêu cầu khi
+  bấm Gửi) che mọi nhóm detector trong câu hỏi, tên/nội dung tệp và lịch sử.
+  Luồng này cho phép gửi bản đã che của hội thoại `highly_confidential` khi có
+  consent và xác nhận; không đổi nhãn hay gửi bản gốc. Kiểm tra lại bản đã che,
+  chặn khi redaction chưa ổn định hoặc có `inspection_limit` ở bất kỳ lượt nào.
+  Private E2EE không được dùng luồng này.
+- Tài liệu dài được quét và che toàn bộ trước khi chọn trích đoạn, tránh làm
+  mất nhãn nhận diện (ví dụ `password:`) ở biên đoạn. Giữ nguyên giới hạn quét
+  65.536 ký tự sau chuẩn hóa; vượt giới hạn thì chặn và yêu cầu tách tệp. Chỉ
+  trích đoạn đã che được lưu trong hội thoại đối với tài liệu dài.
+  Giao diện báo cả danh mục che ở bước này; sự kiện `dlp.redacted` của API chỉ
+  đếm các phát hiện còn nhận diện được tại lớp API, không đếm lại giá trị đã che
+  trước khi chọn trích đoạn.
 - Kiểm tra cả lịch sử đã được phép gửi và phản hồi provider. Quét phản hồi đầy
   đủ trước khi cắt hiển thị 8000 ký tự để không làm mất phần kết thúc private key.
 - Báo cáo chỉ chứa danh mục, detector, số lần và mức phân loại; không chứa mẫu

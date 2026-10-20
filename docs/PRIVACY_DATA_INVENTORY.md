@@ -62,8 +62,15 @@ và thời hạn theo môi trường thật trước production.
 
 ### AI và DLP
 
-- External AI mặc định cần consent có version/timestamp; Private E2EE và dữ liệu
-  `highly_confidential` không được gửi cloud AI.
+- External AI cần consent có version/timestamp; Private E2EE không được gửi
+  cloud AI. API mặc định chặn `highly_confidential`. Khi bấm Gửi, giao diện yêu
+  cầu rõ `sanitize_external_ai=true`: chỉ bản đã che qua DLP của tin nhắn, tên/
+  nội dung tệp và lịch sử được gửi, kể cả trong hội thoại `highly_confidential`;
+  giữ nguyên nhãn và mã hóa lưu trữ. Tệp dài được che toàn bộ trước khi chọn
+  trích đoạn; chỉ trích đoạn đã che được lưu trong hội thoại, tệp gốc ở bộ nhớ
+  tạm có hạn dùng. Luồng này vẫn cần xác nhận, chặn khi vượt
+  giới hạn kiểm tra hoặc bản đã che chưa ổn định. Detector không bảo đảm nhận
+  diện mọi bí mật viết tự do.
 - Khi được phép, message hiện tại và tối đa `AI_HISTORY_MESSAGES` message sau
   thời điểm consent đi qua DLP; mặc định 16, cấu hình trong khoảng 2–40. Secret/
   identifier bị block hoặc redact theo classification. Policy mặc định `2026-10`

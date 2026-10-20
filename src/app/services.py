@@ -133,6 +133,30 @@ _UNEDITABLE_REDACT_TYPES = frozenset(
 )
 
 
+def sanitize_external_projection(scanner: DLPScanner, content: str) -> tuple[str, list[str]]:
+    """Build an explicitly requested redacted copy without changing its class.
+
+    An inspection budget failure is never permission to send an unchecked
+    remainder. A second complete pass also catches sensitive values exposed
+    by replacing an overlapping match. Some contextual detectors recognize
+    their own placeholders, so require stable redaction rather than an empty
+    finding list on that pass.
+    """
+    sanitized, findings = scanner.redact(content)
+    labels = [_DLP_LABELS[item.finding_type] for item in findings]
+    if any(item.finding_type is FindingType.INSPECTION_LIMIT for item in findings):
+        raise DLPPolicyViolation(DLPAction.BLOCK, labels)
+    verified, residual_findings = scanner.redact(sanitized)
+    if verified != sanitized or any(
+        item.finding_type is FindingType.INSPECTION_LIMIT for item in residual_findings
+    ):
+        raise DLPPolicyViolation(
+            DLPAction.BLOCK,
+            labels + [_DLP_LABELS[item.finding_type] for item in residual_findings],
+        )
+    return sanitized, list(dict.fromkeys(labels))
+
+
 # Data-loss-prevention rules applied before any content leaves the trust boundary
 # towards a third-party AI provider.
 #
@@ -264,6 +288,9 @@ class AIService:
         hits = [_DLP_LABELS[item.finding_type] for item in findings]
         return sanitized, list(dict.fromkeys(hits))
 
+    def _sanitize_external_projection(self, content: str) -> tuple[str, list[str]]:
+        return sanitize_external_projection(self.dlp, content)
+
     def generate(
         self,
         current_message: str,
@@ -272,17 +299,23 @@ class AIService:
         allow_external_ai: bool,
         data_class: str = DataClass.INTERNAL.value,
         confirmed: bool = False,
+        sanitize_external_ai: bool = False,
         file_name: str | None = None,
         file_content: str | None = None,
     ) -> tuple[str, list[str]]:
-        sanitized_current_message, redacted_labels = self.redact_with_configured_policy(
-            current_message
+        if sanitize_external_ai and DataClass(data_class) is DataClass.E2EE_PRIVATE:
+            raise DLPPolicyViolation(DLPAction.LOCAL_ONLY, [])
+        redactor = (
+            self._sanitize_external_projection
+            if sanitize_external_ai
+            else self.redact_with_configured_policy
         )
+        sanitized_current_message, redacted_labels = redactor(current_message)
         sanitized_file_name: str | None = None
         sanitized_file_content: str | None = None
         if file_name is not None and file_content is not None:
-            sanitized_file_name, name_labels = self.redact_with_configured_policy(file_name)
-            sanitized_file_content, file_labels = self.redact_with_configured_policy(file_content)
+            sanitized_file_name, name_labels = redactor(file_name)
+            sanitized_file_content, file_labels = redactor(file_content)
             redacted_labels = list(
                 dict.fromkeys(redacted_labels + name_labels + file_labels)
             )
@@ -310,56 +343,63 @@ class AIService:
             raise PermissionError(EXTERNAL_AI_CONSENT_REQUIRED_MESSAGE)
 
         declared_class = DataClass(data_class)
-        if declared_class is DataClass.CONFIDENTIAL and not confirmed:
+        if not confirmed and (
+            declared_class is DataClass.CONFIDENTIAL
+            or (sanitize_external_ai and declared_class is DataClass.HIGHLY_CONFIDENTIAL)
+        ):
             raise DLPPolicyViolation(DLPAction.CONFIRM, [])
 
-        decision = self.dlp.evaluate(
-            current_message,
-            data_class=declared_class,
-            confirmed=confirmed,
-        )
-        decision_labels = [_DLP_LABELS[item.finding_type] for item in decision.findings]
-        if decision.action in {DLPAction.BLOCK, DLPAction.LOCAL_ONLY, DLPAction.CONFIRM}:
-            raise DLPPolicyViolation(decision.action, decision_labels)
-        sanitized_current_message = decision.output_text or ""
-        redacted_labels = list(dict.fromkeys(redacted_labels + decision_labels))
+        # The ordinary API keeps its classification-based blocking semantics.
+        # Explicit sanitized egress uses only the verified copies above; it
+        # neither downgrades the conversation nor sends its original content.
+        if not sanitize_external_ai:
+            decision = self.dlp.evaluate(
+                current_message,
+                data_class=declared_class,
+                confirmed=confirmed,
+            )
+            decision_labels = [_DLP_LABELS[item.finding_type] for item in decision.findings]
+            if decision.action in {DLPAction.BLOCK, DLPAction.LOCAL_ONLY, DLPAction.CONFIRM}:
+                raise DLPPolicyViolation(decision.action, decision_labels)
+            sanitized_current_message = decision.output_text or ""
+            redacted_labels = list(dict.fromkeys(redacted_labels + decision_labels))
 
-        if file_name is not None and file_content is not None:
-            name_decision = self.dlp.evaluate(
-                file_name,
-                data_class=declared_class,
-                confirmed=confirmed,
-                redact_types=_UNEDITABLE_REDACT_TYPES,
-            )
-            name_decision_labels = [
-                _DLP_LABELS[item.finding_type] for item in name_decision.findings
-            ]
-            if name_decision.action in {
-                DLPAction.BLOCK,
-                DLPAction.LOCAL_ONLY,
-                DLPAction.CONFIRM,
-            }:
-                raise DLPPolicyViolation(name_decision.action, name_decision_labels)
-            file_decision = self.dlp.evaluate(
-                file_content,
-                data_class=declared_class,
-                confirmed=confirmed,
-                redact_types=_UNEDITABLE_REDACT_TYPES,
-            )
-            file_decision_labels = [
-                _DLP_LABELS[item.finding_type] for item in file_decision.findings
-            ]
-            if file_decision.action in {
-                DLPAction.BLOCK,
-                DLPAction.LOCAL_ONLY,
-                DLPAction.CONFIRM,
-            }:
-                raise DLPPolicyViolation(file_decision.action, file_decision_labels)
-            sanitized_file_name = name_decision.output_text or ""
-            sanitized_file_content = file_decision.output_text or ""
-            redacted_labels = list(
-                dict.fromkeys(redacted_labels + name_decision_labels + file_decision_labels)
-            )
+            if file_name is not None and file_content is not None:
+                name_decision = self.dlp.evaluate(
+                    file_name,
+                    data_class=declared_class,
+                    confirmed=confirmed,
+                    redact_types=_UNEDITABLE_REDACT_TYPES,
+                )
+                name_decision_labels = [
+                    _DLP_LABELS[item.finding_type] for item in name_decision.findings
+                ]
+                if name_decision.action in {
+                    DLPAction.BLOCK,
+                    DLPAction.LOCAL_ONLY,
+                    DLPAction.CONFIRM,
+                }:
+                    raise DLPPolicyViolation(name_decision.action, name_decision_labels)
+                file_decision = self.dlp.evaluate(
+                    file_content,
+                    data_class=declared_class,
+                    confirmed=confirmed,
+                    redact_types=_UNEDITABLE_REDACT_TYPES,
+                )
+                file_decision_labels = [
+                    _DLP_LABELS[item.finding_type] for item in file_decision.findings
+                ]
+                if file_decision.action in {
+                    DLPAction.BLOCK,
+                    DLPAction.LOCAL_ONLY,
+                    DLPAction.CONFIRM,
+                }:
+                    raise DLPPolicyViolation(file_decision.action, file_decision_labels)
+                sanitized_file_name = name_decision.output_text or ""
+                sanitized_file_content = file_decision.output_text or ""
+                redacted_labels = list(
+                    dict.fromkeys(redacted_labels + name_decision_labels + file_decision_labels)
+                )
 
         # Decrypt/load history only after consent, confirmation, and the current
         # message's DLP decision have all passed. A rejected request therefore
@@ -367,6 +407,13 @@ class AIService:
         history_items = history() if callable(history) else history
         sanitized_history = []
         for item in list(history_items)[-self.settings.ai_history_messages:]:
+            if sanitize_external_ai:
+                sanitized_content, history_labels = self._sanitize_external_projection(
+                    item["content"]
+                )
+                sanitized_history.append({"role": item["role"], "content": sanitized_content})
+                redacted_labels.extend(history_labels)
+                continue
             history_decision = self.dlp.evaluate(
                 item["content"],
                 data_class=data_class,
@@ -704,6 +751,7 @@ class ChatService:
         *,
         allow_external_ai: bool,
         confirm_external_ai: bool = False,
+        sanitize_external_ai: bool = False,
         consent_since: datetime | None = None,
         file_name: str | None = None,
         file_content: str | None = None,
@@ -735,6 +783,7 @@ class ChatService:
                 allow_external_ai=allow_external_ai,
                 data_class=chat_session.data_classification,
                 confirmed=confirm_external_ai,
+                sanitize_external_ai=sanitize_external_ai,
                 **file_kwargs,
             )
         else:
