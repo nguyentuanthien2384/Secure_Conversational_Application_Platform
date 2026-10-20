@@ -1,10 +1,11 @@
-// Local-only DOM controller. No account keys, requests, cookies or web storage.
+// Keys/passwords stay local. Conversation reads use the existing Gradio button;
+// no workbench inputs are submitted, and this script has no network/storage API.
 (() => {
   "use strict";
   const IDLE_MS = 5 * 60 * 1000;
   const FIELDS = ["passphrase", "confirm", "own-public", "own-info", "recipient-public", "recipient-file",
     "recipient-info", "private-file", "plaintext", "context", "packet", "decrypted", "packet-info",
-    "file-input", "file-info", "file-context", "file-result"];
+    "file-input", "file-info", "file-context", "file-result", "source-message", "source-info"];
   const MESSAGES = Object.freeze({
     unsupported: "Trình duyệt cần HTTPS hoặc localhost và hỗ trợ Web Crypto.",
     passphrase: "Dùng mật khẩu sao lưu riêng từ 16 ký tự, tối đa 256 byte UTF-8.",
@@ -54,6 +55,60 @@
       if (recordId && id === String(recordId)) row.setAttribute("data-scap-selected-row", "1");
       else if (typeof row.removeAttribute === "function") row.removeAttribute("data-scap-selected-row");
     }
+  }
+  function renderSourceMessages(item, records) {
+    const select = field(item, "source-message");
+    if (!select || typeof select.replaceChildren !== "function") return;
+    const choices = [];
+    if (!records.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "Chưa nạp nội dung hội thoại";
+      choices.push(option);
+    }
+    for (const record of records) {
+      const option = document.createElement("option");
+      option.value = String(record.id || "");
+      const role = record.role === "user" ? "Người dùng" : record.role === "assistant" ? "Trợ lý" : "Tin nhắn";
+      option.textContent = `#${option.value} · ${role}`;
+      choices.push(option);
+    }
+    select.replaceChildren(...choices);
+  }
+  function clearConversationSource(item, invalidate = false) {
+    if (invalidate) {
+      item.epoch += 1;
+      item.busy = false;
+      buttons(item);
+    }
+    const hadSource = Boolean(item.extractedRecord || item.extractedRecords.length);
+    item.extractedRecord = null;
+    item.extractedRecords = [];
+    clearExtractedFile(item);
+    highlightCipherRow("");
+    renderSourceMessages(item, []);
+    write(item, "source-info", "");
+    if (hadSource) {
+      for (const name of ["plaintext", "context", "packet", "decrypted", "packet-info", "file-context", "file-info", "file-result"]) {
+        write(item, name, "");
+      }
+    }
+  }
+  function requestConversationAfterRestore(item) {
+    const button = document.getElementById("btn-cipher-load");
+    if (!button || button.disabled || typeof button.click !== "function") return false;
+    status(item, "Đã mở khóa. Đang nạp nội dung hội thoại đã chọn để đối chiếu…");
+    button.click();
+    return true;
+  }
+  function textComparison(original, decrypted) {
+    return original === decrypted ? "Đối chiếu: khớp nguyên văn bản gốc." : "Đối chiếu: không khớp văn bản gốc.";
+  }
+  function originalForComparison(item, currentInput) {
+    // Keep the conversation source as the baseline even if its editable copy
+    // changes. A successful crypto roundtrip alone does not prove source equality.
+    const record = item.extractedRecord;
+    return record && !record.packet ? record.content : currentInput;
   }
   function decodeBridgePayload(encoded) {
     if (typeof encoded !== "string" || !encoded || encoded.length > 524288) return null;
@@ -178,6 +233,10 @@
   }
   async function applyExtractedRecord(item, record) {
     if (!item || !record || item.blocked || blocked()) return;
+    // A new selection owns its results; an old encryption must not overwrite it.
+    item.epoch += 1;
+    item.busy = false;
+    buttons(item);
     const id = String(record.id || "");
     const content = typeof record.content === "string" ? record.content : "";
     const context = typeof record.context === "string" ? record.context : "";
@@ -203,6 +262,9 @@
       recipientKeySha256: embedded?.recipientKeySha256 || "",
     };
     highlightCipherRow(id);
+    write(item, "source-message", id);
+    const role = record.role === "user" ? "Người dùng" : record.role === "assistant" ? "Trợ lý" : "Tin nhắn";
+    write(item, "source-info", `Đang đối chiếu tin nhắn #${id} · ${role}. Chọn tin nhắn người dùng để xem nội dung tệp đã trích xuất; phản hồi của trợ lý có thể là bản tóm tắt.`);
     touch(item);
     write(item, "decrypted", "");
     write(item, "file-context", fileContext);
@@ -244,7 +306,7 @@
           const decrypted = await core.decrypt(item.keypair.privateKey, item.keypair.fingerprint, encrypted);
           if (!valid(item, epoch)) return;
           write(item, "decrypted", decrypted);
-          write(item, "packet-info", `Đã tự động đóng gói & giải mã tin nhắn #${id} · Người nhận SHA-256: ${recipient.fingerprint} · Toàn vẹn: hợp lệ.`);
+          write(item, "packet-info", `Đã tự động đóng gói & giải mã tin nhắn #${id} · Người nhận SHA-256: ${recipient.fingerprint} · Toàn vẹn: hợp lệ. ${textComparison(content, decrypted)}`);
         } else {
           write(item, "packet-info", `Đã tự động đóng gói bản mã từ tin nhắn #${id} · Người nhận SHA-256: ${recipient.fingerprint}`);
         }
@@ -299,7 +361,7 @@
       const decrypted = await core.decrypt(item.keypair.privateKey, item.keypair.fingerprint, encrypted);
       if (!valid(item, epoch)) return;
       write(item, "decrypted", decrypted);
-      write(item, "packet-info", `Đã tự động đóng gói & giải mã tin nhắn #${rec.id} · Người nhận SHA-256: ${recipient.fingerprint} · Toàn vẹn: hợp lệ.`);
+      write(item, "packet-info", `Đã tự động đóng gói & giải mã tin nhắn #${rec.id} · Người nhận SHA-256: ${recipient.fingerprint} · Toàn vẹn: hợp lệ. ${textComparison(originalForComparison(item, text), decrypted)}`);
     } else {
       write(item, "packet-info", `Đã tự động đóng gói bản mã từ tin nhắn #${rec.id} · Người nhận SHA-256: ${recipient.fingerprint}`);
     }
@@ -315,6 +377,7 @@
     item.recipient = null;
     item.extractedRecord = null;
     item.extractedRecords = [];
+    renderSourceMessages(item, []);
     clearExtractedFile(item);
     highlightCipherRow("");
     clearTimeout(item.idle);
@@ -356,8 +419,8 @@
         if (!marker) {
           if (state.extractNonce) {
             state.extractNonce = "";
-            state.extractedRecords = [];
-            highlightCipherRow("");
+            clearConversationSource(state, true);
+            status(state, state.keypair ? "Hội thoại đã thay đổi. Khóa vẫn đang mở; bấm Tải bản mã để nạp nội dung mới." : "Chọn hội thoại và tải bản mã để nạp nội dung.");
           }
         } else {
           const nonce = marker.getAttribute?.("data-scap-cipher-nonce") || "";
@@ -365,9 +428,14 @@
           if (nonce && nonce !== state.extractNonce) {
             state.extractNonce = nonce;
             const payload = decodeBridgePayload(encoded);
+            clearConversationSource(state, true);
             state.extractedRecords = payload ? payload.records : [];
+            renderSourceMessages(state, state.extractedRecords);
             const selected = pickDefaultExtractedRecord(state.extractedRecords);
             if (selected) void applyExtractedRecord(state, selected);
+            else if (payload?.status === "no_selection") status(state, (state.keypair ? "Đã mở khóa. " : "") + "Chọn hội thoại ở phía trên rồi bấm Tải bản mã để nạp nội dung đối chiếu.");
+            else if (payload?.status === "empty") status(state, "Hội thoại đã chọn chưa có nội dung để đối chiếu." + (state.keypair ? " Khóa vẫn đang mở." : ""));
+            else status(state, "Chưa nạp được nội dung hội thoại." + (state.keypair ? " Khóa vẫn đang mở;" : "") + " hãy bấm Tải bản mã để thử lại.");
           }
         }
       }
@@ -465,7 +533,9 @@
         }
         if (!valid(item, epoch)) return;
         setPair(item, pair);
-        await syncExtractedAfterKeyReady(item, epoch, core, action === "generate" ? "Đã tạo cặp khóa." : "Đã mở khóa.");
+        if (action !== "restore" || !requestConversationAfterRestore(item)) {
+          await syncExtractedAfterKeyReady(item, epoch, core, action === "generate" ? "Đã tạo cặp khóa." : "Đã mở khóa.");
+        }
       } else if (action === "import-public") {
         item.recipient = null;
         write(item, "recipient-info", "");
@@ -483,17 +553,27 @@
         write(item, "packet", "");
         if (!item.recipient) uiError("no_recipient");
         const recipient = item.recipient;
-        const result = await core.encrypt(recipient, value(item, "plaintext"), value(item, "context"));
+        const original = value(item, "plaintext");
+        const result = await core.encrypt(recipient, original, value(item, "context"));
         if (!valid(item, epoch)) return;
         write(item, "packet", result);
-        write(item, "packet-info", `RSA-OAEP 3072 + AES-256-GCM · Người nhận SHA-256: ${recipient.fingerprint}`);
-        status(item, "Đã mã hóa văn bản.");
+        if (item.keypair && recipient.fingerprint === item.keypair.fingerprint) {
+          const decrypted = await core.decrypt(item.keypair.privateKey, item.keypair.fingerprint, result);
+          if (!valid(item, epoch)) return;
+          write(item, "decrypted", decrypted);
+          write(item, "packet-info", `RSA-OAEP 3072 + AES-256-GCM · Toàn vẹn: hợp lệ. ${textComparison(originalForComparison(item, original), decrypted)}`);
+          status(item, "Đã mã hóa và giải mã để đối chiếu văn bản gốc.");
+        } else {
+          write(item, "packet-info", `RSA-OAEP 3072 + AES-256-GCM · Người nhận SHA-256: ${recipient.fingerprint}`);
+          status(item, "Đã mã hóa văn bản cho người nhận. Cần khóa riêng tương ứng để giải mã.");
+        }
       } else if (action === "decrypt") {
         if (!item.keypair) uiError("no_key");
         const result = await core.decrypt(item.keypair.privateKey, item.keypair.fingerprint, value(item, "packet"));
         if (!valid(item, epoch)) return;
         write(item, "decrypted", result);
-        write(item, "packet-info", "Toàn vẹn: hợp lệ.");
+        const original = originalForComparison(item, value(item, "plaintext"));
+        write(item, "packet-info", "Toàn vẹn: hợp lệ." + (original ? ` ${textComparison(original, result)}` : ""));
         status(item, "Đã giải mã văn bản.");
       } else if (action === "encrypt-file" || action === "decrypt-file") {
         const encrypting = action === "encrypt-file";
@@ -625,6 +705,11 @@
         write(state, "packet-info", "");
         write(state, "file-result", "");
         status(state, "Dữ liệu đã thay đổi. Vui lòng thực hiện lại.");
+      }
+      if (name === "source-message") {
+        const selected = state.extractedRecords.find((record) => String(record.id) === value(state, "source-message"));
+        if (selected) void applyExtractedRecord(state, selected);
+        return;
       }
       if (name === "recipient-public" || name === "recipient-file") {
         state.recipient = null;

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import threading
@@ -22,6 +23,15 @@ from tests.test_ui_feature_completion import callback
 
 ASSET_DIRECTORY = Path(__file__).resolve().parents[1] / "src" / "app" / "ui_assets"
 ASSETS = ("crypto-workbench-core.js", "crypto-workbench.js")
+
+
+def bridge_payload(markup):
+    match = re.fullmatch(
+        r'<span data-scap-cipher-extract="([^"]+)" '
+        r'data-scap-cipher-nonce="([0-9a-f]{16})"></span>', markup,
+    )
+    assert match is not None
+    return json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
 
 
 class Elements(HTMLParser):
@@ -59,8 +69,9 @@ def test_private_workbench_fields_are_native_controls_without_gradio_dependencie
     parser.feed(workbench.value)
     fields = {attrs["data-crypto-field"]: (tag, attrs) for tag, attrs in parser.elements
               if "data-crypto-field" in attrs}
-    assert {"passphrase", "confirm", "private-file", "plaintext", "packet", "decrypted",
+    assert {"passphrase", "confirm", "private-file", "source-message", "plaintext", "packet", "decrypted",
             "file-input", "file-context", "file-info", "file-result"} <= fields.keys()
+    assert fields["source-message"][0] == "select"
     assert fields["passphrase"][1]["type"] == fields["confirm"][1]["type"] == "password"
     assert fields["private-file"][1]["type"] == "file"
     assert fields["decrypted"][1].get("readonly") is None
@@ -72,7 +83,7 @@ def test_private_workbench_fields_are_native_controls_without_gradio_dependencie
         assert not any(name in attrs for name in ("action", "formaction", "src", "name"))
         if tag == "button":
             assert attrs["type"] == "button"
-        if tag in {"input", "textarea"}:
+        if tag in {"input", "textarea", "select"}:
             assert attrs["id"].startswith("cw-")
             assert not any(component.elem_id == attrs["id"] for component in demo.blocks.values())
     for fn in demo.fns.values():
@@ -125,7 +136,8 @@ def test_file_profile_is_fixed_authenticated_encryption_without_raw_aes_key_cont
     assert "RSA-OAEP 3072 / SHA-256" in profile_text
     assert not any(tag in {"input", "textarea", "select", "option", "button"}
                    for tag, _attrs in profile.elements)
-    assert not any(tag in {"select", "option"} for tag, _attrs in parser.elements)
+    selectors = [attrs for tag, attrs in parser.elements if tag == "select"]
+    assert selectors == [{"id": "cw-source-message", "data-crypto-field": "source-message"}]
     assert not any(re.search(r"(?:raw|aes|symmetric)[-_]?key", attrs.get("data-crypto-field", ""))
                    for _tag, attrs in parser.elements)
     text = " ".join(" ".join(parser.text).split())
@@ -191,10 +203,19 @@ def test_crypto_info_callback_uses_only_token_and_selected_session(demo, monkeyp
     assert fn.outputs[0] not in load_cipher.outputs
     button = next(item for item in demo.blocks.values()
                   if isinstance(item, gr.Button) and item.value == "Tải bản mã")
+    assert button.elem_id == "btn-cipher-load"
     dependencies = [item for item in demo.config["dependencies"]
                     if (button._id, "click") in item["targets"]]
     assert {item["id"] for item in dependencies} == {fn._id, load_cipher._id}
     assert next(item for item in dependencies if item["id"] == fn._id)["api_visibility"] == "private"
+    extraction = callback(demo, "extract_cipher_workbench")
+    assert extraction.inputs == load_cipher.inputs
+    assert len(extraction.outputs) == 1
+    assert extraction.outputs[0].elem_id == "cipher-workbench-bridge"
+    chained = next(item for item in demo.config["dependencies"]
+                   if item["id"] == extraction._id)
+    assert chained["trigger_after"] == load_cipher._id
+    assert chained["api_visibility"] == "private"
 
 
 def test_crypto_info_callback_crosses_real_owner_authorization_boundary(demo, client, monkeypatch):
@@ -236,7 +257,7 @@ def test_selection_change_and_logout_clear_metadata_without_touching_local_field
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("callback_name", ["load_cipher", "load_crypto_info"])
+@pytest.mark.parametrize("callback_name", ["load_cipher", "load_crypto_info", "extract_cipher_workbench"])
 def test_slow_cipher_view_cannot_repopulate_after_selecting_another_conversation(
     demo, monkeypatch, callback_name
 ):
@@ -252,6 +273,8 @@ def test_slow_cipher_view_cannot_repopulate_after_selecting_another_conversation
         if callback_name == "load_crypto_info":
             return {"session_id": "fresh-session" if "/fresh-session/" in path else "old-session",
                     "message_counts": {"total": 1}, "integrity_verification": "not_performed"}
+        if path.endswith("/messages"):
+            return [{"id": 1, "content": "fresh-plaintext" if "/fresh-session/" in path else "old-plaintext"}]
         return [{"id": 1, "role": "user", "ciphertext_preview": "fresh-ciphertext" if "/fresh-session/" in path else "old-ciphertext",
                  "nonce": "public-nonce", "crypto_epoch": 1, "encryption_scheme": "envelope-v1",
                  "created_at": "2026-10-18T00:00:00Z"}]
@@ -278,15 +301,22 @@ def test_slow_cipher_view_cannot_repopulate_after_selecting_another_conversation
         assert previous["changed_state_ids"] == []
         fresh = await demo.process_api(fn, [None, "fresh-session", None], state=state)
         assert fresh["data"] != [gr.skip()]
-        assert "fresh-" in str(fresh["data"])
-        assert "old-session" not in str(fresh["data"])
-        assert "old-ciphertext" not in str(fresh["data"])
-        assert len(calls) == 2
+        if callback_name == "extract_cipher_workbench":
+            payload = bridge_payload(fresh["data"][0])
+            assert payload["session_id"] == "fresh-session"
+            assert payload["records"][0]["content"] == "fresh-plaintext"
+            assert "old-" not in json.dumps(payload)
+            assert len(calls) == 4
+        else:
+            assert "fresh-" in str(fresh["data"])
+            assert "old-session" not in str(fresh["data"])
+            assert "old-ciphertext" not in str(fresh["data"])
+            assert len(calls) == 2
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("callback_name", ["load_cipher", "load_crypto_info"])
+@pytest.mark.parametrize("callback_name", ["load_cipher", "load_crypto_info", "extract_cipher_workbench"])
 @pytest.mark.parametrize("new_selection", ["fresh-session", None])
 def test_queued_cipher_view_for_previous_selection_does_not_read_api(
     demo, monkeypatch, callback_name, new_selection
@@ -323,21 +353,26 @@ def test_queued_cipher_view_for_previous_selection_does_not_read_api(
     asyncio.run(scenario())
 
 
-def test_slow_metadata_response_cannot_publish_after_logout(demo, monkeypatch):
+@pytest.mark.parametrize("callback_name", ["load_crypto_info", "extract_cipher_workbench"])
+def test_slow_metadata_response_cannot_publish_after_logout(demo, monkeypatch, callback_name):
     entered, release = threading.Event(), threading.Event()
 
     def api(_token, _method, path, *_args, **_kwargs):
         if path == "/api/auth/logout":
             return {}
-        assert path == "/api/sessions/old-session/crypto-info"
+        assert path.startswith("/api/sessions/old-session/")
         entered.set()
         assert release.wait(15)
+        if callback_name == "extract_cipher_workbench":
+            if path.endswith("/messages"):
+                return [{"id": 1, "content": "PRIVATE OLD PLAINTEXT"}]
+            return [{"id": 1, "ciphertext_preview": "private-ciphertext"}]
         return {"session_id": "old-session", "message_counts": {"total": 99}}
 
     monkeypatch.setattr(gradio_ui, "_api", api)
 
     async def scenario():
-        fn, logout = callback(demo, "load_crypto_info"), callback(demo, "do_logout")
+        fn, logout = callback(demo, callback_name), callback(demo, "do_logout")
         state = SessionState(demo)
         state[fn.inputs[0]._id] = "previous-account"
         state[fn.inputs[1]._id].choices = [("Old", "old-session")]
@@ -356,8 +391,6 @@ def test_slow_metadata_response_cannot_publish_after_logout(demo, monkeypatch):
 
 
 def test_extract_cipher_workbench_builds_bounded_base64_bridge_payload(demo, monkeypatch):
-    import base64
-
     cipher_rows = [
         {
             "id": "5c14f839",
@@ -404,6 +437,7 @@ def test_extract_cipher_workbench_builds_bounded_base64_bridge_payload(demo, mon
     assert match is not None
     payload = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
     assert payload["session_id"] == "sess-1"
+    assert payload["status"] == "ready"
     assert len(payload["records"]) == 2
     assert payload["records"][1]["id"] == "bb8148d7"
     assert payload["records"][1]["content"] == "Nội dung phản hồi"
@@ -411,4 +445,71 @@ def test_extract_cipher_workbench_builds_bounded_base64_bridge_payload(demo, mon
         payload["records"][1]["context"]
         == "session:sess-1|msg:bb8148d7|role:assistant|epoch:1|scheme:envelope-v1"
     )
+
+
+@pytest.mark.parametrize("case,expected,calls_expected", [
+    ("no_selection", "no_selection", 0), ("empty", "empty", 1),
+    ("denied", "unavailable", 1), ("messages_error", "unavailable", 2),
+    ("messages_missing", "unavailable", 2),
+])
+def test_key_restore_reload_receives_explicit_empty_or_unavailable_bridge(
+    demo, monkeypatch, case, expected, calls_expected,
+):
+    calls = []
+
+    def api(_token, _method, path, *_args, **_kwargs):
+        calls.append(path)
+        if case == "denied" or (case == "messages_error" and path.endswith("/messages")):
+            raise gr.Error("PRIVATE API ERROR must not reach the bridge")
+        if case == "empty" or path.endswith("/messages"):
+            return []
+        return [{"id": 139, "ciphertext_preview": "PRIVATE METADATA"}]
+
+    monkeypatch.setattr(gradio_ui, "_api", api)
+    selected = None if case == "no_selection" else "selected-session"
+    fn = callback(demo, "extract_cipher_workbench")
+    markup = fn.fn("authenticated-token", selected, selected)
+    assert bridge_payload(markup) == {
+        "session_id": selected or "", "records": [], "status": expected,
+    }
+    assert len(calls) == calls_expected
+    assert "PRIVATE" not in markup
+    # Every attempt has a new nonce, so an already-open controller can observe
+    # completion even when the selected conversation's result stays empty.
+    assert fn.fn("authenticated-token", selected, selected) != markup
+    calls.clear()
+    assert fn.fn("", selected, selected) == ""
+    assert fn.fn("authenticated-token", "old-session", "new-session") == gr.skip()
+    assert calls == []
+
+
+def test_restore_reload_bridge_reads_complete_owned_conversation_and_denies_another_account(
+    demo, client, app, monkeypatch,
+):
+    monkeypatch.setattr(gradio_ui, "_api_client", lambda: client)
+    monkeypatch.setattr(gradio_ui, "_SESSION_STORE", None)
+    monkeypatch.setattr(gradio_ui, "BASE_URL", "http://testserver")
+    owner = register_and_login(client, "restore-conversation-owner")
+    other = register_and_login(client, "restore-conversation-other")
+    response = client.post("/api/sessions", headers={"Authorization": f"Bearer {owner}"},
+                           json={"title": "Uploaded file conversation"})
+    assert response.status_code == 201
+    session_id = response.json()["id"]
+    original = "Nội dung tệp gốc 🔐\nDòng thứ hai không bị mất."
+    reply = "Phản hồi từ trợ lý: bản tóm tắt riêng."
+    with app.state.database.session_factory() as db:
+        app.state.chat_service.store_message(db, session_id, "user", original)
+        app.state.chat_service.store_message(db, session_id, "assistant", reply)
+        db.commit()
+    fn = callback(demo, "extract_cipher_workbench")
+    payload = bridge_payload(fn.fn(owner, session_id, session_id))
+    assert payload["status"] == "ready"
+    assert [(row["role"], row["content"]) for row in payload["records"]] == [
+        ("user", original), ("assistant", reply),
+    ]
+    assert all(row["context"].startswith(f"session:{session_id}|msg:")
+               for row in payload["records"])
+    denied = bridge_payload(fn.fn(other, session_id, session_id))
+    assert denied == {"session_id": session_id, "records": [], "status": "unavailable"}
+    assert original not in json.dumps(denied, ensure_ascii=False)
 

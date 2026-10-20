@@ -23,7 +23,8 @@ WORKBENCH_HTML = """
       <p data-crypto-field="own-info">Chưa có khóa riêng đang mở.</p>
       <p>Khi xuất khóa phiên tự động, nhập mật khẩu riêng và xác nhận ở hai ô trên.
         Khi mở bản sao JSON, chỉ cần nhập mật khẩu ở ô đầu tiên. Bản sao khóa chỉ chứa khóa,
-        không chứa nội dung cuộc trò chuyện; để kiểm tra nội dung, cần nạp tin nhắn hoặc gói bản mã tương ứng.</p>
+        không chứa nội dung cuộc trò chuyện. Mở khóa thành công sẽ tự nạp nội dung hội thoại đang chọn;
+        bạn cũng có thể dán gói bản mã riêng vào mục 3 để giải mã.</p>
       <label for="cw-own-public">Public key của bạn · SPKI PEM</label>
       <textarea id="cw-own-public" rows="6" readonly spellcheck="false" data-crypto-field="own-public"></textarea>
       <div class="crypto-actions">
@@ -33,6 +34,11 @@ WORKBENCH_HTML = """
     </fieldset>
     <fieldset>
       <legend>2 · Người nhận và văn bản gốc</legend>
+      <label for="cw-source-message">Tin nhắn trong hội thoại để đối chiếu</label>
+      <select id="cw-source-message" data-crypto-field="source-message">
+        <option value="">Chưa nạp nội dung hội thoại</option>
+      </select>
+      <p data-crypto-field="source-info" aria-live="polite"></p>
       <label for="cw-recipient-public">Public key người nhận · SPKI PEM</label>
       <textarea id="cw-recipient-public" rows="6" maxlength="8192" spellcheck="false"
                 data-crypto-field="recipient-public"></textarea>
@@ -55,7 +61,7 @@ WORKBENCH_HTML = """
               autocomplete="off" data-crypto-field="packet"></textarea>
     <div class="crypto-actions"><button type="button" data-crypto-action="decrypt">Giải mã bằng khóa của bạn</button></div>
     <p data-crypto-field="packet-info"></p>
-    <label for="cw-decrypted">Văn bản đã giải mã</label>
+    <label for="cw-decrypted">Văn bản đã giải mã để đối chiếu với bản gốc</label>
     <textarea id="cw-decrypted" rows="6" readonly spellcheck="false" data-crypto-field="decrypted"></textarea>
   </fieldset>
   <fieldset>
@@ -90,7 +96,7 @@ WORKBENCH_CSS = """
 .crypto-workbench fieldset { min-width:0; border:1px solid #cbd5e1; border-radius:10px; padding:16px; margin:12px 0; }
 .crypto-workbench legend { font-weight:700; padding:0 6px; }
 .crypto-workbench label { display:block; font-weight:600; margin:12px 0 5px; }
-.crypto-workbench textarea,.crypto-workbench input { box-sizing:border-box; width:100%; max-width:100%; padding:10px; border:1px solid #94a3b8; border-radius:7px; color:inherit; background:var(--input-background-fill,#fff); }
+.crypto-workbench textarea,.crypto-workbench input,.crypto-workbench select { box-sizing:border-box; width:100%; max-width:100%; padding:10px; border:1px solid #94a3b8; border-radius:7px; color:inherit; background:var(--input-background-fill,#fff); }
 .crypto-workbench textarea { font-family:ui-monospace,monospace; overflow-wrap:anywhere; resize:vertical; }
 .crypto-workbench input[type=file] { font-size:14px; }
 .crypto-workbench p { overflow-wrap:anywhere; }
@@ -101,7 +107,7 @@ WORKBENCH_CSS = """
 .crypto-workbench .crypto-profile dd { margin:4px 0 0; }
 .crypto-workbench [data-crypto-field=file-result] { white-space:pre-wrap; }
 .crypto-workbench button { cursor:pointer; padding:10px 14px; min-height:44px; border:1px solid #64748b; border-radius:7px; font:inherit; color:inherit; background:var(--button-secondary-background-fill,#f1f5f9); }
-.crypto-workbench button:focus-visible,.crypto-workbench input:focus-visible,.crypto-workbench textarea:focus-visible { outline:3px solid #2563eb; outline-offset:2px; }
+.crypto-workbench button:focus-visible,.crypto-workbench input:focus-visible,.crypto-workbench textarea:focus-visible,.crypto-workbench select:focus-visible { outline:3px solid #2563eb; outline-offset:2px; }
 .crypto-workbench button:disabled { cursor:wait; opacity:.6; }
 .crypto-workbench [data-crypto-field=status] { font-weight:600; min-height:24px; }
 #cipher-table tbody tr { cursor:pointer; transition:background-color .15s ease; }

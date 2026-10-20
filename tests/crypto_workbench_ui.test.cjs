@@ -14,7 +14,7 @@ const pair = (name = "alice") => ({privateKey: {type: "private", extractable: fa
 
 function browser(options = {}) {
   const calls = {create: [], restore: [], reencrypt: [], import: [], encrypt: [], decrypt: [], encryptFile: [], decryptFile: [], clipboard: [], downloads: [],
-    revoked: [], network: 0, persistence: 0};
+    revoked: [], contextLoads: [], network: 0, persistence: 0};
   const events = new Map();
   const windowEvents = new Map();
   const timers = new Map();
@@ -29,6 +29,7 @@ function browser(options = {}) {
       this.disabled = false;
       this.isConnected = true;
       this.files = [];
+      this.children = [];
       if (input) {
         let contents = "";
         Object.defineProperty(this, "value", {get: () => contents, set: (value) => {
@@ -40,6 +41,8 @@ function browser(options = {}) {
     getAttribute(name) { return this.attributes[name] ?? null; }
     setAttribute(name, val) { this.attributes[name] = String(val); }
     removeAttribute(name) { delete this.attributes[name]; }
+    append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = [...nodes]; }
     closest(selector) {
       if (selector === "[data-crypto-action]") return this.attributes["data-crypto-action"] ? this : null;
       if (selector === "#btn-logout, #btn-logout-all") return this.logout ? this : null;
@@ -53,8 +56,8 @@ function browser(options = {}) {
     root.fields = new Map();
     for (const name of ["status", "passphrase", "confirm", "own-public", "own-info", "recipient-public", "recipient-file",
       "recipient-info", "private-file", "plaintext", "context", "packet", "decrypted", "packet-info",
-      "file-input", "file-info", "file-context", "file-result"]) {
-      root.fields.set(name, new Element({"data-crypto-field": name}, !["status", "own-info", "recipient-info", "packet-info", "file-info", "file-result"].includes(name)));
+      "file-input", "file-info", "file-context", "file-result", "source-message", "source-info"]) {
+      root.fields.set(name, new Element({"data-crypto-field": name}, !["status", "own-info", "recipient-info", "packet-info", "file-info", "file-result", "source-info"].includes(name)));
     }
     root.buttons = new Map(["generate", "restore", "export-private", "export-public", "copy-public", "import-public", "encrypt", "decrypt", "encrypt-file", "decrypt-file", "clear"]
       .map((name) => [name, new Element({"data-crypto-action": name})]));
@@ -73,6 +76,10 @@ function browser(options = {}) {
     querySelectorAll(selector) { return selector === "tbody tr" ? [...cipherRows.values()] : []; },
     contains(node) { return [...cipherRows.values()].includes(node); },
   };
+  const contextLoadButton = options.loadConversation ? {
+    disabled: false,
+    click(...args) { calls.contextLoads.push(args); options.loadConversation(...args); },
+  } : null;
   const core = {
     limits: {fileBytes: 5242880, fileContainerBytes: 5246380},
     async createKeyPair(...args) { calls.create.push(args); return options.create ? options.create(...args) : pair(); },
@@ -97,6 +104,7 @@ function browser(options = {}) {
       if (id === "app-sec") return app;
       if (id === "cipher-workbench-bridge") return bridgeRoot;
       if (id === "cipher-table") return cipherTable;
+      if (id === "btn-cipher-load") return contextLoadButton;
       return null;
     },
     querySelector(selector) {
@@ -105,6 +113,7 @@ function browser(options = {}) {
       throw new Error(`Unexpected selector: ${selector}`);
     },
     createElement(tag) {
+      if (tag === "option") return new Element({}, true);
       assert.equal(tag, "a");
       return {click() { calls.downloads.push({url: this.href, filename: this.download, blob: blobs.get(this.href)}); }, remove() {}};
     },
@@ -129,7 +138,7 @@ function browser(options = {}) {
     for (const callback of events.get(name) || []) callback({type: name, target, preventDefault() {}});
   }
   return {
-    calls, app, document, core, timers, cipherRows,
+    calls, app, document, core, timers, cipherRows, contextLoadButton,
     field(name) { return root.fields.get(name); },
     button(name) { return root.buttons.get(name); },
     async click(name) { dispatch("click", root.buttons.get(name)); await flush(); },
@@ -145,7 +154,8 @@ function browser(options = {}) {
     detach() { root.isConnected = false; observer(); },
     replace() { const old = root; old.isConnected = false; root = makeRoot(); observer(); return old; },
     idle() { const timer = [...timers.values()].find((item) => item.duration === 300000); assert.ok(timer); timer.callback(); },
-    async extractCipher(records, nonce = "nonce-1") {
+    removeBridge() { bridgeMarker = null; observer(); },
+    async extractCipher(records, nonce = "nonce-1", status, sessionId = "sess-1") {
       cipherRows.clear();
       for (const rec of records) {
         const cell = new Element();
@@ -155,7 +165,9 @@ function browser(options = {}) {
         tr.querySelector = (sel) => sel === "td" ? cell : null;
         cipherRows.set(String(rec.id), tr);
       }
-      const encoded = Buffer.from(JSON.stringify({session_id: "sess-1", records}), "utf8").toString("base64");
+      const payload = {session_id: sessionId, records};
+      if (status !== undefined) payload.status = status;
+      const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
       bridgeMarker = new Element({"data-scap-cipher-extract": encoded, "data-scap-cipher-nonce": nonce});
       observer();
       await flush();
@@ -1084,6 +1096,241 @@ test("real automatic key export restores in a fresh controller and decrypts the 
   assert.equal(fresh.calls.create.length, 0);
   assert.equal(b.calls.network + fresh.calls.network, 0);
   assert.equal(b.calls.persistence + fresh.calls.persistence, 0);
+});
+
+async function restoreSyntheticKey(b) {
+  b.file("private-file", {size: 100, async text() { return pair().encryptedBackup; }});
+  b.field("passphrase").value = "Synthetic restore passphrase 2026";
+  await b.click("restore");
+}
+
+function conversationRecord(id = "source-message", content = "Nội dung tệp được lưu trong hội thoại.") {
+  return {id, role: "user", content,
+    context: `session:sess-1|msg:${id}|role:user|epoch:1|scheme:envelope-v1`};
+}
+
+function matchingTextHooks() {
+  return {
+    encrypt: (_recipient, text, context) => JSON.stringify({ciphertext: text, context}),
+    decrypt: (_key, _fingerprint, packet) => JSON.parse(packet).ciphertext,
+  };
+}
+
+test("restoring a key requests selected conversation data without transmitting local key fields", async () => {
+  const b = browser({
+    ...matchingTextHooks(),
+    loadConversation(...args) { assert.deepEqual(args, []); },
+  });
+  await restoreSyntheticKey(b);
+  assert.equal(b.field("own-public").value, "PUBLIC PEM alice");
+  assert.equal(b.calls.create.length, 0);
+  assert.deepEqual(b.calls.contextLoads, [[]]);
+  assert.equal(b.field("passphrase").value, "");
+  assert.equal(b.field("confirm").value, "");
+  assert.match(b.field("status").textContent, /Đã mở khóa.*[Đđ]ang nạp/);
+  const record = conversationRecord();
+  await b.extractCipher([record], "fresh-restore-reply", "ready");
+  assert.equal(b.field("plaintext").value, record.content);
+  assert.equal(b.field("context").value, record.context);
+  assert.equal(JSON.parse(b.field("packet").value).ciphertext, record.content);
+  assert.equal(b.field("decrypted").value, record.content);
+  assert.equal(b.field("own-public").value, "PUBLIC PEM alice");
+  assert.equal(b.calls.encrypt[0][0].fingerprint, pair().fingerprint);
+  assert.equal(b.calls.create.length, 0);
+  assert.equal(b.calls.network, 0);
+  assert.equal(b.calls.persistence, 0);
+});
+
+test("a failed key restore does not request conversation data or expose the failed password", async () => {
+  const b = browser({
+    restore() { throw {code: "backup"}; },
+    loadConversation() { assert.fail("Only an opened key may trigger the selected conversation loader"); },
+  });
+  await restoreSyntheticKey(b);
+  assert.equal(b.calls.contextLoads.length, 0);
+  assert.equal(b.field("own-public").value, "");
+  assert.match(b.field("status").textContent, /mật khẩu sai/);
+  assert.equal(b.field("status").textContent.includes("Synthetic"), false);
+});
+
+for (const reply of ["no_selection", "empty", "unavailable"]) {
+  test(`restoration finishes with clear ${reply} feedback when conversation data is absent`, async () => {
+    const b = browser({loadConversation() {}});
+    await restoreSyntheticKey(b);
+    assert.equal(b.calls.contextLoads.length, 1);
+    await b.extractCipher([], `restore-${reply}`, reply);
+    assert.equal(b.field("own-public").value, "PUBLIC PEM alice");
+    assert.equal(b.field("plaintext").value, "");
+    assert.equal(b.field("packet").value, "");
+    assert.equal(b.field("decrypted").value, "");
+    assert.equal(b.calls.encrypt.length, 0);
+    assert.doesNotMatch(b.field("status").textContent, /[Đđ]ang nạp/);
+    assert.match(b.field("status").textContent, reply === "no_selection"
+      ? /chọn.*hội thoại/i : reply === "empty" ? /chưa có|không có|trống/i : /chưa.*nạp|không.*nạp|khả dụng|thử lại/i);
+  });
+}
+
+test("an absent conversation selection does not erase independently entered text after opening a backup", async () => {
+  const b = browser({loadConversation() {}});
+  b.field("plaintext").value = "Manually entered text has no saved conversation source.";
+  b.field("context").value = "manual-public-context";
+  await restoreSyntheticKey(b);
+  await b.extractCipher([], "no-selected-conversation", "no_selection");
+  assert.equal(b.field("plaintext").value, "Manually entered text has no saved conversation source.");
+  assert.equal(b.field("context").value, "manual-public-context");
+  assert.equal(b.field("own-public").value, "PUBLIC PEM alice");
+});
+
+test("restoration after a hidden-page clear reloads data with the restored identity instead of a new automatic key", async () => {
+  const b = browser({...matchingTextHooks(), loadConversation() {}, restore: () => pair("bob")});
+  await b.extractCipher([conversationRecord("before-hide")], "old-bridge");
+  assert.equal(b.calls.create.length, 1);
+  b.hide();
+  b.show();
+  assert.equal(b.field("own-public").value, "");
+  assert.equal(b.field("plaintext").value, "");
+  await restoreSyntheticKey(b);
+  assert.equal(b.calls.contextLoads.length, 1);
+  assert.equal(b.field("own-public").value, "PUBLIC PEM bob");
+  const record = conversationRecord("after-restore", "Nội dung được nạp lại sau khi mở khóa.");
+  await b.extractCipher([record], "fresh-after-restore", "ready");
+  assert.equal(b.field("plaintext").value, record.content);
+  assert.equal(b.field("decrypted").value, record.content);
+  assert.equal(b.calls.create.length, 1);
+  assert.equal(b.calls.encrypt.at(-1)[0].fingerprint, pair("bob").fingerprint);
+});
+
+test("removing conversation data invalidates pending ciphertext and clears source fields without closing the key", async () => {
+  const pending = deferred();
+  let encryptions = 0;
+  const b = browser({
+    ...matchingTextHooks(),
+    encrypt(_recipient, text, context) {
+      return ++encryptions === 2 ? pending.promise : JSON.stringify({ciphertext: text, context});
+    },
+  });
+  await b.generate();
+  await b.extractCipher([conversationRecord("old-message", "OLD CONVERSATION CONTENT")], "old-data");
+  assert.equal(b.field("decrypted").value, "OLD CONVERSATION CONTENT");
+  await b.click("encrypt");
+  b.removeBridge();
+  for (const name of ["plaintext", "context", "packet", "decrypted", "file-context"]) {
+    assert.equal(b.field(name).value, "", name);
+  }
+  assert.equal(b.field("own-public").value, "PUBLIC PEM alice");
+  pending.resolve(JSON.stringify({ciphertext: "STALE OLD CONVERSATION"}));
+  await flush();
+  assert.equal(b.field("packet").value, "");
+  assert.equal(b.field("decrypted").value, "");
+  const record = conversationRecord("new-message", "NEW CONVERSATION CONTENT");
+  await b.extractCipher([record], "new-data", "ready", "other-session");
+  assert.equal(b.field("plaintext").value, record.content);
+  assert.equal(b.field("decrypted").value, record.content);
+  assert.equal(b.calls.create.length, 1);
+});
+
+test("a new conversation bridge cancels earlier asynchronous extraction before publishing its plaintext", async () => {
+  const pending = deferred();
+  let encryptions = 0;
+  const b = browser({
+    ...matchingTextHooks(),
+    encrypt(_recipient, text, context) {
+      return ++encryptions === 1 ? pending.promise : JSON.stringify({ciphertext: text, context});
+    },
+  });
+  await b.generate();
+  await b.extractCipher([conversationRecord("previous-message", "OLD ACCOUNT CONVERSATION")], "previous-data");
+  const current = conversationRecord("current-message", "CURRENT CONVERSATION");
+  await b.extractCipher([current], "current-data", "ready", "other-session");
+  pending.resolve(JSON.stringify({ciphertext: "OLD ACCOUNT CONVERSATION"}));
+  await flush();
+  assert.equal(b.field("plaintext").value, current.content);
+  assert.equal(b.field("decrypted").value, current.content);
+  assert.equal(JSON.parse(b.field("packet").value).ciphertext, current.content);
+  assert.equal(b.field("own-public").value, "PUBLIC PEM alice");
+});
+
+test("encrypting with the opened own key returns exact plaintext and comparison feedback with real WebCrypto", async () => {
+  const realCore = require("../src/app/ui_assets/crypto_workbench_core.js");
+  const key = await realCore.createKeyPair("Synthetic comparison backup passphrase 2026");
+  const message = "Nội dung tệp gốc 🔐\nGiữ nguyên dấu, xuống dòng và khoảng trắng.  ";
+  const done = deferred();
+  const b = browser({
+    create: () => key,
+    encrypt: (...args) => realCore.encrypt(...args),
+    async decrypt(...args) {
+      try { return await realCore.decrypt(...args); }
+      finally { done.resolve(); }
+    },
+  });
+  await b.generate();
+  b.field("plaintext").value = message;
+  b.field("context").value = "synthetic-message-comparison";
+  await b.click("encrypt");
+  await done.promise;
+  await flush();
+  assert.equal(b.field("decrypted").value, message);
+  assert.match(b.field("packet-info").textContent, /Đối chiếu: khớp nguyên văn bản gốc\./);
+  assert.equal(b.calls.encrypt.length, 1);
+  assert.equal(b.calls.decrypt.length, 1);
+  assert.equal(b.calls.network, 0);
+  assert.equal(b.calls.persistence, 0);
+});
+
+test("encrypting for another recipient does not claim to decrypt or compare their plaintext", async () => {
+  const b = browser();
+  await b.generate();
+  b.edit("recipient-public", "PUBLIC PEM bob");
+  await b.click("import-public");
+  b.field("plaintext").value = "Synthetic content for another person";
+  await b.click("encrypt");
+  assert.equal(b.calls.encrypt.length, 1);
+  assert.equal(b.calls.decrypt.length, 0);
+  assert.equal(b.field("decrypted").value, "");
+  assert.doesNotMatch(b.field("packet-info").textContent, /khớp nguyên văn/);
+});
+
+for (const action of ["encrypt", "generate"]) {
+  test(`edited plaintext keeps the selected conversation as comparison baseline after ${action}`, async () => {
+    const b = browser(matchingTextHooks());
+    await b.generate();
+    const sourceRecord = conversationRecord("original-source", "Original source content with exact wording.");
+    await b.extractCipher([sourceRecord], `baseline-${action}`, "ready");
+    assert.equal(b.field("decrypted").value, sourceRecord.content);
+    const edited = "Edited text has a valid crypto roundtrip but differs from the saved source.";
+    b.edit("plaintext", edited);
+    if (action === "generate") await b.generate();
+    else await b.click("encrypt");
+    assert.equal(b.field("plaintext").value, edited);
+    assert.equal(b.field("decrypted").value, edited);
+    assert.match(b.field("packet-info").textContent, /Đối chiếu: không khớp văn bản gốc\./);
+    assert.doesNotMatch(b.field("packet-info").textContent, /Đối chiếu: khớp nguyên văn bản gốc\./);
+    await b.click("decrypt");
+    assert.equal(b.field("decrypted").value, edited);
+    assert.match(b.field("packet-info").textContent, /Đối chiếu: không khớp văn bản gốc\./);
+    assert.doesNotMatch(b.field("packet-info").textContent, /Đối chiếu: khớp nguyên văn bản gốc\./);
+  });
+}
+
+test("source selection distinguishes file-reading user content from the assistant summary without replacing the opened key", async () => {
+  const b = browser({...matchingTextHooks(), loadConversation() {}});
+  await restoreSyntheticKey(b);
+  const original = conversationRecord("139", "Văn bản được trích xuất từ tệp gốc; cần đối chiếu nguyên văn.");
+  const summary = {...conversationRecord("140", "Bản tóm tắt từ trợ lý."), role: "assistant"};
+  await b.extractCipher([original, summary], "two-source-messages", "ready");
+  assert.equal(b.field("plaintext").value, summary.content);
+  const options = b.field("source-message").children;
+  assert.ok(options.some(option => option.value === original.id));
+  assert.ok(options.some(option => option.value === summary.id));
+  assert.equal(options.some(option => option.textContent.includes(original.content)), false);
+  assert.equal(options.some(option => option.textContent.includes(summary.content)), false);
+  b.edit("source-message", original.id, "change");
+  await flush();
+  assert.equal(b.field("plaintext").value, original.content);
+  assert.equal(b.field("decrypted").value, original.content);
+  assert.equal(b.field("source-message").value, original.id);
+  assert.equal(b.field("own-public").value, "PUBLIC PEM alice");
+  assert.equal(b.calls.create.length, 0);
 });
 
 

@@ -194,8 +194,16 @@ bản sao khóa, văn bản gốc và nội dung giải mã là các trường D
    nhấn giải mã. Trường ngữ cảnh AAD là thông tin công khai trong gói, không
    điền bí mật vào đó. Gói bị sửa, sai khóa hoặc sai mật khẩu bị từ chối.
    Khi mở bản sao chỉ cần ô mật khẩu đầu tiên. File bản sao khóa chỉ chứa
-   khóa, không chứa lịch sử trò chuyện; cần nạp tin nhắn từ hội thoại hoặc
-   dán gói bản mã tương ứng vào mục 3 để đối chiếu nội dung.
+   khóa, không chứa lịch sử trò chuyện. Mở khóa thành công tự kích hoạt việc
+   nạp nội dung hội thoại đang chọn qua nút **Tải bản mã**; chỉ token và mã
+   hội thoại đi qua callback này, không có mật khẩu hay khóa riêng.
+   Chọn **Tin nhắn trong hội thoại để đối chiếu** ở mục 2 hoặc bấm dòng trong
+   bảng bản mã để đổi tin nhắn gốc/phản hồi. Mục 2 hiện nội dung và AAD, mục 3
+   hiện gói JSON cùng văn bản đã giải mã. Với người nhận là khóa của mình,
+   **Mã hóa văn bản** tự giải mã lại và báo kết quả so sánh nguyên văn. Với
+   public key người khác, cần private key tương ứng để giải mã.
+   Nội dung đối chiếu là văn bản tin nhắn (kể cả phần trích xuất tệp), không
+   phải các byte của PDF gốc. Bạn cũng có thể dán gói bản mã riêng vào mục 3.
 
 Giới hạn là 64 KiB văn bản UTF-8 và 256 byte ngữ cảnh. Khóa và nội dung chỉ ở
 tab hiện tại, không tự lưu vào web storage hoặc database. Công cụ bỏ trạng

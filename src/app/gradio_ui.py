@@ -2400,7 +2400,7 @@ def build_ui(
                         dd_cipher = _pick_dropdown(
                             label="Hội thoại", choices=[], interactive=True, scale=3
                         )
-                        btn_cipher = gr.Button("Tải bản mã", scale=1)
+                        btn_cipher = gr.Button("Tải bản mã", scale=1, elem_id="btn-cipher-load")
                     df_cipher = _data_table(
                         CIPHER_HEADERS, elem_id="cipher-table", elem_classes=["mono-df"]
                     )
@@ -3933,24 +3933,47 @@ def build_ui(
             ctx = f"session:{session_id}|msg:{msg_id}|role:{role}|epoch:{epoch}|scheme:{scheme}"
             return _truncate_utf8(ctx, 256)
 
+        def _cipher_workbench_markup(session_id, records, status):
+            payload = {
+                "session_id": str(session_id or ""),
+                "records": records,
+                "status": status,
+            }
+            encoded = base64.b64encode(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii")
+            nonce = secrets.token_hex(8)
+            return (
+                f'<span data-scap-cipher-extract="{encoded}" '
+                f'data-scap-cipher-nonce="{nonce}"></span>'
+            )
+
         def extract_cipher_workbench(token, session_id, view_id=None):
             if view_id != session_id:
                 return gr.skip()
-            if not token or not session_id:
+            if not token:
                 return ""
-            rows = _api(token, "GET", f"/api/sessions/{session_id}/ciphertexts")
-            if not rows:
-                return ""
-            msg_by_id = {}
+            if not session_id:
+                return _cipher_workbench_markup("", [], "no_selection")
             try:
+                rows = _api(token, "GET", f"/api/sessions/{session_id}/ciphertexts")
+                if not rows:
+                    return _cipher_workbench_markup(session_id, [], "empty")
                 messages = _api(token, "GET", f"/api/sessions/{session_id}/messages")
-                for msg in (messages or []):
-                    if isinstance(msg, dict) and msg.get("id"):
-                        msg_by_id[str(msg["id"])] = str(msg.get("content") or "")
             except gr.Error:
-                pass
+                # A completed key restore must receive an explicit result even
+                # when the selected conversation cannot be read. Never publish
+                # metadata-only rows as though plaintext was loaded.
+                return _cipher_workbench_markup(session_id, [], "unavailable")
+            msg_by_id = {
+                str(msg["id"]): str(msg.get("content") or "")
+                for msg in (messages or []) if isinstance(msg, dict) and msg.get("id")
+            }
+            selected_rows = rows[-50:]
+            if any(str(row.get("id") or "") not in msg_by_id for row in selected_rows):
+                return _cipher_workbench_markup(session_id, [], "unavailable")
             records = []
-            for row in rows[-50:]:
+            for row in selected_rows:
                 row_id = str(row.get("id") or "")
                 content = _truncate_utf8(msg_by_id.get(row_id, ""), 65536)
                 ctx = _cipher_extract_aad_context(str(session_id), row)
@@ -3969,18 +3992,7 @@ def build_ui(
                     "file_name": f"scap-msg-{short_id}.json",
                     "file_context": _truncate_utf8(f"file:{ctx}", 256),
                 })
-            payload = {
-                "session_id": str(session_id),
-                "records": records,
-            }
-            encoded = base64.b64encode(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            ).decode("ascii")
-            nonce = secrets.token_hex(8)
-            return (
-                f'<span data-scap-cipher-extract="{encoded}" '
-                f'data-scap-cipher-nonce="{nonce}"></span>'
-            )
+            return _cipher_workbench_markup(session_id, records, "ready")
 
         btn_cipher.click(
             _guard(load_cipher, 1), [st_token, dd_cipher, st_cipher_view], [df_cipher],
