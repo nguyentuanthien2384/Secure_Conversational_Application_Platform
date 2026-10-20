@@ -10,7 +10,7 @@ WORKBENCH_HTML = """
       <label for="cw-passphrase">Mật khẩu bản sao khóa riêng (ít nhất 16 ký tự)</label>
       <input id="cw-passphrase" type="password" maxlength="256" autocomplete="new-password"
              spellcheck="false" data-crypto-field="passphrase">
-      <label for="cw-confirm">Nhập lại mật khẩu khi tạo khóa</label>
+      <label for="cw-confirm">Nhập lại mật khẩu khi tạo hoặc xuất khóa phiên</label>
       <input id="cw-confirm" type="password" maxlength="256" autocomplete="new-password"
              spellcheck="false" data-crypto-field="confirm">
       <div class="crypto-actions"><button type="button" data-crypto-action="generate">Tạo cặp khóa</button></div>
@@ -21,6 +21,9 @@ WORKBENCH_HTML = """
         <button type="button" data-crypto-action="export-private">Xuất khóa riêng đã mã hóa</button>
       </div>
       <p data-crypto-field="own-info">Chưa có khóa riêng đang mở.</p>
+      <p>Khi xuất khóa phiên tự động, nhập mật khẩu riêng và xác nhận ở hai ô trên.
+        Khi mở bản sao JSON, chỉ cần nhập mật khẩu ở ô đầu tiên. Bản sao khóa chỉ chứa khóa,
+        không chứa nội dung cuộc trò chuyện; để kiểm tra nội dung, cần nạp tin nhắn hoặc gói bản mã tương ứng.</p>
       <label for="cw-own-public">Public key của bạn · SPKI PEM</label>
       <textarea id="cw-own-public" rows="6" readonly spellcheck="false" data-crypto-field="own-public"></textarea>
       <div class="crypto-actions">

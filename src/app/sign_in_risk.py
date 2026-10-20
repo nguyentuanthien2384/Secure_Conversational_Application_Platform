@@ -174,6 +174,7 @@ class SignInRiskService:
         available = self.geoip.check_freshness()
         result = {"backend": self.settings.backend, "available": available,
                   "action": "alert_only", "external_ip_lookup": False,
+                  "checked_at": datetime.now(timezone.utc).isoformat(),
                   "history_hours": self.settings.history_hours,
                   "min_distance_km": self.settings.min_distance_km,
                   "max_speed_kmh": self.settings.max_speed_kmh}

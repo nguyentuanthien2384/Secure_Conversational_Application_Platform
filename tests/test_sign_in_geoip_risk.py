@@ -12,6 +12,7 @@ from sqlalchemy import event, select
 from sqlalchemy.exc import OperationalError
 
 from src.app import sign_in_risk
+from src.app.audit import sign_ui_client_context
 from src.app.audit_chain import verify_chain
 from src.app.db import utcnow
 from src.app.models import AuditEvent, AuthSession, User
@@ -227,6 +228,40 @@ def test_status_endpoint_locates_the_callers_own_address(client, app, monkeypatc
                       headers={"Authorization": "Bearer " + token}).json()
     assert body["current"] == {"resolved": True, "country": "GB", "city": ""}
     assert body["external_ip_lookup"] is False
+    assert datetime.fromisoformat(body["checked_at"]).utcoffset() == timedelta(0)
+
+
+def test_status_rechecks_current_signed_browser_ip_and_time_without_relogin(client, app, monkeypatch):
+    service = app.state.sign_in_risk
+    monkeypatch.setattr(service, "settings", replace(service.settings, backend="maxmind",
+                                                     database_file="feed.mmdb"))
+    monkeypatch.setattr(service.geoip, "check_freshness", lambda: True)
+    _install_locations(app, monkeypatch)
+    token = register_and_login(client, "travel.current-browser")
+    checked = [datetime(2026, 10, 20, 6, 7, 8, tzinfo=timezone.utc)]
+
+    class StatusClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return checked[0].astimezone(tz) if tz else checked[0].replace(tzinfo=None)
+
+    monkeypatch.setattr(sign_in_risk, "datetime", StatusClock)
+
+    def status_from(ip):
+        headers = {"Authorization": "Bearer " + token,
+                   **sign_ui_client_context(app.state.ui_client_context_key, ip, "browser")}
+        response = client.get("/api/auth/sign-in-risk/status", headers=headers)
+        assert response.status_code == 200
+        return response.json()
+
+    first = status_from("81.2.69.160")
+    checked[0] += timedelta(minutes=2)
+    second = status_from("89.160.20.112")
+    assert first["current"] == {"resolved": True, "country": "GB", "city": ""}
+    assert second["current"] == {"resolved": True, "country": "AU", "city": ""}
+    assert first["checked_at"] == "2026-10-20T06:07:08+00:00"
+    assert second["checked_at"] == "2026-10-20T06:09:08+00:00"
+    assert second["external_ip_lookup"] is False
 
 
 def test_old_location_and_same_ip_do_not_raise_travel(client, app, monkeypatch):

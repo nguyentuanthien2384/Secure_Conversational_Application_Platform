@@ -69,6 +69,58 @@ test("encrypted backup restores the same nonextractable private key and public i
   await assert.rejects(webcrypto.subtle.exportKey("pkcs8", restored.privateKey));
 });
 
+test("changing a backup passphrase preserves its RSA identity and previously encrypted text and files", async () => {
+  const newPassphrase = "A user-chosen export passphrase #2026";
+  const original = JSON.parse(alice.encryptedBackup);
+  const file = await core.encryptFile(alice, new Uint8Array([0, 255, 1, 128]),
+    {name: "old-packet.bin", context: "before-password-change"});
+  const encryptedBackup = await core.reencryptKeyBackup(alice.encryptedBackup, PASSPHRASE, newPassphrase);
+  assert.equal(typeof encryptedBackup, "string");
+  assert.ok(!encryptedBackup.includes(newPassphrase));
+  assert.ok(!encryptedBackup.includes("PRIVATE KEY"));
+  const updated = JSON.parse(encryptedBackup);
+  for (const field of ["format", "version", "suite", "kdf", "iterations", "publicSpki", "fingerprint"]) {
+    assert.equal(updated[field], original[field]);
+  }
+  for (const field of ["salt", "nonce", "ciphertext"]) assert.notEqual(updated[field], original[field]);
+  assert.deepEqual(JSON.parse(alice.encryptedBackup), original);
+  await assert.rejects(core.restoreKeyPair(encryptedBackup, PASSPHRASE), safeError("backup"));
+  const restored = await core.restoreKeyPair(encryptedBackup, newPassphrase);
+  assert.equal(restored.fingerprint, alice.fingerprint);
+  assert.equal(restored.publicPem, alice.publicPem);
+  assert.equal(restored.privateKey.extractable, false);
+  assert.deepEqual(Object.keys(restored).sort(), Object.keys(alice).sort());
+  assert.equal(await core.decrypt(restored.privateKey, restored.fingerprint, packet), "Bảo mật 🔐\n零知識\u0000");
+  const recoveredFile = await core.decryptFile(restored.privateKey, restored.fingerprint, file);
+  assert.deepEqual([...recoveredFile.bytes], [0, 255, 1, 128]);
+  assert.equal(recoveredFile.name, "old-packet.bin");
+  await assert.rejects(webcrypto.subtle.exportKey("pkcs8", restored.privateKey));
+});
+
+test("backup password changes keep private-key imports nonextractable and wipe temporary DER", async () => {
+  const privateInputs = [];
+  const wrappedSubtle = new Proxy(webcrypto.subtle, {get(target, name) {
+    if (name === "importKey") return (...args) => {
+      if (args[0] === "pkcs8") {
+        assert.equal(args[3], false);
+        privateInputs.push(args[1]);
+      }
+      return target.importKey(...args);
+    };
+    if (name === "exportKey") return (...args) => {
+      assert.notEqual(args[0], "pkcs8");
+      return target.exportKey(...args);
+    };
+    const value = target[name];
+    return typeof value === "function" ? value.bind(target) : value;
+  }});
+  const checked = isolated({subtle: wrappedSubtle, getRandomValues: webcrypto.getRandomValues.bind(webcrypto)});
+  await checked.reencryptKeyBackup(alice.encryptedBackup, PASSPHRASE, "A new temporary backup password");
+  assert.equal(privateInputs.length, 1);
+  assert.ok(privateInputs[0].length > 1000);
+  assert.ok(privateInputs[0].every((value) => value === 0));
+});
+
 test("Unicode and empty plaintext roundtrip without ciphertext containing cleartext", async () => {
   assert.equal(await core.decrypt(alice.privateKey, alice.fingerprint, packet), "Bảo mật 🔐\n零知識\u0000");
   assert.ok(!packet.includes("Bảo mật"));
@@ -96,6 +148,11 @@ test("wrong backup passphrase and ciphertext changes produce fixed safe failures
   await assert.rejects(core.restoreKeyPair(mutated(alice.encryptedBackup, {ciphertext: changedByte(backup.ciphertext)}), PASSPHRASE), safeError("backup"));
   await assert.rejects(core.restoreKeyPair(mutated(alice.encryptedBackup, {salt: changedByte(backup.salt)}), PASSPHRASE), safeError("backup"));
   await assert.rejects(core.restoreKeyPair(mutated(alice.encryptedBackup, {nonce: changedByte(backup.nonce)}), PASSPHRASE), safeError("backup"));
+  await assert.rejects(core.reencryptKeyBackup(alice.encryptedBackup, "An entirely wrong passphrase", PASSPHRASE), safeError("backup"));
+  for (const field of ["ciphertext", "salt", "nonce"]) {
+    await assert.rejects(core.reencryptKeyBackup(
+      mutated(alice.encryptedBackup, {[field]: changedByte(backup[field])}), PASSPHRASE, PASSPHRASE), safeError("backup"));
+  }
 });
 
 test("backup header is authenticated and public/private pair substitution is rejected", async () => {
@@ -103,6 +160,8 @@ test("backup header is authenticated and public/private pair substitution is rej
   const other = JSON.parse(bob.encryptedBackup);
   await assert.rejects(core.restoreKeyPair(mutated(alice.encryptedBackup,
     {publicSpki: other.publicSpki, fingerprint: other.fingerprint}), PASSPHRASE), safeError("backup"));
+  await assert.rejects(core.reencryptKeyBackup(mutated(alice.encryptedBackup,
+    {publicSpki: other.publicSpki, fingerprint: other.fingerprint}), PASSPHRASE, PASSPHRASE), safeError("backup"));
 
   // Re-authenticate Alice's DER with Bob's public metadata using the known passphrase:
   // only the explicit RSA pair proof can reject this otherwise authentic backup.
@@ -115,6 +174,8 @@ test("backup header is authenticated and public/private pair substitution is rej
   const replacementCiphertext = await webcrypto.subtle.encrypt({name: "AES-GCM", iv: unb64(nonce), additionalData: encoder.encode(JSON.stringify(replacement))}, derived, privateDer);
   new Uint8Array(privateDer).fill(0);
   await assert.rejects(core.restoreKeyPair(JSON.stringify({...replacement, nonce, ciphertext: b64(replacementCiphertext)}), PASSPHRASE), safeError("backup"));
+  await assert.rejects(core.reencryptKeyBackup(JSON.stringify({...replacement, nonce, ciphertext: b64(replacementCiphertext)}),
+    PASSPHRASE, PASSPHRASE), safeError("backup"));
 });
 
 test("backup schema, algorithms and KDF costs reject before any derivation", async () => {
@@ -130,6 +191,8 @@ test("backup schema, algorithms and KDF costs reject before any derivation", asy
     {salt: "!"}, {salt: "AA"}, {nonce: "AA"}, {publicSpki: "A".repeat(1500)}]) {
     await assert.rejects(checked.restoreKeyPair(mutated(alice.encryptedBackup, changes), PASSPHRASE),
       (error) => error.code === "backup");
+    await assert.rejects(checked.reencryptKeyBackup(mutated(alice.encryptedBackup, changes), PASSPHRASE, PASSPHRASE),
+      (error) => error.code === "backup");
   }
   await assert.rejects(checked.restoreKeyPair("x".repeat(16001), PASSPHRASE), (error) => error.code === "backup");
   await assert.rejects(checked.restoreKeyPair(alice.encryptedBackup.replace('"iterations":', '"iterations":600000,"iterations":'), PASSPHRASE),
@@ -141,6 +204,8 @@ test("passphrase policy rejects weak, invalid UTF-16, and unbounded input", asyn
   for (const passphrase of ["", "short password", "a".repeat(257), "🔑".repeat(65), "\ud800".repeat(16), null, {}]) {
     await assert.rejects(core.createKeyPair(passphrase), safeError("passphrase"));
     await assert.rejects(core.restoreKeyPair(alice.encryptedBackup, passphrase), safeError("passphrase"));
+    await assert.rejects(core.reencryptKeyBackup(alice.encryptedBackup, passphrase, PASSPHRASE), safeError("passphrase"));
+    await assert.rejects(core.reencryptKeyBackup(alice.encryptedBackup, PASSPHRASE, passphrase), safeError("passphrase"));
   }
 });
 
@@ -226,6 +291,7 @@ test("weak RSA public keys, alternative exponents, private PEM and malformed pub
 test("unsupported browsers fail safely without network or storage globals", async () => {
   const unavailable = isolated(undefined);
   await assert.rejects(unavailable.createKeyPair(PASSPHRASE), (error) => error.code === "unsupported");
+  await assert.rejects(unavailable.reencryptKeyBackup(alice.encryptedBackup, PASSPHRASE, PASSPHRASE), (error) => error.code === "unsupported");
   await assert.rejects(unavailable.encrypt(alice, "private"), (error) => error.code === "unsupported");
   await assert.rejects(unavailable.decrypt(alice.privateKey, alice.fingerprint, packet), (error) => error.code === "unsupported");
   const isolatedCore = isolated(webcrypto);

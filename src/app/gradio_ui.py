@@ -20,7 +20,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import partial, wraps
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -1637,8 +1637,16 @@ def _geoip_status_markdown(status: dict) -> str:
                     f"{database.get('max_age_days')} ngày hoặc bị lỗi; tạm dừng đánh giá vị trí "
                     "đăng nhập cho tới khi được cập nhật.")
         return "GeoIP hiện không khả dụng; chưa thể kết luận về vị trí đăng nhập."
-    lines = [f"**GeoIP đang bật** · {source}" + (
-        f", cập nhật {built} ({database.get('age_days')} ngày trước)." if built else ".")]
+    lines = [f"**GeoIP đang bật** · cơ sở dữ liệu {source}" + (
+        f", phát hành {built} ({database.get('age_days')} ngày trước)." if built else ".")]
+    try:
+        checked = datetime.fromisoformat(str(status.get("checked_at"))).astimezone(
+            timezone(timedelta(hours=7)),
+        ).strftime("%d/%m/%Y %H:%M:%S")
+    except ValueError:
+        checked = ""
+    if checked:
+        lines.append(f"Lần kiểm tra vị trí: {checked} (UTC+7).")
     current = status.get("current") or {}
     if current.get("resolved"):
         place = ", ".join(_safe_markdown_text(part) for part in (current.get("city"), current.get("country"))
@@ -1650,6 +1658,12 @@ def _geoip_status_markdown(status: dict) -> str:
                      "không định vị được; trên máy chủ thật hệ thống dùng IP công khai của bạn.")
     elif current:
         lines.append("Chưa định vị được địa chỉ IP hiện tại trong cơ sở dữ liệu.")
+    lines.append(
+        "Thông tin được tra lại tự động sau mỗi lần đăng nhập hoặc tải lại trang. "
+        "Đây là vị trí ước lượng theo IP công khai, không phải GPS; cùng một IP có thể vẫn "
+        "hiển thị cùng vị trí dù bạn đăng nhập lại. Ngày phát hành ở trên là ngày của bộ dữ liệu, "
+        "không phải thời điểm kiểm tra vị trí."
+    )
     lines.append(
         f"Mỗi lần đăng nhập thành công được so với các lần đăng nhập trong {status.get('history_hours')} "
         f"giờ trước. Nếu hai vị trí cách nhau trên {status.get('min_distance_km')} km và tốc độ di chuyển "
@@ -3058,6 +3072,11 @@ def build_ui(
             email = _api(token, "GET", "/api/auth/email")
             return _email_markdown(email), table, gr.update(choices=choices, value=None)
 
+        def load_geoip_status(token):
+            if not token:
+                return ""
+            return _geoip_status_markdown(_api(token, "GET", "/api/auth/sign-in-risk/status"))
+
         # ---- hoạt động bảo mật (kiểu trang bảo mật tài khoản Google/GitHub) ----
         ACTIVITY_OUTS = [md_activity, df_activity]
 
@@ -3090,6 +3109,9 @@ def build_ui(
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        ).then(
+            _guard(load_geoip_status, 1), [st_token], [md_geoip_status],
+            api_name=False, show_progress="hidden",
         )
         btn_activity_refresh.click(
             _guard(load_security_activity, len(ACTIVITY_OUTS)), [st_token], ACTIVITY_OUTS,
@@ -3108,6 +3130,9 @@ def build_ui(
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        ).then(
+            _guard(load_geoip_status, 1), [st_token], [md_geoip_status],
+            api_name=False, show_progress="hidden",
         )
 
         def do_mfa_verify(mfa_token, code):
@@ -3145,6 +3170,9 @@ def build_ui(
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        ).then(
+            _guard(load_geoip_status, 1), [st_token], [md_geoip_status],
+            api_name=False, show_progress="hidden",
         )
         persist_after(tb_mfa_code.submit(
             _guard(do_mfa_verify, len(STAGE1)), [st_mfa, tb_mfa_code], STAGE1,
@@ -3156,6 +3184,9 @@ def build_ui(
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        ).then(
+            _guard(load_geoip_status, 1), [st_token], [md_geoip_status],
+            api_name=False, show_progress="hidden",
         )
         btn_mfa_cancel.click(
             lambda: ("", gr.update(visible=False), "", gr.update(visible=True)),
@@ -3205,6 +3236,9 @@ def build_ui(
         ).then(
             _guard(load_account_security, len(ACCOUNT_SECURITY_OUTS)), [st_token],
             ACCOUNT_SECURITY_OUTS, api_name=False, show_progress="hidden",
+        ).then(
+            _guard(load_geoip_status, 1), [st_token], [md_geoip_status],
+            api_name=False, show_progress="hidden",
         )
 
         # ---- quên mật khẩu ----
@@ -4255,9 +4289,6 @@ def build_ui(
             [passkey_bridge, st_passkey_step_up, md_passkey_step_up_hint, btn_passkey_step_up,
              tb_passkey_result], api_name=False,
         )
-
-        def load_geoip_status(token):
-            return _geoip_status_markdown(_api(token, "GET", "/api/auth/sign-in-risk/status"))
 
         btn_geoip_status.click(_guard(load_geoip_status, 1), [st_token], [md_geoip_status], api_name=False)
 

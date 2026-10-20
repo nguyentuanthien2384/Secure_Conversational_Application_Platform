@@ -106,14 +106,12 @@
   }
   function generateAutoPassphrase() {
     const bytes = new Uint8Array(24);
-    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
-      globalThis.crypto.getRandomValues(bytes);
-      let hex = "scap-auto-";
-      for (let i = 0; i < bytes.length; i += 1) hex += bytes[i].toString(16).padStart(2, "0");
-      bytes.fill(0);
-      return hex;
-    }
-    return "Scap-Auto-Session-Passphrase-2026!";
+    if (typeof globalThis.crypto?.getRandomValues !== "function") uiError("unsupported");
+    globalThis.crypto.getRandomValues(bytes);
+    let hex = "scap-auto-";
+    for (let i = 0; i < bytes.length; i += 1) hex += bytes[i].toString(16).padStart(2, "0");
+    bytes.fill(0);
+    return hex;
   }
   function clearExtractedFile(item) {
     if (!item?.extractedFile) return;
@@ -230,10 +228,12 @@
     buttons(item);
     try {
       if (!item.keypair && !item.recipient && typeof core.createKeyPair === "function") {
-        const autoPair = await core.createKeyPair(generateAutoPassphrase());
+        const autoPassphrase = generateAutoPassphrase();
+        const autoPair = await core.createKeyPair(autoPassphrase);
         if (!valid(item, epoch)) return;
         setPair(item, autoPair);
-        write(item, "own-info", `RSA-OAEP 3072 / SHA-256 · SHA-256: ${autoPair.fingerprint} (Khóa phiên tự động)`);
+        item.autoBackupPassphrase = autoPassphrase;
+        write(item, "own-info", `RSA-OAEP 3072 / SHA-256 · SHA-256: ${autoPair.fingerprint} (Khóa phiên tự động; đặt mật khẩu ở hai ô trên trước khi xuất bản sao)`);
       }
       if (content && item.recipient && typeof core.encrypt === "function") {
         const recipient = item.recipient;
@@ -311,6 +311,7 @@
     item.epoch += 1;
     item.busy = false;
     item.keypair = null;
+    item.autoBackupPassphrase = "";
     item.recipient = null;
     item.extractedRecord = null;
     item.extractedRecords = [];
@@ -338,7 +339,7 @@
     const node = document.querySelector('#crypto-workbench [data-scap-crypto-workbench="1"]');
     if (state?.node !== node) {
       if (state) clear(state, "Đã xóa khóa và dữ liệu cục bộ.");
-      state = node ? {node, epoch: 0, busy: false, keypair: null, recipient: null,
+      state = node ? {node, epoch: 0, busy: false, keypair: null, autoBackupPassphrase: "", recipient: null,
         extractNonce: "", extractedRecords: [], extractedRecord: null, extractedFile: null,
         idle: null, urls: new Map(), blocked: blocked()} : null;
       if (state) buttons(state);
@@ -383,6 +384,7 @@
   function uiError(code) { throw {code}; }
   function setPair(item, pair) {
     item.keypair = pair;
+    item.autoBackupPassphrase = "";
     item.recipient = {publicKey: pair.publicKey, publicPem: pair.publicPem, fingerprint: pair.fingerprint};
     write(item, "own-public", pair.publicPem);
     write(item, "own-info", `RSA-OAEP 3072 / SHA-256 · SHA-256: ${pair.fingerprint}`);
@@ -543,6 +545,21 @@
           status(item, "Đã sao chép khóa công khai của bạn.");
         } else {
           const privateBackup = action === "export-private";
+          if (privateBackup && item.autoBackupPassphrase) {
+            const passphrase = value(item, "passphrase");
+            const confirmation = value(item, "confirm");
+            write(item, "passphrase", "");
+            write(item, "confirm", "");
+            if (passphrase !== confirmation) uiError("mismatch");
+            if (typeof core.reencryptKeyBackup !== "function") uiError("unsupported");
+            const backup = await core.reencryptKeyBackup(
+              item.keypair.encryptedBackup, item.autoBackupPassphrase, passphrase,
+            );
+            if (!valid(item, epoch)) return;
+            item.keypair.encryptedBackup = backup;
+            item.autoBackupPassphrase = "";
+            write(item, "own-info", `RSA-OAEP 3072 / SHA-256 · SHA-256: ${item.keypair.fingerprint} (Bản sao đã được bảo vệ bằng mật khẩu bạn đặt)`);
+          }
           download(item, epoch, privateBackup ? item.keypair.encryptedBackup : item.keypair.publicPem,
             privateBackup ? "scap-private-key.encrypted.json" : "scap-public-key.pem",
             privateBackup ? "application/json" : "text/plain;charset=utf-8");

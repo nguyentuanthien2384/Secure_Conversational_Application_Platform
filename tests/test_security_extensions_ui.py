@@ -265,14 +265,18 @@ def test_geoip_ui_distinguishes_disabled_unavailable_and_advisory(demo, monkeypa
 
 def test_geoip_ui_explains_feed_place_rules_and_credits_db_ip():
     base = {"backend": "maxmind", "available": True, "action": "alert_only",
+            "checked_at": "2026-10-20T06:07:08+00:00",
             "history_hours": 24, "min_distance_km": 500, "max_speed_kmh": 900,
             "database": {"type": "DBIP-City-Lite", "built": "2026-10-01", "age_days": 19,
                          "max_age_days": 90}}
     text = gradio_ui._geoip_status_markdown(
         {**base, "current": {"resolved": True, "country": "VN", "city": "Ha*noi"}})
-    assert "DB-IP City Lite, cập nhật 01/10/2026 (19 ngày trước)" in text
+    assert "cơ sở dữ liệu DB-IP City Lite, phát hành 01/10/2026 (19 ngày trước)" in text
+    assert "Lần kiểm tra vị trí: 20/10/2026 13:07:08 (UTC+7)." in text
     assert "Ha\\*noi, VN" in text and "không được lưu" in text
     assert "500 km" in text and "900 km/h" in text and "24 giờ" in text
+    assert "tự động" in text and "đăng nhập" in text and "tải lại trang" in text
+    assert "cùng một IP" in text and "GPS" in text
     assert "[IP Geolocation by DB-IP](https://db-ip.com)" in text
     private = gradio_ui._geoip_status_markdown({**base, "current": {"resolved": False, "reason": "private"}})
     assert "địa chỉ nội bộ" in private
@@ -281,6 +285,42 @@ def test_geoip_ui_explains_feed_place_rules_and_credits_db_ip():
     assert "GeoLite2\\-City" in maxmind and "DB-IP" not in maxmind  # Markdown-escaped name
     stale = gradio_ui._geoip_status_markdown({**base, "available": False})
     assert "chưa khả dụng" in stale and "90 ngày" in stale
+
+
+@pytest.mark.parametrize("token", ["", None])
+def test_geoip_automatic_refresh_without_a_session_clears_status_without_request(demo, monkeypatch, token):
+    calls = []
+    monkeypatch.setattr(gradio_ui, "_api", lambda *args, **kwargs: calls.append(args))
+    assert callback(demo, "load_geoip_status").fn(token) == ""
+    assert calls == []
+
+
+def test_every_completed_login_and_restored_session_refreshes_geoip_display(demo):
+    dependencies = demo.config["dependencies"]
+    names = {item["id"]: demo.fns[item["id"]].fn.__name__ for item in dependencies}
+    starts = [item for item in dependencies if names[item["id"]] in {
+        "restore_session", "do_login", "do_mfa_verify", "finish_passkey_login",
+    }]
+    assert len(starts) == 5  # Restoration, password, MFA click/Enter and passkey.
+    manual = next(item for item in dependencies if names[item["id"]] == "load_geoip_status"
+                  and item.get("trigger_after") is None)
+    for start in starts:
+        pending = [start]
+        reached = []
+        while pending:
+            parent = pending.pop()
+            for child in dependencies:
+                if child.get("trigger_after") != parent["id"]:
+                    continue
+                if names[child["id"]] == "load_geoip_status":
+                    reached.append(child)
+                else:
+                    pending.append(child)
+        assert len(reached) == 1, names[start["id"]]
+        refresh = reached[0]
+        assert refresh["inputs"] == manual["inputs"]
+        assert refresh["outputs"] == manual["outputs"]
+        assert refresh["show_progress"] == "hidden"
 
 
 def test_geoip_ui_reads_real_authenticated_status_without_revealing_lookup_path(demo, http_api):

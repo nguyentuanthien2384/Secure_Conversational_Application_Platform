@@ -115,8 +115,13 @@ quốc gia và khoảng cách làm tròn. VPN hoặc mạng di động có thể
 lượng sai. App nạp file lúc khởi động; dữ liệu quá `GEOIP_MAX_DATABASE_AGE_DAYS`
 ngày thì tạm dừng đánh giá (báo "chưa khả dụng") chứ không chặn đăng nhập. Kiểm
 tra trong **Tài khoản → Hoạt động bảo mật gần đây → Kiểm tra đánh giá vị trí
-đăng nhập**: hiện nguồn dữ liệu, ngày cập nhật, ngưỡng cảnh báo và vị trí ước
-lượng của chính IP bạn đang dùng (chỉ hiển thị cho bạn, không lưu).
+đăng nhập**: trạng thái tự tải lại sau mỗi lần đăng nhập (mật khẩu, 2FA hoặc
+passkey) và khi tải lại trang; nút này cho phép kiểm tra lại thủ công. Giao diện
+hiện nguồn dữ liệu, ngày phát hành bộ dữ liệu, thời điểm kiểm tra (UTC+7), ngưỡng
+cảnh báo và vị trí ước lượng của chính IP bạn đang dùng (chỉ hiển thị cho bạn,
+không lưu). Ngày phát hành bộ dữ liệu không phải lần đăng nhập gần nhất. Đây
+là định vị theo IP, không phải GPS: cùng một IP công khai có thể vẫn hiện cùng
+vị trí sau nhiều lần đăng nhập.
 
 ## Đóng gói cho Docker/VPS
 
@@ -176,12 +181,21 @@ bản sao khóa, văn bản gốc và nội dung giải mã là các trường D
 2. Tải **khóa riêng đã mã hóa**, giữ mật khẩu ở nơi riêng biệt. Không có chức
    năng khôi phục khi mất bản sao hoặc mật khẩu. Private key đang mở không cho
    xuất dạng rõ; chỉ public key có nút sao chép và xuất PEM.
+   Nếu công cụ tự tạo **Khóa phiên tự động** khi nạp tin nhắn, nhập mật khẩu
+   và xác nhận ở hai ô của mục 1 trước lần xuất đầu tiên. Công cụ mã hóa lại
+   bản sao bằng mật khẩu bạn đặt, giữ nguyên cặp khóa/fingerprint và khả năng
+   giải mã các gói đã tạo. Mật khẩu ngẫu nhiên tạm chỉ ở bộ nhớ tab, được bỏ
+   sau khi bảo vệ bản sao hoặc khi công cụ bị khóa/xóa; không xuất bản sao
+   dùng mật khẩu tạm mà người dùng không biết.
 3. Nhập public key người nhận và đối chiếu toàn bộ fingerprint SHA-256 qua kênh
    tin cậy. Nhấn **Dùng public key người nhận**, nhập văn bản rồi mã hóa. Khóa
    vừa tạo cũng được chọn làm người nhận ban đầu để thử tự mã hóa/giải mã.
 4. Người nhận mở bản sao khóa riêng bằng mật khẩu của mình, dán gói JSON và
    nhấn giải mã. Trường ngữ cảnh AAD là thông tin công khai trong gói, không
    điền bí mật vào đó. Gói bị sửa, sai khóa hoặc sai mật khẩu bị từ chối.
+   Khi mở bản sao chỉ cần ô mật khẩu đầu tiên. File bản sao khóa chỉ chứa
+   khóa, không chứa lịch sử trò chuyện; cần nạp tin nhắn từ hội thoại hoặc
+   dán gói bản mã tương ứng vào mục 3 để đối chiếu nội dung.
 
 Giới hạn là 64 KiB văn bản UTF-8 và 256 byte ngữ cảnh. Khóa và nội dung chỉ ở
 tab hiện tại, không tự lưu vào web storage hoặc database. Công cụ bỏ trạng

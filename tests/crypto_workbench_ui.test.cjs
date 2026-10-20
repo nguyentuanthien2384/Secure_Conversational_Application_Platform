@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const {webcrypto} = require("node:crypto");
 const source = fs.readFileSync(path.join(__dirname, "../src/app/ui_assets/crypto_workbench.js"), "utf8");
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; };
@@ -12,7 +13,7 @@ const pair = (name = "alice") => ({privateKey: {type: "private", extractable: fa
   encryptedBackup: JSON.stringify({format: "scap-key-backup", ciphertext: `ENCRYPTED ${name}`})});
 
 function browser(options = {}) {
-  const calls = {create: [], restore: [], import: [], encrypt: [], decrypt: [], encryptFile: [], decryptFile: [], clipboard: [], downloads: [],
+  const calls = {create: [], restore: [], reencrypt: [], import: [], encrypt: [], decrypt: [], encryptFile: [], decryptFile: [], clipboard: [], downloads: [],
     revoked: [], network: 0, persistence: 0};
   const events = new Map();
   const windowEvents = new Map();
@@ -76,6 +77,12 @@ function browser(options = {}) {
     limits: {fileBytes: 5242880, fileContainerBytes: 5246380},
     async createKeyPair(...args) { calls.create.push(args); return options.create ? options.create(...args) : pair(); },
     async restoreKeyPair(...args) { calls.restore.push(args); return options.restore ? options.restore(...args) : pair(); },
+    async reencryptKeyBackup(...args) {
+      calls.reencrypt.push(args);
+      if (options.reencrypt) return options.reencrypt(...args);
+      if ([...args[2]].length < 16) throw {code: "passphrase"};
+      return JSON.stringify({format: "scap-key-backup", ciphertext: "REPROTECTED alice"});
+    },
     async importPublicKey(...args) { calls.import.push(args); return options.import ? options.import(...args) : pair("bob"); },
     async encrypt(...args) { calls.encrypt.push(args); return options.encrypt ? options.encrypt(...args) : JSON.stringify({ciphertext: "SAFE CIPHERTEXT"}); },
     async decrypt(...args) { calls.decrypt.push(args); return options.decrypt ? options.decrypt(...args) : "<img src=x onerror=alert(1)> plaintext"; },
@@ -104,7 +111,8 @@ function browser(options = {}) {
   };
   Object.defineProperty(document, "cookie", {get() { calls.persistence += 1; throw new Error("No cookies allowed"); }});
   const context = {
-    document, Blob, TextEncoder, TextDecoder, atob, ArrayBuffer, Uint8Array, ScapCryptoCore: options.noCore ? undefined : core, isSecureContext: options.secure !== false,
+    document, Blob, TextEncoder, TextDecoder, atob, ArrayBuffer, Uint8Array, crypto: options.noRandom ? {} : webcrypto,
+    ScapCryptoCore: options.noCore ? undefined : core, isSecureContext: options.secure !== false,
     navigator: {clipboard: {async writeText(value) { calls.clipboard.push(value); if (options.clipboard) return options.clipboard(value); }}},
     URL: {createObjectURL(blob) { const url = `blob:local-${++nextUrl}`; blobs.set(url, blob); return url; },
       revokeObjectURL(url) { calls.revoked.push(url); blobs.delete(url); }},
@@ -867,6 +875,215 @@ test("cipher extraction loads embedded scap-encrypted-text JSON packet directly 
   assert.equal(b.field("context").value, "custom-aad");
   assert.equal(JSON.parse(b.field("packet").value).ciphertext, "cipher-b64");
   assert.match(b.field("packet-info").textContent, /pkt-99/);
+});
+
+test("automatic keys require secure randomness instead of exporting a fallback-password backup", async () => {
+  const b = browser({noRandom: true});
+  await b.extractCipher([{id: "auto-export", content: "Synthetic message", context: "synthetic-context"}]);
+  assert.equal(b.calls.create.length, 0);
+  assert.equal(b.field("own-public").value, "");
+  await b.click("export-private");
+  assert.equal(b.calls.downloads.length, 0);
+});
+
+test("automatic session backup export requires a matching strong chosen passphrase", async () => {
+  const b = browser();
+  await b.extractCipher([{id: "auto-export", content: "Synthetic message", context: "synthetic-context"}]);
+  await b.click("export-private");
+  assert.equal(b.calls.downloads.length, 0);
+  assert.match(b.field("status").textContent, /mật khẩu/i);
+  b.field("passphrase").value = "A chosen synthetic backup passphrase";
+  b.field("confirm").value = "A different synthetic passphrase";
+  const beforeMismatch = b.calls.reencrypt.length;
+  await b.click("export-private");
+  assert.equal(b.calls.reencrypt.length, beforeMismatch);
+  assert.equal(b.calls.downloads.length, 0);
+  assert.equal(b.field("passphrase").value, "");
+  assert.equal(b.field("confirm").value, "");
+  assert.match(b.field("status").textContent, /chưa khớp/);
+  b.field("passphrase").value = "too short";
+  b.field("confirm").value = "too short";
+  await b.click("export-private");
+  assert.equal(b.calls.downloads.length, 0);
+  assert.equal(b.field("passphrase").value, "");
+  assert.equal(b.field("confirm").value, "");
+  assert.equal(b.field("status").textContent.includes("too short"), false);
+});
+
+test("automatic backup export reencrypts the existing identity once and clears password inputs before crypto", async () => {
+  const chosen = "A chosen synthetic backup passphrase 2026";
+  const replacement = JSON.stringify({format: "scap-key-backup", ciphertext: "REPROTECTED synthetic key"});
+  let b;
+  b = browser({reencrypt(backup, previous, next) {
+    assert.equal(b.field("passphrase").value, "");
+    assert.equal(b.field("confirm").value, "");
+    assert.equal(backup, pair().encryptedBackup);
+    assert.equal(previous, b.calls.create[0][0]);
+    assert.match(previous, /^scap-auto-[0-9a-f]{48}$/);
+    assert.equal(next, chosen);
+    return replacement;
+  }});
+  await b.extractCipher([{id: "auto-export", content: "Synthetic message", context: "synthetic-context"}]);
+  const publicPem = b.field("own-public").value;
+  const originalPacket = b.field("packet").value;
+  b.field("passphrase").value = chosen;
+  b.field("confirm").value = chosen;
+  await b.click("export-private");
+  assert.equal(b.calls.create.length, 1);
+  assert.equal(b.calls.reencrypt.length, 1);
+  assert.equal(b.calls.downloads.length, 1);
+  assert.equal(await b.calls.downloads[0].blob.text(), replacement);
+  assert.equal(b.calls.downloads[0].filename, "scap-private-key.encrypted.json");
+  assert.equal(b.field("own-public").value, publicPem);
+  assert.equal(b.field("packet").value, originalPacket);
+  await b.click("export-private");
+  assert.equal(b.calls.reencrypt.length, 1);
+  assert.equal(b.calls.downloads.length, 2);
+  assert.equal(await b.calls.downloads[1].blob.text(), replacement);
+  assert.equal(b.calls.network, 0);
+  assert.equal(b.calls.persistence, 0);
+});
+
+test("failed automatic backup reprotection preserves the same key and allows a clean retry", async () => {
+  const chosen = "A chosen synthetic backup passphrase 2026";
+  let attempts = 0;
+  const b = browser({reencrypt(backup) {
+    assert.equal(backup, pair().encryptedBackup);
+    if (++attempts === 1) throw Object.assign(new Error("PRIVATE KEY and synthetic-secret must not appear"), {code: "backup"});
+    return "REPROTECTED BACKUP";
+  }});
+  await b.extractCipher([{id: "auto-export", content: "Synthetic message", context: "synthetic-context"}]);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    b.field("passphrase").value = chosen;
+    b.field("confirm").value = chosen;
+    await b.click("export-private");
+    assert.equal(b.field("passphrase").value, "");
+    assert.equal(b.field("confirm").value, "");
+    assert.equal(b.field("status").textContent.includes("PRIVATE"), false);
+    assert.equal(b.field("status").textContent.includes("synthetic-secret"), false);
+  }
+  assert.equal(b.calls.create.length, 1);
+  assert.equal(b.calls.reencrypt.length, 2);
+  assert.equal(b.calls.downloads.length, 1);
+  assert.equal(await b.calls.downloads[0].blob.text(), "REPROTECTED BACKUP");
+});
+
+test("restored and manually generated keys retain their already protected backup on export", async () => {
+  for (const origin of ["generated", "restored"]) {
+    const b = browser({reencrypt() { assert.fail("A user-protected backup must not require an automatic password"); }});
+    await b.extractCipher([{id: "old-auto-key", content: "Synthetic message", context: "synthetic-context"}]);
+    if (origin === "generated") await b.generate();
+    else {
+      b.file("private-file", {size: 100, async text() { return pair().encryptedBackup; }});
+      b.field("passphrase").value = "An existing synthetic backup passphrase";
+      await b.click("restore");
+    }
+    await b.click("export-private");
+    assert.equal(b.calls.reencrypt.length, 0);
+    assert.equal(b.calls.downloads.length, 1);
+    assert.equal(await b.calls.downloads[0].blob.text(), pair().encryptedBackup);
+  }
+});
+
+test("clear, logout, hide and input edits invalidate pending automatic backup exports", async () => {
+  for (const invalidation of ["clear", "logout", "hide", "edit"]) {
+    const pending = deferred();
+    const chosen = "A chosen synthetic backup passphrase 2026";
+    const b = browser({reencrypt: () => pending.promise});
+    await b.extractCipher([{id: "auto-export", content: "Synthetic message", context: "synthetic-context"}]);
+    b.field("passphrase").value = chosen;
+    b.field("confirm").value = chosen;
+    await b.click("export-private");
+    assert.equal(b.calls.reencrypt.length, 1);
+    if (invalidation === "clear") await b.click("clear");
+    else if (invalidation === "logout") b.logout();
+    else if (invalidation === "hide") b.hide();
+    else b.edit("passphrase", "A newly edited synthetic passphrase");
+    pending.resolve("STALE REPROTECTED BACKUP");
+    await flush();
+    assert.equal(b.calls.downloads.length, 0, invalidation);
+    if (invalidation !== "edit") {
+      if (invalidation === "hide") b.show();
+      await b.generate();
+      await b.click("export-private");
+      assert.equal(b.calls.reencrypt.length, 1, invalidation);
+      assert.equal(await b.calls.downloads[0].blob.text(), pair().encryptedBackup);
+    } else {
+      b.core.reencryptKeyBackup = async (backup) => {
+        assert.equal(backup, pair().encryptedBackup);
+        return "CURRENT REPROTECTED BACKUP";
+      };
+      b.field("passphrase").value = chosen;
+      b.field("confirm").value = chosen;
+      await b.click("export-private");
+      assert.equal(await b.calls.downloads[0].blob.text(), "CURRENT REPROTECTED BACKUP");
+    }
+  }
+});
+
+test("real automatic key export restores in a fresh controller and decrypts the original message packet", async () => {
+  const realCore = require("../src/app/ui_assets/crypto_workbench_core.js");
+  const chosen = "A chosen synthetic backup passphrase 2026";
+  const message = "Synthetic saved conversation 🔐\nRestore must retain this exact content.";
+  const extractionDone = deferred(), reencryptDone = deferred(), restoreDone = deferred(), decryptDone = deferred();
+  let createdPair, restoredPair;
+  const b = browser({
+    async create(passphrase) { createdPair = await realCore.createKeyPair(passphrase); return createdPair; },
+    encrypt: (...args) => realCore.encrypt(...args),
+    decrypt: (...args) => realCore.decrypt(...args),
+    async decryptFile() {
+      extractionDone.resolve();
+      return {bytes: new Uint8Array([1]), name: "synthetic.json", context: "synthetic-context", sha256: "a".repeat(64)};
+    },
+    async reencrypt(...args) {
+      try { return await realCore.reencryptKeyBackup(...args); }
+      finally { reencryptDone.resolve(); }
+    },
+  });
+  await b.extractCipher([{id: "synthetic-message", content: message, context: "synthetic-context"}]);
+  await extractionDone.promise;
+  await flush();
+  const fingerprint = createdPair.fingerprint;
+  const originalBackup = createdPair.encryptedBackup;
+  const packet = b.field("packet").value;
+  assert.equal(b.field("decrypted").value, message);
+  b.field("passphrase").value = chosen;
+  b.field("confirm").value = chosen;
+  await b.click("export-private");
+  await reencryptDone.promise;
+  await flush();
+  assert.equal(b.calls.downloads.length, 1);
+  const exported = await b.calls.downloads[0].blob.text();
+  assert.notEqual(exported, originalBackup);
+  assert.equal(JSON.parse(exported).fingerprint, fingerprint);
+  assert.equal(b.field("packet").value, packet);
+  assert.equal(b.calls.create.length, 1);
+  await b.click("clear");
+  const fresh = browser({
+    async restore(...args) {
+      try { restoredPair = await realCore.restoreKeyPair(...args); return restoredPair; }
+      finally { restoreDone.resolve(); }
+    },
+    async decrypt(...args) {
+      try { return await realCore.decrypt(...args); }
+      finally { decryptDone.resolve(); }
+    },
+  });
+  fresh.file("private-file", {size: Buffer.byteLength(exported), async text() { return exported; }});
+  fresh.field("passphrase").value = chosen;
+  await fresh.click("restore");
+  await restoreDone.promise;
+  await flush();
+  assert.equal(restoredPair.fingerprint, fingerprint);
+  assert.equal(restoredPair.privateKey.extractable, false);
+  fresh.field("packet").value = packet;
+  await fresh.click("decrypt");
+  await decryptDone.promise;
+  await flush();
+  assert.equal(fresh.field("decrypted").value, message);
+  assert.equal(fresh.calls.create.length, 0);
+  assert.equal(b.calls.network + fresh.calls.network, 0);
+  assert.equal(b.calls.persistence + fresh.calls.persistence, 0);
 });
 
 

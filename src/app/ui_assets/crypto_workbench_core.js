@@ -155,6 +155,15 @@
     return subtle().deriveKey({name: "PBKDF2", hash: "SHA-256", iterations: ITERATIONS, salt},
       material, {name: "AES-GCM", length: 256}, false, ["encrypt", "decrypt"]);
   }
+  async function sealBackup(privateDer, publicDer, publicFingerprint, passphraseBytes) {
+    const salt = random(16);
+    const nonce = random(12);
+    const header = backupHeader(encode64(publicDer), publicFingerprint, encode64(salt));
+    const key = await backupKey(passphraseBytes, salt);
+    const ciphertext = await subtle().encrypt({name: "AES-GCM", iv: nonce,
+      additionalData: encoder.encode(JSON.stringify(header)), tagLength: 128}, key, privateDer);
+    return JSON.stringify({...header, nonce: encode64(nonce), ciphertext: encode64(ciphertext)});
+  }
   async function createKeyPair(passphrase) {
     const passphraseBytes = checkedPassphrase(passphrase);
     let privateDer;
@@ -164,16 +173,10 @@
       const publicDer = bytes(await subtle().exportKey("spki", pair.publicKey));
       privateDer = bytes(await subtle().exportKey("pkcs8", pair.privateKey));
       const publicData = await publicFromDer(publicDer);
-      const salt = random(16);
-      const nonce = random(12);
-      const header = backupHeader(encode64(publicDer), publicData.fingerprint, encode64(salt));
-      const key = await backupKey(passphraseBytes, salt);
-      const ciphertext = await subtle().encrypt({name: "AES-GCM", iv: nonce,
-        additionalData: encoder.encode(JSON.stringify(header)), tagLength: 128}, key, privateDer);
+      const encryptedBackup = await sealBackup(privateDer, publicDer, publicData.fingerprint, passphraseBytes);
       const privateKey = await subtle().importKey("pkcs8", privateDer,
         {name: "RSA-OAEP", hash: "SHA-256"}, false, ["decrypt"]);
-      return {...publicData, privateKey,
-        encryptedBackup: JSON.stringify({...header, nonce: encode64(nonce), ciphertext: encode64(ciphertext)})};
+      return {...publicData, privateKey, encryptedBackup};
     } catch (error) {
       if (error instanceof CryptoWorkbenchError && error.code === "unsupported") throw error;
       fail("backup");
@@ -182,9 +185,11 @@
       privateDer?.fill(0);
     }
   }
-  async function restoreKeyPair(encryptedBackup, passphrase) {
-    const passphraseBytes = checkedPassphrase(passphrase);
+  // Only internal callers can access the temporary DER; public operations wipe it.
+  async function openBackup(encryptedBackup, passphraseBytes) {
     let privateDer;
+    let proof;
+    let decryptedProof;
     try {
       subtle();
       const backup = object(parse(encryptedBackup, MAX_BACKUP_BYTES),
@@ -204,21 +209,51 @@
       const privateKey = await subtle().importKey("pkcs8", privateDer,
         {name: "RSA-OAEP", hash: "SHA-256"}, false, ["decrypt"]);
       if (!validRsa(privateKey, "private")) throw new Error();
-      const proof = random(32);
+      proof = random(32);
       const proofCiphertext = await subtle().encrypt({name: "RSA-OAEP"}, publicData.publicKey, proof);
-      const decryptedProof = bytes(await subtle().decrypt({name: "RSA-OAEP"}, privateKey, proofCiphertext));
+      decryptedProof = bytes(await subtle().decrypt({name: "RSA-OAEP"}, privateKey, proofCiphertext));
       let difference = decryptedProof.length ^ proof.length;
       for (let index = 0; index < proof.length; index += 1) difference |= proof[index] ^ decryptedProof[index];
-      proof.fill(0);
-      decryptedProof.fill(0);
       if (difference !== 0) throw new Error();
-      return {...publicData, privateKey, encryptedBackup};
+      return {publicData, publicDer, privateKey, privateDer};
+    } catch (error) {
+      privateDer?.fill(0);
+      throw error;
+    } finally {
+      proof?.fill(0);
+      decryptedProof?.fill(0);
+    }
+  }
+  async function restoreKeyPair(encryptedBackup, passphrase) {
+    const passphraseBytes = checkedPassphrase(passphrase);
+    let opened;
+    try {
+      opened = await openBackup(encryptedBackup, passphraseBytes);
+      return {...opened.publicData, privateKey: opened.privateKey, encryptedBackup};
     } catch (error) {
       if (error instanceof CryptoWorkbenchError && error.code === "unsupported") throw error;
       fail("backup");
     } finally {
       passphraseBytes.fill(0);
-      privateDer?.fill(0);
+      opened?.privateDer.fill(0);
+    }
+  }
+  async function reencryptKeyBackup(encryptedBackup, oldPassphrase, newPassphrase) {
+    let oldPassphraseBytes;
+    let newPassphraseBytes;
+    let opened;
+    try {
+      oldPassphraseBytes = checkedPassphrase(oldPassphrase);
+      newPassphraseBytes = checkedPassphrase(newPassphrase);
+      opened = await openBackup(encryptedBackup, oldPassphraseBytes);
+      return await sealBackup(opened.privateDer, opened.publicDer, opened.publicData.fingerprint, newPassphraseBytes);
+    } catch (error) {
+      if (error instanceof CryptoWorkbenchError && ["unsupported", "passphrase"].includes(error.code)) throw error;
+      fail("backup");
+    } finally {
+      oldPassphraseBytes?.fill(0);
+      newPassphraseBytes?.fill(0);
+      opened?.privateDer.fill(0);
     }
   }
   function packetHeader(recipient, context) {
@@ -408,7 +443,7 @@
       payload?.fill(0);
     }
   }
-  return Object.freeze({createKeyPair, restoreKeyPair, importPublicKey, encrypt, decrypt, encryptFile, decryptFile, CryptoWorkbenchError,
+  return Object.freeze({createKeyPair, restoreKeyPair, reencryptKeyBackup, importPublicKey, encrypt, decrypt, encryptFile, decryptFile, CryptoWorkbenchError,
     limits: Object.freeze({textBytes: MAX_TEXT_BYTES, contextBytes: 256, backupBytes: MAX_BACKUP_BYTES,
       packetBytes: MAX_PACKET_BYTES, passphraseMinimumCharacters: 16, passphraseMaximumBytes: 256,
       fileBytes: MAX_FILE_BYTES, fileContainerBytes: MAX_FILE_CONTAINER_BYTES, fileNameBytes: MAX_FILE_NAME_BYTES}),
