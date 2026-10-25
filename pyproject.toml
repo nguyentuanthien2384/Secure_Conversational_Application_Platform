@@ -5,7 +5,7 @@ description = "Course project for Application and System Security: secure multi-
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=1.15.0,<2.0.0",
+    "anthropic>=1.15.0,<3.0.0",
     "argon2-cffi>=25.1.0",
     # 50.0.0 là bản vá PYSEC-2026-3552; giữ sàn ở đây để pip-audit trong CI không đỏ lại.
     "cryptography>=50.0.0",
